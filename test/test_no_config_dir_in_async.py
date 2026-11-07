@@ -1,0 +1,239 @@
+"""No config_dir() inside async functions.
+
+config_dir() runs maintenance (mkdir, breadcrumb refresh, a shutil.rmtree sweep) on
+every call, which would block the event loop. Async code uses data_home().
+"""
+
+from __future__ import annotations
+
+import ast
+from pathlib import Path
+
+SRC = Path(__file__).resolve().parents[1] / "src" / "kiro_crew"
+
+# Files the AST guard checks for config_dir() calls inside async functions.
+_ASYNC_CHECKED_FILES = [
+    "dashboard/handlers/files.py",
+    "dashboard/file_api/browse.py",
+    "dashboard/file_api/channel_upload.py",
+    "dashboard/file_api/dashboard_config.py",
+    "dashboard/file_api/desktop.py",
+    "dashboard/file_api/editor.py",
+    "dashboard/file_api/git_panel.py",
+    "dashboard/file_api/grep.py",
+    "dashboard/file_api/office_preview.py",
+    "dashboard/file_api/outbox.py",
+    "dashboard/file_api/path_complete.py",
+    "dashboard/file_api/path_probe.py",
+    "dashboard/file_api/pinned_io.py",
+    "dashboard/file_api/project_dirs.py",
+    "dashboard/file_api/project_tree.py",
+    "dashboard/file_api/search.py",
+    "dashboard/file_api/sheet.py",
+    "dashboard/file_api/transfer.py",
+    "dashboard/file_api/uploads.py",
+    "dashboard/file_api/workspaces.py",
+    "dashboard/chat_runner.py",
+    "dashboard/chat_turn/account_identity.py",
+    "dashboard/chat_turn/acp_recovery.py",
+    "dashboard/chat_turn/agent_started.py",
+    "dashboard/chat_turn/app_agent_binding.py",
+    "dashboard/chat_turn/context_cap.py",
+    "dashboard/chat_turn/crew_log_attribution.py",
+    "dashboard/chat_turn/decisions_hooks.py",
+    "dashboard/chat_turn/deny_chokepoints.py",
+    "dashboard/chat_turn/directives.py",
+    "dashboard/chat_turn/eager_spawn.py",
+    "dashboard/chat_turn/file_changes.py",
+    "dashboard/chat_turn/mcp_session.py",
+    "dashboard/chat_turn/model_fallback.py",
+    "dashboard/chat_turn/native_cards.py",
+    "dashboard/chat_turn/elicitation_prompt.py",
+    "dashboard/chat_turn/permission_prompt.py",
+    "dashboard/chat_turn/prompt_assembly.py",
+    "dashboard/chat_turn/queue_cycle.py",
+    "dashboard/chat_turn/queue_drain.py",
+    "dashboard/chat_turn/recipient.py",
+    "dashboard/chat_turn/recovery.py",
+    "dashboard/chat_turn/regenerate_swap.py",
+    "dashboard/chat_turn/segment_flush.py",
+    "dashboard/chat_turn/session_events.py",
+    "dashboard/chat_turn/session_reset.py",
+    "dashboard/chat_turn/slash_commands.py",
+    "dashboard/chat_turn/steer_queue.py",
+    "dashboard/chat_turn/stop_recovery.py",
+    "dashboard/chat_turn/stream_chunks.py",
+    "dashboard/chat_turn/tool_approval.py",
+    "dashboard/chat_turn/tool_results.py",
+    "dashboard/chat_turn/tool_rows.py",
+    "dashboard/chat_turn/turn_admission.py",
+    "dashboard/chat_turn/turn_context.py",
+    "dashboard/chat_turn/turn_dispatch_gates.py",
+    "dashboard/chat_turn/turn_ending.py",
+    "dashboard/chat_turn/turn_entry.py",
+    "dashboard/chat_turn/turn_failures.py",
+    "dashboard/chat_turn/turn_ledgers.py",
+    "dashboard/chat_turn/turn_marker.py",
+    "dashboard/chat_turn/turn_reply_seams.py",
+    "dashboard/chat_turn/turn_spec_hooks.py",
+    "dashboard/chat_turn/turn_stats.py",
+    "dashboard/handlers/knowledge.py",
+    "dashboard/handlers/knowledge_access.py",
+    "dashboard/handlers/knowledge_agent_context.py",
+    "dashboard/handlers/knowledge_bundles.py",
+    "dashboard/handlers/knowledge_embeddings.py",
+    "dashboard/handlers/knowledge_ingest.py",
+    "dashboard/handlers/knowledge_library.py",
+    "dashboard/handlers/knowledge_lifecycle.py",
+    "dashboard/handlers/knowledge_sources.py",
+    "dashboard/handlers/knowledge_sync.py",
+    "dashboard/handlers/messaging.py",
+    "dashboard/messaging_api/agent_push.py",
+    "dashboard/messaging_api/channel_config_writes.py",
+    "dashboard/messaging_api/channel_delivery.py",
+    "dashboard/messaging_api/channel_folder_backfill.py",
+    "dashboard/messaging_api/discord_settings.py",
+    "dashboard/messaging_api/feishu_settings.py",
+    "dashboard/messaging_api/imessage_settings.py",
+    "dashboard/messaging_api/notifications.py",
+    "dashboard/messaging_api/proactive_send.py",
+    "dashboard/messaging_api/run_control.py",
+    "dashboard/messaging_api/run_views.py",
+    "dashboard/messaging_api/slack_settings.py",
+    "dashboard/messaging_api/slack_workspace.py",
+    "dashboard/messaging_api/spawn.py",
+    "dashboard/messaging_api/teams_settings.py",
+    "dashboard/messaging_api/telegram_settings.py",
+    "dashboard/messaging_api/webex_settings.py",
+    "dashboard/messaging_api/wecom_settings.py",
+    "dashboard/server.py",
+    "dashboard/server_runtime/api_entrypoint.py",
+    "dashboard/server_runtime/app_platform.py",
+    "dashboard/server_runtime/browser_lifecycle.py",
+    "dashboard/server_runtime/config_watch.py",
+    "dashboard/server_runtime/crewmate_prune.py",
+    "dashboard/server_runtime/diagnostics.py",
+    "dashboard/server_runtime/heartbeat.py",
+    "dashboard/server_runtime/instances_lifecycle.py",
+    "dashboard/server_runtime/listener.py",
+    "dashboard/server_runtime/listener_claims.py",
+    "dashboard/server_runtime/maintenance.py",
+    "dashboard/server_runtime/mcp_routes.py",
+    "dashboard/server_runtime/middleware_chain.py",
+    "dashboard/server_runtime/owner_notices.py",
+    "dashboard/server_runtime/prevent_sleep.py",
+    "dashboard/server_runtime/safety_grants.py",
+    "dashboard/server_runtime/security_headers.py",
+    "dashboard/server_runtime/security_middleware.py",
+    "dashboard/server_runtime/service_hooks.py",
+    "dashboard/server_runtime/session_restore.py",
+    "dashboard/server_runtime/static_assets.py",
+    "dashboard/server_runtime/stt_hooks.py",
+    "dashboard/server_runtime/tunnel.py",
+    "dashboard/server_runtime/workflow_startup.py",
+    "slack/gateway.py",
+    "slack/gateway_runtime/admission.py",
+    "slack/gateway_runtime/channel_boot.py",
+    "slack/gateway_runtime/channel_lifecycle.py",
+    "slack/gateway_runtime/cron_delivery.py",
+    "slack/gateway_runtime/cron_dispatch.py",
+    "slack/gateway_runtime/cron_exec.py",
+    "slack/gateway_runtime/cron_failure.py",
+    "slack/gateway_runtime/cron_fire.py",
+    "slack/gateway_runtime/cron_turn.py",
+    "slack/gateway_runtime/delivery.py",
+    "slack/gateway_runtime/exit_path.py",
+    "slack/gateway_runtime/heartbeat_turns.py",
+    "slack/gateway_runtime/install_repair.py",
+    "slack/gateway_runtime/mcp_broker.py",
+    "slack/gateway_runtime/memory_lifecycle.py",
+    "slack/gateway_runtime/nudge_channel_fire.py",
+    "slack/gateway_runtime/nudge_dashboard_fire.py",
+    "slack/gateway_runtime/nudge_wiring.py",
+    "slack/gateway_runtime/process_entry.py",
+    "slack/gateway_runtime/result_egress.py",
+    "slack/gateway_runtime/runtime_charge.py",
+    "slack/gateway_runtime/service_boot.py",
+    "slack/gateway_runtime/subagent_injection.py",
+    "slack/gateway_runtime/subagent_wiring.py",
+    "slack/gateway_runtime/turn_approvals.py",
+    "slack/gateway_runtime/update_apply.py",
+    "slack/gateway_runtime/update_schedule.py",
+    "slack/interactions.py",
+    "slack/interactions_approvals.py",
+    "slack/interactions_context.py",
+    "slack/interactions_modals.py",
+    "slack/interactions_options.py",
+    "slack/interactions_sessions.py",
+    "slack/interactions_settings.py",
+    "weixin/gateway.py",
+    "cli_chat.py",
+]
+
+
+def _takes_the_turn(node: ast.AST) -> bool:
+    """A function cut from the dashboard turn's coroutine takes the turn first: its body ran
+    inside ``_run_chat``, on the event loop, so the async rule reads it as it read that
+    coroutine."""
+    return (
+        isinstance(node, ast.FunctionDef)
+        and bool(node.args.args)
+        and node.args.args[0].arg == "turn"
+    )
+
+
+class TestNoConfigDirInAsync:
+    """config_dir() must not be called inside async functions."""
+
+    def test_update_layout_channel_helpers_never_maintain(self) -> None:
+        """The channel read/write must use ``data_home()``, not ``config_dir()``.
+
+        The AST walk above misses them (not ``async def``), but async handlers call
+        ``release_channel()`` and ``set_release_channel()`` (``POST
+        /api/update/channel``).
+        """
+        tree = ast.parse((SRC / "platform" / "update_layout.py").read_text(encoding="utf-8"))
+        # AST, not a substring scan: the module's docstrings NAME config_dir to
+        # explain why it is the wrong helper here, and a text match would flag
+        # exactly the comment that documents the fix.
+        called = {
+            getattr(n.func, "id", None) or getattr(n.func, "attr", None)
+            for n in ast.walk(tree)
+            if isinstance(n, ast.Call)
+        }
+        imported = {
+            alias.name
+            for n in ast.walk(tree)
+            if isinstance(n, ast.ImportFrom)
+            for alias in n.names
+        }
+        assert "config_dir" not in called and "config_dir" not in imported, (
+            "update_layout.py must resolve the data home with data_home(); "
+            "config_dir() re-runs start-of-process maintenance on every call and "
+            "these helpers are reached from async request handlers (#1057)"
+        )
+        assert "data_home" in called, "the channel helpers must resolve a path at all"
+
+        """Every async call site must use data_home() instead of config_dir()."""
+        offenders: list[str] = []
+        for fname in _ASYNC_CHECKED_FILES:
+            fp = SRC / fname
+            if not fp.exists():
+                continue
+            tree = ast.parse(fp.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if not (isinstance(node, ast.AsyncFunctionDef) or _takes_the_turn(node)):
+                    continue
+                for sub in ast.walk(node):
+                    if isinstance(sub, ast.Call):
+                        name = getattr(sub.func, "id", None) or getattr(
+                            sub.func, "attr", None
+                        )
+                        if name == "config_dir":
+                            offenders.append(
+                                f"{fname}:{sub.lineno} in async {node.name}()"
+                            )
+        assert not offenders, (
+            "config_dir() called inside async function (issue #1057). "
+            "Use data_home() instead:\n  " + "\n  ".join(offenders)
+        )

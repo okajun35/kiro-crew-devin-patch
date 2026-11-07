@@ -1,0 +1,742 @@
+"""Capture what every known harness is LAUNCHED as, for the golden and its writer.
+
+Imported by ``test/test_acp_launch_goldens.py`` (read-only) and
+``scripts/update_acp_launch_goldens.py`` (the only writer); it lives here because a test
+must not create files in the repo (AUTOSDE ``no-test-side-effects``).
+
+Captured per backend id: the argv, the spawn and stderr labels, and the env variables
+the spawn adds. The env is a delta so the snapshot depends on the code, not the host;
+search path, interpreter path, pi's gate nonce and the identity token are placeholders.
+Every spawn collaborator is stubbed to a fixed answer (see :func:`_stub_for`).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import inspect
+import json
+import os
+import sys
+from collections.abc import Callable, Sequence
+from pathlib import Path
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock, patch
+
+from kiro_crew.acp import client as client_mod
+from kiro_crew.acp import launch as launch_mod
+from kiro_crew.acp import runtime as runtime_mod
+from kiro_crew.acp.client import AcpClient
+from kiro_crew.acp.harness import claude as claude_mod
+from kiro_crew.acp.harness import codex as codex_harness_mod
+from kiro_crew.acp.harness import deepseek as deepseek_mod
+from kiro_crew.acp.harness import devin as devin_mod
+from kiro_crew.acp.harness import opencode as opencode_mod
+from kiro_crew.acp.harness import pi as pi_mod
+from kiro_crew.acp.harness import pi_node as pi_node_mod
+from kiro_crew.acp.harness import strands as strands_mod
+from kiro_crew.acp.runtime import AcpRuntime
+from kiro_crew.acp.skill_projection import NativeSkillProjection
+from kiro_crew.agent_sdk.backends import (
+    ACP_BACKEND_COPILOT,
+    ACP_BACKEND_DEEPSEEK,
+    ACP_BACKEND_DEVIN,
+    ACP_BACKEND_GOOSE,
+    ACP_BACKEND_OPENCODE,
+    ACP_BACKEND_STRANDS,
+    ACP_BACKENDS_ACP_RUNTIME,
+    ACP_BACKENDS_KIRO_FAMILY,
+    ACP_BACKENDS_KNOWN,
+)
+from kiro_crew.config import paths as config_paths
+from kiro_crew.constants import KIROCREW_SPAWN_INSTANCE_ENV
+from kiro_crew.mcp_gateway.claim import STUB_SESSION_TOKEN_ENV
+
+#: The committed fixture. Resolved from this file so both callers agree on it.
+GOLDEN_PATH = Path(__file__).parent / "fixtures" / "acp_launch_goldens.json"
+
+#: Fixed resolver answers. Absolute and obviously synthetic so a real host path can
+#: never leak into the snapshot.
+_KIRO_BIN = "/opt/bin/kiro-cli"
+_CLAUDE_ACP_ARGV = ["/opt/bin/node", "/opt/lib/claude-agent-acp/index.js"]
+_CODEX_ACP_ARGV = ["/opt/bin/node", "/opt/lib/codex-acp/index.js"]
+_PI_ACP_ARGV = ["/opt/bin/node", "/opt/lib/pi-acp/index.js"]
+_PI_BIN = "/opt/bin/pi"
+_PI_LAUNCHER = "/opt/run/pi-launcher.sh"
+_PI_EXTENSION = "/opt/run/kiro_crew_tool_gate.ts"
+_PI_MCP_HANDOFF = "/opt/run/kirocrew_pi_gate_mcp_handoff.json"
+# The DeepSeek Harness gate artifacts, pinned the same way and for the same reason:
+# both are real files in the owner-only run directory, and the golden records the
+# argv rather than the filesystem.
+_DSH_EXTENSION = "/opt/run/kiro_crew_tool_gate.mjs"
+_DSH_PATCH = "/opt/run/kiro_crew_dsh_gate.patch.yml"
+_OPENCODE_BIN = "/opt/bin/opencode"
+_GOOSE_BIN = "/opt/bin/goose"
+_DEEPSEEK_BIN = "/opt/bin/dsh"
+_COPILOT_BIN = "/opt/bin/copilot"
+_STRANDS_BIN = "/opt/bin/strands"
+# The Strands gate module, sealed into its project directory in the gate leaf.
+_STRANDS_PROJECT = "/opt/run/strands"
+_STRANDS_GATE = "/opt/run/strands/agent.py"
+_SEARCH_PATH = "/opt/bin"
+_OPENCODE_CONFIG = '{"permission":"ask"}'
+
+#: Env keys whose VALUE is a property of the host or the run. The key still has to
+#: appear -- that a harness receives it at all is the fact being pinned.
+VOLATILE_ENV = {
+    "PATH": "<augmented-path>",
+    "KIROCREW_RUNTIME_PYTHON": "<interpreter>",
+    "KIROCREW_PI_GATE_SESSION": "<nonce>",
+    "KIROCREW_DSH_GATE_SESSION": "<nonce>",
+    "KIROCREW_STRANDS_GATE_SESSION": "<nonce>",
+    # Under the capture's own home, so the path is the host's.
+    "KIROCREW_STRANDS_STATE_DIR": "<state-dir>",
+    # The pi steer channel: a stem naming the gateway's pid and the launch nonce, and
+    # a key minted per launch (``acp.harness.pi_steer``).
+    "KIROCREW_PI_STEER": "<steer-stem>",
+    "KIROCREW_PI_STEER_KEY": "<steer-key>",
+    # Minted from ``secrets`` on every client, so it can never match a golden twice.
+    # That a one-session client's child RECEIVES it is the fact being pinned: it is
+    # how a control-plane MCP server on that child resolves its own session.
+    STUB_SESSION_TOKEN_ENV: "<session-token>",
+    # Minted per spawn so a recycled root pid cannot false-match a later spawn; the
+    # tree inherits it and a teardown that has lost its root reads it back out of
+    # /proc to tell the root's own descendants from a fresh runtime's. That the
+    # runtime's child RECEIVES it is the fact being pinned.
+    KIROCREW_SPAWN_INSTANCE_ENV: "<spawn-instance>",
+    # The spawning gateway's data home, so a reclaim can refuse a sibling install's
+    # runtime. That the child RECEIVES it is the fact pinned; the path is the host's.
+    "KIROCREW_SPAWN_HOME": "<data-home>",
+    # The runtime's private-state directory, under the capture's temp dir.
+    # That the codex child RECEIVES it -- its SQLite home is its own -- is the fact
+    # being pinned; the directory is not.
+    "CODEX_SQLITE_HOME": "<scratch>",
+}
+
+#: The parent environment every capture runs against, whatever the recording host's
+#: own environment happens to be.
+#:
+#: ``env_added`` is a delta, so against the ambient env a variable the host already
+#: exports (``KIROCREW_SPAWNED`` inside any agent) would never show as set by ``_spawn``.
+_FIXED_PARENT_ENV = {
+    "PATH": "/opt/bin",
+}
+
+#: Keys carried through from the real environment because the interpreter and the OS
+#: need them, and ``_spawn`` sets none of them -- so their values stay identical
+#: between parent and child and never reach the delta. Windows in particular cannot
+#: resolve a home directory or a temp dir without these.
+_PASSTHROUGH_ENV_KEYS = (
+    "SYSTEMROOT",
+    "SystemRoot",
+    "SYSTEMDRIVE",
+    "USERPROFILE",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "HOME",
+    "TEMP",
+    "TMP",
+    "TMPDIR",
+    "COMSPEC",
+    "PATHEXT",
+    "LOCALAPPDATA",
+    "APPDATA",
+    "PROGRAMDATA",
+)
+
+
+def fixed_parent_env() -> dict:
+    """The parent environment a capture runs against.
+
+    A small fixed base plus an ALLOWLIST carried through from the host. The
+    allowlist is what keeps this usable on Windows; it names only variables
+    ``_spawn`` does not touch, so nothing carried through can hide a key the way the
+    ambient environment did.
+    """
+    env = dict(_FIXED_PARENT_ENV)
+    for key in _PASSTHROUGH_ENV_KEYS:
+        value = os.environ.get(key)
+        if value is not None:
+            env[key] = value
+    return env
+
+
+def golden_key(backend: str) -> str:
+    """The fixture key for *backend*. kiro-cli's id is the empty string."""
+    return backend or "kiro"
+
+
+class _Recorder:
+    """What one ``_spawn`` handed to the factory, the logger and the drainer."""
+
+    def __init__(self) -> None:
+        self.argv: list[str] = []
+        self.env: dict[str, str] = {}
+        self.spawn_label = ""
+        self.stderr_label = ""
+
+
+def _stub_for(real: Any, answer: Callable[[dict[str, Any]], Any]) -> Callable[..., Any]:
+    """A stub for *real* that accepts exactly the arguments *real* accepts.
+
+    Each call is bound against ``real``'s signature, so an undeclared keyword raises
+    ``TypeError`` as it would there; a hand-typed list or ``**kwargs`` would hide drift.
+    ``answer`` receives the bound arguments by name.
+    """
+    signature = inspect.signature(real)
+
+    def _stub(*args: Any, **kwargs: Any) -> Any:
+        bound = signature.bind(*args, **kwargs)
+        bound.apply_defaults()
+        return answer(bound.arguments)
+
+    return _stub
+
+
+def _async_stub_for(real: Any, answer: Callable[[dict[str, Any]], Any]) -> Callable[..., Any]:
+    """:func:`_stub_for` for a collaborator the spawn path awaits."""
+    inner = _stub_for(real, answer)
+
+    async def _stub(*args: Any, **kwargs: Any) -> Any:
+        return inner(*args, **kwargs)
+
+    return _stub
+
+
+async def _windows_cleanup_passthrough(factory: Any) -> Any:
+    """Invoke the spawn factory without charging Windows cleanup capacity.
+
+    Mirrors the POSIX branch of ``create_windows_cleanup_owned_process``: the
+    factory runs, its child is returned, and no admission slot or handle pin is
+    taken. A captured launch owns no real child, so there is nothing to pin.
+    """
+    return await factory()
+
+
+def _allocate_capture_scratch(tmp_path: Path, label: str) -> Path:
+    """A scratch window for *label*, as a REAL directory under *tmp_path*.
+
+    Stands in for ``agent_scratch.allocate_scratch`` (DeepSeek, runtime-served codex).
+    It must be real and under the temp dir: ``record_owner`` writes ``.owner`` into it
+    and the gate probe's window is ``shutil.rmtree``'d, so a fixed host path would be hit.
+    """
+    path = tmp_path / "scratch" / label
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+#: Collaborators the capture answers with one of the call's OWN arguments, and which
+#: argument each answers with. Every one of them reads the host otherwise -- the two
+#: env resolvers and the pod home remap read config and the real environment, the pod
+#: bundle wrap resolves a bundled runtime, and the cgroup wrap asks the OS for a scope
+#: -- while the argv and the env they are handed are the answers this file records. So
+#: each hands its own argument straight back.
+#:
+#: Keyed by attribute name so the stub is built from the live object: see
+#: :func:`_stub_for` for why the accepted arguments are derived rather than typed out.
+_PASSTHROUGH_STUBS: dict[str, Callable[[dict[str, Any]], Any]] = {
+    "scrub_agent_subprocess_env": lambda call: call["env"],
+    "_resolve_spawn_env": lambda call: call["env"],
+    "_apply_pod_home_remap": lambda call: call["env"],
+    "cgroup_scope_argv": lambda call: call["argv"],
+    "apply_pod_bundle_spawn": lambda call: (call["argv"], False),
+}
+
+#: The same, for the collaborator the spawn path awaits. It answers with the argv it
+#: was handed and no cleanup handle, so the sandbox wrap contributes nothing to the
+#: argv this file records.
+_ASYNC_PASSTHROUGH_STUBS: dict[str, Callable[[dict[str, Any]], Any]] = {
+    "wrap_argv_async": lambda call: (list(call["argv"]), None),
+}
+
+
+def _stub_common(stack: list, rec: _Recorder, tmp_path: Path, backend: str = "") -> None:
+    """Patch every collaborator that is not the answer under test."""
+    proc = MagicMock()
+    proc.pid = 4242
+    proc.returncode = None
+    proc.stdout = MagicMock()
+    proc.stderr = MagicMock()
+    proc.stdin = MagicMock()
+
+    async def _factory(*argv: str, **kwargs: Any):
+        rec.argv = [
+            (
+                "<gate-nonce>"
+                if index and argv[index - 1] == "--nonce"
+                else "<interpreter>" if value == sys.executable else value
+            )
+            for index, value in enumerate(argv)
+        ]
+        rec.env = dict(kwargs.get("env") or {})
+        return proc
+
+    async def _drain(_stream, *, label: str):
+        rec.stderr_label = label
+
+    def _finish(_process, _pid, *, label: str) -> bool:
+        rec.spawn_label = label
+        return True
+
+    # The pass-through collaborators, each accepting what the live object accepts.
+    # Patched on the client, whose bindings the launch tail is handed, AND on every
+    # host adapter that binds the same name for its own routing read-back: the
+    # read-back is wrapped and scrubbed exactly like the session spawn, and stubbing
+    # only the tail would leave the read-back on the real sandbox.
+    stack.extend(
+        patch.object(module, name, side_effect=_stub_for(getattr(module, name), answer))
+        for name, answer in _PASSTHROUGH_STUBS.items()
+        for module in (client_mod, *_READBACK_MODULES)
+        if module is client_mod or name in vars(module)
+    )
+    # The Windows cleanup admission is not a launch answer either: it charges a
+    # process-wide capacity slot and pins the REAL child's original handle. The
+    # MagicMock above has no handle to pin, and a failed pin is deliberately
+    # sticky (manual handling refuses every later start in this interpreter),
+    # so the admission hands the factory straight through instead of judging
+    # a fake child. The capacity contract has its own tests.
+    stack.append(
+        patch.object(
+            client_mod.platform_compat,
+            "create_windows_cleanup_owned_process",
+            side_effect=_windows_cleanup_passthrough,
+        )
+    )
+    stack.extend(
+        patch.object(module, name, side_effect=_async_stub_for(getattr(module, name), answer))
+        for name, answer in _ASYNC_PASSTHROUGH_STUBS.items()
+        for module in (client_mod, *_READBACK_MODULES)
+        if module is client_mod or name in vars(module)
+    )
+
+    stack.extend(
+        [
+            patch.object(client_mod, "create_subprocess_limited", side_effect=_factory),
+            patch.object(client_mod, "finish_suspended_spawn", side_effect=_finish),
+            patch.object(AcpClient, "_drain_stderr", side_effect=_drain),
+            patch.object(AcpClient, "_prepare_spawn_workspace", return_value=None),
+            patch.object(
+                devin_mod,
+                "seal_devin_gate",
+                return_value=(
+                    "/sealed/devin-hook.py",
+                    "/sealed/devin-bridge.py",
+                    "/sealed/devin-config.json",
+                ),
+            ),
+            patch.object(AcpClient, "_resolve_session_mcp_servers", return_value=[]),
+            patch.object(client_mod, "inject_xdist_auto_cap", return_value=None),
+            patch.object(client_mod, "_get_child_pids", return_value=[]),
+            # A per-process temp root the sandbox masks, so every harness that does
+            # not need one is captured without it. The DeepSeek arm DOES need one:
+            # its gate's load marker is written by the child into this private
+            # window, because the gate-artifact leaf is sealed read-only against the
+            # child, and a session with nowhere to put the marker is refused rather
+            # than run ungated. It is answered with a real directory under
+            # ``tmp_path`` (see :func:`_allocate_capture_scratch`), one per label,
+            # because the arm WRITES into the window it is handed.
+            patch.object(
+                client_mod.agent_scratch,
+                "allocate_scratch",
+                side_effect=_stub_for(
+                    client_mod.agent_scratch.allocate_scratch,
+                    lambda call: (
+                        _allocate_capture_scratch(tmp_path, call["label"])
+                        if backend in (ACP_BACKEND_DEEPSEEK, ACP_BACKEND_STRANDS)
+                        else None
+                    ),
+                ),
+            ),
+            # Placeholders keep one golden for all platforms: Windows paths use
+            # backslashes and ``KIRO_CHAT_LOG_FILE`` is unset there. ``shared`` folds
+            # into the same placeholders, as in the real function.
+            patch.object(
+                client_mod.agent_scratch,
+                "scratch_env",
+                side_effect=lambda path, shared=None: {
+                    "TMPDIR": "<scratch>",
+                    "TMP": "<scratch>",
+                    "TEMP": "<scratch>",
+                    "KIROCREW_SCRATCH": "<scratch>",
+                    "KIRO_CHAT_LOG_FILE": "<scratch-log>",
+                },
+            ),
+            patch.object(launch_mod, "_run_preflight_bounded", new=AsyncMock(return_value=())),
+            patch("kiro_crew.session._track_pid", return_value=None),
+            patch("kiro_crew.session._track_session_pid", return_value=None),
+            patch.object(
+                client_mod, "assert_voice_runtime_outside_agent_workspace", return_value=None
+            ),
+            patch.object(
+                client_mod,
+                "bind_voice_safe_agent_workspace_async",
+                new=AsyncMock(return_value=(str(tmp_path), None)),
+            ),
+            # kiro-cli's own pre-spawn gates. Each reads disk or the agents tree;
+            # the argv they guard is what this capture records, not their verdicts.
+            patch.object(
+                client_mod, "_resolve_kiro_bin_for_spawn", new=AsyncMock(return_value=_KIRO_BIN)
+            ),
+            patch.object(client_mod, "ensure_agent_materialized", return_value=None),
+            patch(
+                "kiro_crew.acp.skill_projection.prepare_native_skill_projection",
+                return_value=NativeSkillProjection({"kirocrew": "kirocrew-skill-view-golden"}),
+            ),
+            patch.object(client_mod, "require_fresh_derived_spec", return_value=None),
+            patch.object(client_mod, "require_fork_governance", return_value=None),
+            patch.object(
+                client_mod, "delegated_workspace_exposes_sealed_target", return_value=None
+            ),
+            # The adapter resolvers, each at the host adapter that owns it.
+            patch.object(
+                claude_mod,
+                "_resolve_claude_acp_bin",
+                return_value=(_CLAUDE_ACP_ARGV, _SEARCH_PATH),
+            ),
+            patch.object(
+                client_mod, "_resolve_codex_acp_bin", return_value=(_CODEX_ACP_ARGV, _SEARCH_PATH)
+            ),
+            patch.object(pi_mod, "_resolve_pi_acp_bin", return_value=(_PI_ACP_ARGV, _SEARCH_PATH)),
+            patch.object(pi_mod, "_resolve_pi_bin", return_value=(_PI_BIN, _SEARCH_PATH)),
+            patch.object(pi_mod, "_pi_node_choice", return_value=pi_mod.PiNodeChoice()),
+            patch.object(claude_mod, "_resolve_claude_code_executable", return_value=""),
+            patch.object(AcpClient, "_write_claude_local_settings", return_value=None),
+            patch.object(pi_mod, "_seal_pi_gate_extension", return_value=_PI_EXTENSION),
+            patch.object(pi_mod, "_ensure_pi_gate_launcher", return_value=_PI_LAUNCHER),
+            patch.object(pi_mod, "_verify_pi_gate", return_value=("", "")),
+            patch.object(pi_mod, "publish_pi_mcp_handoff", return_value=_PI_MCP_HANDOFF),
+            # A fixed key, so the golden environment is the same on every run.
+            patch.object(pi_mod, "new_pi_mcp_handoff_key", return_value=bytes(32)),
+            patch.object(
+                deepseek_mod, "_seal_deepseek_gate_extension", return_value=_DSH_EXTENSION
+            ),
+            patch.object(deepseek_mod, "_write_deepseek_gate_patch", return_value=_DSH_PATCH),
+            patch.object(pi_mod, "_pi_gate_artifact_dir", return_value="/opt/run"),
+            patch.object(deepseek_mod, "_verify_deepseek_gate", return_value=("", "")),
+            patch.object(opencode_mod, "_verify_opencode_routing", return_value=("", "")),
+            # The Strands launch's host reads, each answered in range: the gate seal and
+            # its project directory, the Python environment, the release, the Node
+            # choice, the config the adapter reads, and the gate's read-back boot.
+            patch.object(strands_mod, "strands_project_dir", return_value=_STRANDS_PROJECT),
+            patch.object(strands_mod, "_seal_strands_gate", return_value=_STRANDS_GATE),
+            patch.object(strands_mod, "strands_python_env_issue", return_value=""),
+            patch.object(strands_mod, "_strands_version_issue", return_value=""),
+            patch.object(pi_node_mod, "choose_pi_node", return_value=pi_node_mod.PiNodeChoice()),
+            patch.object(strands_mod, "_strands_user_project", return_value=("", "")),
+            patch.object(strands_mod, "_strands_vault_env_names", return_value=()),
+            patch.object(strands_mod, "_strands_vault_env", return_value={}),
+            patch.object(
+                strands_mod, "_state_dir", side_effect=lambda home: str(tmp_path / "strands-state")
+            ),
+            patch.object(strands_mod, "_verify_strands_gate", return_value=("", "")),
+            patch.object(opencode_mod, "_opencode_routing_config", return_value=_OPENCODE_CONFIG),
+            # The version gate answers in range: it spawns a child of the synthetic
+            # binary the resolver stub hands the launch, and a version child is not
+            # one of the four launch answers the golden records.
+            patch.object(
+                opencode_mod, "_opencode_version_refusal", new=AsyncMock(return_value=("", ""))
+            ),
+            patch.object(launch_mod, "_unlink_readback_launcher", return_value=None),
+            patch.object(
+                launch_mod,
+                "_resolve_self_served_bin",
+                side_effect=lambda backend: {
+                    ACP_BACKEND_OPENCODE: (_OPENCODE_BIN, _SEARCH_PATH),
+                    ACP_BACKEND_DEVIN: ("/opt/bin/devin", _SEARCH_PATH),
+                    ACP_BACKEND_GOOSE: (_GOOSE_BIN, _SEARCH_PATH),
+                    ACP_BACKEND_DEEPSEEK: (_DEEPSEEK_BIN, _SEARCH_PATH),
+                    ACP_BACKEND_COPILOT: (_COPILOT_BIN, _SEARCH_PATH),
+                    ACP_BACKEND_STRANDS: (_STRANDS_BIN, _SEARCH_PATH),
+                }[backend],
+            ),
+        ]
+    )
+
+
+#: The module-level resolver caches a capture disturbs, each with the module that owns
+#: it. Each is resolved once per process behind an ``_UNRESOLVED`` sentinel, so a
+#: capture has to clear them to make every backend resolve afresh -- and has to put them
+#: back, because the stubbed resolvers WRITE synthetic paths into them during the spawn.
+_ADAPTER_CACHES: dict[str, Any] = {
+    "_claude_acp_argv_cache": claude_mod,
+    "_codex_acp_argv_cache": client_mod,
+    "_pi_acp_argv_cache": pi_mod,
+    "_pi_bin_cache": pi_mod,
+}
+_ADAPTER_CACHE_NAMES = tuple(_ADAPTER_CACHES)
+
+#: The host adapters whose routing read-back binds its own sandbox wrap and scrub.
+_READBACK_MODULES = (pi_mod, opencode_mod, deepseek_mod, strands_mod)
+
+
+def snapshot_bin_caches() -> dict[str, Any]:
+    """The resolver caches as they stand, for :func:`restore_bin_caches`.
+
+    The self-served mapping is copied rather than referenced: it is the same dict
+    object the spawn path mutates, so holding the reference would snapshot nothing.
+    """
+    saved: dict[str, Any] = {
+        name: getattr(module, name) for name, module in _ADAPTER_CACHES.items()
+    }
+    saved["_self_served_bin_caches"] = dict(launch_mod._self_served_bin_caches)
+    return saved
+
+
+def restore_bin_caches(saved: dict[str, Any]) -> None:
+    """Put every resolver cache back exactly as :func:`snapshot_bin_caches` found it.
+
+    The real spawn writes the stub's ``/opt/bin/...`` path into the process-wide cache,
+    where a later test would read it. The mapping is updated in place.
+    """
+    for name, module in _ADAPTER_CACHES.items():
+        setattr(module, name, saved[name])
+    launch_mod._self_served_bin_caches.clear()
+    launch_mod._self_served_bin_caches.update(saved["_self_served_bin_caches"])
+
+
+def _reset_bin_caches() -> None:
+    """Drop the module-level resolver caches so each backend resolves afresh."""
+    unresolved = launch_mod._UNRESOLVED
+    for name, module in _ADAPTER_CACHES.items():
+        setattr(module, name, unresolved)
+    launch_mod._self_served_bin_caches.clear()
+
+
+#: Hosts launched ONLY by ``AcpRuntime``. The kiro family is on the runtime too but
+#: keeps a client arm for the per-session path, so it is captured through ``_spawn``
+#: like every other harness; a runtime-only host has no client arm to drive, and its
+#: launch is the plan its harness resolves at Seam 1.
+RUNTIME_ONLY_BACKENDS = frozenset(ACP_BACKENDS_ACP_RUNTIME - ACP_BACKENDS_KIRO_FAMILY)
+
+
+class _Captured(Exception):
+    """Raised by the stubbed process factory once the launch has been recorded.
+
+    The runtime's spawn continues into the handshake after the factory returns,
+    and that half is the wire, not the launch. Stopping at the factory keeps the
+    capture to the four answers the golden pins.
+    """
+
+
+def _env_delta(parent_env: dict, child_env: dict) -> tuple[dict[str, str], list[str]]:
+    """What the launch ADDED to and REMOVED from the environment it inherited.
+
+    *parent_env* must be read back from ``os.environ`` inside the patch: Windows folds
+    ``SystemRoot`` to ``SYSTEMROOT``, and the pre-roundtrip dict would show a fake removal.
+    """
+    added = {
+        key: VOLATILE_ENV.get(key, value)
+        for key, value in sorted(child_env.items())
+        if parent_env.get(key) != value
+    }
+    removed = sorted(key for key in parent_env if key not in child_env)
+    return added, removed
+
+
+def _default_home_pins(tmp_path: Path) -> list:
+    """The default data home and its breadcrumb, pinned for the whole capture.
+
+    The fixed env has no ``KIROCREW_HOME``, so ``config_dir()`` would create the real
+    ``~/.kiro/crew``; the breadcrumb writer is stubbed for ``conftest._breadcrumb_guard``.
+
+    Enter these before the env patch so they exit after it: a stray thread from an
+    earlier test reads the home at call time.
+    """
+    return [
+        patch.object(config_paths, "_resolve_default_home", lambda: tmp_path / "default-home"),
+        patch.object(config_paths, "_write_recovery_breadcrumb", lambda _home: None),
+    ]
+
+
+def _capture_runtime_served(
+    backend: str, tmp_path: Path, parent_env: dict, extra_patches: Sequence[Any] = ()
+) -> dict[str, Any]:
+    """A host's launch driven through ``AcpRuntime._spawn_admitted``: the only launch of a
+    runtime-only host, and the runtime launch of a kiro-family one.
+
+    Records what the runtime hands the process factory, which records and stops. The
+    runtime has no per-harness labels, so the entry names its server instead.
+    """
+    rec = _Recorder()
+
+    async def _factory(*argv: str, **kwargs: Any):
+        rec.argv = [
+            (
+                "<gate-nonce>"
+                if index and argv[index - 1] == "--nonce"
+                else "<interpreter>" if value == sys.executable else value
+            )
+            for index, value in enumerate(argv)
+        ]
+        rec.env = dict(kwargs.get("env") or {})
+        raise _Captured()
+
+    stack: list = [*_default_home_pins(tmp_path), patch.dict(os.environ, parent_env, clear=True)]
+    stack.extend(
+        patch.object(runtime_mod, name, side_effect=_stub_for(getattr(runtime_mod, name), answer))
+        for name, answer in _PASSTHROUGH_STUBS.items()
+        if hasattr(runtime_mod, name)
+    )
+    stack.extend(
+        patch.object(
+            runtime_mod, name, side_effect=_async_stub_for(getattr(runtime_mod, name), answer)
+        )
+        for name, answer in _ASYNC_PASSTHROUGH_STUBS.items()
+    )
+    stack.extend(
+        [
+            patch.object(runtime_mod, "create_subprocess_limited", side_effect=_factory),
+            patch.object(
+                runtime_mod.platform_compat,
+                "create_windows_cleanup_owned_process",
+                side_effect=_windows_cleanup_passthrough,
+            ),
+            patch.object(runtime_mod, "_forward_ssh_auth_sock", return_value=False),
+            patch.object(runtime_mod, "inject_xdist_auto_cap", return_value=None),
+            patch.object(runtime_mod, "resolve_krb5_ccname", return_value=None),
+            # A real scratch dir under ``tmp_path`` per label (see
+            # :func:`_allocate_capture_scratch`): the codex child's SQLite home is
+            # one of these windows, and that it receives one is a launch answer. Its env
+            # contribution is pinned to the same placeholders as the client arm's,
+            # for the same reasons.
+            patch.object(
+                runtime_mod.agent_scratch,
+                "allocate_scratch",
+                side_effect=lambda label: _allocate_capture_scratch(tmp_path, label),
+            ),
+            patch.object(
+                runtime_mod.agent_scratch,
+                "scratch_env",
+                side_effect=lambda path, shared=None: {
+                    "TMPDIR": "<scratch>",
+                    "TMP": "<scratch>",
+                    "TEMP": "<scratch>",
+                    "KIROCREW_SCRATCH": "<scratch>",
+                    "KIRO_CHAT_LOG_FILE": "<scratch-log>",
+                },
+            ),
+            patch.object(
+                client_mod, "_resolve_codex_acp_bin", return_value=(_CODEX_ACP_ARGV, _SEARCH_PATH)
+            ),
+            patch.object(
+                codex_harness_mod, "resolve_spawn_masks", new=AsyncMock(return_value=((), ()))
+            ),
+            patch.object(codex_harness_mod, "_sandbox_wrapper_generations", return_value=0),
+        ]
+    )
+    stack.extend(extra_patches)
+    saved_caches = snapshot_bin_caches()
+    _reset_bin_caches()
+    entered: list = []
+    # The environment the child inherits, read back from ``os.environ`` inside the
+    # patched context so the delta is measured against the parent's names as the OS
+    # actually stored them (see :func:`_env_delta`).
+    inherited_env: dict[str, str] = {}
+    try:
+        for ctx in stack:
+            entered.append(ctx.__enter__())
+        inherited_env = dict(os.environ)
+        runtime = AcpRuntime(
+            work_dir=tmp_path / "workspace",
+            agent="kirocrew",
+            acp_backend=backend,
+            expect_mcp_reports=False,
+        )
+        try:
+            asyncio.run(runtime._spawn_admitted())
+        except _Captured:
+            pass
+    finally:
+        for ctx in reversed(stack):
+            try:
+                ctx.__exit__(None, None, None)
+            except Exception:  # pragma: no cover - teardown must not mask a failure
+                pass
+        restore_bin_caches(saved_caches)
+    assert rec.argv, f"{backend}: the runtime spawn never reached the process factory"
+    added, removed = _env_delta(inherited_env, rec.env)
+    return {
+        "argv": rec.argv,
+        "served_by": "AcpRuntime",
+        "env_added": added,
+        "env_removed": removed,
+    }
+
+
+def capture(
+    backend: str,
+    tmp_path: Path,
+    *,
+    extra_patches: Sequence[Any] = (),
+    observe: Callable[[Any], None] | None = None,
+) -> dict[str, Any]:
+    """Drive the launch for *backend* and return its answers.
+
+    Runtime-only hosts go through :func:`_capture_runtime_served`, others ``_spawn``.
+    *extra_patches* are entered after every stub, to replace one collaborator.
+    *observe* gets the client after its spawn, still inside the patches.
+    """
+    if backend in RUNTIME_ONLY_BACKENDS:
+        return _capture_runtime_served(backend, tmp_path, fixed_parent_env(), extra_patches)
+    rec = _Recorder()
+    # The environment the spawn runs under: this fixed parent, so ``env_added`` is
+    # what _spawn contributes rather than what this host happened not to have already.
+    # The delta itself is measured against ``os.environ`` as installed from it (see
+    # ``inherited_env`` below and :func:`_env_delta`).
+    parent_env = fixed_parent_env()
+    # Snapshot BEFORE the reset, restore in ``finally``: the reset clears the caches
+    # and the stubbed resolvers then fill them with this file's synthetic paths, so
+    # without the restore a later test in the same worker reads that fiction.
+    saved_caches = snapshot_bin_caches()
+    _reset_bin_caches()
+    stack: list = [*_default_home_pins(tmp_path), patch.dict(os.environ, parent_env, clear=True)]
+    _stub_common(stack, rec, tmp_path, backend)
+    stack.extend(extra_patches)
+    entered: list = []
+    # The environment the child inherits, read back from ``os.environ`` inside the
+    # patched context (see :func:`_env_delta`).
+    inherited_env: dict[str, str] = {}
+    try:
+        for ctx in stack:
+            entered.append(ctx.__enter__())
+        inherited_env = dict(os.environ)
+        client = AcpClient(
+            work_dir=tmp_path / "workspace",
+            session_key="golden-session",
+            acp_backend=backend,
+            model="auto",
+        )
+        asyncio.run(client._spawn())
+        if observe is not None:
+            observe(client)
+    finally:
+        for ctx in reversed(stack):
+            try:
+                ctx.__exit__(None, None, None)
+            except Exception:  # pragma: no cover - teardown must not mask a failure
+                pass
+        restore_bin_caches(saved_caches)
+    added, _removed = _env_delta(inherited_env, rec.env)
+    return {
+        "argv": rec.argv,
+        "spawn_label": rec.spawn_label,
+        "stderr_label": rec.stderr_label,
+        "env_added": added,
+    }
+
+
+def capture_all(tmp_path: Path) -> dict[str, Any]:
+    """Every known backend's launch answers, keyed as the fixture keys them."""
+    return {
+        golden_key(backend): capture(backend, tmp_path / golden_key(backend))
+        for backend in sorted(ACP_BACKENDS_KNOWN)
+    }
+
+
+def render(snapshot: dict[str, Any]) -> str:
+    """The fixture's on-disk text. One spelling, so a rewrite is a content diff."""
+    return json.dumps(snapshot, indent=2, sort_keys=True) + "\n"
+
+
+def read_golden() -> dict[str, Any]:
+    """The committed fixture."""
+    return json.loads(GOLDEN_PATH.read_text(encoding="utf-8"))

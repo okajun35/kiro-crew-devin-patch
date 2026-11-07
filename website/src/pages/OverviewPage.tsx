@@ -1,0 +1,352 @@
+import { lazy, Suspense, type ReactNode } from 'react'
+import { Link, useSearchParams } from 'react-router-dom'
+import { useQuery } from '@tanstack/react-query'
+import { ArrowLeft, ArrowRight, BarChart3, Brain, Clock } from 'lucide-react'
+import { useAppSelector } from '../store'
+import { useUptime } from '../hooks/useUptime'
+import { Uptime } from '../components/Uptime'
+import { api } from '../api/client'
+import type { WakaTimeStats } from '../api/client'
+import { Card, CardTitle, StatCard, Btn, ContentSkeleton } from '../components/ui'
+import { TunnelStatus } from '../components/TunnelStatus'
+import { TailnetMobileCard } from '../components/TailnetMobileCard'
+import ErrorBoundary from '../components/ErrorBoundary'
+import ErrorNotice from '../components/ErrorNotice'
+import { useGuardedLeave } from '../components/NavigationLeaveGuard'
+import { getOverviewStatCards } from './overviewStatCards'
+import { getOverviewPanel } from './overviewPanel'
+import { isOverviewBuiltinSuppressed } from './overviewBuiltins'
+import { UsageTab, WakaTimeTab } from './overview'
+import { useProvider } from '../providers'
+import { providerUsageQuery } from '../api/providerUsageQuery'
+
+import { i18nT } from '../i18n/t'
+import { uiLocation } from '../uiLocations/uiLocation'
+import { compactPluralCount, fmtCompact, fmtDuration } from '../i18n/format'
+import { formatCost } from '../utils/formatCost'
+
+// The record editor and recovery tools are needed only inside this drill-in.
+// Keep them out of the dashboard shell's initial bundle.
+const MemoryTab = lazy(() => import('./overview/MemoryTab'))
+/**
+ * Settings > Overview — mission control.
+ *
+ * One scrollable dashboard, no nested tab bar: a health hero, the stat-tile
+ * grid, and summary cards that drill into the two deep surfaces (memory
+ * browser, usage report) via a URL-backed `?view=` param — the same
+ * list-detail pattern as the Channels tab. KiroCrew/agent config viewers and
+ * the memory graph live in Settings > Developer; configuration import/export is
+ * on the Import tab.
+ */
+
+const DRILL_VIEWS = ['memory', 'usage', 'wakatime'] as const
+type DrillView = (typeof DRILL_VIEWS)[number]
+
+/** A Today-line count: `amount` is the locale's compact number, and `count`, the
+ *  quantity it shows, picks the plural form that agrees with it. */
+function todayCount(n: number | undefined | null): { count: number; amount: string } {
+  return { count: compactPluralCount(n ?? 0), amount: fmtCompact(n ?? Number.NaN) }
+}
+
+/** The Today line: sessions and messages, then tokens and cost when known. */
+function todayLine(sessions: number | undefined, messages: number | undefined, tokens: number | null | undefined, cost: number | null | undefined): string {
+  const parts = [
+    i18nT('pages.overviewPage.today_sessions', todayCount(sessions)),
+    i18nT('pages.overviewPage.today_messages', todayCount(messages)),
+  ]
+  if (tokens != null) parts.push(i18nT('pages.overviewPage.today_tokens', todayCount(tokens)))
+  if (cost != null) parts.push(formatCost(cost))
+  return i18nT('pages.overviewPage.today_line', { summary: parts.join(' · ') })
+}
+
+/** Back link + drill-in content, mirroring the Channels back affordance. */
+function DrillIn({ title, onBack, children, hideTitle = false }: { title: string; onBack: () => void; children: ReactNode; hideTitle?: boolean }) {
+  const leave = useGuardedLeave()
+  return (
+    <div>
+      <Btn
+        onClick={() => leave(onBack)}
+        aria-label={i18nT('pages.overviewPage.back_to_overview')}
+        className="flex items-center gap-1.5 text-[13px] font-medium text-accent bg-transparent border-none cursor-pointer px-0 py-1 mb-2 hover:underline"
+      >
+        <ArrowLeft className="lucide-inline" />
+        {i18nT('pages.overviewPage.overview')}
+      </Btn>
+      {!hideTitle && <div className="text-xl font-bold tracking-tight text-text-strong mb-3">{title}</div>}
+      {children}
+    </div>
+  )
+}
+
+/** Usage summary card — shares the query cache with the Usage drill-in. */
+function UsageSummaryCard({ onOpen }: { onOpen: () => void }) {
+  const provider = useProvider()
+  const { data, isError, error } = useQuery(providerUsageQuery(provider))
+  const b = data?.billing
+  const today = data?.sessions.today
+  return (
+    <Card>
+      <CardTitle>
+        <BarChart3 className="lucide-inline" /> {i18nT('pages.overviewPage.usage')}
+        <button onClick={onOpen} className="ml-auto inline-flex items-center gap-1 text-[12px] font-medium text-accent bg-transparent border-none cursor-pointer hover:underline">
+          {i18nT('pages.overviewPage.view_details')} <ArrowRight size={12} />
+        </button>
+      </CardTitle>
+      {provider.capabilities.usageBilling && isError && (
+        <ErrorNotice title={data ? i18nT('pages.sessionsTab.could_not_refresh') : undefined} message={error?.message} askAgent testId="overview-usage-error" />
+      )}
+      {!provider.capabilities.usageBilling ? (
+        <div className="text-[13px] text-muted">{i18nT('pages.overviewPage.usage_tracking_is_not_available_for')} {provider.displayName}.</div>
+      ) : !data ? (
+        !isError && <div className="skeleton h-14 rounded" />
+      ) : (
+        <div className="flex flex-col gap-2">
+          {data.refreshing ? (
+            <div data-testid="overview-usage-refreshing" className="skeleton h-4 rounded max-w-[320px]" />
+          ) : (
+            <div className="text-[13px] text-muted">
+              {todayLine(today?.sessions, today?.messages, data.tokens?.total, data.costUsd)}
+            </div>
+          )}
+          {b?.plan && (
+            <div className="flex items-center gap-2 text-[12px] text-muted">
+              <span>{b.plan}</span>
+              {typeof b.percentUsed === 'number' && (
+                <>
+                  <div className="flex-1 h-1.5 rounded-full bg-bg-elevated overflow-hidden max-w-[220px]">
+                    <div className="h-full rounded-full bg-accent" style={{ width: `${Math.min(100, Math.max(0, b.percentUsed))}%` }} />
+                  </div>
+                  <span>{Math.round(b.percentUsed)}%</span>
+                </>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+    </Card>
+  )
+}
+
+/** WakaTime summary card — shares the query cache with the WakaTime drill-in. */
+function WakaTimeSummaryCard({ onOpen }: { onOpen: () => void }) {
+  const { data, isError, error } = useQuery<WakaTimeStats>({
+    queryKey: ['wakatime-stats', 'last_7_days'],
+    queryFn: () => api.wakatimeStats('last_7_days'),
+  })
+  // Prefer the include-other total so this card matches the WakaTime drill-in
+  // it opens; the classified-only total_seconds drops the "Other" bucket and
+  // reads low. Fall back to total_seconds when the include-other field is null
+  // (free accounts, which do not report it).
+  const total = data?.stats?.total_seconds_including_other_language ?? data?.stats?.total_seconds ?? 0
+  const fmtHm = (s: number) => {
+    // Round to whole minutes first, then split, so 7199s -> 2h 0m, not 1h 60m.
+    const totalMin = Math.round(Math.max(0, s) / 60)
+    const h = Math.floor(totalMin / 60)
+    const m = totalMin % 60
+    return fmtDuration([[h, 'hour'], [m, 'minute']], { dropZero: true })
+  }
+  return (
+    <Card>
+      <CardTitle>
+        <Clock className="lucide-inline" /> {i18nT('pages.overviewPage.wakatime')}
+        <Btn onClick={onOpen} className="ml-auto border-none bg-transparent px-0 py-0 text-[12px] font-medium text-accent hover:bg-transparent hover:underline">
+          {i18nT('pages.overviewPage.view_details')} <ArrowRight size={12} />
+        </Btn>
+      </CardTitle>
+      {isError ? (
+        <ErrorNotice message={error?.message} askAgent testId="overview-wakatime-error" />
+      ) : !data ? (
+        <div className="skeleton h-14 rounded" />
+      ) : !data.configured ? (
+        <div className="text-[13px] text-muted">{i18nT('pages.overviewPage.wakatime_not_connected')}</div>
+      ) : (
+        <div className="text-[13px] text-muted">
+          {i18nT('pages.overviewPage.wakatime_last_7_days')} <span className="text-text font-mono">{fmtHm(total)}</span>
+        </div>
+      )}
+    </Card>
+  )
+}
+
+/** Memory summary card — consolidation cadence + retention at a glance. */
+function MemorySummaryCard({ onOpen }: { onOpen: () => void }) {
+  const { data, isError, error } = useQuery<{ history_idle_hours?: number; history_max_days?: number; migrated?: boolean }>({
+    queryKey: ['memory-settings'],
+    queryFn: () => api.memorySettings(),
+  })
+  return (
+    <Card>
+      <CardTitle>
+        <Brain className="lucide-inline" /> {i18nT('pages.overviewPage.memory')}
+        <button onClick={onOpen} className="ml-auto inline-flex items-center gap-1 text-[12px] font-medium text-accent bg-transparent border-none cursor-pointer hover:underline" {...uiLocation('overview.memory-details')}>
+          {i18nT('pages.overviewPage.view_details')} <ArrowRight size={12} />
+        </button>
+      </CardTitle>
+      {isError ? (
+        // askAgent on: a read of the persisted memory settings; the card holds no
+        // input. Without this branch a rejected fetch left the skeleton up forever.
+        <ErrorNotice message={error?.message} askAgent testId="overview-memory-error" />
+      ) : !data ? (
+        <div className="skeleton h-14 rounded" />
+      ) : (
+        <div className="flex flex-col gap-1 text-[13px] text-muted">
+          <span>
+            {i18nT('pages.overviewPage.summarizes_chats_into_memory_after')} {data.history_idle_hours ?? 3}{i18nT('pages.overviewPage.h_idle')}
+            {!data.migrated && <> {i18nT('pages.overviewPage.keeps')} {data.history_max_days ?? 90} {i18nT('pages.overviewPage.days_of_history')}</>}
+            {data.migrated && <> {i18nT('pages.overviewPage.semantic_memory_active')}</>}
+          </span>
+          <Link to="/settings/developer/memory" className="text-accent hover:underline w-fit">{i18nT('pages.overviewPage.memory_developer_link')} <ArrowRight size={12} className="lucide-inline" /></Link>
+        </div>
+      )}
+    </Card>
+  )
+}
+
+/** The uptime tile. Its own component so the 1 Hz uptime tick re-renders this
+ *  card, not the whole Overview page. */
+function UptimeStatCard(props: { label: string; accent?: boolean; delay?: number }) {
+  return <StatCard {...props} value={useUptime()} />
+}
+
+type StatId = 'uptime' | 'sessions' | 'messages' | 'cronJobs' | 'subagents' | 'lessons'
+/**
+ * Catalog key per status tile. A flat `Record` of full literal keys, indexed
+ * inline at the `i18nT()` call — the shape `scripts/check-i18n-keys.mjs` can
+ * resolve. These six labels were raw English in the tile array, so they rendered
+ * `UPTIME` / `SESSIONS` / `MESSAGES` above translated copy in every locale.
+ */
+export const STAT_LABEL_KEY: Record<StatId, string> = {
+  uptime: 'pages.overviewPage.stat_uptime',
+  sessions: 'pages.overviewPage.stat_sessions',
+  messages: 'pages.overviewPage.stat_messages',
+  cronJobs: 'pages.overviewPage.stat_cron_jobs',
+  subagents: 'pages.overviewPage.stat_subagents',
+  lessons: 'pages.overviewPage.stat_lessons',
+}
+
+export default function OverviewPage() {
+  const status = useAppSelector(s => s.dashboard.status)
+  const connected = useAppSelector(s => s.dashboard.connected)
+  const refreshTrigger = useAppSelector(s => s.dashboard.refreshTrigger)
+  const [params, setParams] = useSearchParams()
+
+  const rawView = params.get('view')
+  const view: DrillView | null = DRILL_VIEWS.includes(rawView as DrillView) ? (rawView as DrillView) : null
+  const setView = (v: DrillView | null) => setParams(prev => {
+    const next = new URLSearchParams(prev)
+    if (v) next.set('view', v)
+    else next.delete('view')
+    return next
+  }, { replace: true })
+
+  if (view === 'memory') {
+    const selectedStore = params.get('store') || ''
+    return <DrillIn title={i18nT('pages.overviewPage.memory')} hideTitle={!!selectedStore && selectedStore !== 'default'} onBack={() => setView(null)}>
+      <Suspense fallback={<ContentSkeleton rows={6} />}><MemoryTab refreshTrigger={refreshTrigger} selectedStore={selectedStore} focus={params.get('focus')} onStoreNavigate={store => setParams(previous => {
+        const next = new URLSearchParams(previous)
+        if (store) next.set('store', store)
+        else next.delete('store')
+        return next
+      }, { replace: true })} /></Suspense>
+    </DrillIn>
+  }
+  if (view === 'usage') {
+    return <DrillIn title={i18nT('pages.overviewPage.usage')} onBack={() => setView(null)}><UsageTab /></DrillIn>
+  }
+  if (view === 'wakatime') {
+    return <DrillIn title={i18nT('pages.overviewPage.wakatime')} onBack={() => setView(null)}><WakaTimeTab /></DrillIn>
+  }
+
+  // Resolved once per render, and bound to a capitalized local so JSX treats it
+  // as a component rather than an intrinsic element.
+  const overviewPanel = getOverviewPanel()
+  const OverviewPanelComp = overviewPanel?.component
+
+  return (
+    <>
+      {/* Health hero. Status only — Overview edits no config, so it hosts no
+          apply/restart action. Restarting sessions to pick up config changes
+          lives with the surfaces that edit it (Capabilities header). */}
+      <div className="flex items-center gap-4 mb-5">
+        <div>
+          <div className="text-lg font-bold text-text-strong flex items-center gap-2">
+            <span className={`w-2 h-2 rounded-full shrink-0 ${connected && status ? 'bg-ok' : 'bg-warn'}`} />
+            {connected && status ? i18nT('pages.overviewPage.all_systems_running') : status ? i18nT('pages.overviewPage.reconnecting') : i18nT('pages.overviewPage.connecting')}
+          </div>
+          <div className="text-[12.5px] text-muted mt-0.5">
+            {i18nT('pages.overviewPage.up')} <Uptime />{status?.version ? <> {i18nT('pages.overviewPage.v')}{status.version}</> : null}
+          </div>
+        </div>
+      </div>
+
+      {/* Stat tiles */}
+      <div className="grid gap-3.5 grid-cols-[repeat(auto-fit,minmax(150px,1fr))] mb-6">
+        {([
+          { id: 'uptime', accent: true },
+          { id: 'sessions', value: status?.sessions },
+          { id: 'messages', value: status?.messages },
+          { id: 'cronJobs', value: status?.cron_jobs },
+          { id: 'subagents', value: status?.subagents },
+          { id: 'lessons', value: status?.lessons },
+        ] as { id: StatId; value?: string | number | null; accent?: boolean }[]).map((s, i) => (
+          // Keyed on the stable id, not the label: a language switch changes the
+          // label, which would remount every tile and replay the stagger animation.
+          s.id === 'uptime'
+            ? <UptimeStatCard key={s.id} label={i18nT(STAT_LABEL_KEY[s.id])} accent={s.accent} delay={i * 60} />
+            : <StatCard key={s.id} label={i18nT(STAT_LABEL_KEY[s.id])} value={s.value} accent={s.accent} delay={i * 60} />
+        ))}
+        <TunnelStatus delay={6 * 60} />
+        {/* Extension slot: downstream-registered status cards (e.g. an edition
+            credential-TTL card). Empty in the stock build. Each is isolated in
+            its own ErrorBoundary so a throwing card disables only itself. */}
+        {getOverviewStatCards().map((c, i) => {
+          const CardComp = c.component
+          return (
+            <ErrorBoundary key={c.id} scope={`overview-stat-card:${c.id}`} fallback={null}>
+              <CardComp delay={(7 + i) * 60} />
+            </ErrorBoundary>
+          )
+        })}
+      </div>
+
+      {/* Mobile access. Above the summary cards and full width, because it is a
+          guided sequence rather than a metric: it owns the one next action, and
+          in its terminal state it renders a QR the operator scans off the screen.
+          Isolated so a throwing card cannot take the Overview down with it.
+
+          Suppressible downstream: a distribution that disables tailnet outright
+          can remove this surface via `suppressOverviewBuiltin('tailnet-mobile')`
+          rather than patching this file on every sync. Gated OUTSIDE the
+          ErrorBoundary and the spacing wrapper so a suppressed build renders no
+          element at all — leaving the `mb-6` div behind would keep a 24px gap
+          where the card used to be. The core suppresses nothing. */}
+      {!isOverviewBuiltinSuppressed('tailnet-mobile') && (
+        <ErrorBoundary scope="overview-tailnet-mobile" fallback={null}>
+          <div className="mb-6">
+            <TailnetMobileCard />
+          </div>
+        </ErrorBoundary>
+      )}
+
+      {/* Deep-surface summary cards */}
+      <div className="grid gap-3.5 grid-cols-2 max-[760px]:grid-cols-1">
+        <UsageSummaryCard onOpen={() => setView('usage')} />
+        <WakaTimeSummaryCard onOpen={() => setView('wakatime')} />
+        <MemorySummaryCard onOpen={() => setView('memory')} />
+      </div>
+
+      {/* Extension slot: the single downstream-owned panel for the region below
+          the summary cards. One surface, one owner — a second registration
+          fails loud at the seam rather than negotiating layout here. Absent in
+          the stock build, and isolated so a throwing panel takes only itself
+          down, not the whole Overview. */}
+      {overviewPanel && OverviewPanelComp ? (
+        <ErrorBoundary scope={`overview-panel:${overviewPanel.id}`} fallback={null}>
+          <div className="mt-6">
+            <OverviewPanelComp />
+          </div>
+        </ErrorBoundary>
+      ) : null}
+    </>
+  )
+}

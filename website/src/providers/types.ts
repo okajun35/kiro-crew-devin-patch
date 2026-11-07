@@ -1,0 +1,215 @@
+// KiroCrew is KiroACP-only — kiro-cli over ACP is the sole provider. This is a
+// single-member union so the adapter interface below still type-checks for its
+// many consumers.
+export type ProviderId = 'acp'
+
+export interface ProviderCapabilities {
+  hooks: boolean
+  pluginRegistry: boolean
+  agentTemplates: boolean
+  usageBilling: boolean
+  warmPool: boolean
+  modelResolution: boolean
+  toolExecution: boolean
+  subagents: boolean
+  sandbox: boolean
+  contextWindow: boolean
+  modelSwitching: boolean
+  permissionModes: boolean
+  sessionResume: boolean
+  compaction: boolean
+  reasoningEffort: boolean
+}
+
+export interface UsagePeriod {
+  sessions: number
+  messages: number
+  toolCalls: number
+}
+
+export interface TokenBreakdown {
+  input: number
+  output: number
+  cacheCreation: number
+  cacheRead: number
+  total: number
+}
+
+export interface NormalizedUsage {
+  /** Session analytics are still refreshing; billing data is already usable. */
+  refreshing?: boolean
+  sessions: {
+    total: number
+    today: UsagePeriod
+    thisWeek: UsagePeriod
+    thisMonth: UsagePeriod
+    avgMsgsPerSession: number
+    /**
+     * Transcripts the path validator refused while scanning the sessions dir
+     * (#6733). On a Windows roaming-profile (UNC) home every transcript is
+     * refused, so a `total` of 0 with a positive count here is the silent
+     * failure the usage page must not render as a confident zero.
+     */
+    refusedTranscripts: number
+    dailyHistory: {
+      date: string
+      sessions: number
+      messages: number
+      toolCalls: number
+      /** Credits billed that local day; absent when the provider does not report per-day spend. */
+      credits?: number
+    }[]
+  }
+  billing: {
+    plan?: string
+    used?: number
+    limit?: number
+    unit: 'credits' | 'usd' | 'tokens'
+    resets?: string
+    percentUsed?: number
+  } | null
+  tokens?: TokenBreakdown
+  costUsd?: number
+  totalTurns?: number
+  totalDurationMs?: number
+  tokenDailyHistory?: {
+    date: string
+    input: number
+    output: number
+    cacheCreate: number
+    cacheRead: number
+    costUsd: number
+    models?: Record<string, { input: number; output: number; cacheCreate: number; cacheRead: number; costUsd: number }>
+    providers?: Record<string, { input: number; output: number; cacheCreate: number; cacheRead: number; costUsd: number }>
+    providerModels?: Record<string, Record<string, { input: number; output: number; cacheCreate: number; cacheRead: number; costUsd: number }>>
+  }[]
+  tokenProviders?: string[]
+  tokenModels?: string[]
+  tokenProviderModels?: Record<string, string[]>
+}
+
+export interface NormalizedProviderHook {
+  event: string
+  command: string
+  matcher?: string
+  source?: string
+}
+
+/** A configured hook that validated but reaches no provider hook config.
+ *  `reason` is a wire value from the gateway (`disabled`, `confirm`,
+ *  `trigger`, `agent_action`); `command` holds an agent action's prompt. */
+export interface NormalizedUnsentHook {
+  name: string
+  trigger: string
+  matcher: string
+  actionType: string
+  command: string
+  reason: string
+}
+
+export interface NormalizedPlugin {
+  id: string
+  name: string
+  type: 'agent' | 'skill' | 'mcp'
+  source: string
+  version?: string
+}
+
+export interface AgentBinding {
+  name: string
+  kiro_agent?: string
+  workspace?: string
+  memory_store?: string
+}
+
+export interface ProviderLabels {
+  sessionProcess: string
+  processCountLabel: string
+  configFile: string
+  pluginRegistryName: string
+  hooksSection: string
+}
+
+export interface ModelInfo {
+  name: string
+  /**
+   * The backend's own human label for this model, from `GET /api/models`
+   * `display_name`. It is the name the backend reported for the row: an
+   * advertised-selection harness (Claude Code, Codex) advertises one — "Opus 5.5"
+   * for the id `opus` — and kiro-cli prints one beside some ids, so the picker
+   * reads like the backend's own list instead of the raw wire id. Optional and
+   * never defaulted: a row without one (a cold auto-only fallback, the 24h cache
+   * written before this field existed) falls
+   * back to `name` at the render site. Not a translation key — it is
+   * backend-authored text passed through verbatim.
+   */
+  displayName?: string
+  description: string
+  contextWindow?: number
+  supportsExtendedContext?: boolean
+  /**
+   * Relative credit cost of a turn on this model, with Auto as the 1.0
+   * baseline — kiro's `rate_multiplier` from `chat --list-models`, passed
+   * straight through by `GET /api/models`.
+   *
+   * Deliberately OPTIONAL and never defaulted: a missing value means "the
+   * backend did not tell us", which happens on a cold start (the auto-only
+   * fallback list) and for rows served from the 24h localStorage cache written
+   * before this field existed. Substituting 1.0 there would state a price we
+   * were not told — and kiro does re-price (Luna moved 0.6x -> 0.1x in
+   * 2026-07), so a guess can be wrong by 6x. Consumers render nothing when it
+   * is absent.
+   */
+  rateMultiplier?: number
+}
+
+export interface PermissionMode {
+  id: string
+  label: string
+  description: string
+}
+
+export interface ProviderAdapter {
+  readonly id: ProviderId
+  readonly displayName: string
+  readonly capabilities: ProviderCapabilities
+  readonly labels: ProviderLabels
+
+  resolveAgentTemplate(agent: AgentBinding): string
+  /** The model a NEW session on this KiroCrew agent would run on ('' = the
+   *  backend picks). Takes a KiroCrew agent name, not a kiro agent template:
+   *  the per-agent default is stored per agent, and several agents can share
+   *  one template. `app` is the app that owns the session, when one does: its
+   *  own model setting is then part of the answer. */
+  resolveModel(agentName: string, app?: string): Promise<string>
+  /** The provider-level default model for NEW sessions ('' when none is set).
+   *  Distinct from resolveModel, which resolves a specific agent template. */
+  resolveDefaultModel(): Promise<string>
+  /** The provider-level default reasoning effort for NEW sessions ('' = none,
+   *  i.e. let the model choose). A per-session override always outranks it.
+   *  `readConfig` supplies the gateway config body from a shared query cache. */
+  resolveDefaultEffort(readConfig: () => Promise<unknown>): Promise<string>
+
+  fetchUsage(): Promise<NormalizedUsage>
+
+  fetchProviderHooks(): Promise<Record<string, NormalizedProviderHook[]>>
+  /** Hooks the user configured that Crew accepted but left out of the
+   *  provider's own hook config, each with the reason. Optional: a provider
+   *  that drops nothing has none to report. */
+  fetchUnsentProviderHooks?(): Promise<NormalizedUnsentHook[]>
+  /** Re-read the user's hook sources into the provider's hook config without a
+   *  restart. Resolves `false` when the config was not rewritten. Optional: a
+   *  provider that reads its hooks live has nothing to rescan. */
+  rescanProviderHooks?(): Promise<boolean>
+
+  listPlugins(): Promise<NormalizedPlugin[]>
+  installPlugin(pkg: string, type: 'agent' | 'skill' | 'mcp'): Promise<{ ok: boolean; error?: string }>
+  uninstallPlugin(pkg: string, type: 'agent' | 'skill' | 'mcp'): Promise<{ ok: boolean; error?: string }>
+  updatePlugins(type: 'agent' | 'skill' | 'mcp'): Promise<{ ok: boolean; output?: string; error?: string }>
+
+  /** The configured backend's model list, or `backend`'s own when a session runs another harness. */
+  fetchAvailableModels(backend?: string): Promise<ModelInfo[]>
+  getContextWindow(model: string): number
+  getDefaultModel(): string
+  getPermissionModes(): PermissionMode[]
+}

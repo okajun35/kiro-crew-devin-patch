@@ -1,0 +1,204 @@
+/* ── Tailwind CSS v4 entry ──
+   Theme, preflight and the utilities are pulled in piecewise rather than through
+   the one-line `@import "tailwindcss"`, and the difference is deliberate:
+
+   The stock import puts every generated utility inside `@layer utilities`. In a
+   cascade layer, a rule loses to ANY unlayered rule whatever its specificity —
+   so `text-muted` on an element would lose to a bare `a { color: … }` written
+   below, and `hover:text-accent` would lose to `.foo { color: … }`. The 2,900
+   lines of component CSS that follow were written under Tailwind v3, where the
+   utilities were emitted unlayered right here at the top of the file and the
+   two competed on ordinary specificity + source order. Emitting `@tailwind
+   utilities` unlayered keeps that cascade exactly as it was: same position,
+   same rules, same winners. Preflight and this file's own `@layer base` blocks
+   sit in the real `base` layer, which is the position they already occupied
+   (first, and beaten by everything after them).
+
+   `source(none)` turns off v4's automatic template detection, which would scan
+   this whole package (scripts, docs, tests, capture fixtures) for class names.
+   The `@source` lines restore the v3 content list: index.html plus src/**. A
+   downstream edition's own sources are appended by `editionExtensionPlugin` in
+   vite.config.ts (see `EDITION_SOURCE_MARKER` there), gated on the same
+   KIROCREW_ALLOW_EDITION opt-in as the rest of the seam.
+
+   The utility ↔ token bridge (`@theme`, the `dark:` variant and the
+   safe-area utilities) lives in tailwind-theme.css so the phantom-classes gate
+   and the vitest theme guards can compile against it alone. `hover:` keeps
+   Tailwind's default `@media (hover: hover)` gate; the note there says why. */
+@layer theme, base, components, utilities;
+@import "tailwindcss/theme.css" layer(theme);
+@import "tailwindcss/preflight.css" layer(base);
+@import "tw-animate-css";
+@import "./tailwind-theme.css";
+@source "../index.html";
+@source "../src/**/*.{ts,tsx}";
+/* @kirocrew-edition-source */
+@tailwind utilities source(none);
+
+/* ── Tailwind v3 → v4 Preflight compensation ──
+   v4's Preflight changed three defaults this codebase leaned on. Each is restored
+   here as a token-backed base rule rather than as v3's literal grey:
+   - Default border colour: v3 painted every `border` without a `border-<token>`
+     in gray-200 (#e5e7eb) — a visible white hairline in dark themes; v4 uses
+     currentColor, which reads as a text-coloured line. `--border` is the colour
+     every explicit border in the app already uses, so an unqualified `border`
+     now matches them in every theme.
+   - Placeholder colour: v3 used gray-400 (#9ca3af), v4 uses 50% of currentColor.
+     `--muted` is what every `placeholder:text-muted` in the app already asks for.
+   - Buttons lost `cursor: pointer` in v4 Preflight. Nearly every <button> here
+     relies on it; disabled buttons are excluded so `disabled:cursor-default`
+     no longer has to fight the reset. */
+@layer base {
+  *, ::after, ::before, ::backdrop, ::file-selector-button { border-color: var(--border); }
+  input::placeholder, textarea::placeholder { color: var(--muted); }
+  button:not(:disabled), [role="button"]:not(:disabled) { cursor: pointer; }
+}
+
+/* ── The partials ──
+   Every rule outside this file's Tailwind header, base layer, ambient
+   backdrop and app-icon tints lives in a src/styles/ partial, imported here.
+   Tailwind inlines each @import where it stands, so the order of these lines
+   IS the cascade order: never reorder them, and add a rule to the partial that
+   owns its surface (the map is in website/docs/frontend-conventions.md,
+   Styling). */
+@import "./styles/font-faces.css";
+@import "./styles/design-tokens.css";
+@import "./styles/theme-palettes.css";
+
+/* ── Base ── */
+@layer base {
+  *{box-sizing:border-box;margin:0;padding:0}
+  /* overscroll-behavior-y lives on `html`, NOT `body`: from Chromium 140 the
+     viewport propagates overscroll-behavior from the ROOT element, so a `body`
+     declaration is ignored and the macOS rubber-band bounce returns. Keep it
+     here or the "no document bounce" behaviour App.tsx relies on silently
+     regresses on Electron >= 41 / Chrome >= 140. */
+  html{overscroll-behavior-y:none}
+  html,body,#root{height:100%}
+  body{font:400 0.875rem/1.55 var(--font-body);letter-spacing:normal;background:var(--bg);color:var(--text);
+    -webkit-font-smoothing:antialiased;overflow-x:hidden;overflow-y:auto;
+    transition:background-color .25s ease,color .25s ease}
+  /* The dashboard shell is height-locked (h-screen + overflow-hidden), so the
+     document has no reason to scroll on those routes. Lock it. A third-party
+     node appended to <body> — browser extensions do this routinely — otherwise
+     leaves a few pixels of slack, and a wheel event that lands on the document
+     rather than on a pane drags the whole app through them. Containment on the
+     panes cannot cover that path because no chaining is involved.
+     Scoped with :has() so the onboarding and welcome views, which legitimately
+     grow past the viewport, keep their document scroll. */
+  body:has([data-testid="dashboard-shell"]){overflow:hidden}
+  /* Global focus ring for keyboard navigation. Keyed on `:focus-visible` rather
+     than `:focus` so a pointer click never paints it — the ring is drawn only
+     for the keyboard and AT interactions that have no other cue to where focus
+     sits. `outline` is used (not border/box-shadow) because it is painted
+     outside the box and so cannot shift layout.
+     OUTLINE-ONLY BY DESIGN. The accent `outline` carries the theme's identity.
+     It is deliberately NOT paired with a `box-shadow` hairline at the global
+     level, because the house opt-out — `outline-hidden`/`outline-none` — resets
+     only `outline`, not `box-shadow`. A global hairline would therefore survive
+     the opt-out and paint a hard high-contrast rectangle on every element that
+     meant to opt out: the chat composer and docked SearchBar, the
+     programmatically-focused `<h1 tabIndex={-1} outline-hidden>` page titles
+     (OnboardingFlow, AgentImportFlow, PrivacyChapter) and the `focus-visible:
+     bg-*` menu rows. Keeping the global rule outline-only means opting out stays
+     a complete opt-out, exactly as on main.
+     WHERE THE 3:1 HAIRLINE LIVES: controls that need to clear WCAG 1.4.11's 3:1
+     non-text floor in the three light palettes where `--accent` alone is below
+     it (rosepine-light 2.60, everforest-light 2.81, intellij-light 2.92) opt IN
+     to `.focus-ring` / `.focus-ring-accent*`, which add the opaque `--text-strong`
+     hairline on top of the accent band. Those utilities are the migrated call
+     sites from issue #4428; the global accent outline is the baseline cue for
+     everything else. */
+  :focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+  @media(prefers-reduced-motion:reduce){*:not([data-virtuoso-scroller] *),*::before,*::after{animation-duration:0.01ms !important;animation-iteration-count:1 !important}}
+  /* The rule above zeroes animation-DURATION but not animation-DELAY, and both
+     `animate-rise` and `animate-chip-hop` use fill-mode `backwards` — so a
+     stagger-delayed element (Overview stat tiles, Settings cards, follow-up
+     option chips) would sit fully invisible for its whole delay when the user
+     asked for no motion. Zero the delay for those entrances specifically;
+     `!important` is required to beat the inline `animationDelay` the stagger
+     ladder sets. Deliberately scoped to them rather than zeroing every
+     animation delay globally. */
+  @media(prefers-reduced-motion:reduce){.animate-rise,.animate-chip-hop,.skeleton::after{animation-delay:0s !important}}
+  ::selection{background:var(--accent-subtle);color:var(--text-strong)}
+  .bg-accent::selection{background:rgba(255,255,255,.25);color:white}
+  /* No scrollbar is visible at rest. A scroll box shows a thin thumb only while
+     it is being scrolled (`data-scrolling`, set and cleared by
+     lib/scrollReveal.ts), and it shows it in the 6px column the box reserves
+     anyway, so revealing it never moves content. One rule, not a per-surface
+     choice (docs/decisions/2026-10-23-scrollbars-are-never-always-visible.md);
+     a surface that wants NO thumb at all wears `.scrollbar-none`.
+     Two engine halves. WebKit/Blink take the pseudo-elements: the track is the
+     reserved column and the thumb is transparent until the attribute paints it.
+     Firefox has no pseudo-elements and Blink ignores them the moment the
+     standard properties are set, so the standard half is fenced to Firefox by
+     the `-moz-appearance` probe; `scrollbar-width` does not inherit, hence `*`.
+     --muted, not a --border rung: the revealed thumb must clear the WCAG 1.4.11
+     3:1 non-text floor against the surface it scrolls over, and no border rung
+     does in any theme but highcontrast. scrollbarRevealOnly.test.ts measures it
+     per theme and refuses a rule that paints a thumb outside `[data-scrolling]`. */
+  ::-webkit-scrollbar{width:6px;height:6px}
+  ::-webkit-scrollbar-track{background:transparent}
+  ::-webkit-scrollbar-thumb{background:transparent;border-radius:9999px}
+  [data-scrolling]::-webkit-scrollbar-thumb{background:var(--muted)}
+  @supports (-moz-appearance:none){
+    *{scrollbar-width:thin;scrollbar-color:transparent transparent}
+    [data-scrolling]{scrollbar-color:var(--muted) transparent}
+  }
+}
+
+/* ── Ambient background ──
+   Static: the three washes are painted once at 200% size and never animated. A
+   full-viewport fixed pseudo-element repainting three radial gradients every
+   frame would cost battery on every dashboard page for a barely visible drift. */
+body::before{content:'';position:fixed;top:-50%;left:-50%;width:200%;height:200%;
+  background:radial-gradient(ellipse at 20% 50%,color-mix(in srgb,var(--accent) 4%,transparent) 0%,transparent 50%),
+             radial-gradient(ellipse at 80% 20%,color-mix(in srgb,var(--accent) 2.5%,transparent) 0%,transparent 50%),
+             radial-gradient(ellipse at 50% 80%,color-mix(in srgb,var(--accent) 2%,transparent) 0%,transparent 50%);
+  background-size:200% 200%;
+  pointer-events:none;z-index:0}
+[data-mode="light"] body::before{
+  background:radial-gradient(ellipse at 20% 50%,color-mix(in srgb,var(--accent) 5%,transparent) 0%,transparent 50%),
+             radial-gradient(ellipse at 80% 20%,color-mix(in srgb,var(--accent) 3%,transparent) 0%,transparent 50%),
+             radial-gradient(ellipse at 50% 80%,color-mix(in srgb,var(--accent) 3%,transparent) 0%,transparent 50%)}
+
+/* ── App icons (two-color, theme-reactive) ──
+   Idle: muted structure + accent detail. Lit (selected OR hovered inside a
+   .group container): accent structure + text detail. Icons are inlined SVGs
+   that paint via --ico-a / --ico-b (see AppIcon.tsx). */
+.app-icon{--ico-a:var(--muted);--ico-b:var(--accent)}
+.app-icon svg *{transition:fill .2s ease,stroke .2s ease,fill-opacity .2s ease}
+.app-icon[data-selected],
+.group:hover .app-icon,
+a:hover .app-icon,
+button:hover .app-icon{--ico-a:var(--accent);--ico-b:var(--text)}
+/* Left-nav icons: lit when the row is active, and on row hover. The nav row
+   uses Tailwind's named group `group/nav` (not `.group`) and is a div, so it
+   needs its own selectors. */
+.app-icon-nav.is-lit .app-icon{--ico-a:var(--accent);--ico-b:var(--text)}
+.group\/nav:hover .app-icon{--ico-a:var(--accent);--ico-b:var(--text)}
+/* An app's declared inactive icon (ui.pages[].iconInactiveUrl): the rail
+   renders both variants and shows the idle one only on an unlit, unhovered
+   nav row. Anywhere else the normal icon shows. */
+.app-nav-icon-idle{display:none}
+.app-icon-nav:not(.is-lit) .app-nav-icon-idle{display:inline-flex}
+.app-icon-nav:not(.is-lit) .app-nav-icon-lit{display:none}
+.group\/nav:hover .app-icon-nav .app-nav-icon-idle{display:none}
+.group\/nav:hover .app-icon-nav .app-nav-icon-lit{display:inline-flex}
+
+@import "./styles/chat-transcript.css";
+@import "./styles/scrollbars-and-touch-hit.css";
+@import "./styles/shell-chrome.css";
+@import "./styles/focus-and-state-cues.css";
+@import "./styles/sidebar-and-side-panel.css";
+@import "./styles/crew-mode.css";
+@import "./styles/highlights-and-page-zoom.css";
+@import "./styles/liquid-glass.css";
+@import "./styles/content-fit.css";
+@import "./styles/layout-morph.css";
+
+/* The live browser card in the person's control sets the pinned-prompt band aside
+   (pages/chat/browserLiveClearance.ts); it keeps its box, so nothing reflows. */
+html[data-browser-live-takeover] [data-pinned-prompt-band] {
+  visibility: hidden !important;
+}

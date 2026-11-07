@@ -1,0 +1,946 @@
+"""OPTIONS controls and action buttons in Slack, driven through ``kiro_crew.slack.interactions``.
+
+Covers the single-click OPTIONS path end to end (the in-place edit, the post-and-delete
+fallback, a delete that fails and keeps the control's record, a duplicate click, a
+superseded control struck through, the answer pinned to the conversation that asked),
+the "Choose several..." modal's stale and duplicate refusals, the ``action::`` routing edge
+cases (an overflow label, a failing message edit, an oversized payload), the helpers
+that read a control back off its own blocks, and the Slack-thread import into a
+dashboard slot.
+
+Every patch goes through the facade; it forwards the write to the owner module that
+reads the name. The per-message claim and edit-lock maps are reset between tests by
+``test/conftest.py``.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from types import SimpleNamespace
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from kiro_crew.dashboard import chat_persistence
+from kiro_crew.dashboard.chat_utils_slack_options import options_records, set_options_records
+from kiro_crew.slack import interactions as ix
+from kiro_crew.slack.format import (
+    OPTIONS_ACTION_PREFIX,
+    OPTIONS_SEVERAL_BLOCK,
+    OPTIONS_SEVERAL_INPUT,
+    is_options_actions_block,
+)
+from kiro_crew.slack.outbound import (
+    PostedOptions,
+    claim_options_answer,
+    encode_options_token,
+)
+from kiro_crew.testing.wait import await_until
+
+LOGGER = "kiro_crew.slack.interactions"
+MINTED_TS = "2026-10-01T10:00:00+00:00"
+LATER_TS = "2026-10-01T10:05:00+00:00"
+HEADER = {"type": "section", "text": {"type": "mrkdwn", "text": "Which one?"}}
+EXFIL_BLOB = "A" * 50
+EXFIL_URL = f"https://evil.com/exfil?data={EXFIL_BLOB}"
+
+
+# ---------------------------------------------------------------------------
+# Doubles and fixtures
+# ---------------------------------------------------------------------------
+
+
+class _Log:
+    """A conversation log whose newest transcript row is *newest*."""
+
+    def __init__(self, newest: str) -> None:
+        self.newest = newest
+        self.asked: list[str] = []
+
+    def last_row_ts(self, session_key: str) -> str:
+        self.asked.append(session_key)
+        return self.newest
+
+
+def _make_orch() -> MagicMock:
+    orch = MagicMock()
+    orch.slack = MagicMock()
+    orch.slack.update_message = AsyncMock()
+    orch.slack.post_message = AsyncMock(return_value="label-ts")
+    orch.slack.post_blocks = AsyncMock(return_value="fallback-ts")
+    orch.slack.delete_message = AsyncMock()
+    orch.slack.post_ephemeral = AsyncMock()
+    orch.slack.views_open = AsyncMock()
+    orch.dashboard_state = None
+    orch._handler_tasks = set()
+    return orch
+
+
+@pytest.fixture
+def orch(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
+    """A bound orchestrator double, every caller allowed."""
+    o = _make_orch()
+    monkeypatch.setattr(ix, "_orch", o)
+    monkeypatch.setattr(ix, "is_allowed_user", lambda uid: True)
+    return o
+
+
+@pytest.fixture
+def turns(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
+    run = AsyncMock()
+    monkeypatch.setattr(ix, "handle_message", run)
+    return run
+
+
+@pytest.fixture
+def audit(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
+    recorder = MagicMock()
+    monkeypatch.setattr(ix, "sel", lambda: recorder)
+    return recorder
+
+
+@pytest.fixture
+def forget(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
+    """Records the forget of a spent control, with the owner keys pinned to one value."""
+    recorder = MagicMock()
+    monkeypatch.setattr(ix, "forget_slack_options_for_thread", recorder)
+    monkeypatch.setattr(ix, "slack_options_owner_keys_snapshot", lambda state, ts: ("slack:t1",))
+    return recorder
+
+
+async def _join(orch: MagicMock) -> None:
+    tasks = list(orch._handler_tasks)
+    if tasks:
+        await await_until(asyncio.gather(*tasks), what="the handler's background tasks")
+
+
+def _messages(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.name == LOGGER]
+
+
+def _buttons(choices: list[str], block_id: str | None = None) -> dict:
+    block: dict[str, Any] = {
+        "type": "actions",
+        "elements": [
+            {
+                "type": "button",
+                "action_id": f"{OPTIONS_ACTION_PREFIX}{i}",
+                "text": {"type": "plain_text", "text": c},
+                "value": c,
+            }
+            for i, c in enumerate(choices)
+        ],
+    }
+    if block_id:
+        block["block_id"] = block_id
+    return block
+
+
+def _click(choices: list[str], index: int, *, block_id: str | None = None) -> tuple[dict, dict]:
+    """A single-click OPTIONS press on button *index*, from thread ``t1`` message ``m1``."""
+    control = _buttons(choices, block_id)
+    action = dict(control["elements"][index])
+    if block_id:
+        action["block_id"] = block_id
+    payload = {
+        "user": {"id": "U1"},
+        "team": {"id": "T1"},
+        "message": {"ts": "m1", "thread_ts": "t1", "blocks": [HEADER, control]},
+    }
+    return payload, action
+
+
+def _card(choices: list[str], block_id: str = "blk1") -> dict:
+    """A button-click payload on an OPTIONS card from thread ``t1`` message ``m1``."""
+    return {
+        "user": {"id": "U1"},
+        "team": {"id": "T1"},
+        "trigger_id": "trig",
+        "message": {"ts": "m1", "thread_ts": "t1", "blocks": [_buttons(choices, block_id)]},
+    }
+
+
+async def _submit_several(orch: MagicMock, choices: list[str], picked: list[int], block_id="blk1"):
+    opened = _card(choices, block_id)
+    await ix._open_options_several(opened, {"block_id": block_id}, "C1", "m1")
+    view = orch.slack.views_open.await_args.args[1]
+    await ix._handle_options_several_submission(
+        {
+            "user": {"id": "U1"},
+            "view": {
+                "private_metadata": view["private_metadata"],
+                "state": {
+                    "values": {
+                        OPTIONS_SEVERAL_BLOCK: {
+                            OPTIONS_SEVERAL_INPUT: {
+                                "selected_options": [{"value": str(i)} for i in picked]
+                            }
+                        }
+                    }
+                },
+            },
+        }
+    )
+
+
+def _answered(blocks: list[dict], *chosen: str) -> bool:
+    """Whether the context line reads "✅ <@U1> chose <chosen> · <time>"."""
+    names = ", ".join(f"*{c}*" for c in chosen)
+    return _summary(blocks).startswith(f"✅ <@U1> chose {names} · <!date^")
+
+
+def _summary(blocks: list[dict]) -> str:
+    """The mrkdwn text of the context block that replaced the control."""
+    texts = [
+        el["text"]
+        for b in blocks
+        if b.get("type") == "context"
+        for el in b.get("elements", [])
+        if el.get("type") == "mrkdwn"
+    ]
+    assert len(texts) == 1, blocks
+    return texts[0]
+
+
+def _has_live_control(blocks: list[dict]) -> bool:
+    return any(is_options_actions_block(b) for b in blocks)
+
+
+# ---------------------------------------------------------------------------
+# Single-click OPTIONS
+# ---------------------------------------------------------------------------
+
+
+class TestSingleClickOptions:
+    @pytest.mark.asyncio
+    async def test_a_choice_is_rendered_in_place_and_sent_to_the_session(
+        self, orch: MagicMock, turns: AsyncMock, forget: MagicMock
+    ) -> None:
+        payload, action = _click(["A", "B"], 1)
+        await ix._handle_options(payload, action, "C1", "m1")
+        await _join(orch)
+
+        orch.slack.update_message.assert_awaited_once()
+        (channel, ts), kwargs = orch.slack.update_message.await_args
+        assert (channel, ts, kwargs["text"]) == ("C1", "m1", "B")
+        assert kwargs["blocks"][0] is HEADER
+        assert not _has_live_control(kwargs["blocks"])
+        assert _answered(kwargs["blocks"], "B")
+        orch.slack.post_blocks.assert_not_awaited()
+        orch.slack.delete_message.assert_not_awaited()
+
+        turns.assert_awaited_once()
+        args, hm = turns.await_args.args, turns.await_args.kwargs
+        assert args[2:7] == ("C1", "B", "t1", "m1", "U1")
+        assert hm["team_id"] == "T1"
+        assert (hm["target_slot_name"], hm["route_pinned"], hm["asker_key"]) == (None, False, None)
+        forget.assert_called_once_with(None, "t1", "m1", keys=("slack:t1",), channel="C1")
+        # The answer is spent: a later click on the same control cannot claim it.
+        assert claim_options_answer("C1", "m1") is False
+
+    @pytest.mark.asyncio
+    async def test_a_failed_edit_falls_back_to_a_new_post_and_a_delete(
+        self, orch: MagicMock, turns: AsyncMock, forget: MagicMock
+    ) -> None:
+        orch.slack.update_message = AsyncMock(side_effect=RuntimeError("slack 500"))
+        payload, action = _click(["A", "B"], 0)
+        await ix._handle_options(payload, action, "C1", "m1")
+        await _join(orch)
+
+        orch.slack.post_blocks.assert_awaited_once()
+        channel, blocks, text, thread_ts = orch.slack.post_blocks.await_args.args
+        assert (channel, text, thread_ts) == ("C1", "A", "t1")
+        assert _answered(blocks, "A")
+        orch.slack.delete_message.assert_awaited_once_with("C1", "m1")
+        assert turns.await_args.args[2:7] == ("C1", "A", "t1", "fallback-ts", "U1")
+        forget.assert_called_once_with(None, "t1", "m1", keys=("slack:t1",), channel="C1")
+
+    @pytest.mark.asyncio
+    async def test_a_failed_delete_keeps_the_record_and_still_answers(
+        self,
+        orch: MagicMock,
+        turns: AsyncMock,
+        forget: MagicMock,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        orch.slack.update_message = AsyncMock(side_effect=RuntimeError("slack 500"))
+        orch.slack.delete_message = AsyncMock(side_effect=RuntimeError("cant_delete"))
+        payload, action = _click(["A", "B"], 1)
+        with caplog.at_level(logging.WARNING, logger=LOGGER):
+            await ix._handle_options(payload, action, "C1", "m1")
+        await _join(orch)
+
+        # The original buttons are still on screen, so their record must outlive the click.
+        forget.assert_not_called()
+        assert any("Failed to delete original OPTIONS message" in m for m in _messages(caplog))
+        assert turns.await_args.args[2:7] == ("C1", "B", "t1", "fallback-ts", "U1")
+        # The selection reached Slack, so the claim stays held against a second click.
+        assert claim_options_answer("C1", "m1") is False
+
+    @pytest.mark.asyncio
+    async def test_a_second_click_on_an_answered_control_does_nothing(
+        self,
+        orch: MagicMock,
+        turns: AsyncMock,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        assert claim_options_answer("C1", "m1") is True
+        payload, action = _click(["A", "B"], 0)
+        with caplog.at_level(logging.DEBUG, logger=LOGGER):
+            await ix._handle_options(payload, action, "C1", "m1")
+        await _join(orch)
+
+        orch.slack.update_message.assert_not_awaited()
+        orch.slack.post_blocks.assert_not_awaited()
+        turns.assert_not_awaited()
+        assert orch._handler_tasks == set()
+        assert any("was already answered" in m for m in _messages(caplog))
+        orch.slack.post_ephemeral.assert_awaited_once_with(
+            "C1", "U1", "Already answered.", thread_ts="t1"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_superseded_choice_is_struck_through_and_not_answered(
+        self, orch: MagicMock, turns: AsyncMock
+    ) -> None:
+        log = _Log(LATER_TS)
+        orch.dashboard_state = SimpleNamespace(conversation_log=log)
+        token = encode_options_token("slack:t1", MINTED_TS)
+        payload, action = _click(["A", "B"], 0, block_id=token)
+        await ix._handle_options(payload, action, "C1", "m1")
+        await _join(orch)
+
+        assert log.asked == ["slack:t1"]
+        turns.assert_not_awaited()
+        orch.slack.update_message.assert_awaited_once()
+        kwargs = orch.slack.update_message.await_args.kwargs
+        assert _summary(kwargs["blocks"]) == "~A~  |  ~B~"
+        assert kwargs["blocks"][0] is HEADER
+        # Struck through means retired: no later click may answer it.
+        assert claim_options_answer("C1", "m1") is False
+        orch.slack.post_ephemeral.assert_awaited_once_with(
+            "C1", "U1", "Already answered.", thread_ts="t1"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_tokened_choice_is_pinned_to_the_conversation_that_asked(
+        self,
+        orch: MagicMock,
+        turns: AsyncMock,
+        forget: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        state = SimpleNamespace(conversation_log=_Log(MINTED_TS))
+        orch.dashboard_state = state
+        slot_lookup = MagicMock(return_value=SimpleNamespace(key="chat-1"))
+        monkeypatch.setattr(ix, "slack_options_slot", slot_lookup)
+        token = encode_options_token("dashboard:chat-1", MINTED_TS)
+        payload, action = _click(["A", "B"], 1, block_id=token)
+        await ix._handle_options(payload, action, "C1", "m1")
+        await _join(orch)
+
+        slot_lookup.assert_called_once_with(state, "dashboard:chat-1")
+        hm = turns.await_args.kwargs
+        assert hm["target_slot_name"] == "chat-1"
+        assert hm["route_pinned"] is True
+        assert hm["asker_key"] == "dashboard:chat-1"
+        forget.assert_called_once_with(state, "t1", "m1", keys=("slack:t1",), channel="C1")
+
+    @pytest.mark.parametrize(
+        "action,channel,bound",
+        [
+            pytest.param({"action_id": "x"}, "C1", True, id="no-choice"),
+            pytest.param({"action_id": "x", "value": "A"}, "", True, id="no-channel"),
+            pytest.param({"action_id": "x", "value": "A"}, "C1", False, id="no-orchestrator"),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_an_unanswerable_press_is_ignored(
+        self,
+        orch: MagicMock,
+        turns: AsyncMock,
+        monkeypatch: pytest.MonkeyPatch,
+        action: dict,
+        channel: str,
+        bound: bool,
+    ) -> None:
+        if not bound:
+            monkeypatch.setattr(ix, "_orch", None)
+        payload, _ = _click(["A", "B"], 0)
+        await ix._handle_options(payload, action, channel, "m1")
+        orch.slack.update_message.assert_not_awaited()
+        orch.slack.post_message.assert_not_awaited()
+        turns.assert_not_awaited()
+        assert claim_options_answer("C1", "m1") is True
+
+
+# ---------------------------------------------------------------------------
+# action:: buttons and elements
+# ---------------------------------------------------------------------------
+
+
+class TestActionRouting:
+    @pytest.mark.asyncio
+    async def test_an_overflow_action_takes_its_label_from_the_selected_option(
+        self, orch: MagicMock, turns: AsyncMock, audit: MagicMock
+    ) -> None:
+        action = {
+            "action_id": "overflow_1",
+            "selected_option": {"value": 'action::{"snooze": 5}', "text": {"text": "Snooze 5m"}},
+        }
+        payload, _ = _click(["A"], 0)
+        await ix._handle_options(payload, action, "C1", "m1")
+        await _join(orch)
+
+        orch.slack.post_message.assert_awaited_once_with("C1", "Snooze 5m", "t1")
+        assert orch.slack.update_message.await_args.kwargs["text"] == "Snooze 5m"
+        args, hm = turns.await_args.args, turns.await_args.kwargs
+        assert args[2:7] == ("C1", "Snooze 5m", "t1", "label-ts", "U1")
+        assert '[Action button clicked: {"snooze": 5}]' in hm["action_context"]
+        access = audit.log_api_access.call_args.kwargs
+        assert (access["operation"], access["resources"]) == ("slack.action", "overflow_1")
+
+    @pytest.mark.asyncio
+    async def test_a_failing_message_edit_still_routes_the_action(
+        self,
+        orch: MagicMock,
+        turns: AsyncMock,
+        audit: MagicMock,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        orch.slack.update_message = AsyncMock(side_effect=RuntimeError("slack 500"))
+        action = {"action_id": "btn_go", "value": 'action::{"go": 1}', "text": {"text": "Go"}}
+        payload, _ = _click(["A"], 0)
+        with caplog.at_level(logging.DEBUG, logger=LOGGER):
+            await ix._handle_options(payload, action, "C1", "m1")
+        await _join(orch)
+
+        assert "Failed to update action message" in _messages(caplog)
+        orch.slack.post_message.assert_awaited_once_with("C1", "Go", "t1")
+        turns.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_an_oversized_action_payload_is_capped(
+        self, orch: MagicMock, turns: AsyncMock, audit: MagicMock
+    ) -> None:
+        body = "word " * 1000
+        action = {"action_id": "btn_big", "value": f"action::{body}", "text": {"text": "Big"}}
+        payload, _ = _click(["A"], 0)
+        await ix._handle_options(payload, action, "C1", "m1")
+        await _join(orch)
+
+        context = turns.await_args.kwargs["action_context"]
+        embedded = context.split("[Action button clicked: ", 1)[1].rsplit("]\n", 1)[0]
+        assert embedded == body[: ix._ACTION_PAYLOAD_CAP] + "… [truncated]"
+
+
+# ---------------------------------------------------------------------------
+# Forgetting a spent control
+# ---------------------------------------------------------------------------
+
+
+class TestForgetOptionsControl:
+    def test_nothing_is_forgotten_without_an_orchestrator_or_a_thread(
+        self, orch: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        posted = PostedOptions(channel="C1", ts="m1", choices=("A",), blocks=())
+        state = SimpleNamespace(_slack_options_by_key={}, sessions=None)
+        set_options_records(state, "slack:t1", (posted,))
+        orch.dashboard_state = state
+        ix._forget_options_control("", "m1", keys=("slack:t1",), channel="C1")
+        monkeypatch.setattr(ix, "_orch", None)
+        ix._forget_options_control("t1", "m1", keys=("slack:t1",), channel="C1")
+        assert options_records(state, "slack:t1") == (posted,)
+
+    def test_a_failing_forget_is_logged_not_raised(
+        self,
+        orch: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        recorder = MagicMock(side_effect=RuntimeError("store unreadable"))
+        monkeypatch.setattr(ix, "forget_slack_options_for_thread", recorder)
+        with caplog.at_level(logging.DEBUG, logger=LOGGER):
+            ix._forget_options_control("t1", "m1", keys=("slack:t1",))
+        recorder.assert_called_once_with(None, "t1", "m1", keys=("slack:t1",), channel=None)
+        assert "Failed to clear recorded OPTIONS control" in _messages(caplog)
+
+
+# ---------------------------------------------------------------------------
+# Reading a control back off its own blocks
+# ---------------------------------------------------------------------------
+
+
+class TestOptionsBlockId:
+    def test_the_actions_own_block_id_wins(self) -> None:
+        payload = {"actions": [{"block_id": "from-payload"}]}
+        assert ix._options_block_id(payload, {"block_id": "from-action"}) == "from-action"
+
+    def test_the_payload_actions_are_read_when_the_action_has_none(self) -> None:
+        payload = {"actions": ["not-a-dict", {"block_id": ""}, {"block_id": "second"}]}
+        assert ix._options_block_id(payload, {"block_id": 7}) == "second"
+
+    def test_a_later_rows_suffixed_id_still_decodes_to_the_token(self) -> None:
+        from kiro_crew.slack.outbound import decode_options_token, options_row_block_id
+
+        token = encode_options_token("slack:t1", MINTED_TS)
+        assert token is not None
+        row = ix._options_block_id({}, {"block_id": options_row_block_id(token, 1)})
+        assert row != token
+        assert decode_options_token(row) == ("slack:t1", MINTED_TS)
+
+    def test_an_unmarked_payload_has_no_block_id(self) -> None:
+        assert ix._options_block_id({"state": None, "actions": None}) is None
+
+
+class TestOptionsChoicesFromPayload:
+    def test_button_choices_are_gathered_across_every_block(self) -> None:
+        blocks = [
+            HEADER,
+            _buttons(["A", "B"]),
+            {"type": "actions", "elements": [{"action_id": "unrelated", "value": "z"}]},
+            {"type": "actions", "elements": [{"action_id": f"{OPTIONS_ACTION_PREFIX}2"}]},
+        ]
+        assert ix._options_choices_from_payload(blocks) == ["A", "B", ""]
+
+    def test_blocks_without_a_control_yield_no_choices(self) -> None:
+        assert ix._options_choices_from_payload([HEADER]) == []
+        assert ix._options_choices_from_payload(None) == []  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# Refusing a stale control
+# ---------------------------------------------------------------------------
+
+
+class TestRefuseStaleOptions:
+    @pytest.mark.asyncio
+    async def test_without_a_slack_client_nothing_is_edited(
+        self, orch: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        slack = orch.slack
+        orch.slack = None
+        await ix._refuse_stale_options("C1", "m1", _card(["A"]))
+        monkeypatch.setattr(ix, "_orch", None)
+        await ix._refuse_stale_options("C1", "m1", _card(["A"]))
+        slack.update_message.assert_not_awaited()
+        assert claim_options_answer("C1", "m1") is True
+
+    @pytest.mark.asyncio
+    async def test_an_answered_control_is_left_as_the_answer_rendered_it(
+        self, orch: MagicMock
+    ) -> None:
+        assert claim_options_answer("C1", "m1") is True
+        await ix._refuse_stale_options("C1", "m1", _card(["A", "B"]))
+        orch.slack.update_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_stale_control_is_struck_through_and_retired(self, orch: MagicMock) -> None:
+        payload = _card(["A", "B"])
+        payload["message"]["blocks"].insert(0, HEADER)
+        await ix._refuse_stale_options("C1", "m1", payload)
+        orch.slack.update_message.assert_awaited_once()
+        (channel, ts), kwargs = orch.slack.update_message.await_args
+        assert (channel, ts) == ("C1", "m1")
+        assert kwargs["blocks"][0] is HEADER
+        assert _summary(kwargs["blocks"]) == "~A~  |  ~B~"
+        assert not _has_live_control(kwargs["blocks"])
+        assert claim_options_answer("C1", "m1") is False
+
+    @pytest.mark.asyncio
+    async def test_a_failing_strike_through_is_logged_and_the_control_stays_retired(
+        self,
+        orch: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        expire = AsyncMock(side_effect=RuntimeError("slack 500"))
+        monkeypatch.setattr(ix, "expire_options", expire)
+        payload = _card(["A", "B"])
+        with caplog.at_level(logging.DEBUG, logger=LOGGER):
+            await ix._refuse_stale_options("C1", "m1", payload)
+        expire.assert_awaited_once()
+        slack, posted = expire.await_args.args
+        assert slack is orch.slack
+        assert posted == PostedOptions(
+            channel="C1",
+            ts="m1",
+            choices=("A", "B"),
+            blocks=tuple(payload["message"]["blocks"]),
+        )
+        assert any(
+            "could not strike through the stale OPTIONS control" in m for m in _messages(caplog)
+        )
+        assert claim_options_answer("C1", "m1") is False
+
+
+# ---------------------------------------------------------------------------
+# Multi-select submit
+# ---------------------------------------------------------------------------
+
+
+class TestChooseSeveralRefusals:
+    @pytest.mark.asyncio
+    async def test_a_superseded_submission_is_refused_and_audited(
+        self, orch: MagicMock, turns: AsyncMock, audit: MagicMock
+    ) -> None:
+        orch.dashboard_state = SimpleNamespace(conversation_log=_Log(LATER_TS))
+        token = encode_options_token("slack:t1", MINTED_TS)
+        assert token is not None
+        await _submit_several(orch, ["A", "B"], [1], block_id=token)
+        await _join(orch)
+
+        turns.assert_not_awaited()
+        invocation = audit.log_tool_invocation.call_args.kwargs
+        assert invocation["outcome"] == "denied"
+        assert invocation["metadata"] == {"reason": "superseded_control", "channel": "C1"}
+        assert invocation["session_key"] == "t1"
+        orch.slack.update_message.assert_awaited_once()
+        assert _summary(orch.slack.update_message.await_args.kwargs["blocks"]) == "~A~  |  ~B~"
+
+    @pytest.mark.asyncio
+    async def test_a_submission_on_an_answered_control_does_nothing(
+        self,
+        orch: MagicMock,
+        turns: AsyncMock,
+        audit: MagicMock,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        opened = _card(["A", "B"])
+        await ix._open_options_several(opened, {"block_id": "blk1"}, "C1", "m1")
+        view = orch.slack.views_open.await_args.args[1]
+        assert claim_options_answer("C1", "m1") is True  # a click answered it meanwhile
+        with caplog.at_level(logging.DEBUG, logger=LOGGER):
+            await ix._handle_options_several_submission(
+                {
+                    "user": {"id": "U1"},
+                    "view": {
+                        "private_metadata": view["private_metadata"],
+                        "state": {
+                            "values": {
+                                OPTIONS_SEVERAL_BLOCK: {
+                                    OPTIONS_SEVERAL_INPUT: {"selected_options": [{"value": "0"}]}
+                                }
+                            }
+                        },
+                    },
+                }
+            )
+        await _join(orch)
+
+        orch.slack.update_message.assert_not_awaited()
+        orch.slack.post_blocks.assert_not_awaited()
+        turns.assert_not_awaited()
+        assert audit.log_tool_invocation.call_args.kwargs["metadata"]["reason"] == (
+            "already_answered"
+        )
+        assert any(
+            "was already answered; dropping the duplicate click" in m for m in _messages(caplog)
+        )
+
+
+# ---------------------------------------------------------------------------
+# Importing a Slack thread into a dashboard slot
+# ---------------------------------------------------------------------------
+
+
+class _Slot:
+    def __init__(self) -> None:
+        self.key = "slot-1"
+        self.title = ""
+        self.rows: list[tuple[str, str, str]] = []
+
+    def append(self, role: str, text: str, css: str) -> None:
+        self.rows.append((role, text, css))
+
+
+def _dashboard(linked: Any = None) -> MagicMock:
+    ds = MagicMock()
+    ds.get_linked_slot = MagicMock(return_value=linked)
+    ds.get_or_create_slot = MagicMock(return_value=_Slot())
+    ds._self_bot_id = "UBOT"
+    return ds
+
+
+@pytest.fixture
+def saved(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
+    save = AsyncMock(return_value=True)
+    monkeypatch.setattr(chat_persistence, "save_slot_off_loop", save)
+    return save
+
+
+class TestImportThreadToSlot:
+    @pytest.mark.asyncio
+    async def test_an_already_linked_thread_returns_its_slot(self, saved: AsyncMock) -> None:
+        existing = object()
+        ds = _dashboard(linked=existing)
+        slack = MagicMock()
+        slack.fetch_thread_replies = AsyncMock()
+        assert await ix._import_thread_to_slot(slack, ds, "C1", "1700000000.000100") is existing
+        ds.get_linked_slot.assert_called_once_with("1700000000.000100")
+        slack.fetch_thread_replies.assert_not_awaited()
+        ds.get_or_create_slot.assert_not_called()
+        saved.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_thread_of_only_blank_and_link_messages_imports_nothing(
+        self, saved: AsyncMock
+    ) -> None:
+        ds = _dashboard()
+        slack = MagicMock()
+        slack.fetch_thread_replies = AsyncMock(
+            return_value=[
+                {"user": "U1", "text": "   "},
+                {"user": "U1"},
+                {"user": "U1", "text": "!link-to-dashboard"},
+            ]
+        )
+        assert await ix._import_thread_to_slot(slack, ds, "C1", "1700000000.000100") is None
+        ds.get_or_create_slot.assert_not_called()
+        ds.link_slack.assert_not_called()
+        saved.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_long_thread_keeps_its_newest_fifty_messages_redacted(
+        self, saved: AsyncMock
+    ) -> None:
+        ds = _dashboard()
+        replies: list[dict] = [{"user": "U1", "text": f"msg {i}"} for i in range(55)]
+        replies[-3] = {"bot_id": "B1", "text": "from a bot"}
+        replies[-2] = {"user": "UBOT", "text": f"see {EXFIL_URL}"}
+        slack = MagicMock()
+        slack.fetch_thread_replies = AsyncMock(return_value=replies)
+
+        slot = await ix._import_thread_to_slot(slack, ds, "C1", "1700000000.000100")
+
+        assert isinstance(slot, _Slot)
+        slack.fetch_thread_replies.assert_awaited_once_with("C1", "1700000000.000100")
+        assert slot.title == "Slack thread 1700000000 (truncated)"
+        assert len(slot.rows) == 50
+        assert slot.rows[0] == ("user", "msg 5", "msg msg-u")
+        assert slot.rows[-1] == ("user", "msg 54", "msg msg-u")
+        assert slot.rows[-3] == ("assistant", "from a bot", "msg msg-a")
+        role, text, css = slot.rows[-2]
+        assert (role, css) == ("assistant", "msg msg-a")
+        assert EXFIL_BLOB not in text
+        assert "REDACTED" in text
+        ds.link_slack.assert_called_once_with("slot-1", "1700000000.000100", "C1")
+        saved.assert_awaited_once_with(ds, slot)
+        ds.push_slots_update.assert_called_once_with()
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_store_still_imports_an_ordinary_thread(
+        self, saved: AsyncMock, tmp_path
+    ) -> None:
+        from kiro_crew.slack.code_channels.store import CodeChannelStore, set_store
+
+        (tmp_path / "cc.json").write_text("{not json", encoding="utf-8")
+        set_store(CodeChannelStore(tmp_path / "cc.json"))
+        try:
+            ds = _dashboard()
+            slack = MagicMock()
+            slack.fetch_thread_replies = AsyncMock(return_value=[{"user": "U1", "text": "hi"}])
+            slot = await ix._import_thread_to_slot(slack, ds, "C1", "1700000000.000100")
+            assert isinstance(slot, _Slot)
+            ds.link_slack.assert_called_once_with("slot-1", "1700000000.000100", "C1")
+        finally:
+            set_store(None)
+
+    def test_each_refusal_gets_its_own_notice_and_audit_reason(self) -> None:
+        """Only a real anchor refusal says the thread is a code channel's own."""
+        from kiro_crew.slack.code_channels.binding import AnchorHandoffRefused
+        from kiro_crew.slack.interactions_options import (
+            IMPORT_AGENT_MISMATCH_NOTICE,
+            IMPORT_CODE_CHANNEL_NOTICE,
+            ChannelAgentMismatchError,
+            import_refusal,
+        )
+
+        assert import_refusal(AnchorHandoffRefused("1.0")) == (
+            IMPORT_CODE_CHANNEL_NOTICE,
+            "code_channel_anchor",
+        )
+        assert import_refusal(ChannelAgentMismatchError("C1")) == (
+            IMPORT_AGENT_MISMATCH_NOTICE,
+            "channel_agent_mismatch",
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_code_channels_anchor_is_never_imported_into_a_new_slot(
+        self, saved: AsyncMock, tmp_path
+    ) -> None:
+        """Its thread is the binding's own session: refused before any slot."""
+        from kiro_crew.slack.code_channels.binding import AnchorHandoffRefused
+        from kiro_crew.slack.code_channels.store import Binding, CodeChannelStore, set_store
+
+        cc = CodeChannelStore(tmp_path / "cc.json")
+        cc.put_binding(
+            Binding(
+                channel_id="C0CODE",
+                team_id="T1",
+                session_key="owner",
+                anchor_ts="1700000000.000100",
+            )
+        )
+        set_store(cc)
+        try:
+            ds = _dashboard()
+            slack = MagicMock()
+            slack.fetch_thread_replies = AsyncMock(return_value=[{"user": "U1", "text": "hi"}])
+            with pytest.raises(AnchorHandoffRefused):
+                await ix._import_thread_to_slot(slack, ds, "C0CODE", "1700000000.000100")
+            ds.get_or_create_slot.assert_not_called()
+            ds.link_slack.assert_not_called()
+            saved.assert_not_awaited()
+        finally:
+            set_store(None)
+
+
+# ---------------------------------------------------------------------------
+# A code channel's button answers carry the clicker as the row's Slack sender
+# ---------------------------------------------------------------------------
+
+
+class TestCodeChannelAnswerSender:
+    """The ``slack_sender`` contract (rfc-slack-code-channels, sender attribution)."""
+
+    SENDER = {"team_id": "T1ABC", "enterprise_id": "E0ORG1", "user_id": "UOWNER1"}
+
+    @pytest.fixture
+    def bound(self, tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> Any:
+        from kiro_crew.slack.code_channels import routing
+        from kiro_crew.slack.code_channels.store import Binding, CodeChannelStore, set_store
+
+        monkeypatch.setattr(routing, "code_channels_on", lambda _cfg: self.on)
+        self.on = True
+        store = CodeChannelStore(tmp_path / "s.json")
+        store.put_binding(
+            Binding(channel_id="C0CODE", team_id="T1ABC", session_key="chat-1-1", anchor_ts="1.0")
+        )
+        set_store(store)
+        # The channel's session is open: an answer has somewhere to go.
+        slot = SimpleNamespace(key="chat-1-1", running=False)
+        state = SimpleNamespace(get_linked_slot=lambda ts: slot if ts == "1.0" else None)
+        monkeypatch.setattr(routing, "_dashboard_state", lambda: state)
+        yield store
+        set_store(None)
+
+    def _as_clicker(self, payload: dict) -> dict:
+        return {
+            **payload,
+            "user": {"id": "UOWNER1"},
+            "team": {"id": "T1ABC"},
+            "enterprise": {"id": "E0ORG1"},
+        }
+
+    @pytest.mark.asyncio
+    async def test_a_choice_in_a_code_channel_names_the_clicker(
+        self, orch: MagicMock, turns: AsyncMock, forget: MagicMock, bound: Any
+    ) -> None:
+        payload, action = _click(["A", "B"], 1)
+        await ix._handle_options(self._as_clicker(payload), action, "C0CODE", "m1")
+        await _join(orch)
+        assert turns.await_args.kwargs["user_meta"] == {"slack_sender": self.SENDER}
+
+    @pytest.mark.asyncio
+    async def test_a_submit_in_a_code_channel_names_the_clicker(
+        self, orch: MagicMock, turns: AsyncMock, forget: MagicMock, bound: Any
+    ) -> None:
+        """The "Choose several..." modal: the submitter is named like a clicker."""
+        await ix._open_options_several(
+            self._as_clicker(_card(["A", "B"])), {"block_id": "blk1"}, "C0CODE", "m1"
+        )
+        view = orch.slack.views_open.await_args.args[1]
+        await ix._handle_options_several_submission(
+            self._as_clicker(
+                {
+                    "view": {
+                        "private_metadata": view["private_metadata"],
+                        "state": {
+                            "values": {
+                                OPTIONS_SEVERAL_BLOCK: {
+                                    OPTIONS_SEVERAL_INPUT: {"selected_options": [{"value": "1"}]}
+                                }
+                            }
+                        },
+                    }
+                }
+            )
+        )
+        await _join(orch)
+        assert turns.await_args.kwargs["user_meta"] == {"slack_sender": self.SENDER}
+
+    @pytest.mark.asyncio
+    async def test_an_action_button_in_a_code_channel_names_the_clicker(
+        self, orch: MagicMock, turns: AsyncMock, bound: Any
+    ) -> None:
+        action = {"action_id": "act1", "value": 'action::{"k": 1}', "text": {"text": "Go"}}
+        payload = self._as_clicker({"message": {"ts": "m1", "thread_ts": "t1", "blocks": []}})
+        await ix._handle_options(payload, action, "C0CODE", "m1")
+        await _join(orch)
+        assert turns.await_args.kwargs["user_meta"] == {"slack_sender": self.SENDER}
+
+    @pytest.mark.asyncio
+    async def test_an_action_answer_in_a_code_channel_reaches_the_bound_session(
+        self, orch: MagicMock, turns: AsyncMock, bound: Any
+    ) -> None:
+        """A top-level action button has no linked thread: the answer is pinned to
+        the channel's own session, and its label posts top-level."""
+        action = {"action_id": "act1", "value": 'action::{"k": 1}', "text": {"text": "Go"}}
+        payload = self._as_clicker({"message": {"ts": "m1", "blocks": []}})
+        await ix._handle_options(payload, action, "C0CODE", "m1")
+        await _join(orch)
+        kw = turns.await_args.kwargs
+        assert kw["target_slot_name"] == "chat-1-1" and kw["route_pinned"] is True
+        assert orch.slack.post_message.await_args.args[2] is None
+        # An action element (the action_id carries the payload) is pinned too.
+        element = {
+            "action_id": 'action::{"k": 2}',
+            "type": "static_select",
+            "selected_option": {"value": "v", "text": {"text": "V"}},
+        }
+        await ix._handle_options(payload, element, "C0CODE", "m1")
+        await _join(orch)
+        assert turns.await_args.kwargs["target_slot_name"] == "chat-1-1"
+
+    @pytest.mark.asyncio
+    async def test_an_action_answer_elsewhere_is_not_pinned(
+        self, orch: MagicMock, turns: AsyncMock, bound: Any
+    ) -> None:
+        action = {"action_id": "act1", "value": 'action::{"k": 1}', "text": {"text": "Go"}}
+        payload = self._as_clicker({"message": {"ts": "m1", "thread_ts": "t1", "blocks": []}})
+        await ix._handle_options(payload, action, "C1", "m1")
+        await _join(orch)
+        kw = turns.await_args.kwargs
+        assert kw["target_slot_name"] is None and kw["route_pinned"] is False
+        assert orch.slack.post_message.await_args.args[2] == "t1"
+        self.on = False
+        await ix._handle_options(payload, action, "C0CODE", "m1")
+        await _join(orch)
+        assert turns.await_args.kwargs["route_pinned"] is False
+
+    @pytest.mark.asyncio
+    async def test_outside_a_code_channel_or_with_bad_ids_there_is_no_sender(
+        self, orch: MagicMock, turns: AsyncMock, forget: MagicMock, bound: Any
+    ) -> None:
+        payload, action = _click(["A", "B"], 1)
+        await ix._handle_options(self._as_clicker(payload), action, "C1", "m1")
+        await _join(orch)
+        assert turns.await_args.kwargs["user_meta"] is None
+        payload, action = _click(["A", "B"], 0)
+        bad = {**self._as_clicker(payload), "team": {"id": "not-a-team"}}
+        await ix._handle_options(bad, action, "C0CODE", "m1")
+        await _join(orch)
+        assert turns.await_args.kwargs["user_meta"] is None
+
+    @pytest.mark.asyncio
+    async def test_with_code_channels_off_a_stale_binding_names_no_one(
+        self, orch: MagicMock, turns: AsyncMock, forget: MagicMock, bound: Any
+    ) -> None:
+        self.on = False
+        payload, action = _click(["A", "B"], 1)
+        await ix._handle_options(self._as_clicker(payload), action, "C0CODE", "m1")
+        await _join(orch)
+        assert turns.await_args.kwargs["user_meta"] is None

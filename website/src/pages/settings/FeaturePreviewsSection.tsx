@@ -1,0 +1,485 @@
+import { useEffect, useState } from 'react'
+import { useNavigate } from 'react-router-dom'
+import { useMutation } from '@tanstack/react-query'
+import { ArrowRight } from 'lucide-react'
+
+import { SettingsSection, SettingsCard, SettingsToggle } from '../../components/settings'
+import { FeaturePreviewIntroButton, type FeaturePreviewIntro } from '../../components/FeaturePreviewIntroDialog'
+import { usePreviewFlag, useRemoteCrewChat } from '../../hooks/usePreviewFlag'
+import { clearPreviewFlagWriteError, usePreviewFlagWriteError } from '../../hooks/usePreviewFlagServerSync'
+import ErrorNotice from '../../components/ErrorNotice'
+import { Btn } from '../../components/ui'
+import { api } from '../../api/client'
+import { ApiError } from '../../api/apiError'
+import { useSharedCrewPreviewSetting } from './sharedCrewPreviewSetting'
+import { PREVIEW_ARTIFACT_DEPLOY, PREVIEW_CREW_MODE, PREVIEW_EXPLORE, PREVIEW_FOLDER_CONDUCTOR, PREVIEW_LAYOUT_HARNESS, PREVIEW_MATE_SESSIONS, PREVIEW_REMOTE_CREW_CHAT, PREVIEW_SESSION_ENVIRONMENTS, PREVIEW_WEBHOOKS, setPreviewFlag, setRemoteCrewChat } from '../../utils/previewFlags'
+import ErrorBoundary from '../../components/ErrorBoundary'
+import { KasBundleCard } from '../developer/KasBundleCard'
+import { KIRO_SIGN_IN_BACKEND } from '../developer/kiroSignInLink'
+import { useConfigSchema } from '../../components/settingRef/useConfigSchema'
+import { DecisionsCard } from './DecisionsCard'
+import { RemoteDispatchCard } from './RemoteDispatchCard'
+import { i18nT } from '../../i18n/t'
+
+
+/**
+ * Settings > Developer > Feature Previews — opt in to surfaces that ship in the
+ * bundle but are not released yet (see `utils/previewFlags.ts`).
+ *
+ * The first page of the Developer tab's SubNav (`DeveloperPanel.tsx`), above
+ * the internals pages: a reader looking for "how do I turn the unfinished
+ * thing on" finds it first. `DeveloperPage.tsx` redirects the old
+ * `/developer?tab=feature-previews` link here.
+ *
+ * The USER-FACING copy says "features" and "pages", never "surfaces": `Surface`
+ * is the registry's internal term and means nothing to the operator reading the
+ * toggle. The component and catalog keys keep the code vocabulary on purpose —
+ * they name the mechanism, not the copy. The catalog keys also keep their
+ * historical `pages.developer.featurePreviewsTab.*` namespace: renaming seven
+ * keys across fourteen catalogs buys no user-visible change.
+ *
+ * ONE CARD PER FEATURE, and everything that belongs to a feature lives inside
+ * its card: the headline, the sentence explaining what state it is in, its
+ * toggle, and any ingress that only appears once it is on. A reader scanning the
+ * section can then take a card as the whole story of one preview, rather than
+ * pairing a row against an ingress rendered somewhere below it.
+ *
+ * One explicit card per preview flag rather than a loop over a table: the copy
+ * has to be a static `i18nT('literal')` call for `check-i18n-keys.mjs` to
+ * resolve it, and a table of key strings indexed per card is exactly the dynamic
+ * pattern that gate cannot follow. A preview flag is also meant to be
+ * short-lived, so the cost of a card is paid once and then deleted with it.
+ *
+ * Under `pages/settings/` ON PURPOSE, reversing the old tab's stance:
+ * `gen-settings-registry.mjs` scans this directory, so these toggles ARE
+ * indexed into Settings search (`PANEL_TAB_MAP` maps this file to `developer`).
+ * The old tab kept itself out of the index so that searching "webhooks" would
+ * not advertise a hidden page. In Settings the calculus flips: a control the
+ * user can see on a Settings pane but cannot find through Settings search is
+ * the exact coverage gap the settings-coverage gate exists to close, and what
+ * the search hit reaches is the opt-in switch — labelled as a preview — not the
+ * page it holds. The PAGE stays un-advertised: `getAdvertisedSurfaces()` and
+ * the Search Everywhere Pages provider still filter it until the flag is on.
+ *
+ * No `configKey` on the `previewFlags.ts` toggles. That prop only feeds
+ * `settingsRegistry.gen.ts` and the `<SettingRef>` deep link; it does not pick
+ * how a toggle saves (these write through `setPreviewFlag`: the browser cache,
+ * then `dashboard.feature_previews.<name>`). Without it the
+ * `dashboard.feature_previews.*` paths are not in the registry, so a
+ * `<SettingRef>` naming one falls back to its file/CLI hint. Search deep-links
+ * still reach every toggle through its registry id + `data-setting-label`,
+ * which need no configKey.
+ *
+ * The Decisions toggle (now in `DecisionsCard.tsx`) carries no `configKey` either,
+ * for a different reason: it writes no config path. Its value is the KEYSTONE
+ * `decisions_consent.json`, reached through `/api/decisions/consent`, because
+ * `config.json` is writable by an auto-approved agent shell and consent to send
+ * message text off the machine must not be (see `decisionsPreview.ts`). A
+ * `configKey` naming a config path nothing reads would be the drift the
+ * `test_settingref_schema_fixture.py` guard exists to catch, so its absence here
+ * is asserted by `decisionsPreview.test.ts`.
+ *
+ * Each card may also carry a "See what it looks like" button (`FeaturePreviewIntroButton`)
+ * opening a dialog with a REAL capture of the surface the flag reveals, a
+ * sentence on what it does, where it appears once on, and the same switch again.
+ * The intro is defined right here next to its card — the card IS the preview's
+ * definition — as a render-time builder rather than a table of catalog keys,
+ * for the same `check-i18n-keys.mjs` reason the cards are not a loop: the gate
+ * resolves a literal `i18nT('…')`, not a key read out of a nested object. A
+ * preview whose surface has not been captured yet (below: "Chat on a crew",
+ * whose menu entry only exists with a live tunnel to a second machine, which an
+ * isolated capture instance cannot honestly stage) simply has no builder and so
+ * no button — never a dialog with an empty frame.
+ */
+
+/** Public paths of the captures; the files ride `public/`, never a JS chunk. */
+const MEDIA_BASE = '/app-assets/feature-previews'
+
+/** Webhooks: the `/webhooks` page itself, the flag's only door. */
+function webhooksIntro(): FeaturePreviewIntro {
+  return {
+    summary: i18nT('pages.developer.featurePreviewsTab.intro.webhooks_summary'),
+    whereToFind: i18nT('pages.developer.featurePreviewsTab.intro.webhooks_where'),
+    media: [
+      {
+        kind: 'image',
+        light: `${MEDIA_BASE}/webhooks-page-light.png`,
+        dark: `${MEDIA_BASE}/webhooks-page-dark.png`,
+        caption: i18nT('pages.developer.featurePreviewsTab.intro.webhooks_media_page'),
+      },
+    ],
+  }
+}
+
+/**
+ * The card label of *flag*, for the notice that names a switch the gateway
+ * refused. A `switch` of literal `i18nT` calls rather than a table, for the
+ * same `check-i18n-keys.mjs` reason the cards are not a loop.
+ */
+function previewFlagLabel(flag: string): string {
+  switch (flag) {
+    case PREVIEW_ARTIFACT_DEPLOY: return i18nT('pages.developer.featurePreviewsTab.artifact_deploy')
+    case PREVIEW_WEBHOOKS: return i18nT('pages.developer.featurePreviewsTab.webhooks')
+    case PREVIEW_CREW_MODE: return i18nT('pages.developer.featurePreviewsTab.crew_mode')
+    case PREVIEW_EXPLORE: return i18nT('pages.developer.featurePreviewsTab.explore')
+    case PREVIEW_REMOTE_CREW_CHAT: return i18nT('pages.developer.featurePreviewsTab.chat_on_a_crew')
+    case PREVIEW_LAYOUT_HARNESS: return i18nT('pages.developer.featurePreviewsTab.layout_harness')
+    case PREVIEW_FOLDER_CONDUCTOR: return i18nT('pages.developer.featurePreviewsTab.folder_conductor')
+    case PREVIEW_MATE_SESSIONS: return i18nT('pages.developer.featurePreviewsTab.mate_sessions')
+    case PREVIEW_SESSION_ENVIRONMENTS: return i18nT('sessionEnvironments.title')
+    default: return i18nT('pages.settings.developerPanel.feature_previews')
+  }
+}
+
+/**
+ * `data-setting-key` anchor on the section wrapper, for
+ * `?highlight=key:<this>` — what the old `/developer?tab=feature-previews`
+ * link redirects to (`DeveloperPage.tsx`). Not a config path and not a registry entry: it only
+ * exists so useSettingHighlight's direct DOM lookup can ring the whole section.
+ * Neither the settings extractor (which reads `configKey` props on Settings*
+ * primitives) nor the SettingRef call-site guard (which scans `<SettingRef>`)
+ * sees a bare `data-setting-key` attribute, so it cannot leak into search or
+ * pose as a schema path.
+ */
+export const FEATURE_PREVIEWS_HIGHLIGHT_ANCHOR = 'feature-previews-section'
+
+/** Millisecond bound matching Tailnet's cold-restart allowance. */
+export const SHARED_CREW_RESTART_VERIFY_TIMEOUT_MS = 60_000
+
+export function FeaturePreviewsSection() {
+  const navigate = useNavigate()
+  const artifactDeploy = usePreviewFlag(PREVIEW_ARTIFACT_DEPLOY)
+  const webhooks = usePreviewFlag(PREVIEW_WEBHOOKS)
+  const remoteCrewChat = useRemoteCrewChat()
+  const layoutHarness = usePreviewFlag(PREVIEW_LAYOUT_HARNESS)
+  const folderConductor = usePreviewFlag(PREVIEW_FOLDER_CONDUCTOR)
+  const mateSessions = usePreviewFlag(PREVIEW_MATE_SESSIONS)
+  const sessionEnvironments = usePreviewFlag(PREVIEW_SESSION_ENVIRONMENTS)
+  const crewMode = usePreviewFlag(PREVIEW_CREW_MODE)
+  const explore = usePreviewFlag(PREVIEW_EXPLORE)
+  const writeError = usePreviewFlagWriteError()
+  const [gatewayRestarting, setGatewayRestarting] = useState(false)
+  const [restartFailed, setRestartFailed] = useState(false)
+  const sharedCrewPreview = useSharedCrewPreviewSetting({ poll: gatewayRestarting })
+  const sharedCrewSetting = sharedCrewPreview.setting
+  // The stored choice and what this gateway started with disagree: a restart applies it.
+  const sharedCrewNeedsRestart = !!sharedCrewSetting && (sharedCrewSetting.restart_required
+    || (!sharedCrewSetting.env_override && sharedCrewSetting.enabled !== sharedCrewSetting.active))
+  // A dropped restart response is ambiguous until the setting can be read back.
+  const restartGateway = useMutation({
+    mutationFn: () => api.restartGateway(),
+    onMutate: () => setRestartFailed(false),
+    onSuccess: () => setGatewayRestarting(true),
+    onError: (e: unknown) => {
+      if (e instanceof ApiError) {
+        setGatewayRestarting(false)
+        setRestartFailed(true)
+      } else {
+        setGatewayRestarting(true)
+      }
+    },
+  })
+
+  useEffect(() => {
+    if (!gatewayRestarting) return
+
+    const timeoutId = window.setTimeout(() => {
+      setGatewayRestarting(false)
+      setRestartFailed(true)
+    }, SHARED_CREW_RESTART_VERIFY_TIMEOUT_MS)
+
+    return () => window.clearTimeout(timeoutId)
+  }, [gatewayRestarting])
+
+  useEffect(() => {
+    if (sharedCrewNeedsRestart) return
+    setGatewayRestarting(false)
+    setRestartFailed(false)
+  }, [sharedCrewNeedsRestart])
+  // The KAS engine card is for a deployment that can select KAS at all: the same
+  // gate its old mount used, read from the schema's `agent.acp_backend` enum. An
+  // unanswered schema hides nothing, as on the harness tab.
+  const acpBackends = useConfigSchema()?.get('agent.acp_backend')?.enum
+  const kasOffered = !acpBackends || acpBackends.includes(KIRO_SIGN_IN_BACKEND)
+
+  return (
+    // The wrapper exists for the legacy redirect: `?highlight=key:<anchor>`
+    // rings whatever element carries that `data-setting-key`, so this rings
+    // the WHOLE section — header, caveat and all three cards — rather than one
+    // card. A reader arriving from an old Feature Previews bookmark asked a
+    // section-sized question ("where did the tab go?"), and a single ringed
+    // row answers a different one ("is this row selected?"). The wrapper takes
+    // over the between-sections `mt-4` because SettingsSection's own
+    // `first:mt-0` now sees its header as the first child of this div.
+    <div data-setting-key={FEATURE_PREVIEWS_HIGHLIGHT_ANCHOR} className="mt-4">
+    <SettingsSection title={i18nT('pages.settings.developerPanel.feature_previews')}>
+      {/* The "unpolished on purpose" caveat sits under the section header rather
+          than repeated per card: it is true of every card here, and the old tab
+          carried it once as the page description for the same reason. */}
+      <p className="text-[13px] text-muted mb-2">
+        {i18nT('pages.settings.developerPanel.feature_previews_desc')}
+      </p>
+      {/* The gateway refused a toggle and the switch went back to its stored
+          value. Said once for the section, under the intro, and naming the
+          switch, so a refused click on a card further down still says which
+          switch moved back and why. */}
+      {writeError && (
+        <ErrorNotice
+          testId="feature-previews-save-error"
+          // A carry refused as owner-only names the owner rather than a reload:
+          // a reload sends the same carry and gets the same 403.
+          message={writeError.carry
+            ? writeError.denied
+              ? i18nT('pages.settings.developerPanel.feature_previews_carry_denied', { name: previewFlagLabel(writeError.flag) })
+              : i18nT('pages.settings.developerPanel.feature_previews_carry_failed', { name: previewFlagLabel(writeError.flag) })
+            : writeError.denied
+              ? i18nT('pages.settings.developerPanel.feature_previews_save_denied', { name: previewFlagLabel(writeError.flag) })
+              : i18nT('pages.settings.developerPanel.feature_previews_save_failed', { name: previewFlagLabel(writeError.flag) })}
+          onDismiss={clearPreviewFlagWriteError}
+          // The hand-off is safe here: this section holds no draft input, and the
+          // refused switch already shows its stored value, so leaving loses nothing.
+          askAgent
+          className="mb-2"
+        />
+      )}
+      {/* Artifact Deploy ships without a "See what it looks like" intro: the
+          capture pipeline shoots a running pod, and the deploy surface's own
+          screens need a registered AWS profile to show anything real. A card with
+          a toggle and an ingress link is honest; a capture of an empty console
+          would not be worth the media it costs. */}
+      <SettingsCard>
+        <SettingsToggle
+          label={i18nT('pages.developer.featurePreviewsTab.artifact_deploy')}
+          description={i18nT('pages.developer.featurePreviewsTab.artifact_deploy_desc_summary')} hint={i18nT('pages.developer.featurePreviewsTab.artifact_deploy_desc')}
+          checked={artifactDeploy}
+          onChange={v => setPreviewFlag(PREVIEW_ARTIFACT_DEPLOY, v)}
+        />
+        <div className="flex flex-wrap items-center gap-x-4 pt-1">
+          {artifactDeploy && (
+            <button
+              type="button"
+              onClick={() => navigate('/deploy')}
+              className="inline-flex items-center gap-1.5 text-[13px] font-medium text-accent bg-transparent border-none cursor-pointer px-0 py-1 hover:underline"
+            >
+              {i18nT('pages.developer.featurePreviewsTab.open_artifact_deploy')}
+              <ArrowRight size={13} aria-hidden="true" />
+            </button>
+          )}
+        </div>
+      </SettingsCard>
+      <SettingsCard>
+        <SettingsToggle
+          label={i18nT('pages.developer.featurePreviewsTab.webhooks')}
+          hint={i18nT('pages.developer.featurePreviewsTab.inbound_webhook_tokens_registered_contexts_and_r')}
+          checked={webhooks}
+          onChange={v => setPreviewFlag(PREVIEW_WEBHOOKS, v)}
+        />
+        {/* One action row under the toggle: "See what it looks like" always, the ingress
+            link only once the flag is on. Same row so the card keeps one
+            footer whichever state it is in, rather than a link appearing on a
+            new line and pushing the next card down. */}
+        <div className="flex flex-wrap items-center gap-x-4 pt-1">
+          <FeaturePreviewIntroButton
+            title={i18nT('pages.developer.featurePreviewsTab.webhooks')}
+            intro={webhooksIntro()}
+            checked={webhooks}
+            onChange={v => setPreviewFlag(PREVIEW_WEBHOOKS, v)}
+          />
+          {webhooks && (
+            <button
+              type="button"
+              onClick={() => navigate('/webhooks')}
+              className="inline-flex items-center gap-1.5 text-[13px] font-medium text-accent bg-transparent border-none cursor-pointer px-0 py-1 hover:underline"
+            >
+              {i18nT('pages.developer.featurePreviewsTab.open_webhooks')}
+              {/* An in-app arrow, NOT `ExternalLink`: this navigates in the same
+                  tab. Elsewhere in the dashboard the external-link glyph is
+                  reserved for pop-outs and off-site URLs, so using it here would
+                  promise a new window that never opens. */}
+              <ArrowRight size={13} className="lucide-inline" />
+            </button>
+          )}
+        </div>
+      </SettingsCard>
+      {/* Ultra Mode (flag key `mc-preview-crew-mode`): every Crew Mode surface
+          reads this one flag through `lib/crewMode.ts`. A plain switch only,
+          with no preview dialog and no ingress link. Off, a chat already in
+          Crew Mode stays an ordinary chat on its agent. */}
+      <SettingsCard>
+        <SettingsToggle
+          label={i18nT('pages.developer.featurePreviewsTab.crew_mode')}
+          description={i18nT('pages.developer.featurePreviewsTab.crew_mode_desc_summary')}
+          hint={i18nT('pages.developer.featurePreviewsTab.crew_mode_desc')}
+          checked={crewMode}
+          onChange={v => setPreviewFlag(PREVIEW_CREW_MODE, v)}
+        />
+      </SettingsCard>
+      {/* Explore (flag key `mc-preview-explore`): the top-bar pill, its sheet,
+          the milestone notice, the Try today card and Display > Explore. A
+          plain switch, like Ultra Mode's; on, Display > Explore is the inner
+          switch. */}
+      <SettingsCard>
+        <SettingsToggle
+          label={i18nT('pages.developer.featurePreviewsTab.explore')}
+          description={i18nT('pages.developer.featurePreviewsTab.explore_desc_summary')}
+          hint={i18nT('pages.developer.featurePreviewsTab.explore_desc')}
+          checked={explore}
+          onChange={v => setPreviewFlag(PREVIEW_EXPLORE, v)}
+        />
+      </SettingsCard>
+      {/* Shared Crew (People, invites, shared sessions). Unlike the flags above, the
+          switch is not a browser setting: it is the owner's stored choice behind
+          `/api/shared-crew/preview` (a keystone file), which the gateway reads at
+          start, so a change waits for a restart. No `configKey` and no
+          `previewFlags.ts` entry for that reason. The card shows whether or not the
+          People tab does; a gateway without the route, or a caller who is not the
+          owner, gets no card. */}
+      {sharedCrewPreview.visible && (
+        <SettingsCard>
+          <SettingsToggle
+            label={i18nT('sharedCrew.preview_title')}
+            description={i18nT('sharedCrew.preview_desc')}
+            checked={!!sharedCrewSetting && (sharedCrewSetting.env_override || sharedCrewSetting.enabled)}
+            disabled={!sharedCrewSetting || sharedCrewSetting.env_override || sharedCrewPreview.saving}
+            onChange={sharedCrewPreview.set}
+          />
+          {sharedCrewSetting?.env_override && (
+            <p className="text-[12px] text-muted pt-1" data-testid="shared-crew-preview-env">{i18nT('sharedCrew.preview_env_on')}</p>
+          )}
+          {sharedCrewNeedsRestart && (
+            <div className="flex flex-wrap items-center gap-x-3 gap-y-1 pt-1" data-testid="shared-crew-preview-restart">
+              <span className="text-[12px] text-warn">{i18nT('sharedCrew.preview_restart_notice')}</span>
+              <Btn onClick={() => restartGateway.mutate()} disabled={restartGateway.isPending || gatewayRestarting} data-testid="shared-crew-preview-restart-button">
+                {restartGateway.isPending || gatewayRestarting ? i18nT('sharedCrew.preview_restarting') : i18nT('sharedCrew.preview_restart')}
+              </Btn>
+            </div>
+          )}
+          {/* The hand-off is safe here: the section holds no draft input. */}
+          {sharedCrewPreview.loadError && <ErrorNotice variant="inline" askAgent message={i18nT('sharedCrew.preview_load_failed')} testId="shared-crew-preview-load-error" />}
+          {sharedCrewPreview.saveFailed && <ErrorNotice variant="inline" askAgent message={i18nT('sharedCrew.preview_save_failed')} testId="shared-crew-preview-save-error" />}
+          {restartFailed && <ErrorNotice variant="inline" askAgent message={i18nT('sharedCrew.preview_restart_failed')} testId="shared-crew-preview-restart-error" />}
+        </SettingsCard>
+      )}
+      {/* A chat dispatched to another MACHINE over the instances tunnel.
+
+          ONE card for both halves of that feature: starting a chat on a crew and
+          listing that crew's sessions in the sidebar. They were two switches, and
+          one on with the other off let a user open a chat on a crew and then find
+          no crew group to return to it from.
+
+          NO ingress button: turning it on puts the create-menu entry back in the
+          same tick, and that menu is already in front of the user.
+
+          NO "See what it looks like" yet either, and that is the missing-capture rule, not
+          an omission: the entry it adds only renders while a tunnel to a second
+          machine is live (`warmCrews.length > 0` in ChatSidebar), and the
+          isolated instance the captures come from has no honest way to stage
+          one. A dialog with a staged or drawn frame would break the promise the
+          other two dialogs make — that what you see is what will appear. Add a
+          builder here the day a real two-machine capture exists. */}
+      <SettingsCard>
+        <SettingsToggle
+          label={i18nT('pages.developer.featurePreviewsTab.chat_on_a_crew')}
+          description={i18nT('pages.developer.featurePreviewsTab.chat_on_a_crew_desc_summary')}
+          hint={i18nT('pages.developer.featurePreviewsTab.chat_on_a_crew_desc')}
+          checked={remoteCrewChat}
+          onChange={v => setRemoteCrewChat(v)}
+        />
+      </SettingsCard>
+      {/* Dev-only MECHANISM preview, not a shippable surface: the composable-layout
+          mechanism (placement-driven renderer + scope + editor) being built beside
+          the Members page. This card is the FLAG PLUMBING only — the switch exists so
+          the mechanism can be built and tested behind a preview gate.
+
+          NO ingress button, on purpose: unlike the webhooks card, this preview has no
+          routable door in the bundle yet, so a link here would point at a route that
+          does not exist. It follows the toggle-only shape of "Chat on a crew" above —
+          an honest switch with no door to promise. Add a "See what it looks like" intro
+          and/or an ingress the day the feature lands a real capture and route. */}
+      <SettingsCard>
+        <SettingsToggle
+          label={i18nT('pages.developer.featurePreviewsTab.layout_harness')}
+          description={i18nT('pages.developer.featurePreviewsTab.layout_harness_desc_summary')}
+          hint={i18nT('pages.developer.featurePreviewsTab.layout_harness_desc')}
+          checked={layoutHarness}
+          onChange={v => setPreviewFlag(PREVIEW_LAYOUT_HARNESS, v)}
+        />
+      </SettingsCard>
+      {/* A folder drawn around the session that conducts it: that card pinned
+          first inside the folder, with an accent bar and a `conductor` tag.
+
+          Flagged for the reason the others here are not: it is not a DOOR. The
+          cards above hold a page or a menu entry a reader can decline to open,
+          so shipping them visible costs nobody anything; this one re-orders a
+          list people read every day and there is nothing to decline. Held until
+          it has been lived with.
+
+          NO ingress button: turning it on redraws the Sessions list in the same
+          tick, and a link here would point at a list already on screen. NO "See
+          what it looks like" either -- the layout is still settling and a
+          capture would be stale by the next change, which is the same rule the
+          Dynamic Dashboard card above follows. */}
+      <SettingsCard>
+        <SettingsToggle
+          label={i18nT('pages.developer.featurePreviewsTab.folder_conductor')}
+          description={i18nT('pages.developer.featurePreviewsTab.folder_conductor_desc_summary')}
+          hint={i18nT('pages.developer.featurePreviewsTab.folder_conductor_desc')}
+          checked={folderConductor}
+          onChange={v => setPreviewFlag(PREVIEW_FOLDER_CONDUCTOR, v)}
+        />
+      </SettingsCard>
+      {/* A crewmate's sessions leave the person's lists for the mate's Sessions
+          tab. NO ingress button: the change is to lists the reader already sees. */}
+      <SettingsCard>
+        <SettingsToggle
+          label={i18nT('pages.developer.featurePreviewsTab.mate_sessions')}
+          description={i18nT('pages.developer.featurePreviewsTab.mate_sessions_desc_summary')}
+          hint={i18nT('pages.developer.featurePreviewsTab.mate_sessions_desc')}
+          checked={mateSessions}
+          onChange={v => setPreviewFlag(PREVIEW_MATE_SESSIONS, v)}
+        />
+      </SettingsCard>
+      {/* Conductor remote dispatch (`work_ledger.remote_dispatch`). Like the KAS card
+          below, its switch is the gateway's own config value, not a preview flag:
+          every remote-dispatch path reads it per call, so it gates the server and
+          not only the UI. Renders nothing until the config read answers. */}
+      <ErrorBoundary scope="feature-preview-remote-dispatch" fallback={null}>
+        <RemoteDispatchCard />
+      </ErrorBoundary>
+      {/* The built-in KAS engine (`agent.kas_bundle`), the whole card: its switch
+          and the Install button for the pinned engine. It lives here, not on the
+          KAS harness row, while the route is in shadow testing, so the one click
+          that moves every new session onto an engine still being tested is not in
+          plain view of every KAS user. Unlike the cards above, the switch is not
+          a preview flag but its own config value; the card writes it through the
+          same config PATCH it always did. Isolated so a throwing card cannot
+          take the section down. */}
+      {kasOffered && (
+        <SettingsCard>
+          <ErrorBoundary scope="feature-preview-kas-bundle" fallback={null}>
+            <KasBundleCard />
+          </ErrorBoundary>
+        </SettingsCard>
+      )}
+      <SettingsCard>
+        <SettingsToggle
+          label={i18nT('sessionEnvironments.title')}
+          description={i18nT('sessionEnvironments.description_summary')}
+          hint={i18nT('sessionEnvironments.description')}
+          checked={sessionEnvironments}
+          onChange={value => setPreviewFlag(PREVIEW_SESSION_ENVIRONMENTS, value)}
+        />
+      </SettingsCard>
+      {/* LAST, and the only card here whose switch is not in gateway config: it
+          writes the KEYSTONE `decisions_consent.json`, not a config path. It lives in
+          `DecisionsCard.tsx` because it is a list and a detail rather than one row,
+          and that file's own doc comment carries why. */}
+      {/* Mounted SYNCHRONOUSLY. Settings search highlights a control by probing the
+          DOM for it and gives up after 100 ms, so a card behind a chunk boundary was a
+          deep link that rang nothing. The card's own per-point detail panel is the part
+          that is lazy -- see `DecisionsCard.tsx`. */}
+      <DecisionsCard />
+    </SettingsSection>
+    </div>
+  )
+}

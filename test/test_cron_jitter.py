@@ -1,0 +1,406 @@
+"""Tests for cron job jitter logic (_compute_jitter and drift prevention)."""
+
+import asyncio
+from typing import Any
+from unittest.mock import AsyncMock, patch
+
+import pytest
+
+from kiro_crew.cron import (
+    _JITTER_DAILY_MAX,
+    _JITTER_HOURLY_MAX,
+    CronJob,
+    CronSchedule,
+    CronService,
+)
+from kiro_crew.testing.wait import finished
+
+
+def _job(schedule: CronSchedule, strict: bool = False) -> CronJob:
+    return CronJob(id="t1", name="test", message="msg", schedule=schedule, strict_schedule=strict)
+
+
+class TestComputeJitterStrictSchedule:
+    def test_strict_schedule_returns_zero(self):
+        job = _job(CronSchedule(kind="every", every_secs=3600), strict=True)
+        assert CronService._compute_jitter(job) == 0.0
+
+    def test_strict_schedule_daily_returns_zero(self):
+        job = _job(CronSchedule(kind="every", every_secs=86400), strict=True)
+        assert CronService._compute_jitter(job) == 0.0
+
+    def test_strict_schedule_cron_returns_zero(self):
+        job = _job(CronSchedule(kind="cron", cron_expr="0 9 * * 1-5"), strict=True)
+        assert CronService._compute_jitter(job) == 0.0
+
+
+class TestComputeJitterAtJobs:
+    def test_at_job_returns_zero(self):
+        job = _job(CronSchedule(kind="at", at_ts=1700000000.0))
+        assert CronService._compute_jitter(job) == 0.0
+
+
+class TestComputeJitterEveryJobs:
+    def test_sub_hourly_returns_zero(self):
+        """Jobs with interval < 3600s get no jitter."""
+        job = _job(CronSchedule(kind="every", every_secs=300))
+        assert CronService._compute_jitter(job) == 0.0
+
+    def test_30min_returns_zero(self):
+        job = _job(CronSchedule(kind="every", every_secs=1800))
+        assert CronService._compute_jitter(job) == 0.0
+
+    def test_59min_returns_zero(self):
+        job = _job(CronSchedule(kind="every", every_secs=3540))
+        assert CronService._compute_jitter(job) == 0.0
+
+    @patch("kiro_crew.cron.random.uniform", return_value=600.0)
+    def test_hourly_returns_hourly_jitter(self, mock_rand):
+        job = _job(CronSchedule(kind="every", every_secs=3600))
+        result = CronService._compute_jitter(job)
+        mock_rand.assert_called_once_with(0, _JITTER_HOURLY_MAX)
+        assert result == 600.0
+
+    @patch("kiro_crew.cron.random.uniform", return_value=900.0)
+    def test_3hour_returns_hourly_jitter(self, mock_rand):
+        job = _job(CronSchedule(kind="every", every_secs=10800))
+        result = CronService._compute_jitter(job)
+        mock_rand.assert_called_once_with(0, _JITTER_HOURLY_MAX)
+        assert result == 900.0
+
+    @patch("kiro_crew.cron.random.uniform", return_value=3600.0)
+    def test_daily_returns_daily_jitter(self, mock_rand):
+        job = _job(CronSchedule(kind="every", every_secs=86400))
+        result = CronService._compute_jitter(job)
+        mock_rand.assert_called_once_with(0, _JITTER_DAILY_MAX)
+        assert result == 3600.0
+
+    @patch("kiro_crew.cron.random.uniform", return_value=5000.0)
+    def test_weekly_returns_daily_jitter(self, mock_rand):
+        job = _job(CronSchedule(kind="every", every_secs=604800))
+        result = CronService._compute_jitter(job)
+        mock_rand.assert_called_once_with(0, _JITTER_DAILY_MAX)
+        assert result == 5000.0
+
+
+class TestComputeJitterCronExpr:
+    @pytest.mark.parametrize(
+        "cron_expr",
+        [
+            "* * * * *",
+            "*/5 * * * *",
+            "0,30 * * * *",
+            "0-30 * * * *",
+            "0-30/5 * * * *",
+            "1,15-20 * * * *",
+        ],
+    )
+    def test_parsed_sub_hourly_minute_fields_return_zero(self, cron_expr):
+        """Every parsed minute field with multiple fires per hour gets no jitter."""
+        job = _job(CronSchedule(kind="cron", cron_expr=cron_expr))
+
+        with patch("kiro_crew.cron.random.uniform") as mock_rand:
+            result = CronService._compute_jitter(job)
+
+        assert result == 0.0
+        mock_rand.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("cron_expr", "jitter_max"),
+        [
+            ("0 * * * *", _JITTER_HOURLY_MAX),
+            ("0 */2 * * *", _JITTER_HOURLY_MAX),
+            ("0 1,13 * * *", _JITTER_HOURLY_MAX),
+            ("0 3 * * *", _JITTER_DAILY_MAX),
+            ("0 9 * * 1-5", _JITTER_DAILY_MAX),
+            ("30 15 * * *", _JITTER_DAILY_MAX),
+        ],
+    )
+    def test_single_minute_keeps_existing_jitter_band(self, cron_expr, jitter_max):
+        """A single parsed minute keeps the existing hour-field band selection."""
+        job = _job(CronSchedule(kind="cron", cron_expr=cron_expr))
+
+        with patch("kiro_crew.cron.random.uniform", return_value=123.0) as mock_rand:
+            result = CronService._compute_jitter(job)
+
+        assert result == 123.0
+        mock_rand.assert_called_once_with(0, jitter_max)
+
+    def test_minute_range_next_run_is_not_displaced_by_jitter(self):
+        """The next 0-30 run stays on its parsed minute instead of drifting."""
+        from datetime import datetime, timezone
+
+        from kiro_crew.cron import compute_next_run_ts
+
+        frozen_now = datetime(2026, 9, 15, 12, 0, tzinfo=timezone.utc).timestamp()
+        expected_next = datetime(2026, 9, 15, 12, 1, tzinfo=timezone.utc).timestamp()
+        job = _job(CronSchedule(kind="cron", cron_expr="0-30 * * * *"))
+        job.timezone = "UTC"
+
+        with patch("kiro_crew.cron.random.uniform", return_value=_JITTER_HOURLY_MAX):
+            next_run = compute_next_run_ts(job, now=frozen_now)
+            jitter = CronService._compute_jitter(job)
+
+        assert next_run is not None
+        assert next_run + jitter == expected_next
+
+
+class TestComputeJitterBounds:
+    """Verify jitter stays within documented bounds (statistical)."""
+
+    def test_hourly_jitter_within_bounds(self):
+        job = _job(CronSchedule(kind="every", every_secs=3600))
+        results = [CronService._compute_jitter(job) for _ in range(100)]
+        assert all(0 <= r <= _JITTER_HOURLY_MAX for r in results)
+        assert max(results) > 0  # not all zero
+
+    def test_daily_jitter_within_bounds(self):
+        job = _job(CronSchedule(kind="every", every_secs=86400))
+        results = [CronService._compute_jitter(job) for _ in range(100)]
+        assert all(0 <= r <= _JITTER_DAILY_MAX for r in results)
+        assert max(results) > _JITTER_HOURLY_MAX  # should exceed hourly range
+
+
+class TestDriftPrevention:
+    """Test that 'every' jobs use scheduled_ts for last_run_ts."""
+
+    @pytest.mark.asyncio
+    async def test_every_job_uses_scheduled_ts(self):
+        """After execution, last_run_ts should be the pre-jitter time."""
+        import time
+
+        job = CronJob(
+            id="drift1",
+            name="drift-test",
+            message="msg",
+            schedule=CronSchedule(kind="every", every_secs=3600),
+            created_ts=time.time() - 7200,
+        )
+
+        svc = CronService()
+        svc._on_job = None  # no-op execution
+
+        before = time.time()
+        # Patch jitter to a known value so we can verify drift prevention
+        with patch.object(CronService, "_compute_jitter", return_value=0.1):
+            await svc._run_job_isolated(job, svc._claim_run(job.id, "scheduled"))
+        after = time.time()
+
+        # last_run_ts should be ~before (scheduled time), not after+jitter
+        assert before <= job.last_run_ts <= after
+        # The key invariant: last_run_ts should NOT include jitter delay
+        # With 0.1s jitter, the difference should be negligible
+        assert job.last_run_ts < before + 0.5
+
+    @pytest.mark.asyncio
+    async def test_cron_job_uses_post_execution_ts(self):
+        """Cron-expression jobs should use post-execution time (no drift issue)."""
+        import time
+
+        job = CronJob(
+            id="cron1",
+            name="cron-test",
+            message="msg",
+            schedule=CronSchedule(kind="cron", cron_expr="0 * * * *"),
+            created_ts=time.time() - 7200,
+        )
+
+        svc = CronService()
+        svc._on_job = None
+
+        with patch.object(CronService, "_compute_jitter", return_value=0.0):
+            await svc._run_job_isolated(job, svc._claim_run(job.id, "scheduled"))
+
+        # Cron jobs set last_run_ts in _execute (post-execution)
+        assert job.last_run_ts is not None
+
+
+class TestComputeJitterWildcardMinute:
+    def test_every_minute_returns_zero(self):
+        """* * * * * (every minute) gets no jitter."""
+        job = _job(CronSchedule(kind="cron", cron_expr="* * * * *"))
+        assert CronService._compute_jitter(job) == 0.0
+
+    def test_every_minute_weekdays_returns_zero(self):
+        """* * * * 1-5 (every minute on weekdays) gets no jitter."""
+        job = _job(CronSchedule(kind="cron", cron_expr="* * * * 1-5"))
+        assert CronService._compute_jitter(job) == 0.0
+
+
+class TestReaperJitterAllowance:
+    """Test that reaper accounts for jitter in timeout threshold."""
+
+    @staticmethod
+    async def _sweep_once(monkeypatch, tmp_path, age: float, jitter: float) -> tuple[Any, Any]:
+        """Run one real reaper sweep over a live run of job ``j1`` claimed ``age`` seconds ago.
+
+        The reap itself runs for real against a session manager with no
+        processes, so its outcome is read off the job and the run history.
+        """
+        import time as time_mod
+
+        import cron_reaper_helpers
+        from cron_reaper_helpers import _live_task, _make_job, _mock_sessions
+
+        import kiro_crew.cron as cron_mod
+        from kiro_crew import platform_compat
+        from kiro_crew.cron import _RunClaim
+        from kiro_crew.cron_history import CronHistoryStore
+
+        # The session manager holds no process, so a reap must signal nothing.
+        for name in cron_reaper_helpers._KILL_PRIMITIVES:
+            refuse = (
+                cron_reaper_helpers._refuse_unpinned_signal_async
+                if name.endswith("_async")
+                else cron_reaper_helpers._refuse_unpinned_signal
+            )
+            monkeypatch.setattr(platform_compat, name, refuse)
+        # Only the timeout and the jitter make up the deadline under test.
+        for allowance in ("_pool_queue_allowance", "_gate_budget_allowance", "_vet_allowance"):
+            monkeypatch.setattr(cron_mod, allowance, lambda job: 0)
+        svc = CronService(base_dir=None, on_job=AsyncMock())
+        svc._history = CronHistoryStore(base_dir=tmp_path)
+        svc._sessions = _mock_sessions()
+        job = _make_job("j1")
+        svc._jobs = [job]
+        svc._claims["j1"] = _RunClaim(
+            trigger="scheduled",
+            claimed_at=time_mod.time() - age,
+            jitter=jitter,
+            task=_live_task(),
+        )
+        with (
+            patch("kiro_crew.sel.sel"),
+            patch.object(svc, "_save"),
+            patch(  # flake-ok: stands in for the reaper's interval sleep so one sweep runs
+                "asyncio.sleep", AsyncMock(side_effect=[None, asyncio.CancelledError])
+            ),
+        ):
+            with pytest.raises(asyncio.CancelledError):
+                await svc._reaper_loop()
+        return svc, job
+
+    @pytest.mark.asyncio
+    async def test_job_within_timeout_plus_jitter_not_reaped(self, monkeypatch, tmp_path):
+        """Job running for less than timeout+jitter should NOT be reaped."""
+        from kiro_crew.cron import _JOB_TIMEOUT_SECS
+
+        # Past the bare timeout, so only the jitter allowance keeps it alive.
+        svc, job = await self._sweep_once(
+            monkeypatch, tmp_path, _JOB_TIMEOUT_SECS + 600, jitter=1200.0
+        )
+        assert job.last_status != "error"
+        assert await svc._history.get_job_history("j1") == ([], 0)
+
+    @pytest.mark.asyncio
+    async def test_job_exceeding_timeout_plus_jitter_would_be_reaped(self, monkeypatch, tmp_path):
+        """Job running longer than timeout+jitter should be reaped."""
+        from kiro_crew.cron import _JOB_TIMEOUT_SECS
+
+        svc, job = await self._sweep_once(
+            monkeypatch, tmp_path, _JOB_TIMEOUT_SECS + 1200 + 100, jitter=1200.0
+        )
+        assert job.last_status == "error"
+        assert f"(exceeded {_JOB_TIMEOUT_SECS}s deadline)" in job.last_error
+        rows, _total = await svc._history.get_job_history("j1")
+        assert [r["status"] for r in rows] == ["timeout"]
+
+
+class TestJitterWaitEndsOnWallClock:
+    """The jitter wait must count host-suspend time (macOS monotonic does not).
+
+    Regression: a daily job fired in a two-second macOS DarkWake at 05:00 and
+    then sat in ``asyncio.sleep(jitter)`` -- a sleep on mach_absolute_time,
+    which stops while the host sleeps -- for hours of wall time, shown as
+    Running with no marker, no history row and its next run already moved on.
+    """
+
+    @staticmethod
+    def _clock(walls):
+        """A ``time`` stand-in whose wall clock replays ``walls`` (last value sticks)."""
+        import time as real_time
+        import types
+
+        seq = list(walls)
+
+        def wall():
+            return seq.pop(0) if len(seq) > 1 else seq[0]
+
+        return types.SimpleNamespace(time=wall, monotonic=real_time.monotonic)
+
+    @pytest.mark.asyncio
+    async def test_wall_clock_jump_ends_the_wait(self, monkeypatch):
+        """A suspend that carries the wall clock past the deadline ends the wait
+        within one slice of AWAKE time, not after ``jitter`` awake seconds."""
+        import kiro_crew.cron as cron_mod
+
+        base = 1_790_000_000.0
+        # deadline read, first remaining check, then the host "resumes" 66 min on
+        monkeypatch.setattr(cron_mod, "time", self._clock([base, base, base + 3960]))
+        monkeypatch.setattr(cron_mod, "_JITTER_WALL_SLICE_SECS", 0.01)
+
+        # A 59-minute jitter would hang here for 59 minutes under the old sleep.
+        await finished(cron_mod._sleep_out_jitter(59 * 60), "the jitter wait ending on resume")
+
+    @pytest.mark.asyncio
+    async def test_backward_wall_step_cannot_stretch_the_wait(self, monkeypatch):
+        """A wall clock stepped back a day still ends on the monotonic deadline."""
+        import kiro_crew.cron as cron_mod
+
+        base = 1_790_000_000.0
+        monkeypatch.setattr(cron_mod, "time", self._clock([base, base - 86400]))
+        monkeypatch.setattr(cron_mod, "_JITTER_WALL_SLICE_SECS", 0.01)
+
+        await finished(cron_mod._sleep_out_jitter(0.05), "the jitter wait ending on its deadline")
+
+    @pytest.mark.asyncio
+    async def test_no_suspend_waits_the_full_jitter(self):
+        """With no suspend and no clock step the wait is the jitter, as before.
+
+        Measured on ``perf_counter``, not ``monotonic``: on Windows
+        ``monotonic`` ticks in ~15.6 ms steps, so a wait that really lasted
+        50 ms can read as 47 ms. The helper may end on either deadline, so the
+        tolerance is one tick of the coarser of the two clocks it reads.
+        """
+        import time as time_mod
+
+        from kiro_crew.cron import _sleep_out_jitter
+
+        tick = max(
+            time_mod.get_clock_info("monotonic").resolution,
+            time_mod.get_clock_info("time").resolution,
+        )
+        start = time_mod.perf_counter()
+        await _sleep_out_jitter(0.05)
+        assert time_mod.perf_counter() - start >= 0.05 - tick
+
+    @pytest.mark.asyncio
+    async def test_scheduled_run_waits_through_the_wall_clock_helper(self, monkeypatch, tmp_path):
+        """``_run_job_isolated`` routes its jitter through the helper, not a bare sleep:
+        a host that resumes past the wall-clock deadline starts the run at once."""
+        import time
+
+        import kiro_crew.cron as cron_mod
+
+        job = CronJob(
+            id="wall1",
+            name="wall-test",
+            message="msg",
+            schedule=CronSchedule(kind="cron", cron_expr="0 9 * * 1-5"),
+            created_ts=time.time() - 7200,
+        )
+        svc = CronService(base_dir=tmp_path)
+        svc._on_job = None
+
+        base = 1_790_000_000.0
+        # The deadline read, the first remaining check, then the host resumes past it.
+        monkeypatch.setattr(cron_mod, "time", self._clock([base, base, base + 1300]))
+        monkeypatch.setattr(cron_mod, "_JITTER_WALL_SLICE_SECS", 0.01)
+        with patch.object(CronService, "_compute_jitter", return_value=1234.0):
+            # A bare sleep would hold this run for 1234 awake seconds.
+            await finished(
+                svc._run_job_isolated(job, svc._claim_run(job.id, "scheduled")),
+                "the scheduled run past its jitter",
+            )
+
+        assert job.last_run_ts == base + 1300

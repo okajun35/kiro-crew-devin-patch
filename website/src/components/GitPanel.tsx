@@ -1,0 +1,709 @@
+import { useEffect, useRef, useState } from 'react'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { ChevronRight, GitBranch, RefreshCw, RefreshCwOff } from 'lucide-react'
+import { api } from '../api/client'
+import ErrorNotice from './ErrorNotice'
+import GitBranchChanges from './GitBranchChanges'
+import { Btn } from './ui'
+import { errMessage } from '../utils/thunkError'
+import { findReport } from '../utils/errorReport'
+import {
+  gitErrorCode,
+  gitFilterRefusalCause,
+  gitFilterRefusalCopyKey,
+  gitFilterRefusalScope,
+  gitFilterRefusalTitleKey,
+} from '../utils/gitStatusError'
+import { i18nT } from '../i18n/t'
+import { fmtUnit } from '../i18n/format'
+
+/** Relative time label from ISO date string; the remote Git panel shares it. */
+export function relativeTime(iso: string): string {
+  const now = Date.now()
+  const then = new Date(iso).getTime()
+  const secs = Math.round((now - then) / 1000)
+  if (secs < 60) return i18nT('components.gitPanel.just_now')
+  const mins = Math.round(secs / 60)
+  if (mins < 60) return fmtUnit(mins, 'minute')
+  const hrs = Math.round(mins / 60)
+  if (hrs < 24) return fmtUnit(hrs, 'hour')
+  const days = Math.round(hrs / 24)
+  if (days < 30) return fmtUnit(days, 'day')
+  const months = Math.round(days / 30)
+  return fmtUnit(months, 'month')
+}
+
+/** Status letter color class; the remote Git panel shares it. */
+export function statusColor(s: string): string {
+  switch (s) {
+    case 'M': return 'text-warn'
+    case 'A': return 'text-ok'
+    case 'D': return 'text-danger'
+    case '?': return 'text-info'
+    default: return 'text-muted'
+  }
+}
+
+/** Dimmed directory prefix, highlighted filename. */
+function FilePath({ path }: { path: string }) {
+  const lastSlash = path.lastIndexOf('/')
+  if (lastSlash < 0) return <span className="font-mono text-[12px]">{path}</span>
+  return (
+    <span className="font-mono text-[12px]">
+      <span className="text-muted">{path.slice(0, lastSlash + 1)}</span>
+      {path.slice(lastSlash + 1)}
+    </span>
+  )
+}
+
+/** A repository folder as a heading: its name first in line for the width, the
+ *  parent path muted and cut from the LEFT, since the end of a path is what
+ *  tells two checkouts of one repository apart. The name itself still shrinks
+ *  and truncates when it alone is wider than the panel (a 320px panel and a
+ *  worktree named for its branch): a `shrink-0` name overflowed the heading
+ *  and ran under whatever followed it. The parent gives up width eight times
+ *  faster (`shrink-[8]`), so the name loses little until the parent is nearly
+ *  down to its ellipsis. The full path is the heading's `title`. */
+export function RepoPath({ path }: { path: string }) {
+  const trimmed = path.replace(/[\\/]+$/, '')
+  const cut = Math.max(trimmed.lastIndexOf('/'), trimmed.lastIndexOf('\\'))
+  const parent = cut >= 0 ? trimmed.slice(0, cut + 1) : ''
+  const name = cut >= 0 ? trimmed.slice(cut + 1) : trimmed
+  return (
+    <span className="flex min-w-0 font-mono text-[11px]">
+      {parent && (
+        // rtl + bdi: the ellipsis lands on the left while the path still reads LTR.
+        <span dir="rtl" className="truncate text-muted min-w-0 shrink-[8]">
+          <bdi>{parent}</bdi>
+        </span>
+      )}
+      <span className="text-text font-semibold min-w-0 truncate" data-testid="git-repo-name">
+        {name || path}
+      </span>
+    </span>
+  )
+}
+
+/** One repository rendered as a section of the Git tab's list. */
+export interface GitPanelSection {
+  /** The folder the heading names (the same path the routes are asked about). */
+  label: string
+  /** Optional tag after the path, e.g. "Project". */
+  badge?: string
+  /** Tooltip explaining the tag; a one-word tag does not explain itself. */
+  badgeTitle?: string
+  /** Open before the user toggles it. A section with uncommitted changes
+   *  opens on its own either way. */
+  defaultOpen?: boolean
+  /** Whether a collapsed heading DRAWS its "Show changes and history" hint.
+   *  Default true. `GitReposPanel` draws it on the first collapsed section
+   *  only: twenty-four identical hints made the list's quietest state its
+   *  loudest. `false` keeps the hint in the toggle's accessible name
+   *  (visually hidden), so a screen reader hears what every row opens. */
+  expandHintVisible?: boolean
+  /** Whether an OPEN section polls its status on the interval. Default true.
+   *  `GitReposPanel` grants it to the few most recently opened sections only
+   *  (`MAX_POLLING_SECTIONS`): repositories the agent edited open by
+   *  themselves, so without the cap every dirty repository would run its git
+   *  subprocesses every 5 s. An open section without it still fetched once and
+   *  refreshes on window focus and on its Refresh button. */
+  poll?: boolean
+}
+
+type GitStatus = Awaited<ReturnType<typeof api.projectGitStatus>>
+
+/** Whether a section's body is shown. Until the user toggles it
+ *  (`openOverride` null) the state is derived: open by default, or because its
+ *  status failed, or because it has uncommitted changes. Shared by the render
+ *  and the status query's poll
+ *  predicate, so the two can never disagree about which sections are open. */
+function deriveSectionOpen(
+  section: GitPanelSection,
+  openOverride: boolean | null,
+  status: GitStatus | undefined,
+  statusError: unknown,
+): boolean {
+  if (openOverride !== null) return openOverride
+  return !!section.defaultOpen || !!statusError || (status?.files?.length ?? 0) > 0
+}
+
+interface GitPanelProps {
+  projectDir: string
+  onFileOpen?: (path: string) => void
+  /** The heading that names this repository in `GitReposPanel`'s list and
+   *  collapses the section. */
+  section: GitPanelSection
+  /** Reports whether this section's body is shown, on mount and on every
+   *  change, keyed by `projectDir`. The list reads it to find its first
+   *  collapsed section; the open state itself stays here, since it is partly
+   *  derived from this section's own status query. */
+  onOpenChange?: (projectDir: string, open: boolean) => void
+}
+
+export default function GitPanel({ projectDir, onFileOpen, section, onOpenChange }: GitPanelProps) {
+  const queryClient = useQueryClient()
+  const prevBranch = useRef<string | undefined>(undefined)
+  // null = the user has not toggled this section, so its open state is derived.
+  const [openOverride, setOpenOverride] = useState<boolean | null>(null)
+
+  const { data: status, refetch: refetchStatus, isLoading: statusLoading, error: statusError } = useQuery({
+    queryKey: ['git-status', projectDir],
+    queryFn: () => api.projectGitStatus(projectDir),
+    enabled: !!projectDir,
+    // Polled on the interval only while the body is on screen. Each poll runs
+    // several git subprocesses, and the Git tab can list up to
+    // MAX_SLOT_GIT_REPOS sections, so collapsed sections must not keep paying
+    // for it: they fetch once (the header still shows branch and count) and
+    // again on window focus or the Refresh button. React Query re-evaluates
+    // this predicate after every fetch and on every render, so a section that
+    // opens starts polling and one that collapses stops. An open section the
+    // list has not granted polling (`section.poll`) is treated like a
+    // collapsed one here.
+    refetchInterval: query =>
+      section.poll !== false &&
+      deriveSectionOpen(section, openOverride, query.state.data, query.state.error)
+        ? 5000
+        : false,
+    refetchOnWindowFocus: true,
+    retry: 1,
+  })
+
+  // A collapsed section does not fetch history nobody is looking at.
+  const sectionOpen = deriveSectionOpen(section, openOverride, status, statusError)
+
+  useEffect(() => {
+    onOpenChange?.(projectDir, sectionOpen)
+  }, [onOpenChange, projectDir, sectionOpen])
+
+  const { data: log, refetch: refetchLog, error: logError } = useQuery({
+    queryKey: ['git-log', projectDir],
+    queryFn: () => api.projectGitLog(projectDir),
+    enabled: !!projectDir && sectionOpen,
+    staleTime: 30_000,
+    retry: 1,
+  })
+
+  // A failing git backend used to render an EMPTY panel — no changes, no
+  // commits — indistinguishable from a clean repo with no history. Each read
+  // failure now names itself; the panel holds no draft, so the agent hand-off
+  // is offered (a git that is missing or a dir that is not a repo is exactly
+  // what it can diagnose).
+
+  // Refetch log when the branch changes or the branch moves ahead of its
+  // upstream (a new local commit) — otherwise the Commits list goes stale
+  // until the next manual refresh.
+  useEffect(() => {
+    const marker = status?.branch ? `${status.branch}@${status.ahead ?? 0}` : undefined
+    if (marker && prevBranch.current && marker !== prevBranch.current) {
+      refetchLog()
+    }
+    prevBranch.current = marker
+  }, [status?.branch, status?.ahead, refetchLog])
+
+  const fileCount = status?.files?.length ?? 0
+  const isRepository = status?.repo === true
+  const noRepository = !statusError && status?.repo === false
+  const hasNoChanges = fileCount === 0
+  const isClean = !statusError && isRepository && hasNoChanges
+  // The server caps the listing and says so. Unless the panel reads that flag
+  // the cap reads as the total, so a repo with 900 changed files shows "500
+  // uncommitted" and its list simply ends -- an undercount presented as a
+  // count.
+  const listTruncated = !statusError && isRepository && status?.truncated === true
+  const statusErrorMessage = errMessage(statusError)
+  const statusUnavailable = gitErrorCode(statusError) === 'git_status_unavailable'
+  // The log route's coded outage, mirrored from the status side: rendered
+  // untitled with the localized copy, never the backend's English sentence.
+  const logUnavailable = gitErrorCode(logError) === 'git_log_unavailable'
+  // A coded log refusal renders the localized refusal copy, the same as the
+  // coalesced notice does -- it is the same condition, and the backend's own
+  // English sentence under a localized title reads as mixed-language copy in the
+  // other twelve catalogs. An uncoded failure keeps its message, which is then
+  // the only detail there is.
+  const logErrorMessage = errMessage(logError)
+  const localizedLogFailure = i18nT('components.gitPanel.log_failed')
+  // A repo whose own config declares a filter driver is refused by
+  // policy, not by an outage: the cause is knowable, it is permanent for that
+  // repo, and no retry clears it. Both routes refuse together because the cause
+  // is repo-level, so this is ONE notice naming the cause rather than two that
+  // each report a generic failure the reader cannot act on.
+  const statusFilterRefused = gitErrorCode(statusError) === 'git_status_filter_refused'
+  const logFilterRefused = gitErrorCode(logError) === 'git_log_filter_refused'
+  // Coalesce into one notice ONLY when every failure present is the refusal.
+  // The cause is repo-level so the routes normally refuse together, and two
+  // boxes would report one condition twice -- but the routes CAN fail
+  // divergently (a corrupt HEAD gives status `git_status_unavailable` while the
+  // log route still refuses), and collapsing then would hide a real, separate
+  // failure behind the refusal's copy. Suppressing one true condition because a
+  // sibling reported another is the same kind of wrong answer this panel is
+  // being fixed for.
+  const filterRefused =
+    (statusFilterRefused || logFilterRefused) &&
+    !(statusError && !statusFilterRefused) &&
+    !(logError && !logFilterRefused)
+  // Safe by that invariant: inside this branch every present error IS a
+  // refusal, so whichever message is picked carries a refusal code.
+  const filterRefusedMessage = statusErrorMessage || logErrorMessage
+  // One condition, two causes, and the reader gets the one that holds. A
+  // disjunction ("declares a driver, or couldn't be read") made every LFS repo
+  // -- the common case, on every visit -- read a question the backend had
+  // already answered. Unknown/absent cause falls back to the unreadable copy,
+  // which claims strictly less.
+  const filterRefusedCause =
+    gitFilterRefusalCause(statusFilterRefused ? statusError : logError)
+  const filterRefusedCopy = i18nT(gitFilterRefusalCopyKey(filterRefusedCause))
+  // What the refusal accounts for, which is NOT always both halves. Two states
+  // leave one route refusing on its own: the divergent one, where the sibling
+  // route failed for its own reason and carries its own notice; and a recovered
+  // one, where the other route is simply healthy and its list is rendering
+  // underneath. A refusal that claims both halves there either reports the
+  // sibling notice's failure as its own or denies a list on screen -- the same
+  // over-claim this panel already avoids on the status side by dropping the
+  // stale-history clause when the log has its own notice. The title carries the
+  // scope, so the body stays one sentence per cause.
+  const filterRefusedScope = gitFilterRefusalScope(statusFilterRefused, logFilterRefused)
+  const filterRefusedTitle = i18nT(
+    gitFilterRefusalTitleKey(filterRefusedCause, filterRefusedScope),
+  )
+  // "Commit history may be out of date" is a promise about a list that is still
+  // rendered. When the log route ALSO failed there is no list, and the notice
+  // below says so outright, so the two boxes then contradict each other -- one
+  // warning about staleness in something the other says cannot be shown. Drop
+  // the clause exactly when the log side has its own notice.
+  const localizedStatusFailure = i18nT(
+    logError
+      ? 'components.gitPanel.status_failed_no_history'
+      : 'components.gitPanel.status_failed',
+  )
+  // The refusal is permanent only while the repo config stands, and the
+  // notice's own agent hand-off invites changing it in this window. The status
+  // query recovers on its own 5 s interval; the log query has no interval and a
+  // 30 s staleTime, and the branch-change effect above cannot fire on the first
+  // successful status (it needs a PREVIOUS marker, which a refusing status never
+  // set). Its cached refusal would therefore hold `filterRefused` true by
+  // itself, keeping a notice up that says history can't be shown while the
+  // changes list renders under it. Refetch the log the moment the status route
+  // comes back CLEAN -- not merely stops refusing. A status route that fails for
+  // its own reason (the divergent case) proves nothing about the repo config, so
+  // refetching there would churn a query whose refusal is still current.
+  useEffect(() => {
+    if (!statusError && logFilterRefused) {
+      refetchLog()
+    }
+  }, [statusError, logFilterRefused, refetchLog])
+  // Inert ONLY while both routes are still refusing AND the cause is a declared
+  // driver, which is the standing policy state a retry cannot change. An
+  // unreadable config can become readable, and the status route re-polls every
+  // 5 s, so a retry there can genuinely succeed -- promising otherwise, or
+  // deadening the control, would be the same over-claim this panel is being
+  // fixed for. Once either route has recovered, the button is also the manual
+  // escape from the other's cached refusal.
+  const refreshInert =
+    statusFilterRefused && logFilterRefused && filterRefusedCause === 'declared'
+
+  // The second line of the heading: branch, ahead/behind, and the change
+  // count. Rendered INSIDE the toggle button below the path line, so the whole
+  // two-line block the eye reads as one heading is one control. The Refresh
+  // button is the one thing in the heading that is not the toggle, and a
+  // button cannot nest inside a button, so it sits beside the toggle instead
+  // (see the return below).
+  const statusRow = (
+        <div className="flex items-center gap-2 h-[30px] min-w-0">
+          {statusError ? (
+            <span className="text-[12px] text-muted truncate">
+              {i18nT('components.gitPanel.branch_unavailable')}
+            </span>
+          ) : (
+            <>
+              {/* Branch name */}
+              <GitBranch size={14} className="text-accent shrink-0" />
+              <span className="text-[12px] font-medium text-text truncate">
+                {status?.branch || (noRepository
+                  ? i18nT('components.gitPanel.not_a_repository')
+                  : i18nT('components.gitPanel.loading'))}
+              </span>
+
+              {/* Ahead/behind pill */}
+              {status && (status.ahead != null || status.behind != null) && (
+                <span className="text-[10px] px-1.5 py-0.5 rounded bg-bg-hover text-muted font-mono shrink-0">
+                  {status.ahead != null && <>&#x2191;{status.ahead}</>}
+                  {status.behind != null && <>{' '}&#x2193;{status.behind}</>}
+                </span>
+              )}
+            </>
+          )}
+
+          <span className="flex-1" />
+
+          {/* Uncommitted / clean pill. Only the count is coloured: "clean" is
+              the resting state of most rows in a long list, and in green it
+              was the loudest thing on the panel. The one row with changes is
+              what the eye should land on. */}
+          {!noRepository && !statusError && (
+            <span
+              className={`text-[10px] px-1.5 py-0.5 rounded font-medium shrink-0 ${hasNoChanges ? 'bg-bg-hover text-muted' : 'bg-warn/15 text-warn-text'}`}
+              data-testid={hasNoChanges ? 'git-repo-clean-badge' : 'git-repo-changes-badge'}
+            >
+              {statusLoading
+                ? '...'
+                : hasNoChanges
+                  ? i18nT('components.gitPanel.clean')
+                  : listTruncated
+                    ? i18nT('components.gitPanel.uncommitted_capped', { count: fileCount })
+                    : i18nT('components.gitPanel.uncommitted', { count: fileCount })}
+            </span>
+          )}
+        </div>
+  )
+
+  // Refetch both of a section's reads — the Refresh icon's action, shared with
+  // the "Retry" button inside a status/log error notice so the two controls do
+  // the same thing (a reader takes the icon and the in-notice action for two
+  // different retries). Not offered under a filter-driver refusal, where the
+  // copy says a retry will not help and Refresh is deliberately inert. The
+  // branch comparison is keyed on HEAD, so a base that moved under an unchanged
+  // HEAD needs this explicit read too; a collapsed section stays unread.
+  const retrySection = () => {
+    refetchStatus()
+    refetchLog()
+    queryClient.invalidateQueries({ queryKey: ['git-branch-diff', projectDir] })
+  }
+
+  // Refresh. Inert under a filter-driver refusal: the copy right below
+  // says retrying won't help, and a live button over that sentence
+  // contradicts it. The refusal is a standing policy decision keyed on
+  // repo config, so a re-fetch returns the same 503 every time. Kept
+  // in place rather than hidden so the header does not reflow.
+  // Dimming alone was NOT enough -- a reader still could not tell
+  // whether pressing it did anything and said they would press it
+  // anyway -- so the glyph itself changes to the slashed variant. The
+  // shape carries the state without depending on a hover tooltip or
+  // on noticing a contrast difference. Keyed on BOTH routes refusing,
+  // never on the coalescing predicate: a half-recovered pair needs
+  // this button as its escape.
+  //
+  // The inert treatment deviates from the repo's dominant `opacity-40`
+  // disabled skin, at `opacity-60` and a heavier stroke, and that is
+  // deliberate. Everywhere else a disabled glyph carries no
+  // information -- the fade IS the message -- so 40% costs nothing.
+  // Here the whole difference between the two refusal causes is one
+  // thin diagonal at `size={13}`, and a reader shown three frames
+  // called all three crossed-out. The slash is the first thing 40%
+  // erases. Weaker than the live glyph either way, so the resting
+  // convention below is untouched.
+  const refreshButton = (
+          <button
+            type="button"
+            onClick={retrySection}
+            disabled={refreshInert}
+            className={`flex items-center justify-center w-[26px] h-[26px] mr-2 rounded-md shrink-0 self-center transition-colors bg-transparent border-none ${
+              refreshInert
+                ? 'text-muted opacity-60 cursor-not-allowed'
+                : 'cursor-pointer text-muted hover:text-text hover:bg-bg-hover'
+            }`}
+            title={refreshInert
+              ? i18nT('components.gitPanel.refresh_unavailable')
+              : i18nT('components.gitPanel.refresh')}
+            aria-label={refreshInert
+              ? i18nT('components.gitPanel.refresh_unavailable')
+              : i18nT('components.gitPanel.refresh')}
+          >
+            {refreshInert ? <RefreshCwOff size={13} strokeWidth={2.5} /> : <RefreshCw size={13} />}
+          </button>
+  )
+
+  // Request failures stay visible below the header even when content is collapsed.
+  const requestErrors = (
+        (statusError || logError) && (
+          <div className="flex flex-col gap-2 p-3 text-[12px]">
+            {/* The refusal is repo-level, so both routes refuse together: ONE
+                notice naming the cause, not two reporting a generic failure.
+                It goes through ErrorNotice like every other error value here
+                (AUTOSDE errors-use-error-notice) -- the string originates in a
+                503 {error, code} body, and the agent hand-off is the point: a
+                filter-driver config is exactly what it can explain or change. */}
+            {filterRefused ? (
+              <ErrorNotice
+                title={filterRefusedTitle}
+                message={filterRefusedCopy}
+                report={findReport(filterRefusedMessage)}
+                askAgent
+                actionPlacement="below"
+                testId="git-panel-filter-refused"
+              />
+            ) : (
+              <>
+                {statusError && (
+                  <ErrorNotice
+                    // The outage notice is deliberately UNTITLED. A title here
+                    // restated its own first clause, and both notices then
+                    // opened on the same word, so the refusal's permanence and
+                    // this one's transience were a body-read apart. Titled vs
+                    // untitled tells them apart at a glance instead. A coded
+                    // REFUSAL is the exception: it is the same condition the
+                    // coalesced notice names, so it gets that title and that
+                    // localized copy -- the backend's English sentence under a
+                    // localized heading is mixed-language copy in the other
+                    // twelve catalogs, the same defect already fixed on the log
+                    // side.
+                    title={
+                      statusFilterRefused
+                        ? filterRefusedTitle
+                        : !statusUnavailable && statusErrorMessage
+                          ? localizedStatusFailure
+                          : undefined
+                    }
+                    message={
+                      statusFilterRefused
+                        ? filterRefusedCopy
+                        : statusUnavailable
+                          ? localizedStatusFailure
+                          : statusErrorMessage || localizedStatusFailure
+                    }
+                    report={findReport(statusErrorMessage)}
+                    askAgent
+                    // Two notices stack here, each carrying its own report. With
+                    // the shared label nothing said which failure a hand-off
+                    // was for, so both read as one affordance rendered twice.
+                    askAgentLabel={i18nT('components.gitPanel.ask_agent_changes')}
+                    // The same action as the header's Refresh icon, in the
+                    // notice itself: the icon beside the header reads as a
+                    // separate control from a retry, so the notice carries its
+                    // own. An outage can clear on a re-fetch, so unlike the
+                    // filter-driver refusal (which has no notice action) this
+                    // one offers it.
+                    footer={
+                      <Btn type="button" onClick={retrySection} data-testid="git-panel-status-retry">
+                        {i18nT('components.gitPanel.repos_retry')}
+                      </Btn>
+                    }
+                    actionPlacement="below"
+                    testId="git-panel-status-error"
+                  />
+                )}
+                {logError && (
+                  <ErrorNotice
+                    title={
+                      logFilterRefused
+                        ? filterRefusedTitle
+                        : !logUnavailable && logErrorMessage
+                          ? localizedLogFailure
+                          : undefined
+                    }
+                    message={
+                      logFilterRefused
+                        ? filterRefusedCopy
+                        : logUnavailable
+                          ? localizedLogFailure
+                          : logErrorMessage || localizedLogFailure
+                    }
+                    // Explicit, because the hand-off otherwise resolves context
+                    // by looking the MESSAGE up in the error journal, and a
+                    // localized message cannot match the backend's raw string.
+                    // Without it the agent gets the sentence and no endpoint,
+                    // status or code.
+                    report={findReport(logErrorMessage)}
+                    askAgent
+                    askAgentLabel={i18nT('components.gitPanel.ask_agent_history')}
+                    // The same Refresh action, in the notice (see the status
+                    // notice above): a log outage can clear on a re-fetch.
+                    footer={
+                      <Btn type="button" onClick={retrySection} data-testid="git-panel-log-retry">
+                        {i18nT('components.gitPanel.repos_retry')}
+                      </Btn>
+                    }
+                    actionPlacement="below"
+                    testId="git-panel-log-error"
+                  />
+                )}
+              </>
+            )}
+          </div>
+        )
+  )
+
+  const body = (
+      <div className="text-[12px]">
+        {noRepository && (
+          <div role="status" className="px-3 py-8 text-center text-muted text-[12px]">
+            {i18nT('components.gitPanel.not_a_repository_help')}
+          </div>
+        )}
+
+        {/* ── CHANGES section ── */}
+        {!statusError && isRepository && !hasNoChanges && (
+          <section className="py-2">
+            <div className="px-3 pb-1.5 flex items-center gap-1.5">
+              <span className="text-[10px] font-semibold uppercase tracking-wider text-muted">
+                {i18nT('components.gitPanel.changes')}
+              </span>
+              {/* One claim per number: when the listing is capped the note below
+                  carries the count AND qualifies it, so a bare total beside it
+                  would state the same number twice in three words. */}
+              {listTruncated ? (
+                <span role="status" className="text-[10px] text-warn" data-testid="git-panel-truncated">
+                  {i18nT('components.gitPanel.showing_first', { count: fileCount })}
+                </span>
+              ) : (
+                <span className="text-[10px] text-muted">{fileCount}</span>
+              )}
+            </div>
+            <div>
+              {status?.files.map(f => (
+                <button
+                  key={`${f.path}:${f.staged}`}
+                  className="w-full flex items-center gap-2 px-3 py-1 hover:bg-bg-hover cursor-pointer transition-colors bg-transparent border-none text-left"
+                  // Paths are repo-root-relative; anchor them to the repo root
+                  // so the open cannot resolve against a DIFFERENT project's
+                  // dir (the gateway-wide project) when several slots have
+                  // different projects set.
+                  onClick={() => onFileOpen?.(status.repoRoot ? `${status.repoRoot}/${f.path}` : f.path)}
+                  title={f.path}
+                >
+                  <span className={`font-mono font-semibold w-[14px] text-center shrink-0 ${statusColor(f.status)}`}>
+                    {f.status}
+                  </span>
+                  <span className="flex-1 truncate">
+                    <FilePath path={f.path} />
+                  </span>
+                  {(f.additions != null || f.deletions != null) && (
+                    <span className="font-mono text-[11px] shrink-0">
+                      {f.additions != null && f.additions > 0 && <span className="text-[var(--diff-add-text,var(--ok))]">+{f.additions}</span>}
+                      {f.deletions != null && f.deletions > 0 && <span className="text-[var(--diff-del-text,var(--danger))] ml-1">-{f.deletions}</span>}
+                    </span>
+                  )}
+                </button>
+              ))}
+            </div>
+          </section>
+        )}
+
+        {/* ── BRANCH CHANGES section: collapsed, fetched only when opened ── */}
+        {isRepository && (
+          <GitBranchChanges projectDir={projectDir} head={log?.commits?.find(c => c.isHead)?.sha} />
+        )}
+
+        {/* ── COMMITS section ── */}
+        {log?.commits && log.commits.length > 0 && (
+          <section className="py-2 border-t border-border">
+            <div className="px-3 pb-1.5">
+              <span className="text-[10px] font-semibold uppercase tracking-wider text-muted">
+                {i18nT('components.gitPanel.commits')}
+              </span>
+            </div>
+            <div>
+              {log.commits.map(c => (
+                <div key={c.sha} className="px-3 py-1.5 hover:bg-bg-hover transition-colors">
+                  <div className="flex items-center gap-2">
+                    <span className="font-mono text-[11px] text-accent shrink-0">{c.sha.slice(0, 7)}</span>
+                    <span className="truncate text-text">{c.message.split('\n')[0]}</span>
+                  </div>
+                  <div className="text-[11px] text-muted mt-0.5 flex items-center gap-1.5">
+                    <span>{c.author}</span>
+                    <span>-</span>
+                    <span>{relativeTime(c.date)}</span>
+                    {c.isHead && <span className="text-accent font-semibold">HEAD</span>}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </section>
+        )}
+
+        {/* Empty state. Not while the log route has failed: "no commits to
+            display" beside a notice saying history could not be read presents
+            an outage as an empty history. */}
+        {isClean && !logError && (!log?.commits || log.commits.length === 0) && !statusLoading && (
+          <div className="px-3 py-8 text-center text-muted text-[12px]">
+            {i18nT('components.gitPanel.empty_state')}
+          </div>
+        )}
+      </div>
+  )
+
+  return (
+    <section className="border-b border-border" data-testid="git-repo-section" data-path={projectDir}>
+      {/* The heading is two lines (path, then branch and count) that read as
+          one block, so the whole block is ONE toggle button: a click on the
+          branch or the change count of a collapsed section opens it, not just
+          a click on the path line. Refresh is the only other control in the
+          heading and a button cannot nest in a button, so it is a sibling in
+          the same flex row, outside the toggle's hover and hit area. */}
+      <div className="flex items-stretch">
+        <button
+          type="button"
+          className="flex-1 min-w-0 flex flex-col pl-3 pr-2 pt-2 bg-transparent border-none cursor-pointer text-left hover:bg-bg-hover transition-colors"
+          aria-expanded={sectionOpen}
+          // Native tooltip that never changes layout: a title draws over the
+          // page, so it cannot shift a row the way an inline reveal did. It
+          // names the action for the open heading too, where the chevron alone
+          // does not say that a click folds the section away.
+          title={sectionOpen
+            ? i18nT('components.gitPanel.section_collapse_hint')
+            : i18nT('components.gitPanel.section_expand_hint')}
+          onClick={() => setOpenOverride(!sectionOpen)}
+          data-testid="git-repo-toggle"
+        >
+          {/* `flex-wrap`: when the path and the hint do not both fit (a 320px
+              panel), the hint drops to its own line under the path instead of
+              forcing the path to shrink around it or overlapping it. The
+              chevron, path and badge are ONE wrap item, so a long path never
+              leaves its chevron alone on the line above; that item still
+              shrinks to the line (RepoPath truncates). */}
+          <div className="flex flex-wrap items-center gap-x-1.5 gap-y-0.5 min-w-0">
+            <span className="flex items-center gap-1.5 min-w-0 max-w-full" data-testid="git-repo-heading" title={section.label}>
+              <ChevronRight
+                size={12}
+                aria-hidden="true"
+                className={`text-muted shrink-0 transition-transform ${sectionOpen ? 'rotate-90' : ''}`}
+              />
+              <RepoPath path={section.label} />
+              {section.badge && (
+                <span
+                  className="text-[10px] px-1.5 py-0.5 rounded bg-bg-hover text-muted shrink-0"
+                  title={section.badgeTitle}
+                  data-testid="git-repo-badge"
+                >
+                  {section.badge}
+                </span>
+              )}
+            </span>
+            {/* Collapsed only: a chevron's direction alone reads as a guess, so
+                the closed header says in words that it opens. Not a commit
+                count: a collapsed section skips the log fetch. Right after the
+                path (not pushed to the far edge), so it reads as part of the
+                toggle rather than a stray caption. Not `shrink-0` and not
+                nowrap: the hint wraps under the path on a narrow panel (the row
+                is `flex-wrap`) instead of overlapping a long repository name.
+                Drawn visibly on ONE collapsed row of a list
+                (`expandHintVisible`), since the rows are alike and one hint
+                reads for all of them. The other rows keep the same words in the
+                toggle's accessible name (`sr-only`), so a linear screen-reader
+                pass still hears what each row opens; the hidden rows do NOT
+                reveal the hint on hover (a reveal that flipped `sr-only` off
+                moved every row below it), and every toggle instead carries the
+                hint -- expand or collapse -- in its native `title` tooltip,
+                which draws over the page and so shifts nothing. A touch user
+                still gets the first row's visible hint. */}
+            {!sectionOpen && (
+              <span
+                className={
+                  section.expandHintVisible === false
+                    ? 'text-muted text-[11px] min-w-0 sr-only'
+                    : 'text-muted text-[11px] min-w-0'
+                }
+                data-testid="git-repo-expand-hint"
+              >
+                {i18nT('components.gitPanel.section_expand_hint')}
+              </span>
+            )}
+          </div>
+          {statusRow}
+        </button>
+        {refreshButton}
+      </div>
+      {requestErrors}
+      {sectionOpen && body}
+    </section>
+  )
+}

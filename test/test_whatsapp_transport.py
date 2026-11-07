@@ -1,0 +1,991 @@
+"""WhatsApp transport tests: the inbound gauntlet + authorize + targets.
+
+Events are plain namespace fakes shaped like neonize's protobuf messages —
+the transport reads them via getattr, so no optional dependency is needed.
+The matrix covers the five gauntlet stages in order (shape, replay flood,
+echo, group gate, authorize) because ordering IS the contract: e.g. an
+unconfigured group must be dropped before it can produce an audit row.
+"""
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+import pytest
+
+from kiro_crew.messaging.transport import InboundMessage
+from kiro_crew.whatsapp.jids import OwnIdentity
+from kiro_crew.whatsapp.transport import WhatsAppTransport
+
+OWN_JID = "447700900000@s.whatsapp.net"
+OWN_LID = "111222333@lid"
+FRIEND = "447700900111@s.whatsapp.net"
+FRIEND_LID = "999888777@lid"
+GROUP = "120363000000000001@g.us"
+
+
+class FakeClient:
+    """The slice of WhatsAppClient the transport touches."""
+
+    def __init__(self) -> None:
+        self.me = OwnIdentity(jid=OWN_JID, lid=OWN_LID)
+        self.connected_at: float | None = 1_000_000.0
+        self.is_connected = True
+        self.on_message = None
+        self.sent: list[tuple[str, str]] = []
+        self._next_ids = iter(f"SENT{i}" for i in range(1, 100))
+        #: ``@lid`` alias -> phone JID, as the real resolver would answer.
+        self.lid_map: dict[str, str] = {}
+        #: every alias lookup, so a test can assert the result is cached.
+        self.lid_lookups: list[str] = []
+
+    async def send_text(self, jid: str, text: str, on_sent=None) -> list[str]:
+        """Chunks on blank lines, and invokes ``on_sent`` per chunk.
+
+        Calling ``on_sent`` is the faithful part: the real client hands each id
+        over the moment its send lands, and the echo tracker depends on that
+        ordering. A fake that only returned the list would let the echo tests
+        pass against a client that never called back.
+        """
+        ids: list[str] = []
+        for chunk in [c for c in text.split("\n\n") if c] or [text]:
+            message_id = next(self._next_ids)
+            self.sent.append((jid, chunk))
+            ids.append(message_id)
+            if on_sent is not None:
+                on_sent(message_id)
+        return ids
+
+    async def send_voice_bytes(self, jid: str, data: bytes, *, mimetype: str, on_sent=None) -> str:
+        message_id = next(self._next_ids)
+        if on_sent is not None:
+            on_sent(message_id)
+        return message_id
+
+    async def phone_for_lid(self, lid_jid: str) -> str:
+        self.lid_lookups.append(lid_jid)
+        return self.lid_map.get(lid_jid, "")
+
+
+class Msg(SimpleNamespace):
+    """A message fake that answers ``HasField`` the way a protobuf does.
+
+    The inbound path probes presence with ``HasField`` because a protobuf's
+    singular submessage is never None: reading an absent one returns a default
+    instance, so truthiness would report every field present. A fake without
+    ``HasField`` would send that path down its non-protobuf degradation branch and
+    the tests would exercise a shape production never sees.
+    """
+
+    def HasField(self, name: str) -> bool:  # noqa: N802: protobuf's own spelling
+        if not hasattr(self, name):
+            raise ValueError(name)  # what a protobuf raises for an unknown field
+        return getattr(self, name) not in (None, "", 0)
+
+
+def jid_ns(value: str) -> SimpleNamespace:
+    user, _, server = value.partition("@")
+    return SimpleNamespace(User=user, Server=server)
+
+
+def event(
+    *,
+    chat: str,
+    sender: str,
+    text: str = "hello",
+    from_me: bool = False,
+    is_group: bool = False,
+    message_id: str = "MSG1",
+    timestamp: float = 1_000_500.0,
+    mentions: list[str] | None = None,
+    quoted_participant: str = "",
+    quoted_stanza: str = "",
+    image: bool = False,
+) -> SimpleNamespace:
+    if image:
+        # `describe` probes with HasField, so an absent sibling must be falsy.
+        content = Msg(
+            conversation="",
+            extendedTextMessage=None,
+            imageMessage=Msg(caption=text, mimetype="image/jpeg", fileLength=1024),
+        )
+    elif mentions or quoted_participant or quoted_stanza:
+        content = Msg(
+            conversation="",
+            extendedTextMessage=Msg(
+                text=text,
+                contextInfo=SimpleNamespace(
+                    mentionedJID=mentions or [],
+                    participant=quoted_participant,
+                    stanzaID=quoted_stanza,
+                ),
+            ),
+        )
+    else:
+        content = Msg(conversation=text, extendedTextMessage=None)
+    return SimpleNamespace(
+        Info=SimpleNamespace(
+            ID=message_id,
+            Timestamp=timestamp,
+            MessageSource=SimpleNamespace(
+                Chat=jid_ns(chat),
+                Sender=jid_ns(sender),
+                SenderAlt=None,
+                IsFromMe=from_me,
+                IsGroup=is_group,
+            ),
+        ),
+        Message=content,
+    )
+
+
+class Harness:
+    def __init__(self, **transport_kwargs) -> None:
+        self.client = FakeClient()
+        self.dispatched = []
+
+        async def dispatch(msg):
+            self.dispatched.append(msg)
+
+        self.transport = WhatsAppTransport(self.client, dispatch, **transport_kwargs)
+
+
+@pytest.fixture
+def harness() -> Harness:
+    return Harness()
+
+
+@pytest.mark.asyncio
+class TestGauntlet:
+    async def test_own_typed_self_chat_message_dispatches(self, harness):
+        await harness.transport.receive(
+            event(chat=OWN_JID, sender=OWN_JID, from_me=True, text="/status please")
+        )
+        assert len(harness.dispatched) == 1
+        msg = harness.dispatched[0]
+        assert msg.user_id == "447700900000"
+        assert msg.conversation_id == OWN_JID
+        assert msg.channel_type == "whatsapp"
+
+    async def test_own_echo_is_dropped(self, harness):
+        ids = await harness.transport._send_tracked(OWN_JID, "agent reply")
+        await harness.transport.receive(
+            event(chat=OWN_JID, sender=OWN_JID, from_me=True, message_id=ids[0])
+        )
+        assert harness.dispatched == []
+
+    async def test_untracked_from_me_after_echo_still_dispatches(self, harness):
+        await harness.transport._send_tracked(OWN_JID, "agent reply")
+        await harness.transport.receive(
+            event(chat=OWN_JID, sender=OWN_JID, from_me=True, message_id="TYPED1")
+        )
+        assert len(harness.dispatched) == 1
+
+    async def test_replayed_history_is_dropped(self, harness):
+        harness.client.connected_at = 1_000_000.0
+        await harness.transport.receive(
+            event(chat=OWN_JID, sender=OWN_JID, from_me=True, timestamp=999_000.0)
+        )
+        assert harness.dispatched == []
+
+    async def test_replayed_history_in_neonize_milliseconds_is_dropped(self, harness):
+        # neonize sends MessageInfo.Timestamp as UnixMilli; connected_at is seconds.
+        harness.client.connected_at = 1_000_000_000.0
+        await harness.transport.receive(
+            event(chat=OWN_JID, sender=OWN_JID, from_me=True, timestamp=999_000_000_000.0)
+        )
+        assert harness.dispatched == []
+
+    async def test_recent_message_in_neonize_milliseconds_passes(self, harness):
+        harness.client.connected_at = 1_000_000_000.0
+        await harness.transport.receive(
+            event(chat=OWN_JID, sender=OWN_JID, from_me=True, timestamp=999_999_970_000.0)
+        )
+        assert len(harness.dispatched) == 1
+
+    async def test_recent_message_within_grace_passes(self, harness):
+        harness.client.connected_at = 1_000_000.0
+        await harness.transport.receive(
+            event(chat=OWN_JID, sender=OWN_JID, from_me=True, timestamp=999_970.0)
+        )
+        assert len(harness.dispatched) == 1
+
+    async def test_empty_text_and_malformed_events_drop(self, harness):
+        await harness.transport.receive(event(chat=OWN_JID, sender=OWN_JID, text="  "))
+        await harness.transport.receive(SimpleNamespace(Info=None, Message=None))
+        assert harness.dispatched == []
+
+
+@pytest.mark.asyncio
+class TestDMPolicy:
+    async def test_self_policy_denies_friends(self, harness):
+        await harness.transport.receive(event(chat=FRIEND, sender=FRIEND))
+        assert harness.dispatched == []
+
+    async def test_allowlist_admits_listed_number(self):
+        h = Harness(dm_policy="allowlist", allowed_wa_ids=["447700900111"])
+        await h.transport.receive(event(chat=FRIEND, sender=FRIEND))
+        assert len(h.dispatched) == 1
+
+    async def test_allowlist_still_denies_unlisted(self):
+        h = Harness(dm_policy="allowlist", allowed_wa_ids=["447700900222"])
+        await h.transport.receive(event(chat=FRIEND, sender=FRIEND))
+        assert h.dispatched == []
+
+    async def test_unknown_policy_fails_closed_even_for_self(self):
+        h = Harness(dm_policy="everyone")
+        await h.transport.receive(event(chat=OWN_JID, sender=OWN_JID, from_me=True))
+        assert h.dispatched == []
+
+    async def test_disabled_denies_all(self):
+        h = Harness(dm_policy="disabled")
+        await h.transport.receive(event(chat=OWN_JID, sender=OWN_JID, from_me=True))
+        assert h.dispatched == []
+
+
+@pytest.mark.asyncio
+class TestGroups:
+    def cfg(self, mode="mention", rules=""):
+        return [{"jid": GROUP, "name": "G", "mode": mode, "rules": rules, "cooldown_s": 0}]
+
+    #: A configured group admits the agent to the room, not the room to the
+    #: agent: every member below is listed, so these tests judge the GATE.
+    LISTED = ["447700900111"]
+
+    async def test_unconfigured_group_is_invisible(self, harness):
+        await harness.transport.receive(
+            event(chat=GROUP, sender=FRIEND, is_group=True, mentions=[OWN_JID])
+        )
+        assert harness.dispatched == []
+
+    async def test_mention_of_own_jid_dispatches(self):
+        h = Harness(groups=self.cfg(), allowed_wa_ids=self.LISTED)
+        await h.transport.receive(
+            event(chat=GROUP, sender=FRIEND, is_group=True, mentions=[OWN_JID])
+        )
+        assert len(h.dispatched) == 1
+        assert h.dispatched[0].is_mention
+
+    async def test_mention_of_lid_alias_dispatches(self):
+        h = Harness(groups=self.cfg(), allowed_wa_ids=self.LISTED)
+        await h.transport.receive(
+            event(chat=GROUP, sender=FRIEND, is_group=True, mentions=[OWN_LID])
+        )
+        assert len(h.dispatched) == 1
+
+    async def test_unaddressed_group_message_is_dropped_in_mention_mode(self):
+        h = Harness(groups=self.cfg(), allowed_wa_ids=self.LISTED)
+        await h.transport.receive(event(chat=GROUP, sender=FRIEND, is_group=True))
+        assert h.dispatched == []
+
+    async def test_reply_to_agent_message_counts_as_addressed(self):
+        h = Harness(groups=self.cfg(), allowed_wa_ids=self.LISTED)
+        ids = await h.transport._send_tracked(GROUP, "agent said this")
+        await h.transport.receive(
+            event(chat=GROUP, sender=FRIEND, is_group=True, quoted_stanza=ids[0])
+        )
+        assert len(h.dispatched) == 1
+
+    @staticmethod
+    def _captioned(field: str, *, mentions=(), stanza: str = "", participant: str = "") -> Msg:
+        """A media message whose ``contextInfo`` carries the mention or quote."""
+        ctx = SimpleNamespace(mentionedJID=list(mentions), participant=participant, stanzaID=stanza)
+        media = {f: None for f in ("imageMessage", "videoMessage", "documentMessage")}
+        media[field] = Msg(caption="look", mimetype="x/y", fileLength=1, contextInfo=ctx)
+        return Msg(conversation="", extendedTextMessage=None, **media)
+
+    async def test_a_mention_on_a_video_caption_dispatches(self):
+        h = Harness(groups=self.cfg(), allowed_wa_ids=self.LISTED)
+        ev = event(chat=GROUP, sender=FRIEND, is_group=True)
+        ev.Message = self._captioned("videoMessage", mentions=[OWN_JID])
+        await h.transport.receive(ev)
+        assert len(h.dispatched) == 1
+        assert h.dispatched[0].is_mention
+
+    @pytest.mark.parametrize("field", ["imageMessage", "videoMessage", "documentMessage"])
+    async def test_a_caption_mention_or_quote_is_addressed(self, field):
+        h = Harness(groups=self.cfg(), allowed_wa_ids=self.LISTED)
+        ids = await h.transport._send_tracked(GROUP, "agent said this")
+        t = h.transport
+        assert t._is_addressed(self._captioned(field, mentions=[OWN_JID]), GROUP, False)
+        assert t._is_addressed(self._captioned(field, mentions=[OWN_LID]), GROUP, False)
+        assert t._is_addressed(self._captioned(field, stanza=ids[0]), GROUP, False)
+        assert t._is_addressed(self._captioned(field, participant=OWN_JID), GROUP, False)
+        assert not t._is_addressed(self._captioned(field), GROUP, False)
+        assert not t._is_addressed(self._captioned(field, mentions=[FRIEND]), GROUP, False)
+
+    @pytest.mark.parametrize("field", ["audioMessage", "stickerMessage", "ptvMessage"])
+    async def test_a_quote_on_a_voice_note_sticker_or_video_note_is_addressed(self, field):
+        h = Harness(groups=self.cfg(), allowed_wa_ids=self.LISTED)
+        ids = await h.transport._send_tracked(GROUP, "agent said this")
+        t = h.transport
+        assert t._is_addressed(self._captioned(field, stanza=ids[0]), GROUP, False)
+        assert t._is_addressed(self._captioned(field, participant=OWN_JID), GROUP, False)
+        theirs = self._captioned(field, stanza="THEIRS1", participant=FRIEND)
+        assert not t._is_addressed(theirs, GROUP, False)
+
+    async def test_rules_mode_unprompted_dispatches_with_verdict(self):
+        h = Harness(
+            groups=self.cfg(mode="rules", rules="Answer python questions."),
+            allowed_wa_ids=self.LISTED,
+        )
+        await h.transport.receive(
+            event(chat=GROUP, sender=FRIEND, is_group=True, text="how do dicts work?")
+        )
+        assert len(h.dispatched) == 1
+        verdict = h.transport.pending_verdicts.get(id(h.dispatched[0]))
+        assert verdict is None  # popped after dispatch completes
+
+    async def test_non_operator_group_command_dies_silently(self):
+        h = Harness(groups=self.cfg(), allowed_wa_ids=self.LISTED)
+        await h.transport.receive(
+            event(chat=GROUP, sender=FRIEND, is_group=True, text="/new", mentions=[OWN_JID])
+        )
+        assert h.dispatched == []
+
+    async def test_operator_group_command_dispatches(self):
+        h = Harness(groups=self.cfg())
+        await h.transport.receive(
+            event(chat=GROUP, sender=OWN_JID, from_me=True, is_group=True, text="/new")
+        )
+        assert len(h.dispatched) == 1
+
+
+@pytest.mark.asyncio
+class TestGroupSenderAllowlist:
+    """Configuring a group admits the agent to the room, not the room to the agent.
+
+    The group gate says whether the agent may SPEAK in the group. Whether a
+    PERSON may make it speak is the per-sender allowlist every other channel
+    applies to group traffic: the linked account, or a number in
+    ``allowed_wa_ids``. Without it, any member of a configured group who
+    @-mentions the agent (or merely posts, in ``rules`` mode) drives a turn on
+    the operator's host.
+    """
+
+    def cfg(self, mode="mention", rules=""):
+        return [{"jid": GROUP, "name": "G", "mode": mode, "rules": rules, "cooldown_s": 0}]
+
+    def _audit(self, monkeypatch):
+        import kiro_crew.whatsapp.transport as mod
+
+        seen: list[dict] = []
+        monkeypatch.setattr(
+            mod, "sel", lambda: SimpleNamespace(log_api_access=lambda **kw: seen.append(kw))
+        )
+        return seen
+
+    async def test_an_unlisted_member_mentioning_the_agent_is_dropped_and_audited(
+        self, monkeypatch
+    ):
+        seen = self._audit(monkeypatch)
+        h = Harness(groups=self.cfg())
+        await h.transport.receive(
+            event(chat=GROUP, sender=FRIEND, is_group=True, mentions=[OWN_JID])
+        )
+        assert h.dispatched == []
+        assert [(a["operation"], a["outcome"], a["source"], a["caller"]) for a in seen] == [
+            ("whatsapp_transport.authorize_group", "denied", "whatsapp", "447700900111")
+        ]
+
+    async def test_an_unlisted_member_replying_to_the_agent_is_dropped(self):
+        h = Harness(groups=self.cfg())
+        ids = await h.transport._send_tracked(GROUP, "agent said this")
+        await h.transport.receive(
+            event(chat=GROUP, sender=FRIEND, is_group=True, quoted_stanza=ids[0])
+        )
+        assert h.dispatched == []
+
+    async def test_an_unlisted_member_cannot_trigger_a_rules_mode_turn(self):
+        """Rules mode answers unaddressed messages, so the allowlist has to hold
+        for a message that never mentions the agent at all."""
+        h = Harness(groups=self.cfg(mode="rules", rules="Answer python questions."))
+        await h.transport.receive(
+            event(chat=GROUP, sender=FRIEND, is_group=True, text="how do dicts work?")
+        )
+        assert h.dispatched == []
+
+    async def test_dm_policy_open_does_not_admit_group_members(self):
+        """`open` means anyone may DM the agent, not that anyone in a configured
+        group may drive it."""
+        h = Harness(dm_policy="open", groups=self.cfg())
+        await h.transport.receive(
+            event(chat=GROUP, sender=FRIEND, is_group=True, mentions=[OWN_JID])
+        )
+        assert h.dispatched == []
+
+    async def test_a_listed_member_is_admitted_whatever_the_dm_policy(self):
+        h = Harness(dm_policy="self", groups=self.cfg(), allowed_wa_ids=["447700900111"])
+        await h.transport.receive(
+            event(chat=GROUP, sender=FRIEND, is_group=True, mentions=[OWN_JID])
+        )
+        assert len(h.dispatched) == 1
+
+    async def test_the_operator_needs_no_listing(self, monkeypatch):
+        seen = self._audit(monkeypatch)
+        h = Harness(groups=self.cfg())
+        await h.transport.receive(
+            event(chat=GROUP, sender=OWN_JID, from_me=True, is_group=True, text="status?")
+        )
+        assert len(h.dispatched) == 1
+        assert seen == []
+
+    async def test_an_unconfigured_group_still_produces_no_audit_row(self, monkeypatch):
+        """Ordering is the contract: the group gate drops an unconfigured group
+        before the allowlist can write a row per stranger's message."""
+        seen = self._audit(monkeypatch)
+        h = Harness()
+        await h.transport.receive(
+            event(chat=GROUP, sender=FRIEND, is_group=True, mentions=[OWN_JID])
+        )
+        assert h.dispatched == []
+        assert seen == []
+
+
+GROUP_B = "120363000000000002@g.us"
+
+
+@pytest.mark.asyncio
+class TestPerGroupAllowlist:
+    """A group's own ``allowed_wa_ids`` replaces the global list for that group.
+
+    The global list admits a number to every configured group at once; a
+    per-group list lets the operator admit a colleague to one group without
+    admitting them to another. A group without its own list keeps the global one.
+    """
+
+    def _group(self, jid: str, **extra) -> dict:
+        return {"jid": jid, "name": "G", "mode": "mention", "cooldown_s": 0, **extra}
+
+    def _mention(self, chat: str, sender: str = FRIEND):
+        return event(chat=chat, sender=sender, is_group=True, mentions=[OWN_JID])
+
+    def _msg(self, user_id: str, chat: str):
+        return InboundMessage(
+            channel_type="whatsapp", user_id=user_id, conversation_id=chat, text="x"
+        )
+
+    async def test_a_number_on_group_a_is_admitted_in_a_and_dropped_in_b(self):
+        h = Harness(
+            groups=[
+                self._group(GROUP, allowed_wa_ids=["447700900111"]),
+                self._group(GROUP_B, allowed_wa_ids=["447700900222"]),
+            ]
+        )
+        await h.transport.receive(self._mention(GROUP))
+        assert len(h.dispatched) == 1
+        await h.transport.receive(self._mention(GROUP_B))
+        assert len(h.dispatched) == 1
+
+    async def test_a_group_without_its_own_list_falls_back_to_the_global_list(self):
+        h = Harness(
+            groups=[self._group(GROUP, allowed_wa_ids=["447700900222"]), self._group(GROUP_B)],
+            allowed_wa_ids=["447700900111"],
+        )
+        await h.transport.receive(self._mention(GROUP_B))
+        assert len(h.dispatched) == 1
+
+    async def test_a_groups_own_list_replaces_the_global_one(self):
+        """Replace, not add: a globally listed number stays out of a group whose
+        own list does not name it."""
+        h = Harness(
+            groups=[self._group(GROUP, allowed_wa_ids=["447700900222"])],
+            allowed_wa_ids=["447700900111"],
+        )
+        await h.transport.receive(self._mention(GROUP))
+        assert h.dispatched == []
+
+    async def test_an_empty_own_list_admits_only_the_operator(self):
+        h = Harness(
+            groups=[self._group(GROUP, allowed_wa_ids=[])],
+            allowed_wa_ids=["447700900111"],
+        )
+        await h.transport.receive(self._mention(GROUP))
+        assert h.dispatched == []
+        await h.transport.receive(
+            event(chat=GROUP, sender=OWN_JID, from_me=True, is_group=True, text="status?")
+        )
+        assert len(h.dispatched) == 1
+
+    async def test_a_malformed_own_list_fails_closed(self):
+        """A per-group value that is not a list admits nobody there; it never
+        widens to the global list."""
+        h = Harness(
+            groups=[self._group(GROUP, allowed_wa_ids="447700900111")],
+            allowed_wa_ids=["447700900111"],
+        )
+        await h.transport.receive(self._mention(GROUP))
+        assert h.dispatched == []
+
+    async def test_non_digit_entries_are_ignored(self):
+        h = Harness(groups=[self._group(GROUP, allowed_wa_ids=["+447700900111", "abc"])])
+        await h.transport.receive(self._mention(GROUP))
+        assert h.dispatched == []
+
+    async def test_media_fetch_follows_the_per_group_answer(self):
+        h = Harness(
+            groups=[
+                self._group(GROUP, allowed_wa_ids=["447700900111"]),
+                self._group(GROUP_B, allowed_wa_ids=[]),
+            ],
+            allowed_wa_ids=["447700900111"],
+        )
+        assert h.transport._may_fetch_media(self._msg("447700900111", GROUP), is_group=True)
+        assert not h.transport._may_fetch_media(self._msg("447700900111", GROUP_B), is_group=True)
+
+    async def test_the_group_jid_is_matched_the_way_the_gate_matches_it(self):
+        """The entry is keyed through ``normalize_jid``, so an uppercase server in
+        config selects the same group's list the gate selects."""
+        h = Harness(groups=[self._group(GROUP.upper(), allowed_wa_ids=["447700900111"])])
+        assert h.transport._may_fetch_media(self._msg("447700900111", GROUP), is_group=True)
+
+    async def test_coercion_keeps_the_key_only_when_the_entry_has_it(self):
+        from kiro_crew.config.sections import _coerce_whatsapp_groups
+
+        absent, listed, malformed = _coerce_whatsapp_groups(
+            [
+                {"jid": GROUP},
+                {"jid": GROUP_B, "allowed_wa_ids": [" 447700900111 ", "x", 447700900222]},
+                {"jid": "c@g.us", "allowed_wa_ids": None},
+            ]
+        )
+        assert "allowed_wa_ids" not in absent
+        assert listed["allowed_wa_ids"] == ["447700900111", "447700900222"]
+        assert malformed["allowed_wa_ids"] == []
+
+    async def test_reconfigure_adopts_a_new_per_group_list(self):
+        h = Harness(groups=[self._group(GROUP)], allowed_wa_ids=["447700900111"])
+        h.transport.reconfigure(
+            SimpleNamespace(
+                dm_policy="self",
+                allowed_wa_ids=["447700900111"],
+                groups=[self._group(GROUP, allowed_wa_ids=["447700900222"])],
+            )
+        )
+        await h.transport.receive(self._mention(GROUP))
+        assert h.dispatched == []
+
+
+@pytest.mark.asyncio
+class TestOutboundAndTargets:
+    async def test_send_message_tracks_every_chunk_id(self, harness):
+        message_id = await harness.transport.send_message(FRIEND, "hi there")
+        assert message_id == "SENT1"
+        assert harness.transport.echo.is_own_echo(FRIEND, "SENT1")
+
+    async def test_send_voice_tracks_its_id(self, harness):
+        # In the self-chat an untracked echo would come back as the operator
+        # sending a voice note, and the agent would answer its own reply.
+        message_id = await harness.transport.send_voice(OWN_JID, b"OggS", "audio/ogg")
+        assert harness.transport.echo.is_own_echo(OWN_JID, message_id)
+
+    async def test_configured_targets_offline_reason(self, harness):
+        harness.client.is_connected = False
+        targets = harness.transport.configured_targets()
+        assert targets and not targets[0].available
+        assert "pair" in targets[0].unavailable_reason.lower()
+
+    async def test_resolve_configured_target_roundtrip(self, harness):
+        targets = harness.transport.configured_targets()
+        resolved = await harness.transport.resolve_configured_target(targets[0].target_id)
+        assert resolved == (OWN_JID, None)
+
+    async def test_an_unlisted_number_is_not_a_resolvable_target(self):
+        """The dashboard mirror-link path offers what `configured_targets` lists
+        and then round-trips the chosen id back through the resolver, which is the
+        ONLY allowlist check on that path. Resolving an id the list never offered
+        would let a proactive send open a conversation with an arbitrary number.
+        """
+        h = Harness(dm_policy="allowlist", allowed_wa_ids=["447700900111"])
+        offered = {t.target_id for t in h.transport.configured_targets()}
+        assert "user:447700900999" not in offered
+
+        assert await h.transport.resolve_configured_target("user:447700900999") is None
+        # Every id the list DOES offer still resolves.
+        for target_id in offered:
+            assert await h.transport.resolve_configured_target(target_id) is not None
+
+    async def test_capabilities_are_honest(self, harness):
+        """These flags are a claim other code trusts, so each one must match a
+        behaviour the channel actually has.
+        """
+        caps = harness.transport.capabilities
+        # The Web protocol exposes an edit, so the renderer streams by editing
+        # one bubble; reactions are used for receipts.
+        assert caps.streaming and caps.edit and caps.reactions
+        # No interactive widget exists for a personal account: the send succeeds
+        # and renders as nothing, so the trailer degrades to a numbered list.
+        assert caps.max_buttons == 0
+        assert caps.max_message_chars == 4096
+        # No 24-hour customer-service window on this protocol, unlike the Cloud API.
+        assert caps.supports_proactive_send
+        # Inbound routing derives its key from the chat, never a mirror binding.
+        assert not caps.supports_session_resume
+        # Both media directions ship: ingest through whatsapp/attachments.py and
+        # upload through whatsapp/files.py. Asserted because a flag other code
+        # trusts is exactly what goes stale first.
+        assert caps.files_inbound and caps.files_outbound
+
+
+@pytest.mark.asyncio
+class TestGovernanceDenyStopsTheDownload:
+    """A `channels` deny must stop the FETCH, not just the reply.
+
+    The dispatcher's own gate runs after `receive()` has already ingested media,
+    so a gate only there leaves a denied channel performing an authenticated
+    download onto the operator's host on every media message.
+    """
+
+    async def _deny(self, monkeypatch):
+        import kiro_crew.messaging.dispatch as mod
+
+        async def deny(_ct):
+            return False
+
+        # Patched on `dispatch`, not on `identity`: the name is bound at import,
+        # so patching the defining module leaves the bound reference in place and
+        # the test would pass against an ungated fetch.
+        monkeypatch.setattr(mod, "channel_inbound_permitted", deny)
+
+    async def test_a_denied_channel_never_reaches_the_fetch(self, harness, monkeypatch):
+        import kiro_crew.whatsapp.transport as mod
+
+        calls = []
+
+        async def spy(*a, **kw):
+            calls.append(a)
+            raise AssertionError("a denied channel must not download media")
+
+        monkeypatch.setattr(mod, "ingest_media", spy)
+        await self._deny(monkeypatch)
+        await harness.transport.receive(
+            event(chat=OWN_JID, sender=OWN_JID, from_me=True, text="hi", image=True)
+        )
+        assert calls == []
+        assert harness.dispatched == []
+
+    async def test_a_denied_channel_still_admits_a_bare_cancel(self, harness, monkeypatch):
+        """The documented exemption: a runaway turn must remain stoppable."""
+        await self._deny(monkeypatch)
+        await harness.transport.receive(
+            event(chat=OWN_JID, sender=OWN_JID, from_me=True, text="/stop")
+        )
+        assert len(harness.dispatched) == 1
+
+    async def test_media_captioned_as_a_cancel_is_still_gated(self, harness, monkeypatch):
+        """The exemption reads the ENVELOPE, not the caption.
+
+        `msg.attachments` is empty at the point the fetch is decided, so an
+        exemption keyed on it would admit a policy-denied media message whose
+        caption happens to be `/stop`, and the download would already have run.
+        """
+        import kiro_crew.whatsapp.transport as mod
+
+        async def spy(*a, **kw):
+            raise AssertionError("a denied channel must not download media")
+
+        monkeypatch.setattr(mod, "ingest_media", spy)
+        await self._deny(monkeypatch)
+        await harness.transport.receive(
+            event(chat=OWN_JID, sender=OWN_JID, from_me=True, text="/stop", image=True)
+        )
+        assert harness.dispatched == []
+
+
+@pytest.mark.asyncio
+class TestGroupMediaNeedsIndividualAdmission:
+    """Being admitted to the conversation is not being admitted to the machine.
+
+    Step 5 authorizes the group SURFACE, so a configured group never reaches
+    ``authorize`` and membership alone would let any member trigger an
+    authenticated whole-blob download into the gateway's heap. In ``rules`` mode an
+    unaddressed message already answers ``respond=True``, and the per-group
+    cooldown does not bound the fetch because it only starts once a reply actually
+    delivered, which a sentinel-silenced turn never does.
+    """
+
+    def _msg(self, user_id: str):
+        return InboundMessage(
+            channel_type="whatsapp", user_id=user_id, conversation_id=GROUP, text="x"
+        )
+
+    async def test_a_dm_sender_is_unaffected(self, harness):
+        """A DM has already passed `authorize`, so the DM policy is the answer."""
+        assert harness.transport._may_fetch_media(self._msg("447700900111"), is_group=False)
+
+    async def test_an_unlisted_group_member_may_not_trigger_a_fetch(self):
+        h = Harness(dm_policy="allowlist", allowed_wa_ids=["447700900111"])
+        assert not h.transport._may_fetch_media(self._msg("447700900999"), is_group=True)
+
+    async def test_an_allowed_group_member_may(self):
+        h = Harness(dm_policy="allowlist", allowed_wa_ids=["447700900111"])
+        assert h.transport._may_fetch_media(self._msg("447700900111"), is_group=True)
+
+    async def test_the_account_owner_may(self, harness):
+        assert harness.transport._may_fetch_media(self._msg("447700900000"), is_group=True)
+
+    async def test_dm_policy_open_does_not_hand_the_capability_back(self):
+        """`open` resolves to "anyone with a user id", so consulting `authorize`
+        here would re-admit every group member. The gate is individual admission,
+        deliberately independent of `dm_policy`.
+        """
+        h = Harness(dm_policy="open")
+        assert not h.transport._may_fetch_media(self._msg("447700900999"), is_group=True)
+        # ...while the same sender is still free to CHAT under that policy.
+        assert h.transport.authorize(self._msg("447700900999"))
+
+
+@pytest.mark.asyncio
+class TestLinkedIdentityAliases:
+    """WhatsApp multi-device addresses a sender either by their phone number or
+    by their Linked Identity (``<id>@lid``), and the two user parts are
+    UNRELATED strings. The DM allowlist is written in phone numbers, so without
+    folding the alias an allow-listed person is silently ignored -- it fails
+    closed, which is safe, but reads to the operator as a broken channel.
+    """
+
+    async def test_an_allowlisted_peer_addressed_by_lid_is_authorized(self):
+        h = Harness(dm_policy="allowlist", allowed_wa_ids=["447700900111"])
+        h.client.lid_map[FRIEND_LID] = FRIEND
+        await h.transport.receive(event(chat=FRIEND_LID, sender=FRIEND_LID, text="hi"))
+        assert len(h.dispatched) == 1
+        # Attributed to the phone number, so config, audit and the allowlist all
+        # name the same human.
+        assert h.dispatched[0].user_id == "447700900111"
+
+    async def test_the_same_peer_by_phone_needs_no_lookup(self):
+        h = Harness(dm_policy="allowlist", allowed_wa_ids=["447700900111"])
+        await h.transport.receive(event(chat=FRIEND, sender=FRIEND, text="hi"))
+        assert len(h.dispatched) == 1
+        assert h.client.lid_lookups == []
+
+    async def test_an_unresolvable_lid_still_fails_closed(self):
+        """A resolver outage must not open the door: no mapping means the alias
+        is kept, so it does not match the phone-number allowlist and is denied.
+        """
+        h = Harness(dm_policy="allowlist", allowed_wa_ids=["447700900111"])
+        await h.transport.receive(event(chat=FRIEND_LID, sender=FRIEND_LID, text="hi"))
+        assert h.dispatched == []
+
+    async def test_a_stranger_by_lid_is_denied_even_when_resolvable(self):
+        """Resolution is identity folding, not authorization."""
+        h = Harness(dm_policy="allowlist", allowed_wa_ids=["447700900111"])
+        h.client.lid_map["555@lid"] = "447700900222@s.whatsapp.net"
+        await h.transport.receive(event(chat="555@lid", sender="555@lid", text="hi"))
+        assert h.dispatched == []
+
+    async def test_the_alias_is_resolved_once_per_sender(self):
+        h = Harness(dm_policy="allowlist", allowed_wa_ids=["447700900111"])
+        h.client.lid_map[FRIEND_LID] = FRIEND
+        for i in range(3):
+            await h.transport.receive(
+                event(chat=FRIEND_LID, sender=FRIEND_LID, text="hi", message_id=f"M{i}")
+            )
+        assert len(h.dispatched) == 3
+        assert h.client.lid_lookups == [FRIEND_LID]
+
+
+@pytest.mark.asyncio
+class TestOwnOutgoingMessages:
+    """``from_me`` means the ACCOUNT sent it, which includes the operator texting
+    an ordinary contact from their phone. Treating that as a command puts the
+    agent into their private conversations and replies in the contact's chat.
+    """
+
+    async def test_texting_a_contact_is_not_a_command(self, harness):
+        await harness.transport.receive(
+            event(chat=FRIEND, sender=OWN_JID, from_me=True, text="see you at 8")
+        )
+        assert harness.dispatched == [], "the agent answered a private conversation"
+
+    async def test_the_self_chat_is_still_the_command_surface(self, harness):
+        await harness.transport.receive(
+            event(chat=OWN_JID, sender=OWN_JID, from_me=True, text="/status")
+        )
+        assert len(harness.dispatched) == 1
+
+    async def test_the_operator_can_still_address_a_configured_group(self):
+        h = Harness(
+            groups=[{"jid": GROUP, "name": "G", "mode": "mention", "rules": "", "cooldown_s": 0}]
+        )
+        await h.transport.receive(
+            event(chat=GROUP, sender=OWN_JID, from_me=True, is_group=True, text="what is next?")
+        )
+        assert len(h.dispatched) == 1
+
+
+@pytest.mark.asyncio
+class TestPreIngestionOriginalIsCapturedForTheSpool:
+    """The durable inbound spool quotes the spooled text back to the user.
+
+    ``receive`` rewrites ``msg.text`` with attachment context and temp paths
+    before dispatch, so a route built from ``inbound.text`` at the dispatch site
+    would spool -- and the restart notice would quote -- on-disk paths to files
+    that do not survive the restart. The original caption and media count are captured
+    BEFORE ingestion in a side table keyed like the others.
+    """
+
+    async def test_the_original_caption_survives_ingestion(self, harness, monkeypatch, tmp_path):
+        import kiro_crew.whatsapp.transport as mod
+        from kiro_crew.messaging.attachments import IngestResult
+
+        # ``receive`` hands the ingested paths to ``attachments.cleanup`` after
+        # dispatch, which unlinks them. A literal ``/tmp/...`` here made that
+        # unlink a write on the operator's real host; the file lives under
+        # ``tmp_path`` so the cleanup is observable AND sandboxed.
+        image = tmp_path / "kc-att" / "img-1.jpg"
+        image.parent.mkdir()
+        image.write_bytes(b"jpg")
+        assert image.resolve().is_relative_to(tmp_path.resolve())
+
+        async def fake_ingest(*a, **kw):
+            return IngestResult(image_paths=[str(image)])
+
+        monkeypatch.setattr(mod, "ingest_media", fake_ingest)
+        seen: list[tuple[str, tuple[str, int] | None]] = []
+
+        async def dispatch(msg):
+            seen.append((msg.text, harness.transport.pending_original.get(id(msg))))
+
+        harness.transport._dispatch = dispatch
+        await harness.transport.receive(
+            event(chat=OWN_JID, sender=OWN_JID, from_me=True, text="look at this", image=True)
+        )
+
+        assert len(seen) == 1
+        ingested_text, original = seen[0]
+        assert str(image) in ingested_text, "ingestion did not rewrite the text"
+        assert original == ("look at this", 1), "the pre-ingestion original was not captured"
+        assert harness.transport.pending_original == {}, "the side table leaked past dispatch"
+        assert not image.exists(), "receive did not hand the temp path to cleanup"
+
+    async def test_a_voice_note_is_flagged_for_the_dispatch_only(self, harness, monkeypatch):
+        import kiro_crew.whatsapp.transport as mod
+        from kiro_crew.messaging.attachments import IngestResult
+
+        async def fake_ingest(*a, **kw):
+            return IngestResult()
+
+        monkeypatch.setattr(mod, "ingest_media", fake_ingest)
+        seen: list[bool] = []
+
+        async def dispatch(msg):
+            seen.append(id(msg) in harness.transport.pending_voice_note)
+
+        harness.transport._dispatch = dispatch
+        voice = event(chat=OWN_JID, sender=OWN_JID, from_me=True, text="")
+        voice.Message = Msg(
+            conversation="",
+            extendedTextMessage=None,
+            audioMessage=Msg(mimetype="audio/ogg; codecs=opus", fileLength=1024, PTT=True),
+        )
+        await harness.transport.receive(voice)
+        await harness.transport.receive(
+            event(chat=OWN_JID, sender=OWN_JID, from_me=True, text="words", message_id="MSG2")
+        )
+
+        assert seen == [True, False]
+        assert harness.transport.pending_voice_note == set(), "the flag leaked past dispatch"
+
+    async def test_a_text_only_message_records_zero_media(self, harness):
+        seen: list[tuple[str, int] | None] = []
+
+        async def dispatch(msg):
+            seen.append(harness.transport.pending_original.get(id(msg)))
+
+        harness.transport._dispatch = dispatch
+        await harness.transport.receive(
+            event(chat=OWN_JID, sender=OWN_JID, from_me=True, text="just words")
+        )
+
+        assert seen == [("just words", 0)]
+
+
+@pytest.mark.asyncio
+class TestAttachmentCleanupRunsOffTheLoop:
+    """The post-dispatch unlink of ingested media must not run on the gateway loop.
+
+    TMPDIR is not guaranteed to be local disk, so each ``os.unlink`` can be a
+    round trip; every other channel hands the same cleanup to a worker thread.
+    """
+
+    async def test_cleanup_runs_in_a_worker_thread(self, harness, monkeypatch, tmp_path):
+        import threading
+
+        import kiro_crew.whatsapp.transport as mod
+        from kiro_crew.messaging.attachments import IngestResult
+        from kiro_crew.messaging.attachments import cleanup as real_cleanup
+
+        image = tmp_path / "kc-att" / "img-1.jpg"
+        image.parent.mkdir()
+        image.write_bytes(b"jpg")
+
+        async def fake_ingest(*a, **kw):
+            return IngestResult(image_paths=[str(image)])
+
+        cleanup_threads: list[int] = []
+
+        def recording_cleanup(paths):
+            cleanup_threads.append(threading.get_ident())
+            real_cleanup(paths)
+
+        monkeypatch.setattr(mod, "ingest_media", fake_ingest)
+        monkeypatch.setattr(mod, "cleanup", recording_cleanup)
+        loop_thread = threading.get_ident()
+
+        await harness.transport.receive(
+            event(chat=OWN_JID, sender=OWN_JID, from_me=True, text="look", image=True)
+        )
+
+        assert len(harness.dispatched) == 1
+        assert len(cleanup_threads) == 1, "receive did not clean up the ingested media"
+        assert cleanup_threads[0] != loop_thread, "attachment cleanup ran on the event loop"
+        assert not image.exists()
+        assert harness.transport.pending_original == {}
+
+    async def test_a_refused_offload_still_deletes_inline(self, harness, monkeypatch, tmp_path):
+        """A loop whose executor is gone must not leave decrypted media on disk."""
+        import kiro_crew.whatsapp.transport as mod
+        from kiro_crew.messaging.attachments import IngestResult
+
+        image = tmp_path / "kc-att" / "img-1.jpg"
+        image.parent.mkdir()
+        image.write_bytes(b"jpg")
+
+        async def fake_ingest(*a, **kw):
+            return IngestResult(image_paths=[str(image)])
+
+        async def refused(*a, **kw):
+            raise RuntimeError("cannot schedule new futures after shutdown")
+
+        monkeypatch.setattr(mod, "ingest_media", fake_ingest)
+        monkeypatch.setattr(mod.asyncio, "to_thread", refused)
+
+        await harness.transport.receive(
+            event(chat=OWN_JID, sender=OWN_JID, from_me=True, text="look", image=True)
+        )
+
+        assert not image.exists(), "a refused offload left the temp file behind"
+
+
+class TestOwnerDmDedup:
+    """Listing your own number in ``allowed_wa_ids`` is one person, not two.
+    A duplicate target would make ``sole_direct_target`` see two recipients and
+    refuse the DM as ambiguous, silently downgrading it to a dashboard notice."""
+
+    def test_own_number_in_the_allowlist_is_not_a_second_target(self) -> None:
+        from kiro_crew.messaging.transport import sole_direct_target
+
+        own = OWN_JID.split("@")[0]
+        h = Harness(dm_policy="allowlist", allowed_wa_ids=[own])
+        ids = [t.target_id for t in h.transport.configured_targets()]
+        assert ids.count(f"user:{own}") == 1, ids
+        assert sole_direct_target(h.transport.configured_targets()) == f"user:{own}"
+
+    def test_a_genuinely_second_person_is_still_ambiguous(self) -> None:
+        from kiro_crew.messaging.transport import sole_direct_target
+
+        own = OWN_JID.split("@")[0]
+        friend = FRIEND.split("@")[0]
+        h = Harness(dm_policy="allowlist", allowed_wa_ids=[own, friend])
+        assert sole_direct_target(h.transport.configured_targets()) == ""

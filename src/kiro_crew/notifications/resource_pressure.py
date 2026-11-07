@@ -1,0 +1,426 @@
+"""Resource-pressure notification producer (posture → notification bus).
+
+Bridges the advisory resource tier to the notification bus. The posture
+computed by :mod:`kiro_crew.resource_status` reaches agents (the injected
+``[RESOURCES]`` context line and the ``resource_status`` pull tool) but not
+the human: a host can sit at CRITICAL posture — agent runtimes OOM-killed,
+freeze imminent — while the only warnings go to logs. This producer samples
+the same posture on the gateway's event-loop heartbeat cadence and publishes
+user-visible notes to the ``system.resources`` channel.
+
+Episode model (the dedupe/hysteresis core, kept pure for testability):
+
+* An **episode** spans from the first non-ample probe to the first ample
+  probe after it. Within one episode, each signal fires at most once:
+
+  - entering **critical** pushes one critical-priority note immediately,
+    and re-pushes it every :data:`CRITICAL_REALERT_SECS` while the posture
+    stays critical (same ``group_key``, so the feed stacks rather than
+    spams) — a single missed note must not be the only warning before a
+    freeze;
+  - **tight sustained** for :data:`SUSTAINED_TIGHT_SECS` pushes one
+    default-priority note — suppressed once the critical note has fired
+    (it is strictly weaker news), but escalation the other way (tight note
+    already sent, posture then reaches critical) still fires the critical
+    note, because "about to freeze" must not be muffled by an earlier
+    milder warning;
+  - returning to **ample** after any alert pushes one recovery note and
+    closes the episode. An episode that never alerted (a brief tight blip)
+    closes silently.
+
+* ``unknown`` posture (probe failure) is a non-signal: it neither starts,
+  advances, nor closes an episode, so a transient probe hiccup cannot fire
+  a false recovery or reset the sustained-tight timer.
+
+* Hysteresis falls out of the model: critical↔tight oscillation re-alerts
+  nothing because an episode only ends at ample.
+
+A note names the memory its figure measured. When the agent slice's ceiling is
+the tighter reading (``ResourceStatus.agent_ceiling``), the note says "Agent
+memory" and adds the host's own figure, which is what the dashboard's memory
+gauge shows; otherwise it says "Host memory", as it always did.
+
+Thresholds are the existing ``agent.resource_pressure_gb`` /
+``agent.resource_critical_gb`` config keys (read by ``resource_status.probe``
+on every sample — config is fingerprint-cached, so this is cheap and live).
+The off-switch is the standard per-channel control: muting
+``system.resources`` in Settings → Notifications silences every surface
+(badge, sound, native banner) via :class:`ChannelSettings`, the same
+convention every other channel follows. Setting ``resource_pressure_gb`` to
+``0`` disables the tight tier at the source, exactly as it does for the
+agent-facing context line.
+
+The per-app :class:`AppRateLimiter` is deliberately not consulted: it caps
+app producers, and system channels never pass through it (see
+``rate_limit.py``); the episode model already bounds this producer to a few
+notes per pressure episode.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+from typing import TYPE_CHECKING, Callable
+
+from kiro_crew.notifications.bus import _MAX_BODY_LEN, NotificationPayload
+from kiro_crew.resource_status import (
+    POSTURE_AMPLE,
+    POSTURE_CRITICAL,
+    POSTURE_TIGHT,
+    ResourceStatus,
+    probe,
+)
+from kiro_crew.resource_status_agent_ceiling import gb_text
+from kiro_crew.sandbox import check_agents_slice_pressure, reclaim_agents_slice_page_cache
+
+if TYPE_CHECKING:
+    from kiro_crew.notifications.bus import NotificationBus
+
+logger = logging.getLogger(__name__)
+
+CHANNEL = "system.resources"
+
+# How often maybe_sample() actually probes. The caller (the event-loop
+# heartbeat) ticks faster; this gate makes the probe cadence independent of
+# the caller's interval.
+SAMPLE_INTERVAL_SECS = 30.0
+
+# How long posture must stay tight (without recovering to ample) before the
+# sustained-tight note fires.
+SUSTAINED_TIGHT_SECS = 600.0
+
+# While posture STAYS critical, re-push the critical note on this cadence so
+# one missed notification is not the only warning before a freeze. Same
+# group_key as the entry note, so the feed stacks the repeats.
+CRITICAL_REALERT_SECS = 1800.0
+
+# Upper bound on one probe. Must stay BELOW the heartbeat's 5s interval: the
+# heartbeat awaits this sample, so the worst-case gap between beats is
+# interval + this bound. Keeping the bound under the interval leaves the gap
+# far inside any watchdog exit threshold; a memory probe that needs more than
+# this is already pathological and forfeits its sample.
+PROBE_TIMEOUT_SECS = 2.0
+
+# The most slice OOM reports held for the loop. Older ones are counted, not
+# kept, so probes that keep finishing late cannot grow the stash without end.
+MAX_PENDING_OOM_REPORTS = 50
+
+
+def _fmt_load(status: ResourceStatus) -> str:
+    if status.load_per_cpu is None:
+        return ""
+    return f", load {status.load_per_cpu}/core"
+
+
+def _agent_ceiling_context(status: ResourceStatus) -> str:
+    """What a slice-bound note adds after its figure: the host's own figure, and why.
+
+    Empty for a host-bound reading. The host figure is what the dashboard's
+    memory gauge shows, so without it a note reading "0.0 GB" beside a gauge at
+    57% looks like a false alarm when it is the agent ceiling that is full.
+    """
+    ceiling = status.agent_ceiling
+    if ceiling is None:
+        return ""
+    shmem = ceiling.shmem_sentence()
+    return (
+        f" The host itself still has {gb_text(ceiling.host_available_gb)} GB available: this "
+        "ceiling is what agent processes may use together, and at it the kernel slows "
+        "every one of them." + (f" {shmem}" if shmem else "")
+    )
+
+
+class ResourcePressureNotifier:
+    """Turns the advisory posture stream into at-most-once-per-episode notes.
+
+    Owned by ``DashboardState`` alongside the bus it publishes to; driven by
+    :meth:`maybe_sample` from the event-loop heartbeat. ``probe_fn`` and
+    ``clock`` are injectable so tests exercise the episode logic with no
+    real ``/proc`` or wall-clock dependence.
+    """
+
+    def __init__(
+        self,
+        bus: "NotificationBus",
+        *,
+        probe_fn: Callable[[], ResourceStatus] = probe,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._bus = bus
+        self._probe = probe_fn
+        self._clock = clock
+        self._next_sample = 0.0
+        self._inflight = False
+        # Episode state. ``_episode_since`` doubles as the active flag (None =
+        # no episode) and as the sustained-tight timer origin.
+        self._episode_since: float | None = None
+        self._critical_alerted = False
+        self._tight_alerted = False
+        self._last_critical_push = 0.0
+        # Whether the episode's latest alert measured the agent ceiling, so its
+        # recovery note names the same memory the alert did. The recovery
+        # reading itself is ample and carries no attribution.
+        self._alerted_agent_ceiling = False
+        # Slice OOM reports captured by the worker thread, consumed (and
+        # cleared) on the loop side so the bus is only touched from the loop.
+        # The loop takes them only after a probe returned in time, when no
+        # worker is running, so the two sides never touch the list at once.
+        self._slice_oom_reports: list[str] = []
+        self._slice_oom_dropped = 0
+
+    async def maybe_sample(self) -> None:
+        """Probe (off-loop, bounded) and evaluate if the interval elapsed.
+
+        Never raises — this runs inside the event-loop heartbeat, whose only
+        job is proving loop liveness; a broken probe or sink must degrade to
+        a debug log, not kill the heartbeat task. Three guards keep a
+        misbehaving probe from harming the loop it reports on:
+
+        * the probe's synchronous config/procfs reads run in a worker thread
+          (``asyncio.to_thread``), so a slow filesystem cannot block the loop;
+        * the await is bounded by :data:`PROBE_TIMEOUT_SECS` (well below the
+          watchdog's stall threshold) — a stalled probe forfeits its sample
+          instead of starving the heartbeat until the watchdog kills the
+          process;
+        * ``_inflight`` (cleared by the worker thread itself) ensures at most
+          one probe thread exists — after a timeout the abandoned thread
+          still occupies the slot, so a permanently hung probe disables
+          sampling rather than leaking a thread every interval.
+        """
+        try:
+            now = self._clock()
+            if now < self._next_sample or self._inflight:
+                return
+            self._next_sample = now + SAMPLE_INTERVAL_SECS
+            self._inflight = True
+            try:
+                status = await asyncio.wait_for(
+                    asyncio.to_thread(self._run_probe), PROBE_TIMEOUT_SECS
+                )
+            except (asyncio.TimeoutError, TimeoutError):
+                logger.debug("resource-pressure probe timed out; sample skipped")
+                return
+            if self._slice_oom_reports or self._slice_oom_dropped:
+                self._deliver_slice_oom()
+            self.observe(status, now)
+        except Exception:
+            logger.debug("resource-pressure sample failed", exc_info=True)
+
+    def _run_probe(self) -> ResourceStatus:
+        """Worker-thread wrapper: run the probe and release the in-flight slot."""
+        try:
+            # Piggyback the agents-slice OOM check on the same off-loop
+            # cadence: new OOM kills inside kirocrew-agents.slice are logged
+            # with victim scopes and slice memory state (sandbox owns the
+            # format). The message is stashed for the loop side to push onto
+            # the bus — "a random subagent died" must be diagnosable from the
+            # dashboard, not just the log file. Never raises; reads a handful
+            # of cgroup files.
+            #
+            # A report is only ever added to, never replaced: the check
+            # reports each kill once, and a probe that timed out leaves its
+            # report here unread, so the next tick's (usually empty) result
+            # must not overwrite it before the loop pushes it.
+            try:
+                msg = check_agents_slice_pressure()
+            except Exception:
+                msg = None
+                logger.debug("agents-slice OOM check failed", exc_info=True)
+            if msg:
+                self._slice_oom_reports.append(msg)
+                excess = len(self._slice_oom_reports) - MAX_PENDING_OOM_REPORTS
+                if excess > 0:
+                    del self._slice_oom_reports[:excess]
+                    self._slice_oom_dropped += excess
+            # Same tick: drop clean page cache on the agents slice before it
+            # holds the slice at memory.high. The decision is a few file
+            # reads; the writes run in their own thread, so this returns at
+            # once and never spends the probe's budget.
+            try:
+                reclaim_agents_slice_page_cache()
+            except Exception:
+                logger.debug("agents-slice page-cache reclaim failed", exc_info=True)
+            return self._probe()
+        finally:
+            self._inflight = False
+
+    def observe(self, status: ResourceStatus, now: float) -> None:
+        """Advance the episode state machine with one posture reading."""
+        posture = status.posture
+        if posture == POSTURE_CRITICAL:
+            if self._episode_since is None:
+                self._episode_since = now
+            if not self._critical_alerted:
+                self._push_critical(status)
+                self._critical_alerted = True
+                self._last_critical_push = now
+            elif now - self._last_critical_push >= CRITICAL_REALERT_SECS:
+                self._push_critical(status, realert=True)
+                self._last_critical_push = now
+        elif posture == POSTURE_TIGHT:
+            if self._critical_alerted:
+                # A tight reading interrupts "continuously critical", so the
+                # re-alert cadence restarts here: critical<->tight oscillation
+                # must never produce repeat notes (the episode dedupe
+                # promise) — only sustained critical does.
+                self._last_critical_push = now
+            if self._episode_since is None:
+                self._episode_since = now
+            elif (
+                not self._tight_alerted
+                and not self._critical_alerted
+                and now - self._episode_since >= SUSTAINED_TIGHT_SECS
+            ):
+                self._push_tight(status, now - self._episode_since)
+                self._tight_alerted = True
+        elif posture == POSTURE_AMPLE:
+            if self._episode_since is not None:
+                alerted = self._critical_alerted or self._tight_alerted
+                agent_ceiling = self._alerted_agent_ceiling
+                self._episode_since = None
+                self._critical_alerted = False
+                self._tight_alerted = False
+                self._alerted_agent_ceiling = False
+                if alerted:
+                    self._push_recovery(status, agent_ceiling=agent_ceiling)
+        # unknown: non-signal — keep the episode state untouched (see module
+        # docstring).
+
+    # ── note builders ────────────────────────────────────────────────────
+
+    def _deliver_slice_oom(self) -> None:
+        """Push the waiting OOM reports as notes that each fit the body limit.
+
+        A report leaves the stash only once the note carrying it was pushed:
+        a push that fails leaves it and every later one for the next tick.
+        """
+        reports, self._slice_oom_reports = self._slice_oom_reports, []
+        dropped, self._slice_oom_dropped = self._slice_oom_dropped, 0
+        lines = [r[:_MAX_BODY_LEN] for r in reports]
+        if dropped:
+            lines.insert(0, f"{dropped} earlier OOM report(s) were not kept.")
+        batches: list[list[str]] = []
+        for line in lines:
+            if batches and len("\n".join([*batches[-1], line])) <= _MAX_BODY_LEN:
+                batches[-1].append(line)
+            else:
+                batches.append([line])
+        sent = 0
+        try:
+            for batch in batches:
+                self._push_slice_oom("\n".join(batch))
+                sent += len(batch)
+        except Exception:
+            # The dropped-count line is first in the first batch, so it is
+            # either sent or put back with the rest.
+            unsent = lines[sent:]
+            if dropped and sent == 0:
+                unsent = unsent[1:]
+                self._slice_oom_dropped += dropped
+            self._slice_oom_reports[:0] = unsent
+            excess = len(self._slice_oom_reports) - MAX_PENDING_OOM_REPORTS
+            if excess > 0:
+                del self._slice_oom_reports[:excess]
+                self._slice_oom_dropped += excess
+            raise
+
+    def _push_slice_oom(self, message: str) -> None:
+        """One note per detected OOM batch inside the agents slice.
+
+        The kernel picks the victim on an aggregate breach, so without this
+        the user-visible symptom is a subagent dying with exit 137 and no
+        explanation anywhere but the log file. ``group_key`` stacks repeats
+        so a thrashing host does not flood the bell feed.
+        """
+        self._bus.push(
+            NotificationPayload(
+                source="system",
+                channel=CHANNEL,
+                title="Agent subprocess OOM-killed by cgroup ceiling",
+                body=message,
+                group_key="agents-slice-oom",
+                meta={"kind": "agents-slice-oom"},
+            )
+        )
+
+    def _push_critical(self, status: ResourceStatus, *, realert: bool = False) -> None:
+        subject = status.memory_subject
+        title = f"{subject} still critically low" if realert else f"{subject} critically low"
+        ceiling = status.agent_ceiling
+        self._alerted_agent_ceiling = ceiling is not None
+        if ceiling is None:
+            figure = f"Available memory is down to {status.available_gb:.1f} GB"
+        else:
+            figure = (
+                f"Agent processes have {status.available_gb:.1f} GB left under their "
+                f"{gb_text(ceiling.ceiling_gb)} GB memory ceiling"
+            )
+        # The ceiling keeps the host responsive, so only a host-bound reading
+        # warns that the host itself may stop answering.
+        risk = (
+            "Agent processes may be killed and the host can become unresponsive"
+            if ceiling is None
+            else "Agent processes may be killed if their memory keeps growing"
+        )
+        self._bus.push(
+            NotificationPayload(
+                source="system",
+                channel=CHANNEL,
+                priority="critical",
+                title=title,
+                body=(
+                    f"{figure} (critical threshold {status.critical_gb:g} GB"
+                    f"{_fmt_load(status)}).{_agent_ceiling_context(status)} {risk} — "
+                    "stop or defer heavy work (builds, full test suites, sub-agent "
+                    "waves) or free memory now."
+                ),
+                group_key="resource-pressure",
+                meta={"posture": status.posture, "available_gb": status.available_gb},
+            )
+        )
+
+    def _push_tight(self, status: ResourceStatus, sustained_secs: float) -> None:
+        minutes = int(sustained_secs // 60)
+        ceiling = status.agent_ceiling
+        self._alerted_agent_ceiling = ceiling is not None
+        if ceiling is None:
+            figure = (
+                f"Available memory has stayed at or below {status.pressure_gb:g} GB "
+                f"for ~{minutes} minutes (currently {status.available_gb:.1f} GB free"
+            )
+        else:
+            figure = (
+                f"Agent processes have had at most {status.pressure_gb:g} GB left under "
+                f"their {gb_text(ceiling.ceiling_gb)} GB memory ceiling for ~{minutes} minutes "
+                f"(currently {status.available_gb:.1f} GB"
+            )
+        self._bus.push(
+            NotificationPayload(
+                source="system",
+                channel=CHANNEL,
+                title=f"{status.memory_subject} tight for {minutes} minutes",
+                body=(
+                    f"{figure}{_fmt_load(status)}).{_agent_ceiling_context(status)} "
+                    "Consider deferring heavy work until memory frees."
+                ),
+                group_key="resource-pressure",
+                meta={"posture": status.posture, "available_gb": status.available_gb},
+            )
+        )
+
+    def _push_recovery(self, status: ResourceStatus, *, agent_ceiling: bool = False) -> None:
+        subject = "Agent memory" if agent_ceiling else "Host memory"
+        self._bus.push(
+            NotificationPayload(
+                source="system",
+                channel=CHANNEL,
+                title=f"{subject} pressure resolved",
+                body=(
+                    f"Available memory recovered to {status.available_gb:.1f} GB "
+                    f"free{_fmt_load(status)}."
+                ),
+                group_key="resource-pressure",
+                meta={"posture": status.posture, "available_gb": status.available_gb},
+            )
+        )

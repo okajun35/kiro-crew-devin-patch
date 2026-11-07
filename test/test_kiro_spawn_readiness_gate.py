@@ -1,0 +1,711 @@
+"""Poll-driven kiro-cli spawn sites must not run the CLI while signed out.
+
+``kiro-cli`` auto-launches an interactive browser login whenever a subcommand
+runs unauthenticated (``--no-interactive`` does not suppress it and there is no
+opt-out env var). ``/api/models`` is polled every 8s while the model list is
+degraded and ``/api/sessions/usage`` every 30s, so an unauthenticated gateway
+that spawns the CLI on every cycle opens dozens of browser windows and leaves
+the dashboard unusable.
+
+These tests pin the guard: both handlers consult the prerequisite readiness latch
+BEFORE resolving or spawning the binary, and return the shared 503 instead.
+
+The signed-out cases drive the REAL ``reject_if_kiro_unverified`` (never a
+stubbed guard) and pin binary resolution to a fixed path, so a deleted or
+relocated gate must reach ``create_subprocess_exec`` — on a CI runner with no
+kiro-cli installed as much as on a developer machine that has one.
+
+Ordinary sends are UNGATED — the ACP attempt reports auth failures itself and
+they mutate nothing up front. These two sites (and the destructive reruns, which
+rewrite persisted history before their turn) keep failing closed because neither
+can use the ACP attempt as its authority.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import dataclasses
+import json
+from types import SimpleNamespace
+from typing import cast
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+from chat_test_helpers import _make_ready_kiro_prerequisite
+
+from kiro_crew.dashboard import kiro_readiness
+from kiro_crew.dashboard.handlers import agents, sessions
+from kiro_crew.kiro_prerequisite import KiroPrerequisiteService, PrerequisiteStatus
+
+_RESOLVE_TARGET = "kiro_crew.acp.client._resolve_kiro_bin_for_spawn"
+_FAKE_KIRO_BIN = "/usr/bin/kiro-cli"
+
+
+@pytest.fixture(autouse=True)
+def _reset_refusal_warning():
+    """Clear the gate's warn-once flag around every test in this module.
+
+    ``_refusal_warned_at`` is module state by necessity — the fail-closed path has no
+    service object to hang it on — so without this reset every test after the first
+    would see its refusal demoted to DEBUG, and the WARNING assertions would be
+    passing or failing on test ORDER rather than on behaviour.
+    """
+    kiro_readiness._clear_refusal_warning()
+    yield
+    kiro_readiness._clear_refusal_warning()
+
+
+@pytest.fixture(autouse=True)
+def _fresh_catalog_cache(_floor_monkeypatch: pytest.MonkeyPatch):
+    """Start every test with no cached catalog.
+
+    A cached catalog is served without the gate, so a list left warm by an
+    earlier test would turn a signed-out 503 here into a 200 on test ORDER.
+    """
+    _floor_monkeypatch.setattr(agents, "_catalog_cache", agents._CatalogCache())
+
+
+class _SignedOutKiroPrerequisiteService(KiroPrerequisiteService):
+    """Not-ready latch: the guard's ``isinstance`` check must still accept it."""
+
+    # Built without ``__init__``, so the refusal's latch read needs a status here.
+    _status = PrerequisiteStatus(platform="Linux")
+
+    async def session_ready(self) -> bool:
+        return False
+
+    # The gate authorizes on a fresh probe (`verified_ready`), never the bare
+    # latch — a stale ready=True would otherwise green-light a signed-out spawn.
+    async def verified_ready(self, *, max_age_secs: float) -> bool:
+        del max_age_secs
+        return False
+
+
+def _make_signed_out_kiro_prerequisite() -> KiroPrerequisiteService:
+    """Return a filesystem-free NOT-ready prerequisite service."""
+
+    return object.__new__(_SignedOutKiroPrerequisiteService)
+
+
+def _request(service: KiroPrerequisiteService) -> MagicMock:
+    """A request whose app carries *service* as the prerequisite latch.
+
+    ``reject_if_kiro_unverified`` reads ``app["kiro_prerequisite_service"]`` and
+    falls back to ``app["state"].kiro_prerequisite_service``; both are wired so
+    the real guard runs either way. ``state`` also carries the background-task
+    set ``api_sessions_usage`` uses, so a removed gate reaches the scheduling
+    line instead of dying on an unrelated AttributeError.
+    """
+
+    tasks: set[object] = set()
+    app: dict[str, object] = {
+        "kiro_prerequisite_service": service,
+        "state": SimpleNamespace(
+            kiro_prerequisite_service=service,
+            _background_tasks=tasks,
+        ),
+    }
+    request = MagicMock()
+    request.app = app
+    return request
+
+
+@pytest.mark.asyncio
+async def test_api_models_does_not_spawn_while_signed_out() -> None:
+    request = _request(_make_signed_out_kiro_prerequisite())
+    with patch(_RESOLVE_TARGET, AsyncMock(return_value=_FAKE_KIRO_BIN)) as resolve:
+        with patch("asyncio.create_subprocess_exec", AsyncMock()) as spawn:
+            resp = await agents.api_models(request)
+
+    # The gate must run BEFORE resolution, not merely before the spawn.
+    resolve.assert_not_called()
+    # ``create_task``-style call sites make the coroutine without awaiting it,
+    # so only ``assert_not_called`` proves the spawn was never reached.
+    spawn.assert_not_called()
+    assert resp.status == 503
+    assert json.loads(resp.body)["code"] == "kiro_prerequisite_required"
+
+
+@pytest.mark.asyncio
+async def test_api_sessions_usage_does_not_schedule_fetch_while_signed_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Force the refresh branch live so a removed gate really schedules a fetch.
+    monkeypatch.setattr(sessions, "_usage_cache_ts", 0.0)
+    request = _request(_make_signed_out_kiro_prerequisite())
+    with patch.object(sessions, "_fetch_usage_bg", AsyncMock()) as fetch:
+        resp = await sessions.api_sessions_usage(request)
+
+    # The handler schedules the fetch with ``asyncio.create_task``, so the
+    # coroutine is CALLED but never AWAITED — ``assert_not_awaited`` would pass
+    # even if the gate were moved below the scheduling line.
+    fetch.assert_not_called()
+    assert resp.status == 503
+    assert json.loads(resp.body)["code"] == "kiro_prerequisite_required"
+
+
+@pytest.mark.asyncio
+async def test_api_models_still_reaches_spawn_path_when_ready() -> None:
+    """The gate must be a pure add — a ready gateway keeps its existing behavior."""
+    request = _request(_make_ready_kiro_prerequisite())
+    with patch(_RESOLVE_TARGET, AsyncMock(return_value="")) as resolve:
+        resp = await agents.api_models(request)
+
+    # The handler got past the gate and into the pre-existing degraded branch:
+    # binary unresolved, whose 503 body differs from the gate's.
+    resolve.assert_awaited_once()
+    assert resp.status == 503
+    assert json.loads(resp.body) == {
+        "error": "kiro binary not resolved",
+        "code": "model_list_unavailable",
+    }
+
+
+@pytest.mark.asyncio
+async def test_refused_call_is_visible_in_the_log(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The gate must SAY it refused.
+
+    Every post-spawn failure branch in ``api_models`` logs a WARNING, so a reader
+    who greps the log for that endpoint and finds nothing concludes the endpoint is
+    healthy. A silent refusal inverts that conclusion, because an absent log line
+    gets read as evidence.
+    """
+    request = _request(_make_signed_out_kiro_prerequisite())
+    request.path = "/api/models"
+
+    with caplog.at_level("WARNING", logger="kiro_crew.dashboard.kiro_readiness"):
+        with patch(_RESOLVE_TARGET, AsyncMock(return_value=_FAKE_KIRO_BIN)):
+            resp = await agents.api_models(request)
+
+    assert resp.status == 503
+    refusals = [
+        r
+        for r in caplog.records
+        if r.name == "kiro_crew.dashboard.kiro_readiness" and r.levelname == "WARNING"
+    ]
+    assert refusals, "the readiness gate refused a call without logging anything"
+    message = refusals[0].getMessage()
+    # The endpoint has to be IN the line: a grep for the path is how the reader
+    # arrives, and a line that omits it does not answer the question they asked.
+    assert "/api/models" in message
+    assert "kiro_prerequisite_required" in message
+
+
+@pytest.mark.asyncio
+async def test_the_refusal_log_cannot_break_the_fail_closed_path() -> None:
+    """The diagnostic must not add a failure mode to the branch it reports on.
+
+    ``reject_if_kiro_unverified`` is the fail-CLOSED gate, so anything on that
+    branch has to survive a caller that is only request-LIKE — which is what
+    ``test_missing_route_prerequisite_wiring_fails_closed`` exercises. Reading
+    ``.path`` directly raises for such a caller and converts a correct 503 into a
+    500. A silent refusal is the defect this logging removes; an exception here is
+    worse than the silence it replaced.
+    """
+    request = SimpleNamespace(app={"kiro_prerequisite_service": None})
+
+    resp = await kiro_readiness.reject_if_kiro_unverified(request)  # type: ignore[arg-type]
+
+    assert resp is not None
+    assert resp.status == 503
+    assert json.loads(resp.body)["code"] == "kiro_prerequisite_required"
+
+
+@pytest.mark.asyncio
+async def test_a_non_str_path_does_not_reach_the_formatter() -> None:
+    """A request-like double whose ``path`` is not a string must still 503.
+
+    Distinct from the case above: there the attribute is ABSENT, here it exists
+    and is the wrong type, which a plain regex substitution would raise on. Both
+    have to degrade, because both are on the fail-closed branch.
+    """
+    request = _request(_make_signed_out_kiro_prerequisite())  # MagicMock: .path is a mock
+
+    with patch(_RESOLVE_TARGET, AsyncMock(return_value=_FAKE_KIRO_BIN)):
+        resp = await agents.api_models(request)
+
+    assert resp.status == 503
+    assert kiro_readiness._log_safe_path(request) == "<unknown path>"
+
+
+@pytest.mark.asyncio
+async def test_a_newline_in_the_path_cannot_forge_a_log_line(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A decoded newline must not become a second ``gateway.log`` line.
+
+    ``Request.path`` is URL-decoded, so ``%0A`` in a ``{slot}`` segment arrives as
+    a real newline and the route pattern (which excludes only ``/{}``) matches it.
+    Logged verbatim, a caller could append whatever line they liked to the log —
+    forging the very evidence this logging exists to provide.
+
+    Asserted on the RECORD THE GATE ACTUALLY EMITS, not on the helper in
+    isolation: a helper-only test stays green if someone drops the sanitising
+    call from the ``logger.warning`` below, which is the whole regression worth
+    catching.
+    """
+    forged = "/api/chat/slots/a\nWARNING forged line/regenerate"
+    request = _request(_make_signed_out_kiro_prerequisite())
+    request.path = forged
+
+    with caplog.at_level("WARNING", logger="kiro_crew.dashboard.kiro_readiness"):
+        with patch(_RESOLVE_TARGET, AsyncMock(return_value=_FAKE_KIRO_BIN)):
+            resp = await agents.api_models(request)
+
+    assert resp.status == 503
+    records = [r for r in caplog.records if r.name == "kiro_crew.dashboard.kiro_readiness"]
+    assert records, "the gate refused without logging anything"
+    message = records[0].getMessage()
+    # ``splitlines`` is the property that matters, not an absence of two literals:
+    # it is what a Python consumer of the log actually re-splits on, and it covers
+    # every boundary character at once.
+    assert len(message.splitlines()) == 1
+    # Neutralised, not discarded: a caller who sent a control byte is precisely
+    # what the reader of the log wants to know about. ``repr`` spells LF with the
+    # short escape, so this is ``\\n`` rather than ``\\x0a``.
+    assert "\\n" in message
+    assert "forged line" in message
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("encoded", "escaped"),
+    [("\x85", "\\x85"), ("\u2028", "\\u2028"), ("\u2029", "\\u2029")],
+    ids=["U+0085-NEL", "U+2028-LS", "U+2029-PS"],
+)
+async def test_unicode_line_separators_cannot_forge_a_log_line(
+    caplog: pytest.LogCaptureFixture,
+    encoded: str,
+    escaped: str,
+) -> None:
+    """C0 is not the whole boundary set — ``splitlines()`` is wider than C0.
+
+    ``%C2%85`` / ``%E2%80%A8`` / ``%E2%80%A9`` decode to U+0085 / U+2028 / U+2029.
+    None of them is a ``0a`` byte, so none forges a physical line in the log FILE;
+    all three ARE ``str.splitlines()`` boundaries, so a Python consumer that
+    re-splits the log does see a forged line. A guard scoped to C0+DEL let every
+    one of them through.
+    """
+    request = _request(_make_signed_out_kiro_prerequisite())
+    request.path = f"/api/chat/slots/a{encoded}WARNING forged/regenerate"
+
+    with caplog.at_level("WARNING", logger="kiro_crew.dashboard.kiro_readiness"):
+        with patch(_RESOLVE_TARGET, AsyncMock(return_value=_FAKE_KIRO_BIN)):
+            resp = await agents.api_models(request)
+
+    assert resp.status == 503
+    records = [r for r in caplog.records if r.name == "kiro_crew.dashboard.kiro_readiness"]
+    assert records, "the gate refused without logging anything"
+    message = records[0].getMessage()
+    assert len(message.splitlines()) == 1
+    assert escaped in message
+
+
+def test_every_control_byte_is_neutralised_not_just_crlf() -> None:
+    """The whole C0+DEL class, not the two bytes that happen to split a line.
+
+    An ESC byte reaching a terminal that is tailing the log is the same defect
+    wearing different clothes.
+    """
+    rendered = kiro_readiness._log_safe_path(SimpleNamespace(path="/api/a\x1b[2Kb\x00c\x7fd"))
+
+    assert rendered == "'/api/a\\x1b[2Kb\\x00c\\x7fd'"
+
+
+def test_invisible_formatting_characters_are_neutralised() -> None:
+    """``Cf`` splits no line and still forges evidence.
+
+    U+202E RIGHT-TO-LEFT OVERRIDE reorders what a human READS in a rendered log
+    view, and U+200B hides a boundary that is not there. Neither is a
+    ``splitlines()`` boundary, so a guard built only from line-breaking characters
+    would miss both — which is why the class is the ``Cf`` CATEGORY rather than a
+    list of the characters someone happened to think of.
+    """
+    rendered = kiro_readiness._log_safe_path(SimpleNamespace(path="/api/a\u202eb\u200bc"))
+
+    assert rendered == "'/api/a\\u202eb\\u200bc'"
+
+
+def test_categories_a_hand_written_set_would_miss() -> None:
+    """The reason this delegates to ``repr`` instead of listing categories.
+
+    A set of ``Cc``/``Cf``/``Zl``/``Zp`` — the categories that come to mind — lets all
+    of these through, and every one is reachable through ``yarl``'s percent-decoding:
+    ``%C2%A0`` and ``%E3%80%80`` are ``Zs``, ``%EE%80%80`` is ``Co``, ``%CD%B8`` is
+    ``Cn``. ``str.isprintable()`` rejects the lot, so ``repr`` covers them without
+    anyone having to remember to extend a list.
+    """
+    rendered = kiro_readiness._log_safe_path(
+        SimpleNamespace(path="/api/a\u00a0b\u3000c\ue000d\u0378e")
+    )
+
+    assert rendered == "'/api/a\\xa0b\\u3000c\\ue000d\\u0378e'"
+
+
+def test_a_lone_surrogate_still_produces_an_encodable_line() -> None:
+    """Robustness, not a live vector: ``yarl`` does not decode ``%ED%A0%80``.
+
+    Worth pinning anyway because of the failure mode it guards. A surrogate emitted
+    verbatim is a string a UTF-8 log handler cannot encode, and ``logging`` swallows
+    handler errors, so the line vanishes silently. A function whose whole purpose is
+    "the log must not lie about what happened" must not be able to delete the
+    record.
+    """
+    rendered = kiro_readiness._log_safe_path(SimpleNamespace(path="/api/a\ud800b"))
+
+    assert rendered.encode("utf-8")
+    assert "\\ud800" in rendered
+
+
+def test_visible_non_ascii_is_left_alone() -> None:
+    """Over-escaping guard: the goal is an unforgeable path, not an ASCII one.
+
+    Folding every non-ASCII byte would be the easy way to satisfy the finding and
+    would make a legitimate path unreadable for exactly the operators who most need
+    to read it.
+    """
+    rendered = kiro_readiness._log_safe_path(SimpleNamespace(path="/api/文档/café"))
+
+    assert rendered == "'/api/文档/café'"
+
+
+@pytest.mark.asyncio
+async def test_a_polled_outage_warns_once_not_once_per_request() -> None:
+    """The visible line must not become the thing that destroys the log.
+
+    A signed-out gateway with an open dashboard refuses ``/api/models`` every 8s and
+    ``/api/sessions/usage`` every 30s, and BOTH refuse at this gate — the sibling
+    branches that log in ``api_models`` sit below it and are never reached in that
+    state. Left per-request that is ~570 lines/hour into a ``deque(maxlen=1000)``,
+    which churns the whole ring every ~1.8 hours and evicts the diagnostics an
+    operator opened the log to read.
+    """
+    request = _request(_make_signed_out_kiro_prerequisite())
+    request.path = "/api/models"
+
+    with patch(_RESOLVE_TARGET, AsyncMock(return_value=_FAKE_KIRO_BIN)):
+        with patch.object(kiro_readiness.logger, "warning") as warn:
+            with patch.object(kiro_readiness.logger, "debug") as dbg:
+                for _ in range(25):
+                    resp = await agents.api_models(request)
+
+    assert resp.status == 503
+    # Still visible: silence was the original defect and must not come back.
+    assert warn.call_count == 1
+    # And accounted for, not dropped — a reader who turns up DEBUG sees the rest.
+    assert dbg.call_count == 24
+
+
+@pytest.mark.asyncio
+async def test_a_later_outage_warns_again_after_recovery() -> None:
+    """One WARNING per OUTAGE, not one per process lifetime.
+
+    Without the clear-on-authorize half, the first outage after boot consumes the
+    only WARNING the process ever emits and every later outage is silent — the
+    original defect back in a subtler form. This is why
+    ``mcp_discovery._clear_unresolvable`` exists next to its warn-once.
+    """
+    signed_out = _request(_make_signed_out_kiro_prerequisite())
+    signed_out.path = "/api/models"
+    ready = _request(_make_ready_kiro_prerequisite())
+    ready.path = "/api/models"
+
+    with patch(_RESOLVE_TARGET, AsyncMock(return_value=_FAKE_KIRO_BIN)):
+        with patch.object(kiro_readiness.logger, "warning") as warn:
+            await agents.api_models(signed_out)  # outage 1 -> WARNING
+            await agents.api_models(signed_out)  # same outage -> DEBUG
+            assert warn.call_count == 1
+            assert kiro_readiness._refusal_warned_at is not None
+
+            await kiro_readiness.reject_if_kiro_unverified(ready)  # recovered
+            # The observed recovery forgot the reported outage.
+            assert kiro_readiness._refusal_warned_at is None
+            await agents.api_models(signed_out)  # outage 2 -> WARNING again
+
+    assert warn.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_an_unobserved_recovery_does_not_silence_the_next_outage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The clear-on-authorize half is not sufficient on its own.
+
+    Nothing calls the authorized branch on a gateway whose dashboard is closed: the
+    pollers have stopped, so a recovery that happens in that window is never OBSERVED
+    and the flag stays set. Without a floor the next outage logs only DEBUG — the
+    subtler silence the docstring names and the whole point of the mechanism. So the
+    guarantee cannot depend on seeing the recovery: after
+    ``_REFUSAL_REWARN_SECS`` an ongoing or fresh refusal speaks up regardless.
+    """
+    fake_now = [1000.0]
+    monkeypatch.setattr(kiro_readiness, "_clock", lambda: fake_now[0])
+    request = _request(_make_signed_out_kiro_prerequisite())
+    request.path = "/api/models"
+
+    with patch(_RESOLVE_TARGET, AsyncMock(return_value=_FAKE_KIRO_BIN)):
+        with patch.object(kiro_readiness.logger, "warning") as warn:
+            await agents.api_models(request)  # outage 1 -> WARNING
+            assert warn.call_count == 1
+
+            # Still inside the floor: quiet, so the ring is not churned.
+            fake_now[0] += kiro_readiness._REFUSAL_REWARN_SECS - 1
+            await agents.api_models(request)
+            assert warn.call_count == 1
+
+            # Floor elapsed, and NO authorized call ever happened in between.
+            fake_now[0] += 2
+            await agents.api_models(request)
+            # The refusal past the floor was reported anew, at its own time.
+            assert kiro_readiness._refusal_warned_at == fake_now[0]
+
+    assert warn.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_a_ready_gateway_logs_no_refusal() -> None:
+    """No line on the authorized path: the log must stay a signal, not a heartbeat."""
+    request = _request(_make_ready_kiro_prerequisite())
+    request.path = "/api/models"
+
+    with patch(_RESOLVE_TARGET, AsyncMock(return_value="")):
+        with patch.object(kiro_readiness.logger, "warning") as warn:
+            await agents.api_models(request)
+
+    warn.assert_not_called()
+
+
+# ── readiness max-age: polled reads vs destructive reruns ─────────────────
+#
+# ``/api/sessions/usage`` is polled every 30 s and reads a max-age longer than
+# that, so a healthy latch authorizes many polls without an inline ``whoami``
+# probe. Everything else (destructive reruns, ``/v1/chat/completions``, the
+# degraded-only ``/api/models`` poll) keeps the tight 30 s max-age.
+
+
+class _Clock:
+    """A monotonic clock a test advances by hand."""
+
+    def __init__(self) -> None:
+        self._now = 1000.0
+
+    def __call__(self) -> float:
+        return self._now
+
+    def advance(self, seconds: float) -> None:
+        self._now += seconds
+
+
+def _probed_ready_service(clock: _Clock) -> KiroPrerequisiteService:
+    """A ready service whose latch was stamped at the clock's current time."""
+
+    service = KiroPrerequisiteService(assume_ready=False, clock=clock, home=None)
+    service._status = PrerequisiteStatus(
+        platform="linux",
+        installed=True,
+        authenticated=True,
+        ready=True,
+        initial_setup_complete=True,
+    )
+    service._has_probed = True
+    service._last_probe_at = clock()
+    return service
+
+
+@pytest.fixture
+def _empty_catalog_cache(_floor_monkeypatch: pytest.MonkeyPatch):
+    # ``api_models`` serves a warm module-level catalog before it reaches the
+    # unresolved-binary 503; a fresh cache keeps the outcome independent of order.
+    _floor_monkeypatch.setattr(agents, "_catalog_cache", agents._CatalogCache())
+
+
+@pytest.mark.asyncio
+async def test_api_models_keeps_the_tight_bound_and_reprobes_a_stale_latch(
+    _empty_catalog_cache: None,
+) -> None:
+    """``/api/models`` has no spawn cooldown, so a latch a minute old must re-probe
+    before it can authorize the browser-opening spawn."""
+    clock = _Clock()
+    service = _probed_ready_service(clock)
+    # Older than the 30 s bound /api/models reads.
+    clock.advance(60.0)
+
+    with patch.object(service, "_probe", AsyncMock()) as probe:
+        with patch(
+            "kiro_crew.acp.client._resolve_kiro_bin_for_spawn",
+            AsyncMock(return_value=""),
+        ):
+            resp = await agents.api_models(_request(service))
+
+    probe.assert_awaited_once()
+    # The stubbed probe left the latch ready=True, so the gate authorizes and
+    # falls through to the degraded branch (binary unresolved).
+    assert resp.status == 503
+    assert json.loads(cast(bytes, resp.body)) == {
+        "error": "kiro binary not resolved",
+        "code": "model_list_unavailable",
+    }
+
+
+@pytest.mark.asyncio
+async def test_api_sessions_usage_does_not_reprobe_within_the_poll_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A latch a minute old still authorizes ``/api/sessions/usage`` with no probe."""
+    clock = _Clock()
+    service = _probed_ready_service(clock)
+    clock.advance(60.0)
+    monkeypatch.setattr(sessions, "_usage_cache_ts", 0.0)
+
+    with patch.object(service, "_probe", AsyncMock()) as probe:
+        with patch.object(sessions, "_fetch_usage_bg", AsyncMock()):
+            resp = await sessions.api_sessions_usage(_request(service))
+
+    probe.assert_not_awaited()
+    assert resp.status == 200
+
+
+@pytest.mark.asyncio
+async def test_destructive_rerun_gate_still_reprobes_a_stale_latch() -> None:
+    """The 30 s max-age survives for the paths that rewrite persisted history."""
+    clock = _Clock()
+    service = _probed_ready_service(clock)
+    clock.advance(60.0)
+
+    with patch.object(service, "_probe", AsyncMock()) as probe:
+        blocked = await kiro_readiness.reject_if_kiro_unverified(_request(service))
+
+    probe.assert_awaited_once()
+    # The stubbed probe left the latch ready=True, so the gate authorizes.
+    assert blocked is None
+
+
+@pytest.mark.asyncio
+async def test_a_timed_out_probe_is_refused_as_a_timeout_not_a_sign_in_wall() -> None:
+    """A CLI that only answered too slowly may be installed and signed in."""
+    clock = _Clock()
+    service = _probed_ready_service(clock)
+    service._status = PrerequisiteStatus(platform="linux", installed=True, probe_timed_out=True)
+
+    with patch.object(service, "_probe", AsyncMock()) as probe:
+        blocked = await kiro_readiness.reject_if_kiro_unverified(_request(service))
+
+    # The refusal reads the latched verdict; it starts no probe of its own.
+    probe.assert_not_awaited()
+    assert blocked is not None
+    assert blocked.status == 503
+    body = json.loads(cast(bytes, blocked.body))
+    # Not the sign-in code, which the dashboard answers with "run kiro-cli login".
+    assert body["code"] == "kiro_probe_timed_out"
+    assert "timed out" in body["error"]
+
+
+@pytest.mark.asyncio
+async def test_poll_gate_max_age_is_longer_than_the_poll_interval() -> None:
+    """The constant ``/api/sessions/usage`` reads must exceed its 30 s poll cadence."""
+    assert kiro_readiness._POLL_GATE_MAX_AGE_SECS > 30.0
+
+
+_CACHED_ROWS = [{"model_name": "claude-sonnet-4.5", "description": "cached"}]
+
+
+def _warm_catalog(*, age_secs: float) -> None:
+    """Seed the module catalog cache with a list fetched *age_secs* ago."""
+
+    agents._catalog_cache.models = list(_CACHED_ROWS)
+    agents._catalog_cache.fetched_at = agents.time.monotonic() - age_secs
+
+
+@pytest.mark.asyncio
+async def test_api_models_serves_a_fresh_cache_without_the_sign_in_probe() -> None:
+    """A cached list spawns nothing, so it must not pay the 5-spawn re-probe.
+
+    The latch is a minute old, past the 30 s bound: before the fix the gate ran
+    ``_probe`` inline on this call even though the catalog was cached.
+    """
+    clock = _Clock()
+    service = _probed_ready_service(clock)
+    clock.advance(60.0)
+    _warm_catalog(age_secs=0.0)
+
+    with patch.object(service, "_probe", AsyncMock()) as probe:
+        with patch.object(agents, "_entitled_kiro_models", AsyncMock(side_effect=lambda _r, m: m)):
+            with patch.object(agents, "_fetch_kiro_catalog", AsyncMock()) as fetch:
+                resp = await agents.api_models(_request(service))
+
+    probe.assert_not_awaited()
+    fetch.assert_not_called()
+    assert resp.status == 200
+    assert json.loads(cast(bytes, resp.body)) == _CACHED_ROWS
+
+
+@pytest.mark.asyncio
+async def test_api_models_sign_out_found_by_the_refresh_reaches_the_banner() -> None:
+    """An external sign-out with a cached list: refresh is gated, then the 503 returns.
+
+    1. The latch still says ready, so the cached list is served and the stale
+       refresh runs the gate; its probe finds the sign-out and nothing spawns.
+    2. The probe narrowed the latch, so the next call gates inline and answers
+       the ``kiro_prerequisite_required`` 503 the sign-in banner keys on.
+    3. After sign-in, the inline gate's re-probe passes and the list is back.
+    """
+    clock = _Clock()
+    service = _probed_ready_service(clock)
+    ready = service._status
+    clock.advance(60.0)
+    _warm_catalog(age_secs=agents._LIST_MODELS_CATALOG_TTL_SECS + 1.0)
+    request = _request(service)
+
+    def probe_as(status: PrerequisiteStatus) -> AsyncMock:
+        def _probe(*, force: bool = False) -> PrerequisiteStatus:
+            del force
+            service._status = status
+            service._last_probe_at = clock()
+            return status
+
+        return AsyncMock(side_effect=_probe)
+
+    signed_out = dataclasses.replace(ready, authenticated=False, ready=False)
+    with patch.object(agents, "_entitled_kiro_models", AsyncMock(side_effect=lambda _r, m: m)):
+        with patch.object(agents, "_fetch_kiro_catalog", AsyncMock()) as fetch:
+            with patch.object(service, "_probe", probe_as(signed_out)):
+                first = await agents.api_models(request)
+                task = agents._catalog_cache.task
+                assert task is not None
+                await asyncio.gather(task, return_exceptions=True)
+                second = await agents.api_models(request)
+            clock.advance(31.0)
+            with patch.object(service, "_probe", probe_as(ready)):
+                third = await agents.api_models(request)
+
+    fetch.assert_not_called()
+    assert first.status == 200
+    assert json.loads(cast(bytes, first.body)) == _CACHED_ROWS
+    # Nothing spawned, so no backoff entry holds back the next refresh.
+    assert agents._catalog_cache.recent_failure() is None
+    assert second.status == 503
+    assert json.loads(cast(bytes, second.body))["code"] == "kiro_prerequisite_required"
+    assert third.status == 200
+    assert json.loads(cast(bytes, third.body)) == _CACHED_ROWS
+
+
+@pytest.mark.asyncio
+async def test_api_models_stale_cache_refresh_spawns_when_signed_in() -> None:
+    """A verified gateway's stale-cache refresh still reaches the spawn."""
+    _warm_catalog(age_secs=agents._LIST_MODELS_CATALOG_TTL_SECS + 1.0)
+    request = _request(_make_ready_kiro_prerequisite())
+    fresh = [{"model_name": "claude-opus-4.5", "description": "fresh"}]
+
+    with patch.object(agents, "_entitled_kiro_models", AsyncMock(side_effect=lambda _r, m: m)):
+        with patch.object(agents, "_fetch_kiro_catalog", AsyncMock(return_value=fresh)) as fetch:
+            resp = await agents.api_models(request)
+            task = agents._catalog_cache.task
+            assert task is not None
+            await task
+
+    fetch.assert_awaited_once()
+    # The reply was the cached list; the refresh landed behind it.
+    assert json.loads(cast(bytes, resp.body)) == _CACHED_ROWS
+    assert agents._catalog_cache.models == fresh

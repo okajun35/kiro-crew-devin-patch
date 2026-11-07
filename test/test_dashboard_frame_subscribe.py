@@ -1,0 +1,982 @@
+"""``window.kirocrew.subscribe``: the frame contract's third way a value reaches a page.
+
+The two that already exist are a text binding and a frozen snapshot, and neither lets a
+page HEAR a change: a binding is filled by the host, and a snapshot is a value read once.
+A page that draws a tree, a chart or a scene has to redraw when one field moves, and the
+only signal it had was the generic :data:`~kiro_crew.dashboard_frame.PAGE_EVENT` -- which
+says "something landed" and leaves the page to diff the whole read itself.
+
+THE BOOTSTRAP IS EXECUTED HERE, not pattern-matched. Every other test of this module
+asserts on the JS as a string, which is the right check for a containment rule (``is
+textContent used, never innerHTML``) and the wrong one for a behaviour: "fires on first
+load and on every push" is a claim about what runs, and a string holding the word
+``subscribe`` is satisfied by code that never calls back. So the composed document's
+scripts are run under a small DOM shim in Node, and
+:func:`test_the_harness_can_see_a_subscriber_that_never_fires` breaks the bootstrap on
+purpose and requires the probe to report the silence -- a harness that reports an absence
+has to prove first that it can see one.
+"""
+
+from __future__ import annotations
+
+import json
+import shutil
+import subprocess
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from kiro_crew import dashboard_frame
+
+#: The DOM the bootstrap actually touches, and nothing else.
+#:
+#: Written out rather than taken from a headless browser because the surface under test
+#: is four calls wide -- one element lookup, one query, one event registration and one
+#: dispatch -- and a real engine would make the failure of this test a question about the
+#: engine. The shim is deliberately dumb: it records, it does not interpret.
+_SHIM = r"""
+const listeners = {};
+const dispatched = [];
+globalThis.addEventListener = (type, fn) => {
+  (listeners[type] = listeners[type] || []).push(fn);
+};
+globalThis.parent = { postMessage() {} };
+globalThis.Event = class { constructor(type) { this.type = type; } };
+const nodes = [];
+globalThis.document = {
+  readyState: 'complete',
+  documentElement: { setAttribute() {}, lang: '' },
+  getElementById: (id) => (id === 'kirocrew-dashboard-data' ? { textContent: ISLAND } : null),
+  querySelectorAll: () => nodes,
+};
+globalThis.window = globalThis;
+globalThis.dispatchEvent = (event) => {
+  dispatched.push(event.type);
+  for (const fn of listeners[event.type] || []) fn(event);
+  return true;
+};
+globalThis.__push = (read) => {
+  for (const fn of listeners.message || []) {
+    fn({ source: globalThis.parent, data: { type: DATA_TYPE, read } });
+  }
+};
+globalThis.__calls = [];
+"""
+
+
+def _island(read: dict[str, Any]) -> str:
+    """The data island's text, as the composed document carries it."""
+    return json.dumps(read, ensure_ascii=False)
+
+
+def _run(bootstrap: str, read: dict[str, Any], page_js: str) -> list[Any]:
+    """Run *bootstrap* then *page_js* over *read*; return what the page recorded.
+
+    *page_js* is the page's own inline script -- the half a template author writes --
+    and it pushes onto ``__calls``, so the assertion is about what the PAGE observed
+    rather than about the bootstrap's internals.
+    """
+    node = shutil.which("node")
+    if node is None:  # pragma: no cover - CI builds the website, so node is present
+        pytest.skip("node is needed to execute the frame bootstrap")
+    program = "\n".join(
+        (
+            f"const ISLAND = {json.dumps(_island(read))};",
+            f"const DATA_TYPE = {json.dumps(dashboard_frame.DATA_MESSAGE_TYPE)};",
+            _SHIM,
+            bootstrap,
+            page_js,
+            "console.log(JSON.stringify(globalThis.__calls));",
+        )
+    )
+    # On stdin, not `-e`: Windows caps a command line at 32767 characters.
+    done = subprocess.run(
+        [node, "--input-type=module"],
+        input=program,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=60,
+    )
+    assert done.returncode == 0, done.stderr
+    return list(json.loads(done.stdout.strip().splitlines()[-1]))
+
+
+def _read(**over: Any) -> dict[str, Any]:
+    fields = over.pop("fields", {"boards": 2, "owner": "atlas"})
+    version = over.pop("version", 0)
+    generation = over.pop("generation", "")
+    payload = dashboard_frame.read_payload(fields, **over)
+    # The host stamps every read it sends, so a harness that omitted it would test a
+    # document the product never composes. The generation is stamped beside the version
+    # for the same reason: it is what says whose counter that number came from.
+    payload["version"] = version
+    if generation:
+        payload["generation"] = generation
+    return payload
+
+
+class TestSubscribeOnFirstLoad:
+    def test_a_subscriber_is_called_with_the_value_the_island_carries(self) -> None:
+        """FIRST LOAD, before any push.
+
+        The inline script runs during parse, before any binding is filled, so a
+        subscriber fired only on a push would leave the first paint empty.
+        """
+        calls = _run(
+            dashboard_frame._BOOTSTRAP_JS,
+            _read(),
+            "window.kirocrew.subscribe('boards', (v) => __calls.push(v));",
+        )
+        assert calls == [2]
+
+    def test_a_field_the_read_does_not_carry_fires_nothing(self) -> None:
+        """An unresolved field is ABSENT, and absent is not a value.
+
+        Calling back with ``undefined`` would hand the page a number to draw for a fold
+        whose path did not resolve, and a page drawing it would show a blank where the
+        host's own band says the data is older -- two different statements about one
+        cell. The subscriber stays armed and fires when a push carries the field.
+        """
+        calls = _run(
+            dashboard_frame._BOOTSTRAP_JS,
+            _read(fields={"owner": "atlas"}, missing=["boards"]),
+            "window.kirocrew.subscribe('boards', (v) => __calls.push(v));",
+        )
+        assert calls == []
+
+    def test_subscribe_survives_the_refill_that_replaces_the_global(self) -> None:
+        """The global is replaced wholesale on every push, so ``subscribe`` has to
+        travel with it -- a page holding ``window.kirocrew.subscribe`` from first load
+        and calling it after a push must not meet ``undefined``."""
+        calls = _run(
+            dashboard_frame._BOOTSTRAP_JS,
+            _read(),
+            "__push({ fields: { boards: 9 }, agentic: [], seq: 2, stale: false, missing: [] });"
+            "__calls.push(typeof window.kirocrew.subscribe);",
+        )
+        assert calls == ["function"]
+
+
+class TestSubscribeOnEveryPush:
+    def test_a_push_carrying_the_field_calls_back_with_the_new_value(self) -> None:
+        """THE POINT OF THE WHOLE CONTRACT. The host pushes what moved; the page is told
+        which field moved and to what, rather than being handed a new snapshot and left
+        to diff it."""
+        calls = _run(
+            dashboard_frame._BOOTSTRAP_JS,
+            _read(),
+            "window.kirocrew.subscribe('boards', (v) => __calls.push(v));"
+            "__push({ fields: { boards: 3 }, agentic: [], seq: 2, stale: false, missing: [] });"
+            "__push({ fields: { boards: 4 }, agentic: [], seq: 3, stale: false, missing: [] });",
+        )
+        assert calls == [2, 3, 4]
+
+    def test_a_push_that_does_not_carry_the_field_is_silent_for_it(self) -> None:
+        """A subscriber is per FIELD. Firing every subscriber on every push would make
+        the callback another spelling of the generic page event, and a page redrawing a
+        3D scene on a field it does not read is the cost a reader pays for that."""
+        calls = _run(
+            dashboard_frame._BOOTSTRAP_JS,
+            _read(),
+            "window.kirocrew.subscribe('boards', (v) => __calls.push(v));"
+            "__push({ fields: { owner: 'nyx' }, agentic: [], seq: 2, stale: false, missing: [] });",
+        )
+        assert calls == [2]
+
+    def test_one_subscribers_throw_does_not_cost_the_others(self) -> None:
+        """Two blocks on one page are two authors' work on a good day and one author's
+        on a bad one. A throw in the first must not leave the second holding the value
+        from before the push, because that page then shows two fields of different ages
+        with nothing saying so."""
+        calls = _run(
+            dashboard_frame._BOOTSTRAP_JS,
+            _read(),
+            "window.kirocrew.subscribe('boards', () => { throw new Error('x'); });"
+            "window.kirocrew.subscribe('boards', (v) => __calls.push(v));"
+            "__push({ fields: { boards: 7 }, agentic: [], seq: 2, stale: false, missing: [] });",
+        )
+        assert calls == [2, 7]
+
+    def test_unsubscribing_stops_the_callbacks(self) -> None:
+        """``subscribe`` returns its own disposer, so a block that is torn down takes
+        its callback with it rather than drawing into a node that is gone."""
+        calls = _run(
+            dashboard_frame._BOOTSTRAP_JS,
+            _read(),
+            "const off = window.kirocrew.subscribe('boards', (v) => __calls.push(v));"
+            "off();"
+            "__push({ fields: { boards: 5 }, agentic: [], seq: 2, stale: false, missing: [] });",
+        )
+        assert calls == [2]
+
+    def test_a_push_from_another_frame_calls_nothing_back(self) -> None:
+        """The sender check the refill already applies, asserted through the new path.
+
+        Every frame the dashboard embeds runs with ``allow-scripts``, so a sibling can
+        reach ``parent.frames[i]`` and post here. A subscriber is a page's most trusted
+        input -- it is what the page draws from -- so a value arriving from anything but
+        the window that minted the page must not reach one.
+        """
+        calls = _run(
+            dashboard_frame._BOOTSTRAP_JS,
+            _read(),
+            "window.kirocrew.subscribe('boards', (v) => __calls.push(v));"
+            "for (const fn of listeners.message || []) {"
+            "  fn({ source: { other: true },"
+            f"       data: {{ type: {json.dumps(dashboard_frame.DATA_MESSAGE_TYPE)},"
+            "         read: { fields: { boards: 66 }, agentic: [], seq: 9,"
+            "                 stale: false, missing: [] } } });"
+            "}",
+        )
+        assert calls == [2]
+
+
+class TestTheBindingsStayTextOnly:
+    def test_a_subscribed_value_is_never_written_as_markup(self) -> None:
+        """The host still writes a subscribed value only as a text node.
+
+        The bootstrap carries no ``innerHTML``, ``insertAdjacentHTML`` or ``outerHTML``,
+        in the fill path or the delivery path.
+        """
+        js = dashboard_frame._BOOTSTRAP_JS
+        assert "textContent = text(" in js, "the host no longer fills bindings as text"
+        for sink in ("innerHTML", "outerHTML", "insertAdjacentHTML", "document.write"):
+            assert sink not in js, f"the bootstrap reaches {sink}, so a value can become markup"
+
+    def test_a_value_holding_markup_reaches_a_subscriber_as_that_string(self) -> None:
+        """A fold value holds whatever the log recorded, including an issue title with a
+        tag in it. The callback gets the STRING -- not a parsed node, and not an escaped
+        rendering the page would have to undo."""
+        calls = _run(
+            dashboard_frame._BOOTSTRAP_JS,
+            _read(fields={"boards": "<img src=x onerror=alert(1)>"}),
+            "window.kirocrew.subscribe('boards', (v) => __calls.push(v));",
+        )
+        assert calls == ["<img src=x onerror=alert(1)>"]
+
+
+def test_the_harness_can_see_a_subscriber_that_never_fires() -> None:
+    """THE POSITIVE CONTROL for every ``assert calls == []`` above.
+
+    The bootstrap is mutated so delivery is dropped, and this test requires the probe to
+    come back empty. Without it, a shim that silently failed to register the page script
+    at all would make every "fires" test pass vacuously and every "is silent" test pass
+    for the wrong reason -- and the suite would report a contract nothing implements.
+    """
+    broken = dashboard_frame._BOOTSTRAP_JS.replace("entry.cb(", "(function () {})(")
+    assert broken != dashboard_frame._BOOTSTRAP_JS, (
+        "the mutation matched nothing, so this control proves nothing: the delivery call "
+        "has been renamed and this test has to follow it"
+    )
+    calls = _run(
+        broken,
+        _read(),
+        "window.kirocrew.subscribe('boards', (v) => __calls.push(v));"
+        "__push({ fields: { boards: 3 }, agentic: [], seq: 2, stale: false, missing: [] });",
+    )
+    assert calls == [], "the harness reports callbacks a bootstrap that cannot deliver made"
+
+
+def test_the_contract_is_documented_where_a_page_author_reads_it() -> None:
+    """A page author reads the module docstring, not the bootstrap. A third way for a
+    value to reach a page that is only discoverable by reading minified-looking JS inside
+    an f-string is a contract nobody composes against."""
+    doc = Path(dashboard_frame.__file__).read_text(encoding="utf-8")
+    head = doc[: doc.index('"""', doc.index('"""') + 3)]
+    assert "subscribe" in head, (
+        "the module docstring lists the ways a value reaches a page and does not mention "
+        "subscribe, so the only description of it is the code"
+    )
+
+
+def _posted(bootstrap: str, read: dict[str, Any], page_js: str) -> list[Any]:
+    """What the page posted to its parent. The refetch request is a message, not a call."""
+    return _run(
+        bootstrap,
+        read,
+        "globalThis.parent.postMessage = (m) => __calls.push(m);\n" + page_js,
+    )
+
+
+class TestAPatchCarriesOnlyWhatMoved:
+    """A push carries only the changed fields, so the frame merges it into the rest.
+
+    Without the merge ``window.kirocrew.fields`` would hold that one field and every
+    other cell would read missing.
+    """
+
+    def test_a_patch_keeps_the_fields_it_does_not_carry(self) -> None:
+        calls = _run(
+            dashboard_frame._BOOTSTRAP_JS,
+            _read(fields={"boards": 2, "owner": "atlas"}),
+            "__push({ patch: true, version: 1, fields: { boards: 5 }, agentic: [],"
+            "         seq: 2, stale: false, missing: [] });"
+            "__calls.push(window.kirocrew.fields.owner, window.kirocrew.fields.boards);",
+        )
+        assert calls == ["atlas", 5]
+
+    def test_a_patch_fires_only_the_subscribers_for_the_fields_it_carries(self) -> None:
+        """A page redrawing a 3D scene on a field it does not read is the cost a reader
+        pays for a callback that fires on every push."""
+        calls = _run(
+            dashboard_frame._BOOTSTRAP_JS,
+            _read(fields={"boards": 2, "owner": "atlas"}),
+            "window.kirocrew.subscribe('owner', (v) => __calls.push(['owner', v]));"
+            "window.kirocrew.subscribe('boards', (v) => __calls.push(['boards', v]));"
+            "__push({ patch: true, version: 1, fields: { boards: 5 }, agentic: [],"
+            "         seq: 2, stale: false, missing: [] });",
+        )
+        assert calls == [["owner", "atlas"], ["boards", 2], ["boards", 5]]
+
+    def test_a_full_read_replaces_rather_than_merges(self) -> None:
+        """A full read is the answer to a refetch, so it IS the whole truth: merging it
+        would keep a field the host has since dropped from the model and leave the page
+        drawing a value nothing will ever push again."""
+        calls = _run(
+            dashboard_frame._BOOTSTRAP_JS,
+            _read(fields={"boards": 2, "owner": "atlas"}),
+            "__push({ version: 7, fields: { boards: 5 }, agentic: [], seq: 2,"
+            "         stale: false, missing: [] });"
+            "__calls.push(window.kirocrew.fields.owner === undefined,"
+            "             window.kirocrew.fields.boards);",
+        )
+        assert calls == [True, 5]
+
+
+class TestAVersionGapRefetches:
+    def test_a_patch_that_skips_a_version_asks_for_a_full_read(self) -> None:
+        """A page that applied a patch it cannot place in order is a page showing one
+        field from after a change and the rest from before it, with nothing saying so.
+        The gap is the only thing that detects a dropped frame, so it asks for the whole
+        read rather than guessing at the hole."""
+        posted = _posted(
+            dashboard_frame._BOOTSTRAP_JS,
+            _read(fields={"boards": 2}),
+            "__push({ patch: true, version: 1, fields: { boards: 3 }, agentic: [],"
+            "         seq: 2, stale: false, missing: [] });"
+            "__push({ patch: true, version: 4, fields: { boards: 9 }, agentic: [],"
+            "         seq: 5, stale: false, missing: [] });",
+        )
+        assert [m["type"] for m in posted] == [dashboard_frame.REFETCH_MESSAGE_TYPE]
+        assert posted[0]["held"] == 1, "the host is not told which version the page holds"
+
+    def test_the_skipped_patch_is_not_applied(self) -> None:
+        """Asking for a refetch and applying the patch anyway would be the same wrong
+        page, reached one round trip later."""
+        calls = _run(
+            dashboard_frame._BOOTSTRAP_JS,
+            _read(fields={"boards": 2}),
+            "__push({ patch: true, version: 1, fields: { boards: 3 }, agentic: [],"
+            "         seq: 2, stale: false, missing: [] });"
+            "__push({ patch: true, version: 4, fields: { boards: 9 }, agentic: [],"
+            "         seq: 5, stale: false, missing: [] });"
+            "__calls.push(window.kirocrew.fields.boards);",
+        )
+        assert calls == [3]
+
+    def test_consecutive_patches_apply_without_asking(self) -> None:
+        posted = _posted(
+            dashboard_frame._BOOTSTRAP_JS,
+            _read(fields={"boards": 2}),
+            "for (const v of [1, 2, 3]) {"
+            "  __push({ patch: true, version: v, fields: { boards: v }, agentic: [],"
+            "           seq: v, stale: false, missing: [] });"
+            "}",
+        )
+        assert posted == []
+
+    def test_a_patch_after_a_gateway_restart_asks_for_a_whole_read(self) -> None:
+        """A restart restarts the host's counter, so the first patch after one is not
+        the page's next version. There is no exemption for that: a patch computed
+        against a read this page never held must not be applied, and the refetch costs
+        one round trip to replace the whole read instead."""
+        posted = _posted(
+            dashboard_frame._BOOTSTRAP_JS,
+            # The page was composed when the host's counter stood at 9.
+            _read(fields={"boards": 2}, version=9),
+            # The gateway restarted, so its counter is back near one.
+            "__push({ patch: true, version: 1, fields: { boards: 3 }, agentic: [],"
+            "         seq: 2, stale: false, missing: [] });",
+        )
+        assert [m["type"] for m in posted] == [dashboard_frame.REFETCH_MESSAGE_TYPE]
+        assert posted[0]["held"] == 9
+
+    def test_the_page_holds_the_version_the_island_carried(self) -> None:
+        """So the first patch is checked against the read the document was composed
+        from, rather than against nothing."""
+        posted = _posted(
+            dashboard_frame._BOOTSTRAP_JS,
+            _read(fields={"boards": 2}, version=9),
+            "__push({ patch: true, version: 10, fields: { boards: 3 }, agentic: [],"
+            "         seq: 2, stale: false, missing: [] });",
+        )
+        assert posted == []
+
+    def test_a_full_read_resets_the_version_the_page_holds(self) -> None:
+        """So the patch after a refetch is checked against the read that answered it."""
+        posted = _posted(
+            dashboard_frame._BOOTSTRAP_JS,
+            _read(fields={"boards": 2}),
+            "__push({ version: 9, fields: { boards: 3 }, agentic: [], seq: 2,"
+            "         stale: false, missing: [] });"
+            "__push({ patch: true, version: 10, fields: { boards: 4 }, agentic: [],"
+            "         seq: 3, stale: false, missing: [] });",
+        )
+        assert posted == []
+
+
+class TestAnOlderFullReadCannotReplaceANewerOne:
+    """Two gap reads can answer in either order; the older must not replace the newer.
+
+    The version alone cannot decide: a re-armed page restarts its counter, so a lower
+    number can be newer. The generation says which counter a number belongs to.
+    """
+
+    def test_a_reply_that_arrived_late_is_dropped(self) -> None:
+        calls = _run(
+            dashboard_frame._BOOTSTRAP_JS,
+            _read(fields={"boards": 2}, generation="gen-a"),
+            # Two refetches answered out of order: version 7 lands, then version 5.
+            "__push({ version: 7, generation: 'gen-a', fields: { boards: 7 },"
+            "         agentic: [], seq: 7, stale: false, missing: [] });"
+            "__push({ version: 5, generation: 'gen-a', fields: { boards: 5 },"
+            "         agentic: [], seq: 5, stale: false, missing: [] });"
+            "__calls.push(window.kirocrew.fields.boards);",
+        )
+        assert calls == [7], "the older full read replaced the newer one's values"
+
+    def test_a_subscriber_is_not_called_for_the_dropped_reply(self) -> None:
+        """A page that DRAWS would otherwise redraw itself from the stale answer, which
+        is the same wrong picture whether or not the frozen read moved."""
+        calls = _run(
+            dashboard_frame._BOOTSTRAP_JS,
+            _read(fields={"boards": 2}, generation="gen-a"),
+            "window.kirocrew.subscribe('boards', function (v) { __calls.push(v); });"
+            "__push({ version: 7, generation: 'gen-a', fields: { boards: 7 },"
+            "         agentic: [], seq: 7, stale: false, missing: [] });"
+            "__push({ version: 5, generation: 'gen-a', fields: { boards: 5 },"
+            "         agentic: [], seq: 5, stale: false, missing: [] });",
+        )
+        assert calls == [2, 7]
+
+    def test_a_lower_version_from_a_RE_ARMED_page_is_still_applied(self) -> None:
+        """The fence is why this case needs saying: the host replaced the live page, so
+        its first read carries version 1 against a tab holding 7. Fencing on the number
+        alone would leave that tab unable to accept its own recovery, forever."""
+        calls = _run(
+            dashboard_frame._BOOTSTRAP_JS,
+            _read(fields={"boards": 2}, generation="gen-a"),
+            "__push({ version: 7, generation: 'gen-a', fields: { boards: 7 },"
+            "         agentic: [], seq: 7, stale: false, missing: [] });"
+            "__push({ version: 1, generation: 'gen-b', fields: { boards: 1 },"
+            "         agentic: [], seq: 1, stale: false, missing: [] });"
+            "__calls.push(window.kirocrew.fields.boards);",
+        )
+        assert calls == [1], "a re-armed page's own read was refused as stale"
+
+    def test_the_patch_after_a_dropped_reply_is_checked_against_what_the_page_KEPT(
+        self,
+    ) -> None:
+        """The dropped answer must not move `held` either: the page holds 7, so the
+        patch that belongs to it applies and no refetch is asked for."""
+        posted = _posted(
+            dashboard_frame._BOOTSTRAP_JS,
+            _read(fields={"boards": 2}, generation="gen-a"),
+            "__push({ version: 7, generation: 'gen-a', fields: { boards: 7 },"
+            "         agentic: [], seq: 7, stale: false, missing: [] });"
+            "__push({ version: 5, generation: 'gen-a', fields: { boards: 5 },"
+            "         agentic: [], seq: 5, stale: false, missing: [] });"
+            "__push({ patch: true, version: 8, generation: 'gen-a',"
+            "         fields: { boards: 8 }, agentic: [], seq: 8, stale: false,"
+            "         missing: [] });",
+        )
+        assert posted == [], "the page asked for a read it had already been given"
+
+    def test_a_patch_from_a_REPLACEMENT_page_asks_for_a_whole_read(self) -> None:
+        """The host can replace the live page under an open tab: a second tab's load
+        disarms the old page and arms a new one, and the new one's counter starts again.
+        So its patch 2 looks like the next one to a tab holding 1 -- and merging it
+        would mix fields computed from two different reads, which is exactly what the
+        gap check exists to refuse."""
+        posted = _posted(
+            dashboard_frame._BOOTSTRAP_JS,
+            _read(fields={"boards": 2}, version=1, generation="gen-a"),
+            "__push({ patch: true, version: 2, generation: 'gen-b',"
+            "         fields: { boards: 9 }, agentic: [], seq: 2, stale: false,"
+            "         missing: [] });",
+        )
+        assert [m["type"] for m in posted] == [dashboard_frame.REFETCH_MESSAGE_TYPE]
+        assert posted[0]["held"] == 1
+
+    def test_the_replacement_patch_is_not_applied(self) -> None:
+        """Asking for the read and merging anyway would be the same mixed page, reached
+        one round trip later."""
+        calls = _run(
+            dashboard_frame._BOOTSTRAP_JS,
+            _read(fields={"boards": 2}, version=1, generation="gen-a"),
+            "__push({ patch: true, version: 2, generation: 'gen-b',"
+            "         fields: { boards: 9 }, agentic: [], seq: 2, stale: false,"
+            "         missing: [] });"
+            "__calls.push(window.kirocrew.fields.boards);",
+        )
+        assert calls == [2]
+
+    def test_a_patch_from_the_SAME_generation_still_applies(self) -> None:
+        """The condition is about whose counter the number came from, and nothing else:
+        the ordinary push must not start asking for a read it does not need."""
+        posted = _posted(
+            dashboard_frame._BOOTSTRAP_JS,
+            _read(fields={"boards": 2}, version=1, generation="gen-a"),
+            "__push({ patch: true, version: 2, generation: 'gen-a',"
+            "         fields: { boards: 9 }, agentic: [], seq: 2, stale: false,"
+            "         missing: [] });",
+        )
+        assert posted == []
+
+    def test_a_patch_is_not_fenced_by_the_version_it_carries(self) -> None:
+        """An out-of-order PATCH is the gap check's business: it asks for a whole read
+        rather than being dropped, because a patch nobody answers leaves the page
+        showing one field from after a change and the rest from before it."""
+        posted = _posted(
+            dashboard_frame._BOOTSTRAP_JS,
+            _read(fields={"boards": 2}, version=7, generation="gen-a"),
+            "__push({ patch: true, version: 5, generation: 'gen-a',"
+            "         fields: { boards: 5 }, agentic: [], seq: 5, stale: false,"
+            "         missing: [] });",
+        )
+        assert [m["type"] for m in posted] == [dashboard_frame.REFETCH_MESSAGE_TYPE]
+
+
+def test_the_refetch_type_matches_the_tab_that_answers_it() -> None:
+    """The page posts this and the browser tab is what turns it into a full read.
+
+    Mirrored across two languages, so a drift is silent in the worst way: the page
+    would ask forever and the tab would never hear it, leaving a dashboard applying
+    no patches and showing no error -- indistinguishable from a quiet crew.
+    """
+    # `parents[2]` is the repository root: this module sits at `src/kiro_crew/`, so
+    # `parents[1]` is `src` and the path below it never exists -- which made this pin
+    # skip itself every run while reading as green.
+    tab = (
+        Path(dashboard_frame.__file__).resolve().parents[2]
+        / "website"
+        / "src"
+        / "pages"
+        / "members"
+        / "CrewDynamicDashboard.tsx"
+    )
+    # FAILS rather than skips. A cross-language pin that cannot find one of its two
+    # sides has not been satisfied, and a skip is how it went unnoticed before.
+    assert tab.exists(), f"the tab this pin compares against is not at {tab}"
+    text = tab.read_text(encoding="utf-8")
+    assert f"'{dashboard_frame.REFETCH_MESSAGE_TYPE}'" in text, (
+        "the tab does not carry the refetch type the frame posts, so a page that "
+        "cannot place a patch asks for a read nothing answers"
+    )
+    assert "REFETCH_MESSAGE_TYPE" in text
+
+
+def test_the_bootstrap_posts_the_type_the_constant_names() -> None:
+    """The literal inside the script and the exported name, pinned to each other."""
+    assert f'"{dashboard_frame.REFETCH_MESSAGE_TYPE}"' in dashboard_frame._BOOTSTRAP_JS
+
+
+class TestSubscribeCountsAsAPageThatRefills:
+    """A page that draws through ``subscribe`` is one a refill reaches.
+
+    The beacon's ``refill`` flag is what lets the host post new values into the open
+    document instead of loading a new one. The probe only watched ``addEventListener``,
+    and ``subscribe`` never touches it, so every such page was re-minted on every read
+    and the frame was swapped each time the data moved.
+    """
+
+    #: The bootstrap and then the probe, in the order the composed document runs them.
+    _SCRIPTS = "\n".join((dashboard_frame._BOOTSTRAP_JS, dashboard_frame._REFILL_PROBE_JS))
+    _FLAG = f"window[{dashboard_frame._REFILL_FLAG!r}]"
+
+    def _flag_after(self, page_js: str) -> Any:
+        calls = _run(self._SCRIPTS, _read(), f"{page_js}\n__calls.push({self._FLAG});")
+        return calls[-1]
+
+    def test_a_page_that_subscribes_reports_that_it_refills(self) -> None:
+        assert self._flag_after("window.kirocrew.subscribe('boards', () => {});") is True
+
+    def test_a_page_that_never_listens_still_reports_that_it_does_not(self) -> None:
+        """The flag must stay false for a page that draws once, or the host would post
+        values into a document that cannot show them."""
+        assert self._flag_after("") is False
+
+    def test_a_call_that_registers_nothing_does_not_count(self) -> None:
+        """``subscribe`` returns early for a bad name or callback, so no subscriber
+        exists and nothing on the page would redraw."""
+        assert self._flag_after("window.kirocrew.subscribe('boards', 'not a function');") is False
+
+
+def test_a_patch_naming_a_field_missing_dims_the_cell_it_carried_forward() -> None:
+    """A patch merges the fields it did not move, so the old value is still in
+    ``fields``. With no band, ``missing`` is the only thing that can dim it."""
+    calls = _run(
+        dashboard_frame._BOOTSTRAP_JS,
+        _read(),
+        "const cell = { attrs: {}, textContent: '',"
+        "  getAttribute(k) { return k === 'data-dashboard-field' ? 'boards' : this.attrs[k]; },"
+        "  setAttribute(k, v) { this.attrs[k] = v; }, removeAttribute(k) { delete this.attrs[k]; } };"
+        "nodes.push(cell);"
+        "__push({ patch: true, version: 1, fields: { boards: 5 }, missing: [] });"
+        "__calls.push([cell.textContent, cell.attrs['data-dashboard-missing'] || null]);"
+        "__push({ patch: true, version: 2, fields: {}, missing: ['boards'] });"
+        "__calls.push([cell.textContent, cell.attrs['data-dashboard-missing'] || null,"
+        "  window.kirocrew.fields.boards]);",
+    )
+    assert calls == [["5", None], ["5", "true", 5]], calls
+
+
+def test_a_field_named_constructor_is_not_dimmed_while_it_resolves() -> None:
+    """The missing set is looked up as own keys, so an inherited property such as
+    ``constructor`` never reads as missing."""
+    calls = _run(
+        dashboard_frame._BOOTSTRAP_JS,
+        _read(fields={"constructor": 1}),
+        "const cell = { attrs: {}, textContent: '',"
+        "  getAttribute(k) { return k === 'data-dashboard-field' ? 'constructor' : this.attrs[k]; },"
+        "  setAttribute(k, v) { this.attrs[k] = v; }, removeAttribute(k) { delete this.attrs[k]; } };"
+        "nodes.push(cell);"
+        "__push({ patch: true, version: 1, fields: { constructor: 7 }, missing: [] });"
+        "__calls.push([cell.textContent, cell.attrs['data-dashboard-missing'] || null]);",
+    )
+    assert calls == [["7", None]], calls
+
+
+#: A page script recording what each callback was told: value, and the meta flags.
+_RECORD = (
+    "window.kirocrew.subscribe('boards', (v, n, m) =>"
+    "  __calls.push([v, m.missing, Object.keys(m).length]));"
+)
+
+
+class TestASubscriberIsToldAFieldStoppedResolving:
+    """A field named in ``missing`` reaches its subscriber, flagged, with the value the
+    page already drew. Before this a chart drawn from a subscriber froze on the old
+    value at full strength while the bound cells beside it dimmed."""
+
+    def test_present_then_missing_then_present_on_full_reads(self) -> None:
+        calls = _run(
+            dashboard_frame._BOOTSTRAP_JS,
+            _read(),
+            _RECORD
+            + "__push({ fields: { owner: 'atlas' }, agentic: [], seq: 2, missing: ['boards'],"
+            "         version: 1 });"
+            "__push({ fields: { boards: 5 }, agentic: [], seq: 3, missing: [], version: 2 });",
+        )
+        assert calls == [[2, False, 1], [2, True, 1], [5, False, 1]]
+
+    def test_a_two_argument_callback_still_gets_values_only(self) -> None:
+        """An existing page that reads ``cb(value, name)`` redraws what it had: the
+        value it is handed while missing is the one it already drew, never a new one."""
+        calls = _run(
+            dashboard_frame._BOOTSTRAP_JS,
+            _read(),
+            "window.kirocrew.subscribe('boards', (v, n) => __calls.push([v, n]));"
+            "__push({ fields: {}, agentic: [], seq: 2, missing: ['boards'], version: 1 });",
+        )
+        assert calls == [[2, "boards"], [2, "boards"]]
+
+    def test_zero_is_a_value_present_and_missing(self) -> None:
+        calls = _run(
+            dashboard_frame._BOOTSTRAP_JS,
+            _read(fields={"boards": 0}),
+            _RECORD
+            + "__push({ fields: {}, agentic: [], seq: 2, missing: ['boards'], version: 1 });",
+        )
+        assert calls == [[0, False, 1], [0, True, 1]]
+
+    def test_a_patch_naming_it_missing_tells_once_and_its_recovery_is_told(self) -> None:
+        """A patch that names the field missing tells the subscriber; a second patch
+        still naming it does not repeat; a patch that drops it from ``missing`` without
+        carrying it (resolved again, unmoved) tells it with the merged value."""
+        calls = _run(
+            dashboard_frame._BOOTSTRAP_JS,
+            _read(),
+            _RECORD + "__push({ patch: true, version: 1, fields: {}, missing: ['boards'] });"
+            "__push({ patch: true, version: 2, fields: { owner: 'nyx' }, missing: ['boards'] });"
+            "__push({ patch: true, version: 3, fields: {}, missing: [] });"
+            "__push({ patch: true, version: 4, fields: {}, missing: [] });",
+        )
+        assert calls == [[2, False, 1], [2, True, 1], [2, False, 1]]
+
+    def test_a_read_carrying_an_older_value_it_names_missing_flags_it(self) -> None:
+        """``missing`` wins over presence, exactly as the fill reads it."""
+        calls = _run(
+            dashboard_frame._BOOTSTRAP_JS,
+            _read(fields={"boards": 4}, missing=["boards"]),
+            _RECORD,
+        )
+        assert calls == [[4, True, 1]]
+
+    def test_an_agentic_field_going_missing_is_told(self) -> None:
+        """``meta`` carries only ``missing``; the agentic marks stay on the global."""
+        stamp = "2026-10-30T12:00:00Z"
+        calls = _run(
+            dashboard_frame._BOOTSTRAP_JS,
+            _read(agentic=["boards"], written_at={"boards": stamp}),
+            _RECORD + "__push({ fields: {}, agentic: ['boards'], seq: 2, missing: ['boards'],"
+            f"         written_at: {{ boards: '{stamp}' }}, version: 1 }});",
+        )
+        assert calls == [[2, False, 1], [2, True, 1]]
+
+    def test_a_field_the_page_never_held_stays_silent_when_named_missing(self) -> None:
+        """No older value exists to mark, and ``undefined`` is not a value."""
+        calls = _run(
+            dashboard_frame._BOOTSTRAP_JS,
+            _read(fields={"owner": "atlas"}, missing=["boards"]),
+            _RECORD
+            + "__push({ fields: {}, agentic: [], seq: 2, missing: ['boards'], version: 1 });",
+        )
+        assert calls == []
+
+
+def _cell_js(name: str) -> str:
+    return (
+        "const cell = { attrs: {}, textContent: 'old',"
+        f"  getAttribute(k) {{ return k === 'data-dashboard-field' ? '{name}' : this.attrs[k]; }},"
+        "  setAttribute(k, v) { this.attrs[k] = v; }, removeAttribute(k) { delete this.attrs[k]; } };"
+        "nodes.push(cell);"
+    )
+
+
+_CELL_STATE = (
+    "__calls.push([cell.textContent, cell.attrs['data-dashboard-missing'] || null,"
+    "  cell.attrs['data-dashboard-missing-label'] || null]);"
+)
+
+
+class TestAMissingCellSaysSo:
+    """Dimming alone read as a real number. A missing cell carries a label the host CSS
+    draws after the value, in the reader's language, and keeps the value it showed."""
+
+    def test_the_label_is_set_while_missing_and_cleared_on_recovery(self) -> None:
+        calls = _run(
+            dashboard_frame._BOOTSTRAP_JS,
+            _read(),
+            _cell_js("boards")
+            + "__push({ fields: { boards: 3 }, agentic: [], seq: 2, missing: [], version: 1 });"
+            + _CELL_STATE
+            + "__push({ fields: {}, agentic: [], seq: 3, missing: ['boards'], version: 2 });"
+            + _CELL_STATE
+            + "__push({ fields: { boards: 0 }, agentic: [], seq: 4, missing: [], version: 3 });"
+            + _CELL_STATE,
+        )
+        assert calls == [
+            ["3", None, None],
+            ["3", "true", "not current"],
+            ["0", None, None],
+        ]
+
+    def test_the_label_is_in_the_readers_language(self) -> None:
+        calls = _run(
+            dashboard_frame._BOOTSTRAP_JS,
+            _read(),
+            _cell_js("boards")
+            + "__push({ fields: {}, agentic: [], seq: 2, missing: ['boards'], version: 1,"
+            "         locale: 'zh-CN' });" + _CELL_STATE,
+        )
+        assert calls == [["old", "true", dashboard_frame._MISSING_LABELS["zh-CN"]]]
+
+    def test_every_shipped_catalog_has_a_label(self) -> None:
+        from kiro_crew.context_assembly.output_contract import _UI_LANGUAGE_CATALOGS
+
+        assert set(dashboard_frame._MISSING_LABELS) == set(_UI_LANGUAGE_CATALOGS)
+        assert all(label.strip() for label in dashboard_frame._MISSING_LABELS.values())
+
+    def test_the_host_css_draws_the_label(self) -> None:
+        css = dashboard_frame._HOST_CSS
+        assert "[data-dashboard-missing='true']::after" in css
+        assert "attr(data-dashboard-missing-label)" in css
+
+
+#: A page script counting the page-wide event.
+_COUNT_EVENTS = (
+    "globalThis.__events = 0;"
+    "addEventListener('kirocrew-dashboard', () => { globalThis.__events += 1; });"
+)
+_EVENTS = "__calls.push(globalThis.__events);"
+
+
+def _push(**over: Any) -> str:
+    """A full read in the shape the host posts, as a page-script push."""
+    return f"__push({json.dumps(_read(**over))});"
+
+
+class TestAnUnchangedReadRedrawsNothing:
+    """A read whose values did not move must not redraw the page.
+
+    The tab re-reads the whole page on every fold advance, on a reconnect and on the
+    60 s fallback, so most reads carry exactly what the page already shows. Firing
+    every subscriber and the page event for them made each one redraw the whole page,
+    which a reader sees as the page reloading.
+    """
+
+    def test_a_full_read_with_the_same_values_calls_no_subscriber(self) -> None:
+        calls = _run(dashboard_frame._BOOTSTRAP_JS, _read(), _RECORD + _push(version=1))
+        assert calls == [[2, False, 1]]
+
+    def test_a_full_read_with_the_same_values_fires_no_page_event(self) -> None:
+        calls = _run(
+            dashboard_frame._BOOTSTRAP_JS, _read(), _COUNT_EVENTS + _push(version=1) + _EVENTS
+        )
+        assert calls == [0]
+
+    def test_a_full_read_with_the_same_values_does_not_rewrite_a_cell(self) -> None:
+        """A page that writes its own text over a bound cell keeps it."""
+        calls = _run(
+            dashboard_frame._BOOTSTRAP_JS,
+            _read(),
+            _cell_js("boards") + "cell.textContent = 'page text';" + _push(version=1) + _CELL_STATE,
+        )
+        assert calls == [["page text", None, None]]
+
+    def test_a_patch_repeating_a_held_value_calls_no_subscriber(self) -> None:
+        calls = _run(
+            dashboard_frame._BOOTSTRAP_JS,
+            _read(),
+            _RECORD + "__push({ patch: true, version: 1, fields: { boards: 2 }, missing: [] });",
+        )
+        assert calls == [[2, False, 1]]
+
+    def test_an_equal_read_with_fields_in_a_new_order_is_unchanged(self) -> None:
+        calls = _run(
+            dashboard_frame._BOOTSTRAP_JS,
+            _read(fields={"boards": [1, 2], "owner": "atlas"}),
+            _COUNT_EVENTS + _push(fields={"owner": "atlas", "boards": [1, 2]}, version=1) + _EVENTS,
+        )
+        assert calls == [0]
+
+    def test_a_changed_field_still_calls_back_and_fires_the_event_once(self) -> None:
+        calls = _run(
+            dashboard_frame._BOOTSTRAP_JS,
+            _read(),
+            _COUNT_EVENTS + "window.kirocrew.subscribe('owner', (v) => __calls.push(['owner', v]));"
+            "window.kirocrew.subscribe('boards', (v) => __calls.push(['boards', v]));"
+            + _push(fields={"boards": 3, "owner": "atlas"}, version=1)
+            + _EVENTS,
+        )
+        assert calls == [["owner", "atlas"], ["boards", 2], ["boards", 3], 1]
+
+    def test_a_changed_read_key_outside_fields_still_fires_the_event(self) -> None:
+        """A page may draw any key of the read, such as ``last_user_at``."""
+        calls = _run(
+            dashboard_frame._BOOTSTRAP_JS,
+            _read(),
+            _COUNT_EVENTS + _push(version=1, last_user_at="2026-11-01T00:00:00Z") + _EVENTS,
+        )
+        assert calls == [1]
+
+    def test_an_equal_full_read_after_a_patch_redraws_nothing(self) -> None:
+        """A patch keeps the read's ``subject`` and ``last_user_at``, so the full read
+        that repeats it is not taken for a change."""
+        calls = _run(
+            dashboard_frame._BOOTSTRAP_JS,
+            _read(last_user_at="2026-11-01T00:00:00Z"),
+            _COUNT_EVENTS
+            + "__push({ patch: true, version: 1, fields: { boards: 3 }, missing: [] });"
+            + _push(
+                version=2,
+                fields={"boards": 3, "owner": "atlas"},
+                last_user_at="2026-11-01T00:00:00Z",
+            )
+            + "__calls.push(window.kirocrew.last_user_at);"
+            + _EVENTS,
+        )
+        assert calls == ["2026-11-01T00:00:00Z", 1]
+
+    def test_a_host_shaped_patch_keeps_the_held_subject_and_stamp(self) -> None:
+        """The host's patch carries the builder's defaults for ``subject`` and
+        ``last_user_at``; the page keeps its own, and the equal full read after it
+        redraws nothing."""
+        stamp = "2026-11-01T00:00:00Z"
+        patch = _read(fields={"boards": 3}, version=1)
+        patch["patch"] = True
+        calls = _run(
+            dashboard_frame._BOOTSTRAP_JS,
+            _read(subject="session", last_user_at=stamp),
+            _COUNT_EVENTS
+            + f"__push({json.dumps(patch)});"
+            + "__calls.push(window.kirocrew.subject, window.kirocrew.last_user_at);"
+            + _push(
+                version=2,
+                fields={"boards": 3, "owner": "atlas"},
+                subject="session",
+                last_user_at=stamp,
+            )
+            + _EVENTS,
+        )
+        assert patch["subject"] == "crewmate" and patch["last_user_at"] == ""
+        assert calls == ["session", stamp, 1]
+
+    def test_an_unchanged_read_a_minute_later_still_fires_the_event_only(self) -> None:
+        """A page drawing "idle for 20 min" from the clock redraws on the event, so an
+        unchanged read still fires it once a minute, without refill or callbacks."""
+        calls = _run(
+            dashboard_frame._BOOTSTRAP_JS,
+            _read(),
+            _COUNT_EVENTS + _RECORD + "const t0 = Date.now(); let now = t0;"
+            "Date.now = () => now;"
+            + _push(version=1)
+            + "now = t0 + 61000;"
+            + _push(version=2)
+            + "now = t0 + 62000;"
+            + _push(version=3)
+            + _EVENTS,
+        )
+        assert calls == [[2, False, 1], 1]
+
+    def test_the_minute_tick_refills_a_cell_before_the_page_redraws(self) -> None:
+        """A page that reformats a bound cell's text (a shortened timestamp) redraws
+        from the recorded value on the tick, not from its own earlier output."""
+        calls = _run(
+            dashboard_frame._BOOTSTRAP_JS,
+            _read(),
+            _cell_js("boards")
+            + "addEventListener('kirocrew-dashboard', () => __calls.push(cell.textContent));"
+            "const t0 = Date.now(); let now = t0; Date.now = () => now;"
+            "cell.textContent = 'page text';"
+            "now = t0 + 61000;" + _push(version=1),
+        )
+        assert calls == ["2"]
+
+    def test_only_missing_moving_still_fires_the_event(self) -> None:
+        """A field going missing changes what the page shows (the dim and the label)."""
+        calls = _run(
+            dashboard_frame._BOOTSTRAP_JS,
+            _read(),
+            _COUNT_EVENTS + _push(version=1, missing=["boards"]) + _EVENTS,
+        )
+        assert calls == [1]
+
+    def test_missing_and_back_are_still_told_across_unchanged_reads(self) -> None:
+        """The missing contract: "gone" once, "back" once, with full reads between that
+        repeat the same values staying silent."""
+        gone = {"fields": {"owner": "atlas"}, "missing": ["boards"]}
+        calls = _run(
+            dashboard_frame._BOOTSTRAP_JS,
+            _read(),
+            _RECORD
+            + _push(version=1, **gone)
+            + _push(version=2, **gone)
+            + _push(version=3)
+            + _push(version=4),
+        )
+        assert calls == [[2, False, 1], [2, True, 1], [2, False, 1]]
+
+    def test_the_unchanged_read_still_moves_the_version_the_page_holds(self) -> None:
+        """Skipping the redraw must not skip the bookkeeping: the next patch is checked
+        against the read that just landed."""
+        posted = _posted(
+            dashboard_frame._BOOTSTRAP_JS,
+            _read(),
+            _push(version=9)
+            + "__push({ patch: true, version: 10, fields: { boards: 4 }, missing: [] });",
+        )
+        assert posted == []

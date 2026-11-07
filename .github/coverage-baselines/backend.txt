@@ -1,0 +1,25 @@
+# Per-file coverage baseline — files below the floor when the gate landed.
+#
+# The gate (scripts/check_per_file_coverage.py) requires every measured file to
+# meet the per-file floor EXCEPT the ones listed here. This list may only
+# shrink. A refresh DELETES graduated and vanished entries and copies every
+# surviving line through verbatim, so a recorded rate is never rewritten and no
+# path can be added -- neither a new offender nor a regression can be cleared by
+# refreshing instead of by adding tests. Each line therefore stays an accurate
+# record of the moment it was taken.
+#
+# Refresh after a file graduates, is deleted, or is renamed:
+#   python3 scripts/check_per_file_coverage.py <report> --label <lane> \
+#       --floor <n> --baseline <this file> --update-baseline
+#
+# Format: <path> <rate-when-recorded>   # <covered>/<statements>
+src/kiro_crew/apple_speech/__init__.py 53.4   # 196/367
+src/kiro_crew/apps/builtins/file_explorer/server.py 71.9   # 396/551
+src/kiro_crew/apps/builtins/mochi/stats_service.py 66.9   # 212/317
+src/kiro_crew/apps/builtins/ops_mission_control/backend/providers/cloudwatch.py 58.9   # 116/197
+src/kiro_crew/computer_use/macos_skylight.py 54.8   # 142/259
+src/kiro_crew/conpty.py 27.9   # 12/43
+src/kiro_crew/dashboard/_types.py 0.0   # 0/3
+src/kiro_crew/emoji_list.py 0.0   # 0/1
+src/kiro_crew/instances/ssm_token_mint.py 21.5   # 17/79
+src/kiro_crew/mcp_gateway/transport.py 73.1   # 163/223

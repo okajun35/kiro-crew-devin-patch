@@ -1,0 +1,823 @@
+[
+  {
+    "agent_capabilities": {
+      "_meta": {
+        "cognition.ai/chains": true,
+        "cognition.ai/commandRevision": true,
+        "cognition.ai/documentLifecycle": true,
+        "cognition.ai/editableCommands": true,
+        "cognition.ai/megaplan": true,
+        "cognition.ai/mentionTypes": [
+          {
+            "type": "file"
+          },
+          {
+            "type": "directory"
+          },
+          {
+            "type": "git"
+          },
+          {
+            "icon": "book",
+            "label": "Rules",
+            "type": "rule"
+          },
+          {
+            "icon": "zap",
+            "label": "Skills",
+            "type": "skill"
+          },
+          {
+            "icon": "file-text",
+            "label": "Plans",
+            "type": "plan"
+          },
+          {
+            "type": "conversation"
+          },
+          {
+            "type": "terminal"
+          },
+          {
+            "icon": "map",
+            "label": "Codemaps",
+            "type": "codemap"
+          }
+        ],
+        "cognition.ai/midTurnPrompts": true,
+        "cognition.ai/multiRootWorkspace": true,
+        "cognition.ai/persistOnCreate": true,
+        "cognition.ai/ruleMentions": true,
+        "cognition.ai/sessionDefaultConfigOptions": true,
+        "cognition.ai/sessionListContentSearch": true,
+        "cognition.ai/sessionListOrderBy": [
+          "updated_at",
+          "created_at"
+        ],
+        "cognition.ai/sessionListSortDirection": true,
+        "cognition.ai/sessionRename": true,
+        "cognition.ai/sessionShare": true,
+        "cognition.ai/terminalLifecycle": true,
+        "cognition.ai/userConfig": true,
+        "cognition.ai/userEdits": true,
+        "cognition.ai/userShellCommand": true
+      },
+      "auth": {},
+      "loadSession": true,
+      "mcpCapabilities": {
+        "http": true,
+        "sse": true
+      },
+      "promptCapabilities": {
+        "audio": false,
+        "embeddedContext": true,
+        "image": true
+      },
+      "sessionCapabilities": {
+        "additionalDirectories": {},
+        "close": {
+          "_meta": {
+            "cognition.ai/force": true
+          }
+        },
+        "delete": {},
+        "list": {}
+      }
+    },
+    "agent_version": "0.0.0-dev",
+    "frame": "response",
+    "id": 1,
+    "protocol_version": 1
+  },
+  {
+    "action": "skip",
+    "frame": "_cognition.ai/mcp/serversChanged"
+  },
+  {
+    "action": "skip",
+    "frame": "_cognition.ai/mcp/serversChanged"
+  },
+  {
+    "action": "skip",
+    "frame": "_cognition.ai/mcp/serversChanged"
+  },
+  {
+    "action": "skip",
+    "frame": "_cognition.ai/mcp/serversChanged"
+  },
+  {
+    "action": "skip",
+    "frame": "_cognition.ai/mcp/serversChanged"
+  },
+  {
+    "config_options": [
+      {
+        "category": "mode",
+        "currentValue": "accept-edits",
+        "id": "mode",
+        "name": "Session Mode",
+        "options": [
+          {
+            "_meta": {
+              "cognition.ai/icon": "code"
+            },
+            "description": "Write and edit code",
+            "name": "Code",
+            "value": "accept-edits"
+          }
+        ],
+        "type": "select"
+      },
+      {
+        "category": "model",
+        "currentValue": "swe-2-high",
+        "description": "AI model to use",
+        "id": "model",
+        "name": "Model",
+        "options": [
+          {
+            "_meta": {
+              "cognition.ai/supportsImages": true
+            },
+            "name": "SWE-2",
+            "value": "swe-2-high"
+          }
+        ],
+        "type": "select"
+      },
+      {
+        "category": "thought_level",
+        "currentValue": "high",
+        "id": "thought_level",
+        "name": "Thinking",
+        "options": [
+          {
+            "name": "High",
+            "value": "high"
+          }
+        ],
+        "type": "select"
+      },
+      {
+        "category": "model_config",
+        "currentValue": "standard",
+        "id": "speed",
+        "name": "Speed",
+        "options": [
+          {
+            "name": "Standard",
+            "value": "standard"
+          }
+        ],
+        "type": "select"
+      }
+    ],
+    "frame": "response",
+    "id": 2,
+    "modes": {
+      "advertised": true,
+      "current": "accept-edits",
+      "ids": [
+        "accept-edits",
+        "smart",
+        "ask",
+        "plan",
+        "bypass"
+      ]
+    },
+    "session_id": "devin-session-1"
+  },
+  {
+    "action": "update",
+    "events": [],
+    "frame": "session/update",
+    "session_update": "session_info_update"
+  },
+  {
+    "action": "skip",
+    "frame": "_cognition.ai/mcp/serversChanged"
+  },
+  {
+    "action": "skip",
+    "frame": "_cognition.ai/mcp/serversChanged"
+  },
+  {
+    "action": "update",
+    "events": [],
+    "frame": "session/update",
+    "session_update": "config_option_update"
+  },
+  {
+    "action": "update",
+    "events": [],
+    "frame": "session/update",
+    "session_update": "current_mode_update"
+  },
+  {
+    "action": "skip",
+    "frame": "_cognition.ai/mcp/serversChanged"
+  },
+  {
+    "action": "update",
+    "events": [],
+    "frame": "session/update",
+    "session_update": "config_option_update"
+  },
+  {
+    "action": "update",
+    "events": [],
+    "frame": "session/update",
+    "session_update": "current_mode_update"
+  },
+  {
+    "action": "skip",
+    "frame": "_cognition.ai/mcp/serversChanged"
+  },
+  {
+    "action": "update",
+    "events": [
+      {
+        "kind": "thinking_chunk",
+        "text": "The user's prompt instructs me to call `project_list` exactly once and use no other tools. However, the system's rules state I *must* call `mcp_list_tools` before any other tool calls on a server. This creates a conflict. I'll prioritize the system rule and call `mcp_list_tools` first, then `project_list` once, and report the results."
+      }
+    ],
+    "frame": "session/update",
+    "session_update": "agent_thought_chunk",
+    "text_chunk": {
+      "text": "The user's prompt instructs me to call `project_list` exactly once and use no other tools. However, the system's rules state I *must* call `mcp_list_tools` before any other tool calls on a server. This creates a conflict. I'll prioritize the system rule and call `mcp_list_tools` first, then `project_list` once, and report the results.",
+      "thinking": true
+    }
+  },
+  {
+    "action": "skip",
+    "frame": "_cognition.ai/thinking_complete",
+    "params": {
+      "blockIndex": 0,
+      "durationMs": 27,
+      "sessionId": "devin-session-1"
+    }
+  },
+  {
+    "action": "permission",
+    "events": [
+      {
+        "kind": "permission_request",
+        "options": [
+          {
+            "id": "allow_once",
+            "label": "Allow once"
+          },
+          {
+            "id": "reject_once",
+            "label": "Reject"
+          }
+        ],
+        "request_id": "crew-devin-gate-d4ef83d0377d4d7395b21aac5bc31634",
+        "title": "mcp_list_tools",
+        "tool_call_id": "mcp_list_tools:0#498d9ef621054e72866498d87273bc93"
+      }
+    ],
+    "frame": "session/request_permission",
+    "recorded_options": {
+      "always": "allow_once",
+      "once": "allow_once",
+      "reject": "reject_once"
+    }
+  },
+  {
+    "action": "update",
+    "events": [
+      {
+        "kind": "tool_call",
+        "raw_tool_params": {
+          "server_name": "for-takt:takt-bridge"
+        },
+        "title": "Listed MCP tools for for-takt:takt-bridge",
+        "tool_call_id": "mcp_list_tools:0#498d9ef621054e72866498d87273bc93",
+        "tool_input": "{\n  \"server_name\": \"for-takt:takt-bridge\"\n}",
+        "tool_kind": "unknown",
+        "wire_title": "Listed MCP tools for for-takt:takt-bridge"
+      }
+    ],
+    "frame": "session/update",
+    "session_update": "tool_call"
+  },
+  {
+    "action": "update",
+    "events": [],
+    "frame": "session/update",
+    "session_update": "tool_call_update"
+  },
+  {
+    "action": "update",
+    "events": [
+      {
+        "kind": "tool_result",
+        "tool_call_id": "mcp_list_tools:0#498d9ef621054e72866498d87273bc93",
+        "tool_final": true,
+        "tool_output": "\n- `goal_create`\n- `project_list`\n- `goal_list`\n- `goal_get`\n- `goal_update`\n- `goal_set_status`\n- `goal_log`\n- `goal_ask`\n- `goal_answer`\n- `goal_withdraw_question`\n- `goal_task_update`\n- `goal_complete`\n- `integration_check`\n- `integration_apply`\n- `takt_tasks`\n- `takt_run_detail`\n- `takt_enqueue`\n- `takt_tell`\n- `takt_run`\n- `takt_runner_status`\n- `takt_runner_stop`\n- `takt_goal_files`",
+        "tool_output_bytes": 391,
+        "tool_output_digest": "59dbec8280b357d708eb4b4afd7e7978ccd23d9ffd027c9e0b3941fd5c579b97",
+        "tool_status": "completed"
+      }
+    ],
+    "frame": "session/update",
+    "session_update": "tool_call_update"
+  },
+  {
+    "action": "update",
+    "events": [],
+    "frame": "session/update",
+    "session_update": "session_info_update"
+  },
+  {
+    "action": "update",
+    "events": [
+      {
+        "kind": "thinking_chunk",
+        "text": "I need to call `project_list` just once. The `mcp_call_tool` server should be used for this, with the `project_list` tool and empty arguments."
+      }
+    ],
+    "frame": "session/update",
+    "session_update": "agent_thought_chunk",
+    "text_chunk": {
+      "text": "I need to call `project_list` just once. The `mcp_call_tool` server should be used for this, with the `project_list` tool and empty arguments.",
+      "thinking": true
+    }
+  },
+  {
+    "action": "skip",
+    "frame": "_cognition.ai/thinking_complete",
+    "params": {
+      "blockIndex": 1,
+      "durationMs": 24,
+      "sessionId": "devin-session-1"
+    }
+  },
+  {
+    "action": "permission",
+    "events": [
+      {
+        "kind": "permission_request",
+        "options": [
+          {
+            "id": "allow_once",
+            "label": "Allow once"
+          },
+          {
+            "id": "reject_once",
+            "label": "Reject"
+          }
+        ],
+        "request_id": "crew-devin-gate-932dc68650834ee8950ec5cba0fd7842",
+        "title": "mcp__for-takt:takt-bridge__project_list",
+        "tool_call_id": "mcp_call_tool:0#5fa573c2221e48709bfbd540845f0929"
+      }
+    ],
+    "frame": "session/request_permission",
+    "recorded_options": {
+      "always": "allow_once",
+      "once": "allow_once",
+      "reject": "reject_once"
+    }
+  },
+  {
+    "action": "update",
+    "events": [
+      {
+        "kind": "tool_call",
+        "title": "Calling project_list from for-takt:takt-bridge",
+        "tool_call_id": "mcp_call_tool:0#5fa573c2221e48709bfbd540845f0929",
+        "tool_kind": "unknown",
+        "wire_title": "Calling project_list from for-takt:takt-bridge"
+      }
+    ],
+    "frame": "session/update",
+    "session_update": "tool_call"
+  },
+  {
+    "action": "update",
+    "events": [],
+    "frame": "session/update",
+    "session_update": "tool_call_update"
+  },
+  {
+    "action": "update",
+    "events": [
+      {
+        "kind": "tool_result",
+        "tool_call_id": "mcp_call_tool:0#5fa573c2221e48709bfbd540845f0929",
+        "tool_final": true,
+        "tool_output": "{\"projects\": [{\"path\": \"~/tmp/takt\", \"name\": \"takt\", \"hasTakt\": true, \"missing\": false}]}",
+        "tool_output_bytes": 89,
+        "tool_output_digest": "4d90f363e3d151588e4bd382e6e578302931fee644eb7ee679c55c459f26962d",
+        "tool_status": "completed"
+      }
+    ],
+    "frame": "session/update",
+    "session_update": "tool_call_update"
+  },
+  {
+    "action": "update",
+    "events": [
+      {
+        "kind": "thinking_chunk",
+        "text": "I need to finalize the report, ensuring it includes the returned project list and ends precisely with the MATE-KIT-OK token. The project list should confirm only one project was returned. The token must be the absolute last thing in the output, with no trailing characters or punctuation. I'll include the JSON for the project list before the final token."
+      }
+    ],
+    "frame": "session/update",
+    "session_update": "agent_thought_chunk",
+    "text_chunk": {
+      "text": "I need to finalize the report, ensuring it includes the returned project list and ends precisely with the MATE-KIT-OK token. The project list should confirm only one project was returned. The token must be the absolute last thing in the output, with no trailing characters or punctuation. I'll include the JSON for the project list before the final token.",
+      "thinking": true
+    }
+  },
+  {
+    "action": "update",
+    "events": [
+      {
+        "kind": "text_chunk",
+        "text": "`project"
+      }
+    ],
+    "frame": "session/update",
+    "session_update": "agent_message_chunk",
+    "text_chunk": {
+      "text": "`project",
+      "thinking": false
+    }
+  },
+  {
+    "action": "skip",
+    "frame": "_cognition.ai/thinking_complete",
+    "params": {
+      "blockIndex": 2,
+      "durationMs": 0,
+      "sessionId": "devin-session-1"
+    }
+  },
+  {
+    "action": "update",
+    "events": [
+      {
+        "kind": "text_chunk",
+        "text": "_list` returned:\n\n"
+      }
+    ],
+    "frame": "session/update",
+    "session_update": "agent_message_chunk",
+    "text_chunk": {
+      "text": "_list` returned:\n\n",
+      "thinking": false
+    }
+  },
+  {
+    "action": "update",
+    "events": [
+      {
+        "kind": "text_chunk",
+        "text": "```json\n{\""
+      }
+    ],
+    "frame": "session/update",
+    "session_update": "agent_message_chunk",
+    "text_chunk": {
+      "text": "```json\n{\"",
+      "thinking": false
+    }
+  },
+  {
+    "action": "update",
+    "events": [
+      {
+        "kind": "text_chunk",
+        "text": "projects\": [{\"path"
+      }
+    ],
+    "frame": "session/update",
+    "session_update": "agent_message_chunk",
+    "text_chunk": {
+      "text": "projects\": [{\"path",
+      "thinking": false
+    }
+  },
+  {
+    "action": "update",
+    "events": [
+      {
+        "kind": "text_chunk",
+        "text": "\": \"/home"
+      }
+    ],
+    "frame": "session/update",
+    "session_update": "agent_message_chunk",
+    "text_chunk": {
+      "text": "\": \"/home",
+      "thinking": false
+    }
+  },
+  {
+    "action": "update",
+    "events": [
+      {
+        "kind": "text_chunk",
+        "text": "/hddwm390"
+      }
+    ],
+    "frame": "session/update",
+    "session_update": "agent_message_chunk",
+    "text_chunk": {
+      "text": "/hddwm390",
+      "thinking": false
+    }
+  },
+  {
+    "action": "update",
+    "events": [
+      {
+        "kind": "text_chunk",
+        "text": "/tmp/takt\","
+      }
+    ],
+    "frame": "session/update",
+    "session_update": "agent_message_chunk",
+    "text_chunk": {
+      "text": "/tmp/takt\",",
+      "thinking": false
+    }
+  },
+  {
+    "action": "update",
+    "events": [
+      {
+        "kind": "text_chunk",
+        "text": " \"name\": \""
+      }
+    ],
+    "frame": "session/update",
+    "session_update": "agent_message_chunk",
+    "text_chunk": {
+      "text": " \"name\": \"",
+      "thinking": false
+    }
+  },
+  {
+    "action": "update",
+    "events": [
+      {
+        "kind": "text_chunk",
+        "text": "takt\", \""
+      }
+    ],
+    "frame": "session/update",
+    "session_update": "agent_message_chunk",
+    "text_chunk": {
+      "text": "takt\", \"",
+      "thinking": false
+    }
+  },
+  {
+    "action": "update",
+    "events": [
+      {
+        "kind": "text_chunk",
+        "text": "hasTakt\":"
+      }
+    ],
+    "frame": "session/update",
+    "session_update": "agent_message_chunk",
+    "text_chunk": {
+      "text": "hasTakt\":",
+      "thinking": false
+    }
+  },
+  {
+    "action": "update",
+    "events": [
+      {
+        "kind": "text_chunk",
+        "text": " true, \"missing"
+      }
+    ],
+    "frame": "session/update",
+    "session_update": "agent_message_chunk",
+    "text_chunk": {
+      "text": " true, \"missing",
+      "thinking": false
+    }
+  },
+  {
+    "action": "update",
+    "events": [
+      {
+        "kind": "text_chunk",
+        "text": "\": false}]}\n"
+      }
+    ],
+    "frame": "session/update",
+    "session_update": "agent_message_chunk",
+    "text_chunk": {
+      "text": "\": false}]}\n",
+      "thinking": false
+    }
+  },
+  {
+    "action": "update",
+    "events": [
+      {
+        "kind": "text_chunk",
+        "text": "```\n\nMATE-K"
+      }
+    ],
+    "frame": "session/update",
+    "session_update": "agent_message_chunk",
+    "text_chunk": {
+      "text": "```\n\nMATE-K",
+      "thinking": false
+    }
+  },
+  {
+    "action": "update",
+    "events": [
+      {
+        "kind": "text_chunk",
+        "text": "IT-OK"
+      }
+    ],
+    "frame": "session/update",
+    "session_update": "agent_message_chunk",
+    "text_chunk": {
+      "text": "IT-OK",
+      "thinking": false
+    }
+  },
+  {
+    "action": "skip",
+    "frame": "_cognition.ai/turn_stats",
+    "params": {
+      "responseDimensions": [
+        {
+          "groupTitle": "Response Statistics",
+          "kind": {
+            "pluralTail": " messages",
+            "prefix": "",
+            "tail": " message",
+            "type": "cumulativeMetric",
+            "value": 3.0
+          },
+          "label": "Agent messages",
+          "uid": "agent_messages"
+        },
+        {
+          "groupTitle": "Response Statistics",
+          "kind": {
+            "type": "metric",
+            "value": "SWE-2 High"
+          },
+          "label": "Model",
+          "uid": "model"
+        },
+        {
+          "groupTitle": "Token Usage",
+          "kind": {
+            "pluralTail": " tokens",
+            "prefix": "",
+            "tail": " token",
+            "type": "cumulativeMetric",
+            "value": 35998.0
+          },
+          "label": "Input tokens",
+          "uid": "input_tokens"
+        },
+        {
+          "groupTitle": "Token Usage",
+          "kind": {
+            "pluralTail": " tokens",
+            "prefix": "",
+            "tail": " token",
+            "type": "cumulativeMetric",
+            "value": 587.0
+          },
+          "label": "Output tokens",
+          "uid": "output_tokens"
+        },
+        {
+          "groupTitle": "Token Usage",
+          "kind": {
+            "pluralTail": " tokens",
+            "prefix": "",
+            "tail": " token",
+            "type": "cumulativeMetric",
+            "value": 19008.0
+          },
+          "label": "Cached input tokens",
+          "uid": "cached_input_tokens"
+        }
+      ],
+      "sessionId": "devin-session-1",
+      "turnClientMessageId": "881d2f98-cfbe-4b47-a18d-30c1cadb2ac2",
+      "turnRequestId": "fae8188a-b1d9-4951-a25a-1f6a64d7595c"
+    }
+  },
+  {
+    "action": "skip",
+    "frame": "_cognition.ai/agent_stopped",
+    "params": {
+      "cause": "complete",
+      "sessionId": "devin-session-1",
+      "stats": {
+        "commandsRun": 0,
+        "filesChanged": 0,
+        "inputTokens": 19395,
+        "modelLabel": "SWE-2 High",
+        "outputTokens": 185,
+        "requestId": "fae8188a-b1d9-4951-a25a-1f6a64d7595c",
+        "responseDimensions": [
+          {
+            "groupTitle": "Response Statistics",
+            "kind": {
+              "pluralTail": " messages",
+              "prefix": "",
+              "tail": " message",
+              "type": "cumulativeMetric",
+              "value": 3.0
+            },
+            "label": "Agent messages",
+            "uid": "agent_messages"
+          },
+          {
+            "groupTitle": "Response Statistics",
+            "kind": {
+              "type": "metric",
+              "value": "SWE-2 High"
+            },
+            "label": "Model",
+            "uid": "model"
+          },
+          {
+            "groupTitle": "Token Usage",
+            "kind": {
+              "pluralTail": " tokens",
+              "prefix": "",
+              "tail": " token",
+              "type": "cumulativeMetric",
+              "value": 35998.0
+            },
+            "label": "Input tokens",
+            "uid": "input_tokens"
+          },
+          {
+            "groupTitle": "Token Usage",
+            "kind": {
+              "pluralTail": " tokens",
+              "prefix": "",
+              "tail": " token",
+              "type": "cumulativeMetric",
+              "value": 587.0
+            },
+            "label": "Output tokens",
+            "uid": "output_tokens"
+          },
+          {
+            "groupTitle": "Token Usage",
+            "kind": {
+              "pluralTail": " tokens",
+              "prefix": "",
+              "tail": " token",
+              "type": "cumulativeMetric",
+              "value": 19008.0
+            },
+            "label": "Cached input tokens",
+            "uid": "cached_input_tokens"
+          }
+        ],
+        "tokensPerSec": 1250.0,
+        "toolCalls": 2,
+        "totalTimeMs": 3095,
+        "ttftMs": 2947
+      }
+    }
+  },
+  {
+    "frame": "response",
+    "id": 3,
+    "prompt_tokens": [
+      19395,
+      185,
+      8832,
+      0
+    ],
+    "stop_reason": "end_turn"
+  },
+  {
+    "action": "update",
+    "events": [],
+    "frame": "session/update",
+    "session_update": "usage_update",
+    "usage": [
+      19580,
+      262000
+    ],
+    "usage_cost": null
+  }
+]

@@ -1,0 +1,266 @@
+// Thin fetch wrapper for the Papyrus backend.
+//
+// The routes are registered directly on the main gateway's aiohttp Application
+// (see kiro_crew/apps/builtins/papyrus/backend/routes.py:register_routes), so the
+// base path is /api/apps/papyrus — matching issue-radar and code-review-sage, NOT
+// the /apps/{name}/api reverse-proxy prefix used by apps that run as a separate
+// child process.
+//
+// This is a BUILTIN dashboard page rendered inside the main React tree, so every
+// request is a same-origin fetch carrying the dashboard's session cookie. The
+// app-sdk data hooks are deliberately not used — they need the SDK's scoped-API
+// layer, which a builtin page mounts for itself via `AppScopedApiProvider`. App
+// identity is published for every builtin page by BuiltinAppRoute.
+
+const API = '/api/apps/papyrus'
+
+/** Endpoint path for the compiled PDF. */
+const PDF_PATH = '/pdf'
+
+/** One row of the project list. */
+export interface Project {
+  name: string
+  /** Main-document mtime, in epoch SECONDS (Python's st_mtime). */
+  modified: number
+  has_pdf: boolean
+  /**
+   * What to DISPLAY for this paper: the name the user set, else `name`. Never an
+   * identifier — `name` stays the key for
+   * every call below, for the PDF URL and for the paper's chat slot, so a
+   * rename cannot break a link.
+   *
+   * The server always sends something displayable (it falls back to `name`), but
+   * an older backend does not send the field at all — hence the `??` at the one
+   * render site rather than trust here.
+   */
+  title: string
+  /**
+   * Which paper this row is: changes when a paper is deleted and created again
+   * under the same name. {@link papyrusApi.setTitle} sends it back so a row
+   * loaded before that replacement cannot rename the new paper.
+   */
+  generation: string
+}
+
+export interface ProjectDetail {
+  name: string
+  /**
+   * What to DISPLAY for this paper, resolved exactly as {@link Project.title}
+   * is — so the workspace header and the list row that opened it agree.
+   *
+   * Resolved server-side rather than carried over from the list: a paper opened
+   * straight from a URL never went through the list, and the client holds only
+   * `name`. An older backend omits the field, hence the fallback at the render
+   * site.
+   */
+  title: string
+  main_file: string
+  files: string[]
+  has_pdf: boolean
+}
+
+/** One parsed compiler message. `line` is null when the log gave no line. */
+export interface Diagnostic {
+  level: 'error' | 'warning' | 'typesetting'
+  message: string
+  line: number | null
+  file: string | null
+}
+
+export interface CompileResult {
+  ok: boolean
+  log: string
+  errors: Diagnostic[]
+  duration_ms: number
+}
+
+export interface GitStatus {
+  is_git: boolean
+  branch?: string
+  dirty?: boolean
+  has_remote?: boolean
+  ahead?: number
+  behind?: number
+  changes?: string[]
+  recent_commits?: string[]
+  /** Set when the status probe itself failed, so the toolbar can stay quiet. */
+  error?: string
+}
+
+/** Live state of the managed-compiler provisioning job. */
+export interface ManagedCompilerJob {
+  state: 'idle' | 'downloading' | 'verifying' | 'installing' | 'done' | 'error'
+  error: string
+  attempt: number
+  bytes_downloaded: number
+  bytes_total: number
+  elapsed: number
+}
+
+/**
+ * The app's own digest-pinned Tectonic install — the reason a stock machine can
+ * compile at all. `supported` is false where no pinned build exists (32-bit
+ * Linux, BSD, Windows-on-ARM); there the UI keeps the manual-install advice.
+ */
+export interface ManagedCompiler {
+  supported: boolean
+  installed: boolean
+  /** Upstream release tag the pinned digests were computed from. */
+  release: string
+  version: string
+  job: ManagedCompilerJob
+}
+
+export interface Health {
+  status: string
+  /** Basename of the compiler found on the host, or '' when there is none. */
+  compiler: string
+  git: boolean
+  managed: ManagedCompiler
+}
+
+/** Thrown by every call below, carrying the server's own message when it sent one. */
+export class PapyrusApiError extends Error {
+  status: number
+  /** Raw git/compiler output, when the endpoint returned any. */
+  output: string
+  /** The backend's machine-readable `code`, or '' when it sent none. */
+  code: string
+  /** For `invalid_project_name`: the refused character, or '' when none was named. */
+  char: string
+
+  constructor(message: string, status: number, output = '', code = '', char = '') {
+    super(message)
+    this.name = 'PapyrusApiError'
+    this.status = status
+    this.output = output
+    this.code = code
+    this.char = char
+  }
+}
+
+interface ErrorBody {
+  error?: string
+  output?: string
+  code?: string
+  char?: string
+}
+
+/** Prefer the backend's own `{error}`/`reason` over a bare "HTTP 500". */
+async function toError(r: Response): Promise<PapyrusApiError> {
+  let body: ErrorBody | null = null
+  try {
+    body = (await r.json()) as ErrorBody
+  } catch {
+    body = null
+  }
+  return new PapyrusApiError(
+    body?.error || r.statusText || `HTTP ${r.status}`,
+    r.status,
+    body?.output || '',
+    typeof body?.code === 'string' ? body.code : '',
+    typeof body?.char === 'string' ? body.char : '',
+  )
+}
+
+async function get<T>(path: string, params: Record<string, string> = {}): Promise<T> {
+  const q = new URLSearchParams(params)
+  const suffix = q.toString() ? `?${q.toString()}` : ''
+  const r = await fetch(`${API}${path}${suffix}`, { credentials: 'same-origin' })
+  if (!r.ok) throw await toError(r)
+  return r.json() as Promise<T>
+}
+
+async function send<T>(method: string, path: string, body: unknown): Promise<T> {
+  const r = await fetch(`${API}${path}`, {
+    method,
+    credentials: 'same-origin',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+  if (!r.ok) throw await toError(r)
+  return r.json() as Promise<T>
+}
+
+async function del<T>(path: string, params: Record<string, string>): Promise<T> {
+  const q = new URLSearchParams(params)
+  const r = await fetch(`${API}${path}?${q.toString()}`, {
+    method: 'DELETE',
+    credentials: 'same-origin',
+  })
+  if (!r.ok) throw await toError(r)
+  return r.json() as Promise<T>
+}
+
+/**
+ * Compile is the one call that legitimately takes tens of seconds (a paper with a
+ * bibliography needs four compiler passes), so it does NOT go through the shared
+ * `send` error path: a non-ok response here is a FAILED COMPILE with a parseable
+ * log, not a transport error, and throwing would discard exactly the output the
+ * user needs to fix their document.
+ */
+async function compile(name: string): Promise<CompileResult> {
+  const r = await fetch(`${API}/compile`, {
+    method: 'POST',
+    credentials: 'same-origin',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name }),
+  })
+  const data = (await r.json().catch(() => null)) as CompileResult | ErrorBody | null
+  if (data && 'ok' in data) return data as CompileResult
+  // A transport/authorization failure with no compile payload — surface it as a
+  // failed compile whose "log" is the error, so one code path renders both.
+  const message = (data as ErrorBody | null)?.error || r.statusText || `HTTP ${r.status}`
+  return { ok: false, log: message, errors: [], duration_ms: 0 }
+}
+
+/** URL of the compiled PDF, cache-busted so a recompile is never served stale. */
+export function pdfUrl(name: string, version: number): string {
+  const q = new URLSearchParams({ name, v: String(version) })
+  return `${API}${PDF_PATH}?${q.toString()}`
+}
+
+export const papyrusApi = {
+  health: () => get<Health>('/health'),
+
+  /**
+   * Start the managed-compiler install. Answers 202 the moment the background job
+   * starts, so the caller polls `/health` for `managed.job` rather than awaiting
+   * the ~10-22MB transfer on this request.
+   */
+  provisionCompiler: () => send<{ ok: boolean; state: string }>('POST', '/compiler/provision', {}),
+
+  listProjects: () => get<{ projects: Project[] }>('/projects'),
+  createProject: (name: string) => send<{ name: string; main_file: string }>('POST', '/projects', { name }),
+  cloneProject: (url: string, name?: string) =>
+    send<{ name: string; main_file: string }>('POST', '/projects/clone', { url, name: name || '' }),
+  getProject: (name: string) => get<ProjectDetail>('/project', { name }),
+  deleteProject: (name: string) => del<{ ok: boolean }>('/project', { name }),
+
+  listFiles: (name: string) => get<{ files: string[] }>('/files', { name }),
+  readFile: (name: string, path: string) => get<{ path: string; content: string }>('/file', { name, path }),
+  saveFile: (name: string, path: string, content: string) =>
+    send<{ ok: boolean; path: string }>('PUT', '/file', { name, path, content }),
+  createFile: (name: string, path: string) =>
+    send<{ ok: boolean; path: string }>('POST', '/file', { name, path, content: '' }),
+  deleteFile: (name: string, path: string) => del<{ ok: boolean }>('/file', { name, path }),
+  setMainFile: (name: string, path: string) =>
+    send<{ ok: boolean; main_file: string }>('PUT', '/main', { name, path }),
+  /**
+   * Rename what the list shows for a paper. `name` (the directory) is untouched.
+   *
+   * An empty `title` CLEARS the override, and the response carries whatever wins
+   * next — `name` — so the caller renders the answer instead of re-deriving it.
+   */
+  setTitle: (name: string, title: string, generation: string) =>
+    send<{ ok: boolean; title: string }>('PUT', '/title', { name, title, generation }),
+
+  compile,
+
+  gitStatus: (name: string) => get<GitStatus>('/git', { name }),
+  gitCommit: (name: string, message: string) =>
+    send<{ ok: boolean; output: string }>('POST', '/git/commit', { name, message }),
+  gitPush: (name: string) => send<{ ok: boolean; output: string }>('POST', '/git/push', { name }),
+  gitPull: (name: string) =>
+    send<{ ok: boolean; output: string; stashed: boolean }>('POST', '/git/pull', { name }),
+}

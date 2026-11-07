@@ -1,0 +1,135 @@
+[
+  {
+    "agent_capabilities": {
+      "loadSession": true,
+      "mcpCapabilities": {
+        "http": true,
+        "sse": true
+      },
+      "promptCapabilities": {
+        "embeddedContext": true,
+        "image": true
+      },
+      "sessionCapabilities": {
+        "close": {},
+        "fork": {},
+        "list": {},
+        "resume": {}
+      }
+    },
+    "agent_version": "1.19.1",
+    "frame": "response",
+    "id": 1,
+    "protocol_version": 1
+  },
+  {
+    "config_options": [
+      {
+        "category": "model",
+        "currentValue": "stub/tool-1",
+        "id": "model",
+        "name": "Model",
+        "options": [
+          {
+            "name": "Stub/tool-1",
+            "value": "stub/tool-1"
+          }
+        ],
+        "type": "select"
+      },
+      {
+        "category": "mode",
+        "currentValue": "build",
+        "id": "mode",
+        "name": "Session Mode",
+        "options": [
+          {
+            "description": "The default agent. Executes tools based on configured permissions.",
+            "name": "build",
+            "value": "build"
+          }
+        ],
+        "type": "select"
+      }
+    ],
+    "frame": "response",
+    "id": 2,
+    "session_id": "opencode-session-1"
+  },
+  {
+    "action": "update",
+    "events": [
+      {
+        "kind": "tool_call",
+        "title": "kirocrew-core_monitor_start",
+        "tool_call_id": "call_live_1",
+        "tool_kind": "other",
+        "wire_title": "kirocrew-core_monitor_start"
+      }
+    ],
+    "frame": "session/update",
+    "session_update": "tool_call"
+  },
+  {
+    "action": "update",
+    "events": [
+      {
+        "kind": "tool_call_update",
+        "raw_tool_params": {
+          "interval_secs": 300,
+          "message": "Watch CI on this PR; stop when it is green."
+        },
+        "title": "kirocrew-core_monitor_start",
+        "tool_call_id": "call_live_1",
+        "tool_input": "{\n  \"message\": \"Watch CI on this PR; stop when it is green.\",\n  \"interval_secs\": 300\n}",
+        "tool_kind": "other",
+        "wire_title": "kirocrew-core_monitor_start"
+      }
+    ],
+    "frame": "session/update",
+    "session_update": "tool_call_update"
+  },
+  {
+    "action": "update",
+    "events": [
+      {
+        "kind": "tool_result",
+        "tool_call_id": "call_live_1",
+        "tool_final": true,
+        "tool_output": "Monitor loop requested for this session.\n[[KIROCREW_SESSION_DIRECTIVE]]{\"kind\":\"monitor_start\",\"args\":{\"message\":\"Watch CI on this PR; stop when it is green.\",\"interval_secs\":300,\"gate\":true}}",
+        "tool_output_bytes": 192,
+        "tool_output_digest": "a3b4b4df2e1e8cb82c908bab69088629c85052ac0a558e8447f881e6b8dc96be",
+        "tool_status": "completed"
+      }
+    ],
+    "frame": "session/update",
+    "session_update": "tool_call_update"
+  },
+  {
+    "action": "update",
+    "events": [
+      {
+        "kind": "text_chunk",
+        "message_id": "msg-1",
+        "text": "done"
+      }
+    ],
+    "frame": "session/update",
+    "session_update": "agent_message_chunk",
+    "text_chunk": {
+      "text": "done",
+      "thinking": false
+    }
+  },
+  {
+    "frame": "response",
+    "id": 3,
+    "prompt_tokens": [
+      5,
+      1,
+      0,
+      0
+    ],
+    "stop_reason": "end_turn"
+  }
+]

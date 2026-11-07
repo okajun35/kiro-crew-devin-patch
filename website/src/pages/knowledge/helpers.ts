@@ -1,0 +1,146 @@
+import { useState } from 'react'
+import { fmtDateFields, fmtList, fmtRelative } from '../../i18n/format'
+import { i18nT } from '../../i18n/t'
+import { copyToClipboard } from '../../utils/clipboard'
+import { localDaysAgo } from '../chat/sessionOrder'
+
+export function typeBadgeVariant(t: string): 'ok' | 'warn' | 'err' | 'aim' {
+  if (['design_doc', 'code_doc'].includes(t)) return 'aim'
+  if (['runbook', 'policy'].includes(t)) return 'warn'
+  if (['report', 'presentation'].includes(t)) return 'ok'
+  return 'ok'
+}
+
+export function formatDate(iso: string) {
+  return fmtDateFields(iso, { month: 'short', day: 'numeric', year: 'numeric' })
+}
+
+const DAY_MS = 24 * 60 * 60 * 1000
+
+export function formatRelativeDate(iso: string): string {
+  // Local calendar days, not elapsed 24h periods: a sync at 23:00 seen at 00:30
+  // is "yesterday". A future instant (clock skew) folds into today.
+  const now = new Date()
+  const days = Math.max(0, localDaysAgo(now, new Date(iso)))
+  // "today" / "yesterday" come from the locale's own relative-time words: a
+  // pinned day unit with `numeric: 'auto'` renders 0 and -1 as those words, so
+  // no catalog key is needed and every language gets its idiomatic form.
+  if (days <= 1) return fmtRelative(now.getTime() - days * DAY_MS, { unit: 'day', now })
+  if (days < 7) return i18nT('pages.knowledge.helpers.days_ago', { n: days })
+  if (days < 30) return i18nT('pages.knowledge.helpers.weeks_ago', { n: Math.floor(days / 7) })
+  return i18nT('pages.knowledge.helpers.months_ago', { n: Math.floor(days / 30) })
+}
+
+/** Copy-with-confirmation for the knowledge views.
+ *
+ *  Routed through the shared helper, not `navigator.clipboard` directly: that
+ *  API needs a secure context, so on a plain-HTTP dashboard it does not exist
+ *  and a bare call throws before anything is copied. The confirmation is gated
+ *  on the helper's boolean — a tick over an unchanged clipboard is worse than
+ *  none, because the user finds out only when they paste. */
+export function useCopy() {
+  const [copied, setCopied] = useState(false)
+  const copy = async (text: string) => {
+    if (!(await copyToClipboard(text))) return
+    setCopied(true)
+    setTimeout(() => setCopied(false), 1500)
+  }
+  return { copied, copy }
+}
+
+// API type vocabulary, mirroring the backend's `item_type` enum. These are
+// DISCRIMINANTS, not copy: they are submitted as the filter/create value and
+// compared server-side, so the literals must stay verbatim in every locale.
+export const ITEM_TYPES = ['design_doc', 'runbook', 'meeting_notes', 'code_doc', 'presentation', 'report', 'policy', 'personal_notes', 'external_reference', 'document']
+export const STATUSES = ['active', 'archived']
+
+/**
+ * Visible label per knowledge item type and status. FULL literal keys so the
+ * key-reference gate can verify each one; a type outside the list keeps its
+ * own name with underscores shown as spaces.
+ */
+const ITEM_TYPE_LABEL_KEY: Record<string, string> = {
+  design_doc: 'pages.knowledge.index.type_design_doc',
+  runbook: 'pages.knowledge.index.type_runbook',
+  meeting_notes: 'pages.knowledge.index.type_meeting_notes',
+  code_doc: 'pages.knowledge.index.type_code_doc',
+  presentation: 'pages.knowledge.index.type_presentation',
+  report: 'pages.knowledge.index.type_report',
+  policy: 'pages.knowledge.index.type_policy',
+  personal_notes: 'pages.knowledge.index.type_personal_notes',
+  external_reference: 'pages.knowledge.index.type_external_reference',
+  document: 'pages.knowledge.index.type_document',
+}
+
+// Singular, for one item's badge; the list filter keeps its own plural labels.
+const ITEM_STATUS_LABEL_KEY: Record<string, string> = {
+  active: 'pages.knowledge.detailView.status_active',
+  archived: 'pages.knowledge.detailView.status_archived',
+}
+
+// Own keys only: a stored type such as `toString` must not reach an inherited
+// Object.prototype member and hand a function to i18nT.
+export function itemTypeLabel(t: string): string {
+  return Object.hasOwn(ITEM_TYPE_LABEL_KEY, t) ? i18nT(ITEM_TYPE_LABEL_KEY[t]) : t.replace(/_/g, ' ')
+}
+
+export function itemStatusLabel(s: string): string {
+  return Object.hasOwn(ITEM_STATUS_LABEL_KEY, s) ? i18nT(ITEM_STATUS_LABEL_KEY[s]) : s
+}
+// Status the list view opens on. This is the default view, NOT user narrowing,
+// so the onboarding empty state treats this value as "no filter applied".
+export const DEFAULT_STATUS_FILTER = 'active'
+// Fallback shown/used only until GET /api/knowledge/config resolves. The
+// backend's `FileReader.SUPPORTED` (src/kiro_crew/knowledge/readers.py) is the
+// single source of truth for what upload ingests; this mirror exists so the
+// file picker and the copy are not empty during the config round-trip.
+// test/test_knowledge_formats_parity.py holds this list identical to
+// `sorted(FileReader.SUPPORTED - {''})`, so it cannot silently drift.
+export const FALLBACK_SUPPORTED_FORMATS = [
+  '.adoc', '.asciidoc',
+  '.c', '.cpp', '.cs', '.csv', '.docx', '.go', '.h', '.htm', '.html', '.java',
+  '.js', '.json', '.jsonl', '.kt', '.kts', '.log', '.md', '.ndjson', '.org',
+  '.pdf', '.php', '.phtml', '.ps1', '.psd1', '.psm1', '.py', '.rb', '.rs', '.scala', '.sh',
+  '.swift', '.ts', '.txt', '.yaml', '.yml',
+]
+
+/**
+ * Render an extension list (from `/api/knowledge/config`, or the fallback
+ * above) as a localized display string for the "Supported formats" copy. The
+ * extensions themselves are DNT tokens; only the list separators localize.
+ */
+export function formatSupportedFormats(exts: readonly string[]): string {
+  return fmtList(exts, { type: 'conjunction' })
+}
+
+/**
+ * Onboarding copy for the Knowledge Library help dialog and empty state.
+ *
+ * GETTERS, not values: this object is built once at module load, so an
+ * `i18nT()` call in a plain property initialiser would freeze the boot language
+ * and never re-resolve on a language switch. A getter runs on every property
+ * ACCESS instead, and both consumers (`index.tsx`) read these properties inside
+ * JSX — so the lookup happens per render while the public shape stays exactly
+ * what it was, and no call site has to change.
+ */
+export const ONBOARDING = {
+  get title() {
+    return i18nT('pages.knowledge.helpers.welcome_to_the_knowledge_library')
+  },
+  get description() {
+    return i18nT('pages.knowledge.helpers.your_centralized_knowledge_base_with_entity_extr')
+  },
+  // A method rather than a getter because the caller supplies the formats
+  // display string (derived from /api/knowledge/config). Like the getters, it
+  // resolves i18nT per CALL, so a language switch still re-renders correctly.
+  steps(formatsDisplay: string) {
+    return [
+      i18nT('pages.knowledge.helpers.drop_files_here_or_click_upload_to_ingest_docume'),
+      i18nT('pages.knowledge.helpers.documents_are_chunked_entities_extracted_and_rel'),
+      i18nT('pages.knowledge.helpers.search_across_all_knowledge_filter_by_type_or_ex'),
+      // The format list itself is a set of DNT file extensions, interpolated
+      // so only the sentence around it is translated.
+      i18nT('pages.knowledge.helpers.supported_formats', { formats: formatsDisplay }),
+    ]
+  },
+}

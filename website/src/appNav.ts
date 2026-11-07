@@ -1,0 +1,258 @@
+import { hasBuiltinIcon } from './apps/builtinIcons'
+import { appPageLabel } from './components/appstore/appManifest'
+import type { AppAdoptionRow } from './components/appstore/types'
+import { classifyManifestArt, installedIcon } from './components/appstore/useHeroArt'
+
+/**
+ * Where an installed app lives in the dashboard — one definition, shared by every
+ * surface that offers a way to open one.
+ *
+ * The left rail and the Search Everywhere palette both have to turn an app record
+ * from `GET /api/apps` into a destination. Deriving that twice is how they drift:
+ * a palette copy that missed the orphaned branch would send the user to a page the
+ * app no longer has, and one that missed the `enabled` filter would offer to open
+ * an app that is switched off. Route and eligibility therefore live here; only
+ * ICON RENDERING stays per-surface, because the rail tints orphaned apps and sizes
+ * its glyph for a 16px row while the palette does not.
+ */
+
+/** A UI page an app publishes in `manifest.ui.pages`. */
+export interface AppNavPage {
+  route: string
+  icon?: string
+  iconUrl?: string
+  /** Icon file for the nav row when the app is NOT selected, relative to `ui/`. */
+  iconInactiveUrl?: string
+  label?: string
+}
+
+/**
+ * The subset of `GET /api/apps` this module reads. Pinned locally (rather than
+ * imported from a consumer) so a field this derivation depends on cannot quietly
+ * change shape — the same reason `sessionsProvider` pins its own response type.
+ */
+export interface AppNavRecord {
+  name: string
+  displayName?: string
+  enabled?: boolean
+  /** Set when the gateway skipped this built-in at boot: it has no routes, so it is not live. */
+  unavailable?: { reason: string }
+  origin?: string
+  orphaned?: boolean
+  /** Git URL the install recorded — the repo an external app's art resolves against. */
+  sourceUrl?: string
+  /** Present for a former built-in the gateway moves to its registry copy. */
+  adoption?: AppAdoptionRow
+  manifest?: {
+    iconUrl?: string
+    iconUrlDark?: string
+    /**
+     * What an EXTERNAL app actually declares. The manifest contract gives a
+     * fetched app `iconPath` (repo-relative) and reserves `iconUrl` for a
+     * builtin's absolute client-local path, so reading only `iconUrl` here left
+     * every external app's rail and command-palette icon as the generic box —
+     * the one surface that renders on every load.
+     */
+    iconPath?: string
+    iconPathDark?: string
+    /** The repo a manifest declares for its own art paths, when it declares one. */
+    repo?: string
+    /** The app's own listing copy per locale; read by the label helper. */
+    l10n?: unknown
+    ui?: {
+      entry?: string
+      pages?: AppNavPage[]
+    }
+  }
+}
+
+/** An app that has a place in the dashboard, with its destination resolved. */
+export interface AppNavTarget {
+  /** App name (the `/api/apps` key, and the `/apps/<name>` path segment). */
+  name: string
+  /** Route to navigate to. */
+  route: string
+  /** Nav id — `app-<name>` for AppHost-routed apps, the bare name for native builtins. */
+  id: string
+  /** Display label, localised. */
+  label: string
+  /** True when the app needs migration; its route points at the migrate page. */
+  orphaned: boolean
+  /**
+   * True for a builtin app (`origin === 'builtin'`).
+   *
+   * Exposed because the lucide-glyph icon fallback is builtin-only: `iconName`
+   * comes from the manifest, so looking it up for an INSTALLED app would render a
+   * builtin glyph for any app whose `page.icon` happens to collide with one.
+   */
+  builtin: boolean
+  /**
+   * Whether the rail and palette may render the Lucide glyph named by `iconName`:
+   * a builtin's, or an adopted former built-in's legacy glyph, which comes from
+   * the gateway's own adoption row rather than from the app's manifest.
+   */
+  glyphAllowed: boolean
+  /** Custom top-level icon (an absolute `/app-assets/...` path), when the manifest has one. */
+  iconUrl: string
+  /** Dark-appearance variant of `iconUrl`, when the manifest ships one. */
+  iconUrlDark: string
+  /** Lucide glyph name from the app's first UI page, for the builtin icon lookup. */
+  iconName: string
+  /** Page-relative icon file (installed apps), resolved against `/apps/<name>/ui/`. */
+  pageIconUrl: string
+  /**
+   * The icon the rail shows while this app's row is NOT selected, from the first
+   * page's `iconInactiveUrl`: a resolved URL, or `''` when the manifest declares
+   * none (or one this module refuses). Empty means the row keeps one icon.
+   */
+  inactiveIconUrl: string
+}
+
+/**
+ * Resolve a page-icon value from an installed manifest against the app's UI
+ * asset route, `/apps/<name>/ui/…` — the base `ui.pages[]` icon files are
+ * documented relative to.
+ *
+ * The manifest is untrusted, and the rail renders on every dashboard load, so
+ * the value goes through the same classifier as every other manifest art path:
+ * a host, a scheme, a dot segment or an off-allowlist absolute path answers `''`.
+ * A same-origin client-art path (a built-in's `/app-assets/…`) passes as-is.
+ */
+export function installedUiArt(path: unknown, appName: string): string {
+  const kind = classifyManifestArt(path)
+  if (kind === 'refused') return ''
+  const value = path as string
+  // The classifier judged the value the URL parser sees (tabs and newlines
+  // dropped, ends trimmed). Refuse a value that differs from it rather than
+  // re-derive that form here, so the URL built below is the one it judged.
+  if (/^[\u0000-\u0020]|[\u0000-\u0020]$|[\t\n\r]/.test(value)) return ''
+  if (kind === 'same-origin') return value
+  const rel = value.startsWith('./') ? value.slice(2) : value
+  try {
+    const encoded = rel.split('/').map(encodeURIComponent).join('/')
+    return `/apps/${encodeURIComponent(appName)}/ui/${encoded}`
+  } catch {
+    // A lone surrogate is valid JSON but makes encodeURIComponent throw. This
+    // runs for every app on every rail refresh, so one bad manifest must cost
+    // only its own inactive icon, never the whole Apps list.
+    return ''
+  }
+}
+
+/**
+ * The UI page a navigable app opens at, or `null` when it has none.
+ *
+ * The guard and the read are ONE expression on purpose. Asking
+ * `manifest?.ui?.pages?.length` in one place and then asserting
+ * `manifest!.ui!.pages![0]` in another is the shape that produced #3689: the
+ * assertion outlives the guard it was written against. Returning the page makes
+ * "navigable" and "here is the page" the same answer, so they cannot disagree.
+ */
+function firstUiPage(app: AppNavRecord): AppNavPage | null {
+  const pages = app.manifest?.ui?.pages
+  return pages && pages.length > 0 ? pages[0] : null
+}
+
+/** The route grammar a legacy nav entry must match (one kebab-case segment). */
+const LEGACY_NAV_ROUTE_RE = /^\/[a-z0-9]+(?:-[a-z0-9]+)*$/
+
+/**
+ * The route and glyph a former built-in keeps after the gateway adopted its
+ * registry copy, or `null` for every other app.
+ *
+ * Both values come from the gateway's `adoption` row, which copies them from the
+ * pin compiled into the wheel -- never from the app's own manifest, so an app
+ * cannot claim a bare route or a built-in glyph for itself. Only an adopted,
+ * non-builtin record with a bundle to render qualifies: a record still owned by
+ * the built-in keeps its compiled page. A glyph name the rail has no glyph for
+ * reads as `''`, so the rail falls back the way it does for any app.
+ */
+export function adoptedLegacyNav(app: AppNavRecord): { route: string; icon: string } | null {
+  if (app.origin === 'builtin' || app.adoption?.state !== 'adopted' || !app.manifest?.ui?.entry) return null
+  const nav = app.adoption.legacyNav
+  if (!nav || typeof nav.route !== 'string' || !LEGACY_NAV_ROUTE_RE.test(nav.route)) return null
+  return { route: nav.route, icon: typeof nav.icon === 'string' && hasBuiltinIcon(nav.icon) ? nav.icon : '' }
+}
+
+/**
+ * Whether *app* contributes a dashboard destination at all.
+ *
+ * Disabled apps, built-ins the gateway skipped at boot (`unavailable`: no routes
+ * were registered) and apps with no UI page have nowhere to go, so no surface
+ * should offer to open them.
+ */
+export function isAppNavigable(app: AppNavRecord): boolean {
+  return !!app.enabled && !app.unavailable && !!firstUiPage(app)
+}
+
+/**
+ * Resolve *app* to its dashboard destination, or `null` when it has none.
+ *
+ * Three routing cases, in precedence order:
+ *  1. **Orphaned** — the app predates a manifest migration, so it goes to the
+ *     migration page rather than to a page it may no longer serve.
+ *  2. **AppHost-routed** — installed apps, and builtins that ship a dynamic UI
+ *     bundle (`manifest.ui.entry`) and therefore have no natively compiled
+ *     surface, are served under `/apps/<name>`.
+ *  3. **Native builtin** — no `ui.entry`, so its compiled surface is already
+ *     registered at the page's own route.
+ */
+export function appNavTarget(app: AppNavRecord): AppNavTarget | null {
+  const page = app.enabled && !app.unavailable ? firstUiPage(app) : null
+  if (!page) return null
+  const isBuiltin = app.origin === 'builtin'
+  const orphaned = !!app.orphaned
+  const appHostRouted = !isBuiltin || !!app.manifest?.ui?.entry
+  const legacy = adoptedLegacyNav(app)
+  const route = orphaned
+    ? `/apps/migrate/${app.name}`
+    : legacy
+      ? legacy.route
+      : appHostRouted
+        ? `/apps/${app.name}`
+        : page.route
+  return {
+    name: app.name,
+    route,
+    // The bare name for an adopted former built-in, as it had while it was one:
+    // the rail's hidden, order and pinned preferences are keyed by this id.
+    id: legacy ? app.name : appHostRouted ? `app-${app.name}` : app.name,
+    label: appPageLabel(app.name, page.label, app.displayName, app.origin, app.manifest?.l10n),
+    orphaned,
+    builtin: isBuiltin,
+    glyphAllowed: isBuiltin || !!legacy,
+    // Routed through the shared resolver rather than taken raw: an installed
+    // `app.json` is untrusted content, and both consumers of this target (the
+    // left rail and the command palette) render for EVERY enabled app on every
+    // dashboard load — so a manifest naming an external host would leak the
+    // viewer to it without them opening anything. A built-in's absolute
+    // `/app-assets/…` still passes through unchanged.
+    //
+    // `installedArt` first: everything here IS installed, and its art sits in
+    // the app's own install directory, so serving it from `/apps/{name}/art/…`
+    // keeps the rail off the blob proxy entirely. That matters most on this
+    // surface — it is the one that renders on every load, so a proxy 403 during
+    // a cold start would blank every external app's rail icon at once.
+    // `iconPath` before `iconUrl`, matching the order the detail page and the
+    // backend both use: a fetched app declares the repo-relative one, and reading
+    // only `iconUrl` is why an external app kept the generic box here even after
+    // its detail page showed the real icon.
+    iconUrl: installedIcon(app.manifest?.iconPath, app.manifest?.iconUrl, app.name),
+    iconUrlDark: installedIcon(
+      app.manifest?.iconPathDark, app.manifest?.iconUrlDark, app.name,
+    ),
+    iconName: legacy ? legacy.icon : page.icon || '',
+    pageIconUrl: page.iconUrl || '',
+    inactiveIconUrl: installedUiArt(page.iconInactiveUrl, app.name),
+  }
+}
+
+/** Every navigable app in *apps*, in the order the API returned them. */
+export function appNavTargets(apps: readonly AppNavRecord[]): AppNavTarget[] {
+  const out: AppNavTarget[] = []
+  for (const app of apps) {
+    const target = appNavTarget(app)
+    if (target) out.push(target)
+  }
+  return out
+}

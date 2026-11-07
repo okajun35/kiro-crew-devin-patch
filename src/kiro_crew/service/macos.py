@@ -1,0 +1,558 @@
+"""launchd LaunchAgent generation and control for macOS.
+
+The plist lives at ``~/Library/LaunchAgents/dev.kirocrew.gateway.plist``
+and is bootstrapped into the ``gui/<uid>`` domain with
+``launchctl bootstrap``. It keeps the gateway continuously
+running. Dev Fleet's restart is launchd-owned: SIGTERM first, then SIGKILL only
+after the finite ``ExitTimeOut`` if cooperative shutdown does not finish.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import plistlib
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+from kiro_crew.atomic_write import atomic_write
+from kiro_crew.gateway_shutdown_budget import TOTAL_SHUTDOWN_BUDGET_SECS
+from kiro_crew.pod import launchd as _pod_launchd
+from kiro_crew.service.common import (
+    LAUNCHD_LABEL,
+    kirocrew_bin,
+    launchd_live_program,
+    service_environment,
+)
+from kiro_crew.subprocess_utf8 import UTF8_TEXT
+
+log = logging.getLogger(__name__)
+
+PLIST_DIR = Path.home() / "Library" / "LaunchAgents"
+PLIST_PATH = PLIST_DIR / f"{LAUNCHD_LABEL}.plist"
+LOG_DIR = Path.home() / "Library" / "Logs" / "KiroCrew"
+STDOUT_LOG = LOG_DIR / "gateway.log"
+STDERR_LOG = LOG_DIR / "gateway.err"
+#: See :func:`kiro_crew.service.common.launchd_live_program` for why the agent
+#: runs a generated launcher rather than the resolved binary.
+LIVE_PROGRAM = Path(launchd_live_program())
+
+
+def _xml_escape(value: str) -> str:
+    return (
+        value.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
+def render_plist() -> str:
+    """Render the launchd LaunchAgent plist contents.
+
+    ``ProgramArguments[0]`` is the :data:`LIVE_PROGRAM` launcher, not the
+    resolved binary, so the agent can be repointed at another checkout (with its
+    own working directory and PATH) without rewriting — and re-bootstrapping —
+    the plist. :func:`install` renders a pass-through launcher aimed at
+    :func:`kirocrew_bin` by default.
+    """
+    bin_path = _xml_escape(str(LIVE_PROGRAM))
+    home_str = str(Path.home())
+    out_log = _xml_escape(str(STDOUT_LOG))
+    err_log = _xml_escape(str(STDERR_LOG))
+    env_entries = "".join(
+        f"        <key>{_xml_escape(key)}</key>\n"
+        f"        <string>{_xml_escape(value)}</string>\n"
+        for key, value in service_environment(home_str).items()
+    )
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
+        '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+        '<plist version="1.0">\n'
+        "<dict>\n"
+        "    <key>Label</key>\n"
+        f"    <string>{LAUNCHD_LABEL}</string>\n"
+        "    <key>ProgramArguments</key>\n"
+        "    <array>\n"
+        f"        <string>{bin_path}</string>\n"
+        "        <string>gateway</string>\n"
+        # A background service must never open a browser. launchd starts this on
+        # login, on every KeepAlive respawn, and on every `kickstart` — which is
+        # what Dev Fleet's Restart button runs — so without this the user gets a
+        # new dashboard tab each time. The surface they are already using (a
+        # browser tab or the Electron window) reconnects on its own.
+        "        <string>--no-open</string>\n"
+        "    </array>\n"
+        "    <key>RunAtLoad</key>\n"
+        "    <true/>\n"
+        "    <key>KeepAlive</key>\n"
+        "    <true/>\n"
+        "    <key>ExitTimeOut</key>\n"
+        f"    <integer>{TOTAL_SHUTDOWN_BUDGET_SECS}</integer>\n"
+        "    <key>EnvironmentVariables</key>\n"
+        "    <dict>\n"
+        f"{env_entries}"
+        "    </dict>\n"
+        f"    <key>StandardOutPath</key>\n"
+        f"    <string>{out_log}</string>\n"
+        f"    <key>StandardErrorPath</key>\n"
+        f"    <string>{err_log}</string>\n"
+        "</dict>\n"
+        "</plist>\n"
+    )
+
+
+def _plist_payload(path: Path) -> dict[str, object] | None:
+    try:
+        payload = plistlib.loads(path.read_bytes())
+    except (OSError, ValueError, plistlib.InvalidFileException):
+        return None
+    except Exception as exc:
+        # plistlib's XML parser exposes ExpatError without re-exporting its type.
+        # Avoid importing the unsafe low-level XML module; malformed local plist
+        # input fails closed, while an unrelated parser failure still surfaces.
+        if (type(exc).__module__, type(exc).__name__) == (
+            "xml.parsers.expat",
+            "ExpatError",
+        ):
+            return None
+        raise
+    return payload if isinstance(payload, dict) else None
+
+
+def _launchctl_print_value(printed: str, key: str) -> str | None:
+    prefix = f"{key} = "
+    for line in printed.splitlines():
+        stripped = line.strip()
+        if stripped.startswith(prefix):
+            return stripped[len(prefix):].strip()
+    return None
+
+
+def loaded_restart_contract_current(printed: str) -> bool:
+    """Return whether the loaded launchd job has the expected restart contract."""
+    timeout = _launchctl_print_value(printed, "exit timeout")
+    properties = _launchctl_print_value(printed, "properties")
+    if timeout is None or properties is None:
+        return False
+    try:
+        parsed_timeout = int(timeout)
+    except ValueError:
+        return False
+    flags = {part.strip().lower() for part in properties.split("|")}
+    return "keepalive" in flags and parsed_timeout == TOTAL_SHUTDOWN_BUDGET_SECS
+
+
+def restart_contract_current(path: Path | None = None) -> bool:
+    """Return whether *path* has the expected graceful-restart contract."""
+    payload = _plist_payload(path or PLIST_PATH)
+    if payload is None:
+        return False
+    timeout = payload.get("ExitTimeOut")
+    return (
+        payload.get("KeepAlive") is True
+        and type(timeout) is int
+        and timeout == TOTAL_SHUTDOWN_BUDGET_SECS
+    )
+
+
+class ServiceInstallError(RuntimeError):
+    """Raised when LaunchAgent install can't proceed without manual user action."""
+
+
+def _write_plist_atomic(contents: str) -> None:
+    """Write the plist atomically.
+
+    Via :func:`kiro_crew.atomic_write.atomic_write` (same-directory temp file,
+    then ``os.replace``), so a SIGINT or crash never leaves a partial XML
+    document that ``launchctl load`` would reject. ``fsync`` is off.
+
+    ``mode=0o600`` must be explicit: without it the umask decides, which is
+    world-readable under a common ``022``. launchd loads the agent as the owning
+    user, so nobody else needs to read it.
+    """
+    atomic_write(PLIST_PATH, contents, mode=0o600)
+
+
+def _launchctl(*args: str, check: bool = False) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["launchctl", *args],
+        capture_output=True,
+        # launchctl writes labels and plist paths as UTF-8 whatever the locale.
+        **UTF8_TEXT,
+        check=check,
+    )
+
+
+def _sh_quote(raw: str) -> str:
+    """POSIX single-quote *raw* for the generated launcher script."""
+    return "'" + raw.replace("'", "'\\''") + "'"
+
+
+def render_live_program(target_bin: str, *, working_dir: str | None = None,
+                        path_prefix: "list[str] | None" = None) -> str:
+    """Render the launcher the agent executes (see LIVE_PROGRAM).
+
+    With no *working_dir* this is a pass-through to *target_bin* — what a plain
+    ``service install`` needs. Dev Fleet's cutover supplies the target checkout's
+    directory and venv-first PATH so the whole process tree, including anything
+    that re-invokes ``kirocrew`` by name, resolves to the checkout that is now
+    live. Without that, PATH-resolved subprocesses would keep hitting the old
+    install while the gateway ran the new one.
+
+    ``exec "$@"`` forwarding matters: the plist passes ``gateway`` as argv[1], so
+    the launcher must hand its own arguments through unchanged.
+    """
+    lines = [
+        "#!/bin/sh",
+        "# Generated by KiroCrew (service install / Dev Fleet make-live).",
+        "# Rewritten atomically on every change - do not edit by hand.",
+    ]
+    if working_dir:
+        lines.append(f"cd {_sh_quote(working_dir)} || exit 1")
+    if path_prefix:
+        lines.append(f"PATH={_sh_quote(':'.join(path_prefix))}")
+        lines.append("export PATH")
+    lines.append(f"exec {_sh_quote(target_bin)} \"$@\"")
+    return "\n".join(lines) + "\n"
+
+
+def write_live_program(contents: str, path: Path | None = None) -> None:
+    """Write the live-gateway launcher atomically and make it executable.
+
+    *path* defaults to :data:`LIVE_PROGRAM`; Dev Fleet passes the path it reports
+    as the live program, so writer and reader agree on the file.
+
+    Atomic because the agent may be kickstarted at any moment and would exec a
+    truncated script. ``atomic_write`` sets *mode* before any content is
+    written, so the file never appears without its exec bit or with a wider mode.
+    ``0o700``, not ``0o755``: launchd runs the agent as the owning user.
+    """
+    dest = path or LIVE_PROGRAM
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    # nosemgrep: python.lang.security.audit.insecure-file-permissions.insecure-file-permissions -- launchd EXECUTES this file as the ProgramArguments entry, so the exec bit is required and the rule's suggested 0o644 would stop the agent from spawning at all. 0o700 is the tightest mode that still works: owner-only, in the owner's own application-support directory, and the agent runs as that same user.  # noqa: E501
+    atomic_write(dest, contents, mode=0o700)
+
+
+def _repairer_bin() -> str:
+    """The executable of the install performing the repair.
+
+    ``KIROCREW_SERVICE_BIN``, else the ``kirocrew`` console script beside the
+    running interpreter. No ``PATH`` fallback: an unrelated ``kirocrew`` earlier
+    on ``PATH`` would be baked in, and the gateway would come back as a
+    different install than the one that repaired it.
+
+    Raises ``OSError`` when neither resolves to an executable file. Refusing
+    writes nothing, so a later run can still repair; a wrong target would leave
+    launchd unable to spawn the agent and, since the file then exists, suppress
+    every later repair. The caller logs the reason.
+    """
+    override = os.environ.get("KIROCREW_SERVICE_BIN", "").strip()
+    if override:
+        resolved = kirocrew_bin()
+        if not _is_executable_file(Path(resolved)):
+            raise OSError(
+                f"refusing to restore the launchd launcher: KIROCREW_SERVICE_BIN "
+                f"resolves to {resolved!r}, which is not an executable file."
+            )
+        return resolved
+    sibling = Path(sys.executable).parent / (
+        "kirocrew.exe" if os.name == "nt" else "kirocrew"
+    )
+    if _is_executable_file(sibling):
+        # The launcher persists this path, so on a managed venv it names the
+        # stable link rather than the versioned tree the interpreter runs from.
+        from kiro_crew.platform.tree_liveness import through_stable_link
+
+        return through_stable_link(str(sibling))
+    raise OSError(
+        "refusing to restore the launchd launcher: no kirocrew console script "
+        f"beside the running interpreter ({sys.executable}). PATH is not "
+        "consulted, because an unrelated kirocrew ahead of this install on PATH "
+        "would be persisted into the agent. Set KIROCREW_SERVICE_BIN to the "
+        "intended executable, or install so the console script sits beside the "
+        "interpreter."
+    )
+
+
+def _is_executable_file(path: Path) -> bool:
+    try:
+        return path.is_file() and os.access(path, os.X_OK)
+    except OSError:
+        return False
+
+
+def ensure_live_program() -> bool:
+    """Restore a missing launcher without touching the plist. True if written.
+
+    The plist's ``ProgramArguments[0]`` runs the launcher under Application
+    Support; without it launchd exits the agent ``EX_CONFIG`` and stops retrying,
+    silently. ``install`` would also restore it, but rewriting the plist drops
+    operator-added ``EnvironmentVariables`` (e.g. ``KIROCREW_PORT``).
+
+    Acts only when the installed plist runs the launcher; otherwise the file
+    would be a script nothing runs. The restored launcher targets the running
+    install: a Dev Fleet cutover's worktree and PATH were in the lost file, and
+    Make live can re-target it. Callers do the platform check.
+    """
+    if LIVE_PROGRAM.exists():
+        return False
+    # Reuses the module's own payload reader rather than parsing again: it already
+    # fails closed on the cases that matter here — unreadable, not a plist, a
+    # malformed-XML plist (an unescaped `&` in a hand-added value is the usual
+    # way), and a non-dict root. That matters because this runs on the gateway
+    # startup path, where anything escaping a check that only decides whether to
+    # rewrite a launcher becomes a crash loop under KeepAlive.
+    payload = _plist_payload(PLIST_PATH)
+    if payload is None:
+        return False
+    # ProgramArguments carries no type guarantee either, so validate before indexing.
+    argv = payload.get("ProgramArguments")
+    if not isinstance(argv, list) or not argv or str(argv[0]) != str(LIVE_PROGRAM):
+        # No agent, or one that execs something else — not a launcher of ours.
+        return False
+    write_live_program(render_live_program(_repairer_bin()))
+    log.warning(
+        "Restored the missing launchd launcher at %s -- the agent %s was loaded "
+        "with nothing to execute. It now targets this install; use Dev Fleet's "
+        "Make live to point it at a different checkout.",
+        LIVE_PROGRAM, LAUNCHD_LABEL,
+    )
+    return True
+
+
+#: How long :func:`install` waits for a ``bootout`` to take effect before it
+#: bootstraps the new plist. ``bootout`` returns before launchd has finished
+#: unloading the job, and a ``bootstrap`` of a label that is still loaded fails.
+_BOOTOUT_SETTLE_SECS = 10.0
+_BOOTOUT_POLL_SECS = 0.2
+
+
+def _uid() -> int:
+    # ``os.getuid`` is absent on Windows; the guard keeps the module importable
+    # there (the test suite imports it on every platform), as in restart().
+    return getattr(os, "getuid", lambda: -1)()
+
+
+def _legacy_domains() -> tuple[str, ...]:
+    """Domains a legacy ``load -w`` install may hold the agent in.
+
+    ``gui/<uid>`` for an install from a normal login session, ``user/<uid>``
+    for one from SSH. Searched so an agent installed by an older version is
+    still found, stopped and reinstalled cleanly.
+    """
+    return (_pod_launchd.domain(), f"user/{_uid()}")
+
+
+def _bootout(*, wait: bool) -> bool:
+    """``bootout`` the agent from whichever domain holds it.
+
+    Returns True when launchd accepted the bootout, False when the agent was
+    not loaded in any searched domain or launchd refused (the refusal is
+    logged). With ``wait``, polls until the label has left the domain, because
+    ``bootout`` is asynchronous.
+    """
+    for domain in _legacy_domains():
+        target = f"{domain}/{LAUNCHD_LABEL}"
+        res = _launchctl("bootout", target)
+        if res.returncode == 0:
+            if wait:
+                deadline = time.monotonic() + _BOOTOUT_SETTLE_SECS
+                while time.monotonic() < deadline:
+                    if _pod_launchd._service_absent(_launchctl("print", target)):
+                        break
+                    time.sleep(_BOOTOUT_POLL_SECS)
+            return True
+        # A missing domain (gui/<uid> with nobody at the desktop) holds no job:
+        # move on to the next one rather than calling it a refusal.
+        if not (_pod_launchd._service_absent(res) or _domain_unavailable(res)):
+            log.warning(
+                "launchctl bootout %s refused (rc=%s): %s",
+                target, res.returncode, (res.stderr or res.stdout).strip(),
+            )
+            return False
+    return False
+
+
+def install() -> None:
+    """Write the plist and bootstrap the agent into ``gui/<uid>``.
+
+    Idempotent: boots out a loaded agent first (from either domain a legacy
+    ``load -w`` used) so the new plist takes effect. Also rewrites
+    :data:`LIVE_PROGRAM`, which the plist executes, so re-running ``service
+    install`` repairs a deleted application-support directory.
+
+    The domain is explicit so an SSH install lands where ``restart`` and ``stop``
+    address it. Without ``gui/<uid>`` (SSH, nobody at the desktop) it falls back
+    to ``user/<uid>`` and logs that. ``enable`` clears a persistent disabled
+    override that a legacy ``unload -w`` wrote.
+
+    Raises :class:`ServiceInstallError` with a readable message if ``launchctl
+    bootstrap`` fails; the CLI prints it.
+    """
+    PLIST_DIR.mkdir(parents=True, exist_ok=True)
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    # Write the launcher BEFORE loading: a loaded agent whose Program does not
+    # exist fails to spawn and KeepAlive would retry it in a tight loop.
+    write_live_program(render_live_program(kirocrew_bin()))
+    if PLIST_PATH.exists():
+        _bootout(wait=True)
+    _write_plist_atomic(render_plist())
+    domain = _pod_launchd.domain()
+    load_res = _bootstrap_into(domain)
+    if load_res.returncode != 0 and _domain_unavailable(load_res):
+        # Bootstrapping into gui/<uid> from SSH while nobody is logged in at
+        # the desktop answers "125: Domain does not support specified action".
+        # The user/<uid> domain exists whenever the user does, and stop and
+        # uninstall search it, so the install still succeeds there.
+        fallback = f"user/{_uid()}"
+        log.warning(
+            "launchd domain %s is unavailable (no desktop login); "
+            "bootstrapping %s into %s instead",
+            domain, LAUNCHD_LABEL, fallback,
+        )
+        domain = fallback
+        load_res = _bootstrap_into(domain)
+    if load_res.returncode != 0:
+        reason = (load_res.stderr or load_res.stdout).strip()
+        raise ServiceInstallError(
+            f"`launchctl bootstrap {domain}` failed: {reason}\n"
+            f"   Plist: {PLIST_PATH}\n"
+            f"   Tail the agent logs at {STDOUT_LOG} / {STDERR_LOG} for details."
+        )
+    log.info("Bootstrapped %s into launchd domain %s", LAUNCHD_LABEL, domain)
+
+
+def _bootstrap_into(domain: str) -> subprocess.CompletedProcess[str]:
+    """``enable`` then ``bootstrap`` the plist into ``domain``."""
+    _launchctl("enable", f"{domain}/{LAUNCHD_LABEL}")
+    return _launchctl("bootstrap", domain, str(PLIST_PATH))
+
+
+def _domain_unavailable(res: subprocess.CompletedProcess[str]) -> bool:
+    """True when launchd refused the bootstrap because the domain is absent.
+
+    launchctl reports this as error 125, "Domain does not support specified
+    action", which is what ``gui/<uid>`` answers with nobody at the desktop.
+    """
+    text = f"{res.stderr or ''}\n{res.stdout or ''}".lower()
+    return res.returncode == 125 or "125: domain does not support" in text
+
+
+def uninstall() -> str | None:
+    """Boot out and remove the plist and the live-gateway launcher. Idempotent.
+
+    Returns the launchd domain that still holds the agent when no bootout was
+    accepted, else None, so the caller can report a teardown that did not stop
+    it. The files are removed either way.
+    """
+    accepted = False
+    if PLIST_PATH.exists():
+        accepted = _bootout(wait=False)
+        PLIST_PATH.unlink()
+    # Drop the launcher too: leaving it behind would make a later `status` look
+    # like a partially installed service.
+    try:
+        LIVE_PROGRAM.unlink()
+    except OSError:
+        pass
+    # An accepted bootout is asynchronous, so probing after it would race the
+    # job's exit. Without one (refused, never loaded, or no plist left by an
+    # earlier refused run) ask launchd directly.
+    return None if accepted else _loaded_domain()
+
+
+def _loaded_domain() -> str | None:
+    """The domain where ``launchctl print`` finds the agent, else None.
+
+    Unlike :func:`is_loaded` it does not read the plist, so it still sees a job
+    whose plist is gone, and only a definite answer (exit 0) counts as loaded.
+    """
+    for domain in _legacy_domains():
+        if _launchctl("print", f"{domain}/{LAUNCHD_LABEL}").returncode == 0:
+            return domain
+    return None
+
+
+def is_active() -> bool:
+    """Return True if launchd reports the agent loaded with a PID."""
+    res = _launchctl("list", LAUNCHD_LABEL)
+    if res.returncode != 0:
+        return False
+    # `launchctl list <label>` prints a plist-ish dict with PID = <int>;
+    # an unloaded agent returns nonzero. A loaded-but-not-running agent
+    # has PID = "-" instead of a number.
+    for line in res.stdout.splitlines():
+        line = line.strip()
+        if line.startswith('"PID"'):
+            return "=" in line and line.split("=")[-1].strip().rstrip(";").isdigit()
+    return True  # `list <label>` succeeded; treat as active even if PID line absent
+
+
+def stop() -> bool:
+    """Stop the agent without triggering its ``KeepAlive`` restart.
+
+    Dev Fleet restarts by signalling the job so ``KeepAlive`` respawns it;
+    operator stop boots the job out of its domain, so there is nothing left for
+    ``KeepAlive`` to respawn, while the plist and its enabled state stay in
+    place for the next login. Returns True only when launchd accepted the
+    bootout, so no caller reports a stop that was refused.
+    """
+    if not PLIST_PATH.exists():
+        return False
+    return _bootout(wait=False)
+
+
+def is_loaded() -> bool:
+    """True when launchd holds the agent in a domain :func:`install` uses.
+
+    Probes ``launchctl print <domain>/<label>`` over ``gui/<uid>`` then
+    ``user/<uid>``, naming each domain, so the answer is the same from SSH as
+    from the desktop. :func:`is_active` reads the caller's domain instead and
+    from SSH misses a ``gui/<uid>`` job, which is why the restart path gates on
+    this. Only a definite "not found" (or ``125`` from a missing domain) counts
+    as absent; any other answer is treated as loaded so a managed agent is
+    never replaced by a foreground gateway on a flaky probe.
+    """
+    if not PLIST_PATH.exists():
+        return False
+    for domain in _legacy_domains():
+        res = _launchctl("print", f"{domain}/{LAUNCHD_LABEL}")
+        if not (_pod_launchd._service_absent(res) or _domain_unavailable(res)):
+            return True
+    return False
+
+
+def restart() -> bool:
+    """Restart the running agent. Returns True iff the restart was accepted.
+
+    ``launchctl kickstart -k <domain>/<label>``: launchd does the kill and the
+    respawn itself, so this is safe from inside the process being restarted.
+    Tries ``gui/<uid>`` then ``user/<uid>``, the domains :func:`install` uses.
+
+    Not ``unload`` + ``load``: from the gateway, ``unload`` SIGTERMs the caller
+    before ``load`` runs, leaving the agent down. ``launchctl restart`` is
+    deprecated and acts like ``stop``, and ``KeepAlive`` respawns the loaded job
+    without re-reading anything.
+
+    False when the plist is absent or the kickstart is rejected.
+    """
+    if not PLIST_PATH.exists():
+        return False
+    for domain in _legacy_domains():
+        res = _launchctl("kickstart", "-k", f"{domain}/{LAUNCHD_LABEL}")
+        if res.returncode == 0:
+            return True
+        if not (_pod_launchd._service_absent(res) or _domain_unavailable(res)):
+            return False
+    return False
+
+
+def status() -> str:
+    """Return a human-readable status block from launchctl."""
+    res = _launchctl("list", LAUNCHD_LABEL)
+    if res.returncode != 0:
+        return f"kirocrew service is not loaded ({res.stderr.strip() or 'no entry'})\n"
+    return res.stdout

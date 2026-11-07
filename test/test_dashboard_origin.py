@@ -1,0 +1,1519 @@
+"""Tests for dashboard origin helpers."""
+
+from __future__ import annotations
+
+import logging
+import socket
+from unittest.mock import patch
+
+import pytest
+
+from kiro_crew.dashboard.origin import (
+    _host_without_port,
+    bind_address_for,
+    build_allowed_origins,
+    build_dashboard_url,
+    check_host,
+    check_origin,
+    dashboard_origin,
+    format_dashboard_urls,
+    parse_dashboard_url,
+    resolve_dashboard_host,
+    should_canonicalize_host,
+)
+
+
+class TestBindAddressFor:
+    """KIROCREW_BIND overrides ONLY the TCP bind address (container support).
+
+    A malformed value falls back to loopback, so it can only narrow exposure.
+    """
+
+    @pytest.mark.parametrize(
+        "local_only, expected",
+        [
+            pytest.param(True, "127.0.0.1", id="default_is_loopback"),
+            pytest.param(False, "0.0.0.0", id="local_only_false_binds_all"),
+        ],
+    )
+    def test_without_the_env_var(
+        self, monkeypatch: pytest.MonkeyPatch, local_only: bool, expected: str
+    ) -> None:
+        monkeypatch.delenv("KIROCREW_BIND", raising=False)
+        assert bind_address_for(local_only) == expected
+
+    @pytest.mark.parametrize(
+        "value, expected",
+        [
+            pytest.param("0.0.0.0", "0.0.0.0", id="env_override_binds_all_interfaces"),
+            pytest.param("10.0.0.7", "10.0.0.7", id="env_override_specific_interface"),
+            pytest.param("::", "::", id="env_override_ipv6_any"),
+            pytest.param(" 0.0.0.0 ", "0.0.0.0", id="env_override_whitespace_stripped"),
+            # Fail-narrow: a typo must degrade to loopback, never widen exposure.
+            pytest.param(
+                "all-interfaces-please", "127.0.0.1", id="invalid_value_falls_back_to_loopback"
+            ),
+            # Only IP literals: a hostname would resolve at bind time with
+            # environment-dependent results; reject rather than guess.
+            pytest.param("eth0.local", "127.0.0.1", id="hostname_rejected"),
+            pytest.param("", "127.0.0.1", id="empty_value_is_ignored"),
+        ],
+    )
+    def test_with_the_env_var(
+        self, monkeypatch: pytest.MonkeyPatch, value: str, expected: str
+    ) -> None:
+        monkeypatch.setenv("KIROCREW_BIND", value)
+        assert bind_address_for(True) == expected
+
+    def test_override_does_not_touch_local_only_urls(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # The override changes the TCP bind ONLY: URL building keeps
+        # local_only semantics (no token requirement change here — auth
+        # middleware is mounted unconditionally by the server paths).
+        monkeypatch.setenv("KIROCREW_BIND", "0.0.0.0")
+        assert resolve_dashboard_host(True) == "localhost"
+        origins = build_allowed_origins(5476, True)
+        assert "http://localhost:5476" in origins
+
+
+class TestProbePaths:
+    """PROBE_PATHS is the host_validation exemption set for orchestrator
+    health probes (kubelet / Docker HEALTHCHECK address pods by IP). Pin the
+    exact membership: adding a path here widens the unauthenticated,
+    Host-check-free surface and must be a deliberate, reviewed act."""
+
+    def test_exact_membership(self) -> None:
+        from kiro_crew.dashboard.origin import PROBE_PATHS
+
+        assert PROBE_PATHS == {"/api/health", "/api/live", "/api/ready"}
+
+
+class TestBuildAllowedOrigins:
+    def test_default_origins(self) -> None:
+        origins = build_allowed_origins(5476, local_only=True)
+        assert "http://127.0.0.1:5476" in origins
+        assert "http://localhost:5476" in origins
+        assert "http://kirocrew.localhost:5476" in origins
+
+    def test_configured_host_adds_http_with_port(self) -> None:
+        origins = build_allowed_origins(5476, local_only=True, configured_host="myhost")
+        assert "http://myhost:5476" in origins
+
+    def test_dashboard_url_empty_no_extra_origin(self) -> None:
+        baseline = build_allowed_origins(5476, local_only=True)
+        with_empty = build_allowed_origins(5476, local_only=True, dashboard_url="")
+        assert baseline == with_empty
+
+    @pytest.mark.parametrize(
+        "dashboard_url, origin",
+        [
+            pytest.param(
+                "https://kirocrew.local",
+                "https://kirocrew.local",
+                id="dashboard_url_https_adds_origin",
+            ),
+            pytest.param(
+                "http://myhost:8080", "http://myhost:8080", id="dashboard_url_http_with_port"
+            ),
+            pytest.param(
+                "myhost:8080", "http://myhost:8080", id="dashboard_url_no_scheme_normalized"
+            ),
+            pytest.param(
+                "https://kirocrew.local:8443",
+                "https://kirocrew.local:8443",
+                id="dashboard_url_keeps_non_default_port",
+            ),
+        ],
+    )
+    def test_dashboard_url_adds_its_origin(self, dashboard_url: str, origin: str) -> None:
+        origins = build_allowed_origins(5476, local_only=True, dashboard_url=dashboard_url)
+        assert origin in origins
+
+    def test_dashboard_url_preserves_existing_origins(self) -> None:
+        origins = build_allowed_origins(
+            5476,
+            local_only=True,
+            configured_host="myhost",
+            dashboard_url="https://kirocrew.local",
+        )
+        assert "http://myhost:5476" in origins
+        assert "https://kirocrew.local" in origins
+        assert "http://localhost:5476" in origins
+
+    @pytest.mark.parametrize(
+        "origin, port",
+        [
+            pytest.param(
+                "https://kirocrew.local", 443, id="dashboard_url_strips_default_https_port"
+            ),
+            pytest.param("http://kirocrew.local", 80, id="dashboard_url_strips_default_http_port"),
+        ],
+    )
+    def test_dashboard_url_strips_the_default_port(self, origin: str, port: int) -> None:
+        origins = build_allowed_origins(5476, local_only=True, dashboard_url=f"{origin}:{port}")
+        assert origin in origins
+        assert f"{origin}:{port}" not in origins
+
+    def test_dashboard_url_malformed_port_ignored(self) -> None:
+        origins = build_allowed_origins(5476, local_only=True, dashboard_url="https://host:abc")
+        assert len([o for o in origins if "host:abc" in o]) == 0
+
+
+class TestDashboardOrigin:
+    @pytest.mark.parametrize(
+        "url, expected",
+        [
+            pytest.param("", "", id="empty_returns_empty"),
+            # None-safety guard: an explicit "url": null in config must be treated
+            # as "no origin", not crash the caller.
+            pytest.param(None, "", id="none_returns_empty"),
+            pytest.param("https://kirocrew.local", "https://kirocrew.local", id="https_url"),
+            pytest.param("myhost:8080", "http://myhost:8080", id="bare_host_defaults_to_http"),
+            pytest.param("https://host:443", "https://host", id="strips_default_https_port"),
+            pytest.param("https://host:abc", "", id="malformed_port_returns_empty"),
+            pytest.param("http://[::1]:8080", "http://[::1]:8080", id="ipv6_brackets_preserved"),
+            pytest.param("http://[::1]", "http://[::1]", id="ipv6_no_port"),
+            pytest.param("ftp://host", "", id="ftp_scheme_rejected"),
+            pytest.param("file:///etc/passwd", "", id="file_scheme_rejected"),
+        ],
+    )
+    def test_origin_of(self, url: str | None, expected: str) -> None:
+        assert dashboard_origin(url) == expected  # type: ignore[arg-type]
+
+
+class TestSchemeAgreement:
+    """Verify parse_dashboard_url and dashboard_origin agree on scheme for bare hostnames."""
+
+    def test_bare_hostname_gets_http(self) -> None:
+        host, _ = parse_dashboard_url("myhost:9090")
+        origin = dashboard_origin("myhost:9090")
+        assert origin == f"http://{host}:9090"
+
+
+class TestParseDashboardUrlMalformed:
+    """A typo in the user-editable dashboard.url config field must not abort
+    gateway startup. parse_dashboard_url is called unguarded during boot, and
+    urlparse()/.port raise ValueError on a malformed IPv6 literal or a
+    non-integer port — those must degrade to defaults, not propagate."""
+
+    @pytest.fixture(autouse=True)
+    def _clean_port_env(self, monkeypatch):
+        monkeypatch.delenv("KIROCREW_PORT", raising=False)
+
+    @pytest.mark.parametrize(
+        "url, expected",
+        [
+            # urlparse("http://[::1") raises ValueError('Invalid IPv6 URL'); 5476 is _DEFAULT_PORT.
+            pytest.param("http://[::1", ("", 5476), id="malformed_ipv6_falls_back_to_defaults"),
+            # parsed.port raises ValueError on a non-numeric port.
+            pytest.param(
+                "http://myhost:notaport", ("", 5476), id="non_integer_port_falls_back_to_defaults"
+            ),
+            pytest.param("http://myhost:9090", ("myhost", 9090), id="valid_url_still_parses"),
+        ],
+    )
+    def test_parse(self, url: str, expected: tuple[str, int]) -> None:
+        assert parse_dashboard_url(url) == expected
+
+
+# Patch target for TestFormatDashboardUrls below. format_dashboard_urls lives in
+# dashboard.urls (the stdlib-only leaf module the CLI imports); dashboard.origin
+# only re-exports it for back-compat. Collaborators are resolved in the defining
+# module's namespace, so patching "...origin.machine_hostname" is INERT here — it
+# rebinds origin's copy while format_dashboard_urls keeps calling urls'. Point at
+# the defining module so the patches actually take effect.
+_MOD = "kiro_crew.dashboard.urls"
+
+
+class TestBuildDashboardUrl:
+    def test_token_appended(self) -> None:
+        assert (
+            build_dashboard_url("http://localhost:5476", "abc") == "http://localhost:5476?token=abc"
+        )
+
+    def test_empty_token_returns_bare_url(self) -> None:
+        assert build_dashboard_url("http://localhost:5476") == "http://localhost:5476"
+
+    def test_not_local_without_token_raises(self) -> None:
+        with pytest.raises(ValueError, match="token is required"):
+            build_dashboard_url("http://host:5476", "", local_only=False)
+
+    def test_local_without_token_ok(self) -> None:
+        assert (
+            build_dashboard_url("http://localhost:5476", "", local_only=True)
+            == "http://localhost:5476"
+        )
+
+    def test_not_local_with_token_ok(self) -> None:
+        url = build_dashboard_url("http://host:5476", "tok", local_only=False)
+        assert url == "http://host:5476?token=tok"
+
+    def test_special_chars_in_token_are_encoded(self) -> None:
+        url = build_dashboard_url("http://localhost:5476", "a&b=c#d")
+        assert url == "http://localhost:5476?token=a%26b%3Dc%23d"
+
+    def test_truthy_non_bool_local_only_still_requires_token(self) -> None:
+        """review-bot hardening: 'local_only is not True' catches truthy non-booleans."""
+        with pytest.raises(ValueError, match="token is required"):
+            build_dashboard_url("http://host:5476", "", local_only="yes")  # type: ignore[arg-type]
+
+
+class TestFormatDashboardUrls:
+    @pytest.fixture(autouse=True)
+    def _not_over_ssh(self, _floor_monkeypatch):
+        """Unset the two variables ``format_dashboard_urls`` reads, and nothing else.
+
+        Clearing ``os.environ`` would drop the floor's ``KIROCREW_HOME`` pin, and a
+        resolver left by an earlier test could then reach the real ``~/.kiro/crew``.
+        Uses the floor's own monkeypatch, which a test's ``monkeypatch.undo()`` cannot lift.
+        """
+        _floor_monkeypatch.delenv("SSH_CONNECTION", raising=False)
+        _floor_monkeypatch.delenv("SSH_CLIENT", raising=False)
+
+    @patch(f"{_MOD}.devspaces_proxy_url", return_value=None)
+    @patch(f"{_MOD}.machine_hostname", return_value="localhost")
+    def test_local_direct_url(self, _mh: object, _dp: object) -> None:
+        lines = format_dashboard_urls("http://localhost:5476", port=5476)
+        assert len(lines) == 2
+        assert lines[0] == "👻 Dashboard:"
+        assert "http://localhost:5476" in lines[1]
+
+    @patch(f"{_MOD}.devspaces_proxy_url", return_value=None)
+    @patch(f"{_MOD}.machine_hostname", return_value="localhost")
+    def test_token_in_url_shown(self, _mh: object, _dp: object) -> None:
+        lines = format_dashboard_urls("http://localhost:5476?token=abc", port=5476)
+        assert "token=abc" in lines[1]
+
+    @patch.dict("os.environ", {"SSH_CONNECTION": "1.2.3.4 1234 5.6.7.8 5678"})
+    @patch(f"{_MOD}.devspaces_proxy_url", return_value=None)
+    @patch(f"{_MOD}.machine_hostname", return_value="myhost")
+    @patch(f"{_MOD}.socket.gethostbyname", side_effect=socket.gaierror)
+    def test_remote_ssh_tunnel_instructions(self, _dns: object, _mh: object, _dp: object) -> None:
+        lines = format_dashboard_urls("http://localhost:5476?token=t", port=5476)
+        assert any("ssh -NL 5476:localhost:5476 myhost" in ln for ln in lines)
+        assert any("http://localhost:5476?token=t" in ln for ln in lines)
+        assert any("systemd" in ln for ln in lines)
+
+    @patch(f"{_MOD}.devspaces_proxy_url", return_value=None)
+    @patch(f"{_MOD}.machine_hostname", return_value="myhost.internal.example.com")
+    @patch(f"{_MOD}.socket.gethostbyname", return_value="10.0.0.1")
+    def test_local_with_resolvable_host_adds_remote_hint(
+        self, _dns: object, _mh: object, _dp: object
+    ) -> None:
+        lines = format_dashboard_urls("http://localhost:5476", port=5476, local_only=True)
+        assert any("Remote" in ln and "ssh -NL" in ln for ln in lines)
+
+    @patch(f"{_MOD}.devspaces_proxy_url", return_value=None)
+    @patch(f"{_MOD}.machine_hostname", return_value="Mac-1234.local")
+    def test_a_hanging_hostname_lookup_cannot_stall_startup(
+        self, _mh: object, _dp: object, monkeypatch, tmp_path
+    ) -> None:
+        """The Remote hint is cosmetic; the event loop it runs on is not.
+
+        On a macOS runner the hostname lookup can sit in a multi-second mDNS timeout,
+        past the watchdog's 15 s threshold, so it is bounded and the hint is dropped.
+        """
+        import threading
+
+        import kiro_crew.config.paths as _paths
+        from kiro_crew.testing.wait import wait_until
+
+        # Mitigation: while @patch.dict(clear=True) has KIROCREW_HOME absent, any
+        # _resolve_default_home() call sets _resolved_home to the real ~/.kiro/crew
+        # and fires the suite's home-isolation guard. Pinning _resolve_default_home
+        # makes that impossible regardless of which code path reaches it in this
+        # test's execution window.
+        monkeypatch.setattr(_paths, "_resolve_default_home", lambda: tmp_path / "default")
+
+        release = threading.Event()
+        lookups: list[threading.Thread] = []
+        # Captures whether the lookup was still pending when format_dashboard_urls
+        # returned (snapshot taken before release.set() unblocks the resolver).
+        lookup_pending_at_return: list[bool] = []
+
+        def _hang(_host: str) -> str:
+            lookups.append(threading.current_thread())
+            release.wait(30)
+            return "10.0.0.1"
+
+        with (
+            patch(f"{_MOD}.socket.gethostbyname", side_effect=_hang),
+            patch(f"{_MOD}.HOSTNAME_RESOLVE_TIMEOUT_SECS", 0.2),
+        ):
+            try:
+                lines = format_dashboard_urls("http://localhost:5476", port=5476, local_only=True)
+            finally:
+                # Record ordering BEFORE unblocking: True when the lookup is
+                # still running (is_alive) or not yet scheduled (lookups empty),
+                # meaning format_dashboard_urls returned without waiting for it.
+                lookup_pending_at_return.append(not lookups or any(t.is_alive() for t in lookups))
+                release.set()
+            # Join the resolver thread inside the patch scope so a late-starting
+            # worker still calls _hang rather than the real gethostbyname.
+            wait_until(lambda: lookups and not any(t.is_alive() for t in lookups))
+
+        # The lookup was still pending when format_dashboard_urls returned: the
+        # function abandoned the resolver rather than blocking on it.
+        assert lookup_pending_at_return[
+            0
+        ], "format_dashboard_urls blocked until the hostname lookup completed"
+        assert not any("Remote" in ln for ln in lines)
+
+    @patch(f"{_MOD}.devspaces_proxy_url", return_value=None)
+    @patch(f"{_MOD}.machine_hostname", return_value="myhost.internal.example.com")
+    @patch(f"{_MOD}.socket.gethostbyname", return_value="10.0.0.1")
+    def test_custom_host_suppresses_remote_hint(
+        self, _dns: object, _mh: object, _dp: object
+    ) -> None:
+        lines = format_dashboard_urls("http://localhost:5476", port=5476, has_custom_host=True)
+        assert not any("Remote" in ln for ln in lines)
+
+    @patch(f"{_MOD}.devspaces_proxy_url", return_value="https://proxy.devspaces.example.com")
+    @patch(f"{_MOD}.machine_hostname", return_value="localhost")
+    def test_devspaces_proxy_shown_when_not_local(self, _mh: object, _dp: object) -> None:
+        lines = format_dashboard_urls("http://host:5476?token=t", port=5476, local_only=False)
+        assert any("Proxy" in ln and "proxy.devspaces" in ln for ln in lines)
+
+    @patch(f"{_MOD}.devspaces_proxy_url", return_value="https://proxy.devspaces.example.com")
+    @patch(f"{_MOD}.machine_hostname", return_value="localhost")
+    def test_devspaces_proxy_hidden_when_local(self, _mh: object, _dp: object) -> None:
+        lines = format_dashboard_urls("http://localhost:5476", port=5476, local_only=True)
+        assert not any("Proxy" in ln for ln in lines)
+
+    @patch(f"{_MOD}.devspaces_proxy_url", return_value="https://proxy.devspaces.example.com")
+    @patch(f"{_MOD}.machine_hostname", return_value="localhost")
+    def test_token_propagated_to_proxy_url(self, _mh: object, _dp: object) -> None:
+        lines = format_dashboard_urls("http://host:5476?token=abc", port=5476, local_only=False)
+        proxy_line = [ln for ln in lines if "Proxy" in ln][0]
+        assert "proxy.devspaces.example.com?token=abc" in proxy_line
+
+    @pytest.mark.parametrize(
+        "url, local_only",
+        [
+            pytest.param("http://host:5476", False, id="not_local_without_token_raises"),
+            pytest.param(
+                "http://host:5476?debug=1", False, id="not_local_with_non_token_query_raises"
+            ),
+            pytest.param("http://host:5476", "yes", id="truthy_non_bool_local_only_raises"),
+        ],
+    )
+    def test_a_remote_url_without_a_token_raises(self, url: str, local_only: object) -> None:
+        with pytest.raises(ValueError, match="token is required"):
+            format_dashboard_urls(url, port=5476, local_only=local_only)  # type: ignore[arg-type]
+
+
+class TestCheckOriginLoopbackTrust:
+    """check_origin tightened (CSE SEC-016): only the bound port and explicitly
+    opted-in loopback ports are trusted — not every loopback port."""
+
+    def _make_request(
+        self, origin: str, remote: str = "127.0.0.1", allowed=None, host: str = ""
+    ) -> object:
+        """Create a minimal mock request with Origin header and allowed_origins.
+
+        *host* sets the request ``Host`` header (used by the same-origin
+        loopback fallback).
+        """
+        from unittest.mock import MagicMock
+
+        request = MagicMock()
+        headers = {}
+        if origin:
+            headers["Origin"] = origin
+        if host:
+            headers["Host"] = host
+        request.headers = headers
+        request.remote = remote
+        # Only allow port 5476 — simulates the default config
+        if allowed is None:
+            allowed = {"http://localhost:5476", "http://127.0.0.1:5476"}
+        request.app = {"allowed_origins": allowed}
+        return request
+
+    @pytest.mark.parametrize(
+        "origin, remote, host, trusted",
+        [
+            # A loopback origin on a non-bound port is NOT trusted by default (CSRF guard).
+            pytest.param(
+                "http://localhost:8777",
+                "127.0.0.1",
+                "",
+                False,
+                id="localhost_different_port_rejected_by_default",
+            ),
+            pytest.param(
+                "http://127.0.0.1:9999",
+                "127.0.0.1",
+                "",
+                False,
+                id="127_0_0_1_different_port_rejected_by_default",
+            ),
+            # Standard case: origin matches allowed set exactly.
+            pytest.param(
+                "http://localhost:5476", "127.0.0.1", "", True, id="exact_match_still_works"
+            ),
+            # Remote origin not in allowed set should be rejected.
+            pytest.param(
+                "http://evil.com:5476", "127.0.0.1", "", False, id="non_loopback_origin_rejected"
+            ),
+            # No Origin header from loopback remote (local process) is trusted.
+            pytest.param("", "127.0.0.1", "", True, id="no_origin_loopback_remote_trusted"),
+            # No Origin header from non-loopback remote is rejected.
+            pytest.param("", "10.0.0.5", "", False, id="no_origin_non_loopback_remote_rejected"),
+            # Same-origin loopback fallback (embedded multi-instance iframe): the
+            # iframe is served at <host>:<tunnelPort> and opens its WS to that same
+            # location.host, so Origin == Host. Trust it even though the port is
+            # not in allowed_origins.
+            pytest.param(
+                "http://kirocrew.localhost:7779",
+                "127.0.0.1",
+                "kirocrew.localhost:7779",
+                True,
+                id="same_origin_loopback_port_trusted",
+            ),
+            pytest.param(
+                "http://127.0.0.1:8777",
+                "127.0.0.1",
+                "127.0.0.1:8777",
+                True,
+                id="same_origin_127_loopback_port_trusted",
+            ),
+            # SEC-016 boundary preserved: a malicious local page on an arbitrary port
+            # sends its own Origin while the Host is the gateway's -- they differ, so
+            # the same-origin fallback must NOT trust it.
+            pytest.param(
+                "http://localhost:9999",
+                "127.0.0.1",
+                "kirocrew.localhost:7779",
+                False,
+                id="origin_host_mismatch_rejected",
+            ),
+            # The fallback is loopback-only: a public host with Origin == Host must
+            # still go through the allowlist (not auto-trusted).
+            pytest.param(
+                "http://evil.com:7779",
+                "127.0.0.1",
+                "evil.com:7779",
+                False,
+                id="same_origin_non_loopback_not_trusted_by_fallback",
+            ),
+        ],
+    )
+    def test_default_allowed_set(self, origin: str, remote: str, host: str, trusted: bool) -> None:
+        request = self._make_request(origin, remote=remote, host=host)
+        assert check_origin(request) is trusted
+
+    def test_opted_in_loopback_port_trusted(self) -> None:
+        """A loopback port the operator added (via KIROCREW_ALLOWED_LOOPBACK_PORTS,
+        folded into allowed_origins) is accepted — SSH-tunnel support, opt-in."""
+        allowed = {
+            "http://localhost:5476",
+            "http://127.0.0.1:5476",
+            "http://localhost:8777",
+            "http://127.0.0.1:8777",
+        }
+        request = self._make_request("http://localhost:8777", allowed=allowed)
+        assert check_origin(request) is True
+
+
+class TestCheckOriginRefusalLogging:
+    """Every refusal writes a throttled WARNING to the gateway log, so a
+    dashboard on a non-allowlisted origin is not refused silently."""
+
+    _LOGGER = "kiro_crew.dashboard.origin"
+
+    @pytest.fixture(autouse=True)
+    def _reset_throttle(self):
+        from kiro_crew.dashboard import origin as origin_mod
+
+        def _reset() -> None:
+            origin_mod._refusal_log_last.clear()
+            origin_mod._refusal_window.update(start=0.0, count=0)
+
+        _reset()
+        yield
+        _reset()
+
+    def _make_request(self, headers: dict[str, str], remote: str = "127.0.0.1") -> object:
+        from unittest.mock import MagicMock
+
+        request = MagicMock()
+        request.headers = headers
+        request.remote = remote
+        request.method = "POST"
+        request.path = "/api/chat/send"
+        request.app = {"allowed_origins": {"http://localhost:5476", "http://127.0.0.1:5476"}}
+        return request
+
+    def _refusals(self, caplog) -> list[str]:
+        return [r.getMessage() for r in caplog.records if r.name == self._LOGGER]
+
+    def test_disallowed_origin_is_logged_with_origin_and_path(self, caplog) -> None:
+        caplog.set_level(logging.WARNING, logger=self._LOGGER)
+        request = self._make_request({"Origin": "https://tunnel.example.dev"})
+        assert check_origin(request) is False
+        (message,) = self._refusals(caplog)
+        assert "POST '/api/chat/send'" in message
+        assert "origin not in the allowlist" in message
+        assert "'https://tunnel.example.dev'" in message
+        assert "dashboard.url" in message
+
+    def test_missing_origin_from_remote_peer_is_logged(self, caplog) -> None:
+        caplog.set_level(logging.WARNING, logger=self._LOGGER)
+        assert check_origin(self._make_request({}, remote="10.0.0.5")) is False
+        (message,) = self._refusals(caplog)
+        assert "no Origin header" in message
+        assert "10.0.0.5" in message
+
+    def test_opaque_origin_is_logged(self, caplog) -> None:
+        caplog.set_level(logging.WARNING, logger=self._LOGGER)
+        assert check_origin(self._make_request({"Origin": "null"})) is False
+        (message,) = self._refusals(caplog)
+        assert "opaque origin" in message
+
+    def test_referer_fallback_logs_origin_only_never_path_or_query(self, caplog) -> None:
+        """A Referer is a full URL and a dashboard URL can carry a token, so only
+        scheme://host[:port] may reach the log."""
+        caplog.set_level(logging.WARNING, logger=self._LOGGER)
+        request = self._make_request(
+            {"Referer": "https://evil.example/page?token=SECRET-TOKEN-VALUE"}
+        )
+        assert check_origin(request, fallback_header="Referer") is False
+        (message,) = self._refusals(caplog)
+        assert "'https://evil.example'" in message
+        assert "SECRET-TOKEN-VALUE" not in message
+        assert "/page" not in message
+
+    def test_allowed_and_trusted_requests_are_not_logged(self, caplog) -> None:
+        caplog.set_level(logging.DEBUG, logger=self._LOGGER)
+        assert check_origin(self._make_request({"Origin": "http://localhost:5476"})) is True
+        assert check_origin(self._make_request({}, remote="127.0.0.1")) is True
+        # require=False lets a missing Origin through; that is not a refusal.
+        assert check_origin(self._make_request({}, remote="10.0.0.5"), require=False) is True
+        assert self._refusals(caplog) == []
+
+    def test_repeats_are_throttled_per_origin(self, caplog) -> None:
+        caplog.set_level(logging.WARNING, logger=self._LOGGER)
+        for _ in range(5):
+            check_origin(self._make_request({"Origin": "https://a.example"}))
+        check_origin(self._make_request({"Origin": "https://b.example"}))
+        messages = self._refusals(caplog)
+        assert len(messages) == 2
+        assert "'https://a.example'" in messages[0]
+        assert "'https://b.example'" in messages[1]
+
+    def test_repeat_is_logged_again_after_the_interval(self, caplog) -> None:
+        """Ages the recorded timestamp instead of patching the clock, so nothing
+        else in the process sees a fake ``time.monotonic``."""
+        from kiro_crew.dashboard import origin as origin_mod
+
+        caplog.set_level(logging.WARNING, logger=self._LOGGER)
+        check_origin(self._make_request({"Origin": "https://a.example"}))
+        (key,) = origin_mod._refusal_log_last
+        origin_mod._refusal_log_last[key] -= origin_mod._REFUSAL_LOG_INTERVAL_SECS + 1
+        check_origin(self._make_request({"Origin": "https://a.example"}))
+        assert len(self._refusals(caplog)) == 2
+
+    def test_varying_origins_cannot_exceed_the_global_budget(self, caplog) -> None:
+        """The origin is attacker-chosen, so a fresh one per request must not buy
+        a fresh line: past the budget one summary line, then silence."""
+        from kiro_crew.dashboard import origin as origin_mod
+
+        caplog.set_level(logging.WARNING, logger=self._LOGGER)
+        budget = origin_mod._REFUSAL_LOG_BUDGET
+        for i in range(budget * 10):
+            assert check_origin(self._make_request({"Origin": f"https://h{i}.example"})) is False
+        messages = self._refusals(caplog)
+        assert len(messages) == budget + 1
+        assert "further refusals are not logged" in messages[-1]
+
+    def test_budget_resets_when_the_interval_ends(self, caplog) -> None:
+        from kiro_crew.dashboard import origin as origin_mod
+
+        caplog.set_level(logging.WARNING, logger=self._LOGGER)
+        for i in range(origin_mod._REFUSAL_LOG_BUDGET + 5):
+            check_origin(self._make_request({"Origin": f"https://h{i}.example"}))
+        origin_mod._refusal_window["start"] -= origin_mod._REFUSAL_LOG_INTERVAL_SECS + 1
+        caplog.clear()
+        check_origin(self._make_request({"Origin": "https://late.example"}))
+        (message,) = self._refusals(caplog)
+        assert "'https://late.example'" in message
+
+    def test_throttle_map_is_bounded(self, monkeypatch) -> None:
+        from kiro_crew.dashboard import origin as origin_mod
+
+        monkeypatch.setattr(origin_mod, "_REFUSAL_LOG_BUDGET", 10_000)
+        for i in range(origin_mod._REFUSAL_LOG_MAX_KEYS + 10):
+            check_origin(self._make_request({"Origin": f"https://h{i}.example"}))
+        assert len(origin_mod._refusal_log_last) <= origin_mod._REFUSAL_LOG_MAX_KEYS
+
+    def test_decoded_newline_in_path_cannot_forge_a_log_line(self, caplog) -> None:
+        """``request.path`` is percent-decoded, so ``%0A`` arrives as a real newline."""
+        caplog.set_level(logging.WARNING, logger=self._LOGGER)
+        request = self._make_request({"Origin": "https://evil.example"})
+        request.path = "/api/x\n12:00:00 WARNING kiro_crew.dashboard.ws: forged"
+        assert check_origin(request) is False
+        (message,) = self._refusals(caplog)
+        assert "\n" not in message
+        assert "\\n12:00:00" in message
+
+
+class TestAllowedLoopbackPortsEnv:
+    """KIROCREW_ALLOWED_LOOPBACK_PORTS opts specific loopback ports into the allowed set."""
+
+    @patch.dict("os.environ", {"KIROCREW_ALLOWED_LOOPBACK_PORTS": "8777,9000"}, clear=True)
+    def test_env_ports_added(self, monkeypatch) -> None:
+        # The gateway always has a context installed by the time it builds the set.
+        # ``clear=True`` drops the test home pin, so without these the
+        # ``dashboard_origins`` probe and its SEL record would reach the real home.
+        from types import SimpleNamespace
+
+        import kiro_crew.sel as sel_mod
+        from kiro_crew.platform import context as pc
+
+        monkeypatch.setattr(pc, "installed_context", lambda: SimpleNamespace(governance=None))
+        monkeypatch.setattr(sel_mod, "sel", lambda: SimpleNamespace(log_governance_decision=dict))
+        origins = build_allowed_origins(7777, local_only=True)
+        assert "http://localhost:8777" in origins
+        assert "http://127.0.0.1:8777" in origins
+        assert "http://[::1]:8777" in origins
+        assert "http://localhost:9000" in origins
+
+    @patch.dict("os.environ", {"KIROCREW_ALLOWED_LOOPBACK_PORTS": "notaport"})
+    def test_non_numeric_ignored(self) -> None:
+        origins = build_allowed_origins(7777, local_only=True)
+        assert not any(":notaport" in o for o in origins)
+
+    def test_no_env_only_bound_port(self, monkeypatch) -> None:
+        monkeypatch.delenv("KIROCREW_ALLOWED_LOOPBACK_PORTS", raising=False)
+        origins = build_allowed_origins(7777, local_only=True)
+        assert "http://localhost:7777" in origins
+        assert "http://localhost:8777" not in origins
+
+
+class TestShouldCanonicalizeHost:
+    """Loopback host canonicalization for the SPA's per-origin localStorage."""
+
+    def test_redirects_localhost_to_canonical_document_nav(self) -> None:
+        assert should_canonicalize_host(
+            "localhost:7777",
+            "kirocrew.localhost",
+            method="GET",
+            sec_fetch_dest="document",
+        )
+
+    def test_a_literal_address_converges_like_a_name(self) -> None:
+        # The gateway holds both loopback families on its port, so every spelling
+        # in the canonicalizable set reaches the same listener and converging them
+        # is a spelling change. What a redirect must never move is a CREDENTIAL,
+        # and that is gated separately -- see the credential case below, which does
+        # not depend on which families are bound.
+        assert should_canonicalize_host(
+            "127.0.0.1:7777", "localhost", method="GET", sec_fetch_dest="document"
+        )
+
+    def test_no_redirect_for_a_credential_bearing_navigation(self) -> None:
+        # The 302 preserves the query verbatim, so redirecting a ?token=
+        # navigation hands the bearer to whatever answers the canonical name.
+        # This holds even between the two names, which are otherwise converged.
+        assert should_canonicalize_host(
+            "kirocrew.localhost:7777",
+            "localhost",
+            method="GET",
+            sec_fetch_dest="document",
+        ), "control: without a credential these two names do converge"
+        assert not should_canonicalize_host(
+            "kirocrew.localhost:7777",
+            "localhost",
+            method="GET",
+            sec_fetch_dest="document",
+            carries_credential=True,
+        )
+
+    def test_no_redirect_when_already_canonical(self) -> None:
+        assert not should_canonicalize_host(
+            "kirocrew.localhost:7777",
+            "kirocrew.localhost",
+            method="GET",
+            sec_fetch_dest="document",
+        )
+
+    def test_no_redirect_for_non_document_dest(self) -> None:
+        # XHR / fetch / websocket / sub-resource requests must never be redirected.
+        for dest in ("empty", "websocket", "script", "style", "image", None):
+            assert not should_canonicalize_host(
+                "localhost:7777",
+                "kirocrew.localhost",
+                method="GET",
+                sec_fetch_dest=dest,
+            )
+
+    def test_no_redirect_for_mutating_methods(self) -> None:
+        for method in ("POST", "PUT", "DELETE", "PATCH"):
+            assert not should_canonicalize_host(
+                "localhost:7777",
+                "kirocrew.localhost",
+                method=method,
+                sec_fetch_dest="document",
+            )
+
+    def test_no_redirect_for_non_loopback_request_host(self) -> None:
+        # A real hostname / reverse-proxy vhost is never canonicalized.
+        assert not should_canonicalize_host(
+            "kirocrew.example.com:7777",
+            "kirocrew.localhost",
+            method="GET",
+            sec_fetch_dest="document",
+        )
+
+    def test_no_redirect_when_canonical_not_loopback(self) -> None:
+        assert not should_canonicalize_host(
+            "localhost:7777",
+            "kirocrew.example.com",
+            method="GET",
+            sec_fetch_dest="document",
+        )
+
+    def test_host_without_port(self) -> None:
+        assert should_canonicalize_host(
+            "localhost", "kirocrew.localhost", method="GET", sec_fetch_dest="document"
+        )
+
+    def test_ipv6_loopback_bracket_host_not_redirected(self) -> None:
+        # [::1]:7777 must PARSE to ::1 rather than "[" -- that is what the bracket
+        # handling is for, and it is the part of this case that no rule change can
+        # make irrelevant, because a host that parses to "[" would silently fail
+        # every loopback comparison in this module.
+        assert _host_without_port("[::1]:7777") == "::1"
+        assert should_canonicalize_host(
+            "[::1]:7777",
+            "kirocrew.localhost",
+            method="GET",
+            sec_fetch_dest="document",
+        )
+
+    def test_ipv6_loopback_bracket_host_without_port(self) -> None:
+        # Same as above for a bracket host with no port. The bracket branch of
+        # _host_without_port stays load-bearing for origin.py's own loopback
+        # check, which is where it is pinned directly.
+        assert _host_without_port("[::1]") == "::1"
+        assert should_canonicalize_host(
+            "[::1]", "kirocrew.localhost", method="GET", sec_fetch_dest="document"
+        )
+
+
+class TestResolveDashboardHost:
+    """Canonical loopback host must be plain ``localhost`` (resolves everywhere,
+    including Safari / SSH tunnels — unlike ``*.localhost``)."""
+
+    def test_local_only_returns_localhost(self) -> None:
+        assert resolve_dashboard_host(local_only=True) == "localhost"
+
+    def test_configured_host_wins(self) -> None:
+        assert (
+            resolve_dashboard_host(local_only=True, configured_host="myhost.example")
+            == "myhost.example"
+        )
+
+
+class TestBuildHostCanonicalRedirect:
+    """End-to-end tests for the extracted 302 middleware (runtime behavior)."""
+
+    @pytest.mark.asyncio
+    async def test_document_nav_302s_preserving_port_path_query(self) -> None:
+        from urllib.parse import urlsplit
+
+        from aiohttp import web
+        from aiohttp.test_utils import TestClient, TestServer
+
+        from kiro_crew.dashboard.server import build_host_canonical_redirect
+
+        async def _ok(_request: web.Request) -> web.Response:
+            return web.Response(text="ok")
+
+        app = web.Application(middlewares=[build_host_canonical_redirect("kirocrew.localhost")])
+        app.router.add_get("/chat", _ok)
+
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get(
+                "/chat",
+                params={"view": "split"},
+                headers={"Host": "localhost:7777", "Sec-Fetch-Dest": "document"},
+                allow_redirects=False,
+            )
+            assert resp.status == 302
+            loc = urlsplit(resp.headers["Location"])
+            assert loc.hostname == "kirocrew.localhost"  # host converged
+            assert loc.port == 7777  # port preserved
+            assert loc.path == "/chat"  # path preserved
+            assert "view=split" in loc.query  # query preserved
+
+    @pytest.mark.asyncio
+    async def test_credential_bearing_nav_is_served_not_redirected(self) -> None:
+        # A 302 preserves the query, so redirecting a ?token= navigation would put
+        # that bearer on a request to whatever answers the canonical host. The
+        # navigation is served where it was addressed instead, and the response
+        # body proves the handler ran rather than a redirect being followed.
+        from aiohttp import web
+        from aiohttp.test_utils import TestClient, TestServer
+
+        from kiro_crew.dashboard.server import build_host_canonical_redirect
+
+        async def _ok(_request: web.Request) -> web.Response:
+            return web.Response(text="ok")
+
+        app = web.Application(middlewares=[build_host_canonical_redirect("kirocrew.localhost")])
+        app.router.add_get("/chat", _ok)
+
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get(
+                "/chat",
+                params={"token": "abc123"},
+                headers={"Host": "localhost:7777", "Sec-Fetch-Dest": "document"},
+                allow_redirects=False,
+            )
+            assert resp.status == 200
+            assert await resp.text() == "ok"
+            assert "Location" not in resp.headers
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("cookie_name", ["mc_token_7777", "mc_refresh_7777"])
+    async def test_signed_in_literal_nav_is_served_not_redirected(self, cookie_name: str) -> None:
+        # The session cookie is host-only, so a browser signed in on 127.0.0.1
+        # does not carry it to localhost. Redirecting its document navigation
+        # there lands it on a host where it has no session: every API call 403s
+        # with X-Auth-Required and the page reads "Session expired".
+        # A navigation bearing this gateway's session is served where it was sent.
+        from aiohttp import web
+        from aiohttp.test_utils import TestClient, TestServer
+
+        from kiro_crew.dashboard.server import build_host_canonical_redirect
+
+        async def _ok(_request: web.Request) -> web.Response:
+            return web.Response(text="served here")
+
+        app = web.Application(middlewares=[build_host_canonical_redirect("localhost")])
+        app.router.add_get("/apps/library", _ok)
+
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get(
+                "/apps/library",
+                headers={
+                    "Host": "127.0.0.1:7777",
+                    "Sec-Fetch-Dest": "document",
+                    "Cookie": f"{cookie_name}=opaque",
+                },
+                allow_redirects=False,
+            )
+            assert resp.status == 200
+            assert await resp.text() == "served here"
+            assert "Location" not in resp.headers
+
+    @pytest.mark.asyncio
+    async def test_other_port_session_cookie_does_not_hold_the_redirect(self) -> None:
+        # Cookies are not port-isolated, so a 127.0.0.1 jar can hold another
+        # gateway's mc_token_<port>. That cookie is no session HERE, so it must
+        # not stop this gateway's spelling convergence.
+        from aiohttp import web
+        from aiohttp.test_utils import TestClient, TestServer
+
+        from kiro_crew.dashboard.server import build_host_canonical_redirect
+
+        async def _ok(_request: web.Request) -> web.Response:
+            return web.Response(text="ok")
+
+        app = web.Application(middlewares=[build_host_canonical_redirect("localhost")])
+        app.router.add_get("/chat", _ok)
+
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get(
+                "/chat",
+                headers={
+                    "Host": "127.0.0.1:7777",
+                    "Sec-Fetch-Dest": "document",
+                    "Cookie": "mc_token_8888=opaque; mc_refresh_8888=opaque",
+                },
+                allow_redirects=False,
+            )
+            assert resp.status == 302
+            assert resp.headers["Location"].startswith("http://localhost:7777/chat")
+
+    @pytest.mark.asyncio
+    async def test_literal_address_nav_is_redirected_when_it_carries_nothing(self) -> None:
+        # End to end through the middleware: a credential-free document navigation
+        # on a literal converges onto the canonical name, because both families
+        # reach this same gateway. The credential case next door is what proves a
+        # bearer is never moved this way.
+        from aiohttp import web
+        from aiohttp.test_utils import TestClient, TestServer
+
+        from kiro_crew.dashboard.server import build_host_canonical_redirect
+
+        async def _ok(_request: web.Request) -> web.Response:
+            return web.Response(text="ok")
+
+        app = web.Application(middlewares=[build_host_canonical_redirect("localhost")])
+        app.router.add_get("/chat", _ok)
+
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get(
+                "/chat",
+                headers={"Host": "127.0.0.1:7777", "Sec-Fetch-Dest": "document"},
+                allow_redirects=False,
+            )
+            assert resp.status == 302
+            assert resp.headers["Location"].startswith("http://localhost:7777/chat")
+
+    @pytest.mark.asyncio
+    async def test_verified_relay_document_nav_skips_local_redirect(self) -> None:
+        from aiohttp import web
+        from aiohttp.test_utils import TestClient, TestServer
+
+        from kiro_crew.dashboard.kiro_relay.caller import (
+            RELAY_USER_HEADER,
+            CrewKind,
+            HostBinding,
+            published_relay_caller,
+        )
+        from kiro_crew.dashboard.kiro_relay.ingress import (
+            RELAY_INGRESS_APP_KEY,
+            RelayIngress,
+            relay_ingress_middleware,
+        )
+        from kiro_crew.dashboard.relay_headers import relay_header_strip_middleware
+        from kiro_crew.dashboard.server import build_host_canonical_redirect
+
+        owner = "kiro-user.owner-0001"
+        ingress = RelayIngress(enabled=True)
+        ingress.bind_host(HostBinding(crew_kind=CrewKind.PERSONAL, owner_user_id=owner))
+
+        async def _ok(request: web.Request) -> web.Response:
+            caller = published_relay_caller(request)
+            assert caller is not None and caller.kiro_user_id == owner
+            return web.Response(text="ok")
+
+        app = web.Application(
+            middlewares=[
+                relay_ingress_middleware(strict_internal_paths=frozenset()),
+                relay_header_strip_middleware,
+                build_host_canonical_redirect("localhost"),
+            ]
+        )
+        app[RELAY_INGRESS_APP_KEY] = ingress
+        app.router.add_get("/", _ok)
+        headers = {"Host": "127.0.0.1:7777", "Sec-Fetch-Dest": "document"}
+
+        async with TestClient(TestServer(app)) as client:
+            # A caller header alone cannot exempt a local navigation from canonicalization.
+            for local_headers in (headers, {**headers, RELAY_USER_HEADER: owner}):
+                local = await client.get("/", headers=local_headers, allow_redirects=False)
+                assert local.status == 302
+                assert local.headers["Location"] == "http://localhost:7777/"
+
+            relayed = await client.get(
+                "/",
+                headers=ingress.stamp_headers(headers.items(), relay_user=owner),
+                allow_redirects=False,
+            )
+            assert relayed.status == 200
+            assert await relayed.text() == "ok"
+            assert "Location" not in relayed.headers
+
+    @pytest.mark.asyncio
+    async def test_xhr_and_post_not_redirected(self) -> None:
+        from aiohttp import web
+        from aiohttp.test_utils import TestClient, TestServer
+
+        from kiro_crew.dashboard.server import build_host_canonical_redirect
+
+        async def _ok(_request: web.Request) -> web.Response:
+            return web.Response(text="ok")
+
+        app = web.Application(middlewares=[build_host_canonical_redirect("kirocrew.localhost")])
+        app.router.add_get("/api/x", _ok)
+        app.router.add_post("/api/x", _ok)
+
+        async with TestClient(TestServer(app)) as client:
+            # XHR/fetch (Sec-Fetch-Dest: empty) on a loopback alias is NOT redirected.
+            xhr = await client.get(
+                "/api/x",
+                headers={"Host": "localhost:7777", "Sec-Fetch-Dest": "empty"},
+                allow_redirects=False,
+            )
+            assert xhr.status == 200
+            # A mutating method is never redirected, even as a document nav.
+            post = await client.post(
+                "/api/x",
+                headers={"Host": "localhost:7777", "Sec-Fetch-Dest": "document"},
+                allow_redirects=False,
+            )
+            assert post.status == 200
+
+    @pytest.mark.asyncio
+    async def test_empty_canonical_host_is_noop(self) -> None:
+        # local_only=False passes canonical_host="" -> middleware never redirects
+        # (reverse-proxy / remote-host deployments are untouched).
+        from aiohttp import web
+        from aiohttp.test_utils import TestClient, TestServer
+
+        from kiro_crew.dashboard.server import build_host_canonical_redirect
+
+        async def _ok(_request: web.Request) -> web.Response:
+            return web.Response(text="ok")
+
+        app = web.Application(middlewares=[build_host_canonical_redirect("")])
+        app.router.add_get("/chat", _ok)
+
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get(
+                "/chat",
+                headers={"Host": "localhost:7777", "Sec-Fetch-Dest": "document"},
+                allow_redirects=False,
+            )
+            assert resp.status == 200
+
+    @pytest.mark.asyncio
+    async def test_no_redirect_while_a_loopback_family_is_uncovered(self) -> None:
+        # A 302 onto an ambiguous name is a credential send: the browser follows it
+        # carrying the host-only Lax session cookie, on exactly the top-level
+        # navigation this middleware converts. `?token=` is refused separately and
+        # is not the only credential in play. So the redirect is withheld whenever
+        # this gateway does not hold every family the name resolves to -- and the
+        # usual reason a family is uncovered is that another process holds it,
+        # which is the party the redirect would hand the cookie to.
+        from aiohttp import web
+        from aiohttp.test_utils import TestClient, TestServer
+
+        from kiro_crew.dashboard.server import build_host_canonical_redirect
+
+        async def _ok(_request: web.Request) -> web.Response:
+            return web.Response(text="served here")
+
+        app = web.Application(
+            middlewares=[
+                build_host_canonical_redirect("localhost", holds_every_family=lambda: False)
+            ]
+        )
+        app.router.add_get("/chat", _ok)
+
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get(
+                "/chat",
+                headers={"Host": "127.0.0.1:7777", "Sec-Fetch-Dest": "document"},
+                allow_redirects=False,
+            )
+            assert resp.status == 200
+            assert await resp.text() == "served here"
+
+    @pytest.mark.asyncio
+    async def test_redirect_still_happens_while_every_family_is_held(self) -> None:
+        # The control the case above needs: without it, a middleware that never
+        # redirects at all would pass, which is the redirect deleted rather than
+        # gated.
+        from urllib.parse import urlsplit
+
+        from aiohttp import web
+        from aiohttp.test_utils import TestClient, TestServer
+
+        from kiro_crew.dashboard.server import build_host_canonical_redirect
+
+        async def _ok(_request: web.Request) -> web.Response:
+            return web.Response(text="ok")
+
+        app = web.Application(
+            middlewares=[
+                build_host_canonical_redirect("localhost", holds_every_family=lambda: True)
+            ]
+        )
+        app.router.add_get("/chat", _ok)
+
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get(
+                "/chat",
+                headers={"Host": "127.0.0.1:7777", "Sec-Fetch-Dest": "document"},
+                allow_redirects=False,
+            )
+            assert resp.status == 302
+            assert urlsplit(resp.headers["Location"]).hostname == "localhost"
+
+
+class TestHoldsEveryLoopbackFamily:
+    """The server-side counterpart of ``listenerSecretsFor``.
+
+    A never-bound family and a dead listener answer the same. Before publication the
+    answer is False: coverage cannot be proven, and that costs one redirect.
+    """
+
+    @staticmethod
+    def _state(sidecars: dict[str, object] | None, **guards: object) -> object:
+        state = type("S", (), {})()
+        if sidecars is not None:
+            state._listener_sidecars = sidecars
+        for name, guard in guards.items():
+            setattr(state, name, guard)
+        return state
+
+    def test_both_claims_and_no_guards_is_covered(self) -> None:
+        from kiro_crew.dashboard.server import _holds_every_loopback_family
+
+        state = self._state({"primary": (1, "127.0.0.1", "s"), "secondary": (1, "::1", "s")})
+        assert _holds_every_loopback_family(state) is True  # type: ignore[arg-type]
+
+    def test_a_missing_secondary_claim_is_uncovered(self) -> None:
+        from kiro_crew.dashboard.server import _holds_every_loopback_family
+
+        state = self._state({"primary": (1, "127.0.0.1", "s")})
+        assert _holds_every_loopback_family(state) is False  # type: ignore[arg-type]
+
+    def test_nothing_published_yet_is_uncovered(self) -> None:
+        from kiro_crew.dashboard.server import _holds_every_loopback_family
+
+        assert _holds_every_loopback_family(self._state(None)) is False  # type: ignore[arg-type]
+
+    def test_a_closed_listener_is_uncovered_even_with_both_claims(self) -> None:
+        from kiro_crew.dashboard.server import _holds_every_loopback_family
+
+        class _Dead:
+            def listener_open(self) -> bool:
+                return False
+
+        state = self._state(
+            {"primary": (1, "127.0.0.1", "s"), "secondary": (1, "::1", "s")},
+            _secondary_listener_guard=_Dead(),
+        )
+        assert _holds_every_loopback_family(state) is False  # type: ignore[arg-type]
+
+
+class TestBuildAllowedHosts:
+    """build_allowed_hosts derives the DNS-rebinding Host allowlist from the
+    same allowed_origins set the CSRF check uses."""
+
+    def test_loopback_floor_always_present(self) -> None:
+        from kiro_crew.dashboard.origin import build_allowed_hosts
+
+        hosts = build_allowed_hosts(set())
+        assert {"localhost", "127.0.0.1", "::1", "kirocrew.localhost"} <= hosts
+
+    def test_hostnames_extracted_port_stripped(self) -> None:
+        from kiro_crew.dashboard.origin import build_allowed_hosts
+
+        hosts = build_allowed_hosts({"http://myhost:8080", "https://kirocrew.example.com"})
+        # Exact set-membership assertion (build_allowed_hosts returns a set of
+        # bare hostnames, never host:port). Compare the whole derived set rather
+        # than `<literal> in hosts` so the check is unambiguously exact — this
+        # also avoids CodeQL py/incomplete-url-substring-sanitization, which
+        # cannot tell that `hosts` is a set (exact) rather than a URL string.
+        assert hosts == {
+            "localhost",
+            "127.0.0.1",
+            "::1",
+            "kirocrew.localhost",
+            "myhost",  # port dropped from myhost:8080
+            "kirocrew.example.com",
+        }
+
+    def test_ipv6_bracket_stripped(self) -> None:
+        from kiro_crew.dashboard.origin import build_allowed_hosts
+
+        hosts = build_allowed_hosts({"http://[::1]:8777"})
+        assert "::1" in hosts
+
+
+class TestCheckHost:
+    """check_host is an independent DNS-rebinding barrier: it runs for every
+    method and does NOT trust loopback remote."""
+
+    def _make_request(self, host: str, allowed=None, remote: str = "127.0.0.1"):
+        from unittest.mock import MagicMock
+
+        request = MagicMock()
+        request.headers = {"Host": host} if host is not None else {}
+        request.remote = remote
+        if allowed is None:
+            allowed = {"http://localhost:5476", "http://127.0.0.1:5476"}
+        # dict .get mirrors aiohttp app mapping access used by check_host
+        request.app = {"allowed_origins": allowed}
+        return request
+
+    def test_spoofed_host_rejected(self) -> None:
+        from kiro_crew.dashboard.origin import check_host
+
+        req = self._make_request("evil.rebind.attacker.com")
+        assert check_host(req) is False
+
+    def test_spoofed_host_rejected_even_from_loopback_remote(self) -> None:
+        """The rebinding connection IS loopback while Host is forged — loopback
+        remote must NOT bypass the Host check (unlike check_origin)."""
+        from kiro_crew.dashboard.origin import check_host
+
+        req = self._make_request("attacker.com", remote="127.0.0.1")
+        assert check_host(req) is False
+
+    def test_localhost_host_accepted(self) -> None:
+        from kiro_crew.dashboard.origin import check_host
+
+        assert check_host(self._make_request("localhost:5476")) is True
+
+    def test_loopback_ip_host_accepted(self) -> None:
+        from kiro_crew.dashboard.origin import check_host
+
+        assert check_host(self._make_request("127.0.0.1:5476")) is True
+
+    def test_tunnel_port_host_accepted_port_independent(self) -> None:
+        """SSH-tunnel local port (localhost:8777) still matches 'localhost'."""
+        from kiro_crew.dashboard.origin import check_host
+
+        assert check_host(self._make_request("localhost:8777")) is True
+
+    def test_configured_remote_host_accepted(self) -> None:
+        from kiro_crew.dashboard.origin import check_host
+
+        allowed = {"http://localhost:5476", "https://kirocrew.example.com"}
+        req = self._make_request("kirocrew.example.com", allowed=allowed)
+        assert check_host(req) is True
+
+    def test_missing_host_allowed_from_loopback(self) -> None:
+        """No Host header from a loopback remote is local IPC (mcp-core, doctor)
+        and is allowed; browsers always send Host so this is not a rebinding gap."""
+        from kiro_crew.dashboard.origin import check_host
+
+        assert check_host(self._make_request(None, remote="127.0.0.1")) is True
+
+    def test_missing_host_denied_from_non_loopback(self) -> None:
+        """Deny-by-default: a headerless request from a non-loopback remote is
+        rejected rather than blanket-allowed (review-bot security-controls)."""
+        from kiro_crew.dashboard.origin import check_host
+
+        assert check_host(self._make_request(None, remote="10.0.0.5")) is False
+
+    def test_empty_allowlist_denied(self) -> None:
+        """Deny-by-default: a missing/empty allowed_origins must NOT bypass the
+        Host check (review-bot security-controls, fail-open guard)."""
+        from kiro_crew.dashboard.origin import check_host
+
+        req = self._make_request("evil.com", allowed=set())
+        assert check_host(req) is False
+
+    def test_missing_allowed_origins_denied(self) -> None:
+        """None allowlist (key never set / race) is a denial, not fail-open."""
+        from unittest.mock import MagicMock
+
+        from kiro_crew.dashboard.origin import check_host
+
+        request = MagicMock()
+        request.headers = {"Host": "localhost:5476"}
+        request.app = {}  # dict.get("allowed_origins") -> None
+        assert check_host(request) is False
+
+
+class TestCanonicalHostSpellings:
+    """A different spelling of an allowed loopback host passes,
+    and nothing else does. Both checks canonicalize the request side and the
+    allowed side with the same helper; ports in Origin still match exactly."""
+
+    _ALLOWED = frozenset(
+        {"http://localhost:5476", "http://127.0.0.1:5476", "http://[::1]:5476", "http://localhost"}
+    )
+
+    def _req(self, *, host: str | None = None, origin: str = "", remote: str = "127.0.0.1"):
+        from unittest.mock import MagicMock
+
+        request = MagicMock()
+        headers = {}
+        if host is not None:
+            headers["Host"] = host
+        if origin:
+            headers["Origin"] = origin
+        request.headers = headers
+        request.remote = remote
+        request.app = {"allowed_origins": set(self._ALLOWED)}
+        return request
+
+    @pytest.mark.parametrize(
+        "host",
+        [
+            "[0:0:0:0:0:0:0:1]:5476",
+            "[0:0:0:0:0:0:0:1]",
+            "[0000::0001]:5476",
+            "localhost.:5476",
+            "localhost.",  # default port 80, no port in Host
+            "LOCALHOST.:80",
+        ],
+    )
+    def test_check_host_accepts_canonical_spellings(self, host: str) -> None:
+        assert check_host(self._req(host=host)) is True
+
+    @pytest.mark.parametrize(
+        "host",
+        [
+            "localhost..:5476",
+            "localhost..",
+            ".:5476",
+            "[::2]:5476",
+            "[0:0:0:0:0:0:0:2]:5476",
+            "[::ffff:10.0.0.1]:5476",  # IPv4-mapped, not loopback
+            "[::ffff:127.0.0.2]:5476",  # mapped, not in the allowed set
+            "[::1:5476",  # unclosed bracket
+            "[0:0:0:0:0:0:0:1",
+            "[localhost]:5476",  # bracketed non-IPv6
+            "[::1]x:5476",
+            "[::1]:",
+            "[::1]:54a6",
+            "0:0:0:0:0:0:0:1",  # bare IPv6
+            "localhost:",
+            "localhost:abc",
+            "127.0.0.1.:5476",  # IP literal with a dot is not a DNS name
+            "127.000.000.001:5476",
+            "10.0.0.1:5476",
+            "evil.com.:5476",
+            ":5476",
+            "[::1%eth0]:5476",
+        ],
+    )
+    def test_check_host_still_refuses(self, host: str) -> None:
+        assert check_host(self._req(host=host)) is False
+
+    @pytest.mark.parametrize(
+        "origin",
+        [
+            "http://[0:0:0:0:0:0:0:1]:5476",
+            "http://localhost.:5476",
+            "http://LOCALHOST.:5476",
+            "http://127.0.0.1:5476",
+            "http://localhost.",  # matches allowed "http://localhost" (port 80)
+        ],
+    )
+    def test_check_origin_accepts_canonical_spellings(self, origin: str) -> None:
+        assert check_origin(self._req(origin=origin)) is True
+
+    @pytest.mark.parametrize(
+        "origin",
+        [
+            "http://localhost..:5476",
+            "http://localhost.:80",  # ports match exactly: ":80" is not "no port"
+            "http://localhost.:5477",
+            "https://localhost.:5476",  # scheme must match
+            "http://[0:0:0:0:0:0:0:2]:5476",
+            "http://[::ffff:10.0.0.1]:5476",
+            "http://[::1:5476",
+            "http://[localhost]:5476",
+            "http://evil.com.:5476",
+            "http://10.0.0.1:5476",
+            "http://127.0.0.1.:5476",
+            "http://:5476",
+        ],
+    )
+    def test_check_origin_still_refuses(self, origin: str) -> None:
+        assert check_origin(self._req(origin=origin)) is False
+
+    def test_same_origin_fallback_canonical(self) -> None:
+        """Origin == Host on an unlisted loopback port, spelled differently."""
+        req = self._req(origin="http://[0:0:0:0:0:0:0:1]:7779", host="[::1]:7779")
+        assert check_origin(req) is True
+        req = self._req(origin="http://localhost.:7779", host="localhost:7779")
+        assert check_origin(req) is True
+
+    @pytest.mark.parametrize(
+        "origin, host",
+        [
+            ("http://localhost.:7779", "localhost:7780"),  # port differs
+            ("http://localhost.:7779", "localhost"),
+            ("http://localhost..:7779", "localhost..:7779"),  # not loopback
+            ("http://[::ffff:10.0.0.1]:7779", "[::ffff:10.0.0.1]:7779"),
+            ("http://[::1]:7779", "[::1:7779"),  # malformed Host
+            ("http://evil.com.:7779", "evil.com:7779"),
+        ],
+    )
+    def test_same_origin_fallback_still_refuses(self, origin: str, host: str) -> None:
+        assert check_origin(self._req(origin=origin, host=host)) is False
+
+
+class TestFrameAncestorsValue:
+    """``'self'`` plus the ancestors ``'self'`` cannot express.
+
+    Both halves are load-bearing and each covers a case the other gets wrong, so
+    both directions are pinned here — a regression in either one blanks every
+    widget frame on one of the two access paths while leaving the other working,
+    which is exactly how it shipped past a first round of verification.
+    """
+
+    def test_self_is_always_present(self) -> None:
+        """The serving origin must be named by ``'self'``, not derived server-side.
+
+        The browser resolves ``'self'`` against the real URL; behind a TLS tunnel a
+        ``Host``-built value names ``http://localhost:<port>`` and refuses the frame.
+        """
+        from kiro_crew.dashboard.origin import frame_ancestors_value
+
+        assert frame_ancestors_value() == "'self'"
+
+    def test_an_embedding_ancestor_is_added(self) -> None:
+        """The grandparent origin is what ``'self'`` alone leaves out.
+
+        ``frame-ancestors`` is matched against EVERY ancestor, so a widget nested in
+        the Instances embed (local dashboard -> embedded dashboard -> widget) is
+        refused on ``'self'`` alone even though its immediate parent matches.
+        """
+        from kiro_crew.dashboard.origin import frame_ancestors_value
+
+        assert frame_ancestors_value(["http://localhost:5476"]) == "'self' http://localhost:5476"
+
+    def test_several_ancestors_keep_their_order(self) -> None:
+        from kiro_crew.dashboard.origin import frame_ancestors_value
+
+        value = frame_ancestors_value(["http://127.0.0.1:5476", "http://localhost:5476"])
+        assert value == "'self' http://127.0.0.1:5476 http://localhost:5476"
+
+    def test_a_duplicate_ancestor_is_not_repeated(self) -> None:
+        from kiro_crew.dashboard.origin import frame_ancestors_value
+
+        value = frame_ancestors_value(["http://localhost:5476", "http://localhost:5476"])
+        assert value == "'self' http://localhost:5476"
+
+    @pytest.mark.parametrize(
+        "bad",
+        [
+            "http://[::1]:5476",
+            "http://localhost:5476/path",
+            "http://localhost:5476; script-src *",
+            "http://localhost:5476 http://evil.example",
+            "'self'",
+            "*",
+            "",
+        ],
+    )
+    def test_an_inexpressible_or_injecting_ancestor_is_dropped(self, bad: str) -> None:
+        """The producer is not trusted to have made the value header-safe.
+
+        A bracketed IPv6 literal is not a CSP host-source, a space smuggles a second
+        source, and a semicolon a whole directive; each is dropped here.
+        """
+        from kiro_crew.dashboard.origin import frame_ancestors_value
+
+        assert frame_ancestors_value([bad]) == "'self'"
+
+
+class TestBoundedHostnameResolve:
+    """The resolver is best-effort, and 'best-effort' has to include the failure
+    to START the worker at all."""
+
+    def test_thread_exhaustion_reads_as_unresolved_not_as_a_raise(self, monkeypatch):
+        """A RuntimeError from ``Thread.start`` must not escape into the banner.
+
+        The result only decides one ``ssh -NL`` hint line; a raise would lose the
+        whole banner, including the authenticated URL.
+        """
+        from kiro_crew.dashboard import urls as urls_mod
+
+        class _RefusingThread:
+            def __init__(self, *a, **k):
+                pass
+
+            def start(self):
+                raise RuntimeError("can't start new thread")
+
+            def join(self, timeout=None):  # pragma: no cover - never reached
+                raise AssertionError("join must not be reached when start failed")
+
+        monkeypatch.setattr(urls_mod.threading, "Thread", _RefusingThread)
+
+        assert urls_mod._resolve_hostname_bounded("example.invalid") is None

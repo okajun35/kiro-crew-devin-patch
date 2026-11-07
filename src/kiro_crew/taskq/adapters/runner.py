@@ -1,0 +1,1597 @@
+"""Runner adapters: TaskRunner steps and workflow agent calls as taskq rows.
+
+The subagent entry writes a row before it acknowledges a spawn, defers it
+under memory pressure instead of refusing, and claims it under a lease when a
+slot frees (``subagent_manager/admission/``). The two other entry points
+that start agent turns -- a TaskRunner step (``task_executor.execute_task``)
+and a workflow ``ctx.agent()`` call (``workflows/agent_pool.py``) -- run on
+``SessionManager`` sessions, not on ``SubagentManager.spawn``, so they cannot
+reuse that code path literally. This module gives them the same CONTRACT over
+the same store:
+
+* :class:`RunnerLane` -- one execution gate bounded by the live effective cap.
+  It is the "equivalent hook" the adaptive controller (RFC §5.2) needs for the
+  runner entries: the cap it reads IS the controller's clamp, a raise arrives as
+  :meth:`RunnerLane.pump`, and ``mode=fixed`` pins the bound. Waiters are FIFO
+  and hold nothing but a future.
+* :class:`RunnerAdmission` -- ``accept`` (write-before-ack; a failed write is a
+  refusal, never an id), ``admit`` (defer on pressure, then a lane slot, then
+  ``TaskStore.claim`` under a lease), and the :class:`Admitted` handle the
+  runner drives: ``running`` / ``progress`` / ``renew`` / ``settle``,
+  ``recovering`` for a turn that ended on a non-success stop reason, and the
+  two waits a step can enter -- ``yield_dependency`` (a dependency signal parks
+  the row in ``waiting_dependency`` and the lane slot is released until the
+  coordinator wakes it) and ``waiting_input`` (a terminal question).
+* :func:`adopt_orphaned_rows` -- the recovery adapter for the rows the boot
+  reconciler could only stamp ``awaiting_adapter``: a run whose interrupted
+  step is safe to retry is resumed from the runner's own checkpoint; one whose
+  step may have had a side effect is settled ``unknown_side_effect`` and left
+  for a human, never re-run blind. It also ends the ``queued`` rows a dead
+  incarnation accepted but never claimed -- these kinds have no dispatcher, so
+  nothing else would ever look at them again.
+
+Lanes follow RFC §13 Q5: a run launched by a cron or a hook queues in the
+``system`` lane; anything else queues under the session that launched it.
+
+Specification: ``docs/system-specs/modules/taskq.md`` (§ Runner adapters),
+``taskrunner.md``, ``workflows.md``.
+
+The lane, the claimed-row handle and the vocabulary every runner piece shares live in
+``runner_lane``, ``runner_handle`` and ``runner_vocab`` beside this module (the owner
+table below); this module binds every name they define and stays their import path.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+from dataclasses import dataclass, field
+from typing import Any, Awaitable, Callable, Iterable
+
+from kiro_crew.recovery.ladder import L3_ACP_RUNTIME, RecoveryDecision, RecoveryLadder
+
+from ..dependency import DependencyCoordinator, DependencySignal
+from ..lanes import SYSTEM_LANE, lane_key_for  # noqa: F401
+from ..migrate import TASKRUNNER_ID_PREFIX  # noqa: F401
+from ..model import DONE  # noqa: F401
+from ..model import KIND_WORKFLOW_AGENT  # noqa: F401
+from ..model import (
+    ADMITTED,
+    ADOPTED_RESUME_EVENT,
+    CANCELLED,
+    CLAIMABLE,
+    FAILED,
+    KIND_TASKRUNNER_STEP,
+    PARKED,
+    QUEUED,
+    RECOVERING,
+    RECOVERY_MAX_ATTEMPTS,
+    RETRY_WAIT,
+    RUNNING,
+    SIDE_EFFECT_IDEMPOTENT_KEY,
+    SIDE_EFFECT_NONE,
+    SIDE_EFFECT_UNKNOWN,
+    STARTING,
+    TERMINAL,
+    UNKNOWN_SIDE_EFFECT,
+    WAITING,
+    WAITING_DEPENDENCY,
+    WAITING_INPUT,
+    TaskRecord,
+    recovery_exhausted,
+)
+from ..store import TaskStore, TaskStoreUnavailable
+from ..waits import WaitLedger, WaitRecord
+from .runner_handle import Admitted
+from .runner_lane import RunnerLane
+from .runner_vocab import OWNER_TASKRUNNER  # noqa: F401
+from .runner_vocab import OWNER_WORKFLOW  # noqa: F401
+from .runner_vocab import owner_of  # noqa: F401
+from .runner_vocab import (
+    _DEFAULT_ADMIT_WAIT_SECS,
+    _MAX_ADMIT_SLEEP_SECS,
+    _MAX_DURABLE_ANSWER_CHARS,
+    ANSWER_TRUNCATED,
+    INPUT_WAIT_ONLY,
+    LANE_SYSTEM,
+    MODE_AIMD,
+    MODE_FIXED,
+    PARAM_ACCEPTED_BY,
+    PARAM_LANE,
+    PARAM_SAFE_RETRY,
+    RUNNER_RECOVERY_ADAPTERS,
+    SYSTEM_SOURCES,
+    UNCLAIMED,
+    WORKFLOW_ID_PREFIX,
+    RunnerAdmissionRefused,
+    RunnerLaneSelfBlocked,
+    RunnerTaskCancelled,
+    _answer_detail,
+    lane_for,
+    run_task_id,
+    step_task_id,
+    workflow_task_id,
+)
+
+logger = logging.getLogger(__name__)
+
+#: The modules this one binds the runner's lane, its row handle and their shared
+#: vocabulary from, lowest layer first. Each imports only modules listed before it and
+#: never this one at run time, and one that logs does so under this module's logger. This
+#: module binds every project name it bound as one file, so it stays the one import path; a
+#: name a test patches through it must be one only the code kept here reads, because an
+#: owner reads its own namespace and a patch of this module does not reach it.
+_RUNNER_OWNERS = (
+    "kiro_crew.taskq.adapters.runner_vocab",
+    "kiro_crew.taskq.adapters.runner_lane",
+    "kiro_crew.taskq.adapters.runner_handle",
+)
+
+
+class RunnerAdmission:
+    """Admission for runner entries over the shared task store.
+
+    ``store`` is a :class:`TaskStore`, a zero-arg callable returning one (or
+    ``None`` while the durable queue is off), or ``None``. With no store the
+    lane still bounds concurrency; nothing is persisted and every handle
+    reports success -- the legacy in-memory behaviour, kept so a broken
+    ``tasks.db`` never turns into a refused run.
+
+    ``pressure`` answers ``resource_status.cached_admission_check`` shape
+    (``.admitted``/``.reason``); a refusal defers the row for
+    ``admit_wait_secs`` instead of refusing it. ``clock`` / ``sleep`` are
+    injectable so tests run on a fake clock.
+    """
+
+    def __init__(
+        self,
+        store: TaskStore | Callable[[], TaskStore | None] | None,
+        *,
+        lane: RunnerLane | None = None,
+        pressure: Callable[[], Any] | None = None,
+        admit_wait_secs: float = _DEFAULT_ADMIT_WAIT_SECS,
+        clock: Callable[[], float] = time.time,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        ladder: RecoveryLadder | None = None,
+        coordinator: DependencyCoordinator | None = None,
+        name: str = "runner",
+        require_store: bool = False,
+        store_error: Callable[[], str | None] | None = None,
+    ) -> None:
+        self._store_src: Callable[[], TaskStore | None]
+        if store is None:
+            self._store_src = lambda: None
+        elif isinstance(store, TaskStore):
+            fixed_store: TaskStore = store
+            self._store_src = lambda: fixed_store
+        else:
+            self._store_src = store
+        self.lane = lane or RunnerLane(name=f"{name}-lane")
+        self._pressure = pressure
+        self._admit_wait = max(0.0, float(admit_wait_secs))
+        self._clock = clock
+        self._sleep = sleep
+        self._ladder = ladder
+        self._coordinator = coordinator
+        self._name = name
+        self._wakes: dict[str, asyncio.Event] = {}
+        #: The loop each wake event belongs to, captured where the event is
+        #: created (always a coroutine of the run that parks). An operator
+        #: action reaches :meth:`on_wake` on an ``asyncio.to_thread`` worker
+        #: (``dashboard/handlers/tasks.py``), and ``Event.set`` is a loop
+        #: operation, so the set is posted to THIS loop rather than made on the
+        #: worker -- see :meth:`on_wake`.
+        self._wake_loops: dict[str, asyncio.AbstractEventLoop] = {}
+        self._input_answers: dict[str, str | None] = {}
+        self._deferred = 0
+        #: ``agent.task_queue_enabled``: with the queue ON, a missing store is
+        #: a REFUSAL (typed), never a fall-back to lane-only admission whose
+        #: rows a restart cannot see. ``store_error`` names why it is missing.
+        self._require_store = bool(require_store)
+        self._store_error = store_error
+        #: Terminal writes that hit ``TaskStoreUnavailable``: (generation,
+        #: state, result_ref, error) per task, retried by :meth:`admit` and
+        #: :meth:`tick` until the write commits or the row is fenced. A handle
+        #: is settled only once its write committed OR this durable retry owns it.
+        self._pending_finish: dict[str, tuple[int, str, str | None, str | None]] = {}
+
+    # -- plumbing ------------------------------------------------------------
+
+    def in_memory(self) -> RunnerAdmission:
+        """Use the same live resource bounds without a durable task store.
+
+        Restricted work must not reach the persistent dependency coordinator or
+        terminal-write retry queue. The existing storeless handle owns its waits
+        and outcomes in memory while sharing this admission's lane and pressure.
+        """
+        return RunnerAdmission(
+            None,
+            lane=self.lane,
+            pressure=self._pressure,
+            admit_wait_secs=self._admit_wait,
+            clock=self._clock,
+            sleep=self._sleep,
+            ladder=self._ladder,
+            name=self._name,
+        )
+
+    @property
+    def store(self) -> TaskStore | None:
+        try:
+            return self._store_src()
+        except Exception:  # noqa: BLE001 - a broken getter means no store
+            return None
+
+    @property
+    def coordinator(self) -> DependencyCoordinator | None:
+        return self._coordinator
+
+    def attach_coordinator(self, coordinator: DependencyCoordinator | None) -> None:
+        """Hand the per-scope schedule over from this admission's own :meth:`tick`.
+
+        For an admission built while the store was still opening, when there
+        was no coordinator to pass in. Once one is attached the coordinator owns
+        the schedule and ``tick`` stops scanning the wait ledger, so the caller
+        must also make the coordinator re-read the rows (``rebuild``) or a wait
+        parked in between has no wake path.
+        """
+        self._coordinator = coordinator
+
+    @property
+    def ladder(self) -> RecoveryLadder | None:
+        return self._ladder
+
+    def now(self) -> float:
+        return float(self._clock())
+
+    @property
+    def deferred_count(self) -> int:
+        return self._deferred
+
+    def _drop_wake(self, task_id: str) -> None:
+        """Let go of one row's wake state: the event, the loop it belongs to and
+        any unconsumed answer. One method, so the three cannot drift apart."""
+        self._wakes.pop(task_id, None)
+        self._wake_loops.pop(task_id, None)
+        self._input_answers.pop(task_id, None)
+
+    def forget(self, task_id: str) -> None:
+        self._drop_wake(task_id)
+        if self._coordinator is not None:
+            try:
+                self._coordinator.forget(task_id)
+            except Exception:  # noqa: BLE001 - advisory
+                logger.debug("dependency coordinator forget failed", exc_info=True)
+
+    def stats(self) -> dict[str, Any]:
+        return {
+            **self.lane.stats(),
+            "deferred": self._deferred,
+            "store": self.store is not None,
+            "pending_terminal_writes": len(self._pending_finish),
+        }
+
+    async def _db(self, fn: Any, *args: Any, **kw: Any) -> Any:
+        """Run one of this admission's store-touching helpers off the loop.
+
+        With no store attached there is nothing to offload and *fn* runs inline;
+        otherwise it runs on the store's single writer thread, which is also
+        what keeps posted and awaited writes in submission order.
+        """
+        store = self.store
+        if store is None:
+            return fn(*args, **kw)
+        return await store.run(fn, *args, **kw)
+
+    def _refuse_if_store_required(self) -> None:
+        if self._require_store and self.store is None:
+            why = None
+            if self._store_error is not None:
+                try:
+                    why = self._store_error()
+                except Exception:  # noqa: BLE001 - the reason is advisory
+                    why = None
+            raise RunnerAdmissionRefused(
+                why or "durable task queue enabled but its store is unavailable"
+            )
+
+    def defer_terminal_write(
+        self,
+        task_id: str,
+        generation: int,
+        state: str,
+        *,
+        result_ref: str | None,
+        error: str | None,
+    ) -> None:
+        """Own a terminal write the store could not take right now. Newest write
+        per task wins (a task ends once).
+
+        :meth:`admit` and :meth:`tick` are the replayers, and ``admit`` is the
+        one every wired consumer reaches: the next unit this runner starts is
+        what commits the write, so a run that carries on settles the step it
+        just finished. A write owned by an admission nothing calls again is
+        durable by RECONCILE -- the row stays ``running`` under this
+        incarnation's lease, and the next boot settles it by side-effect class.
+        """
+        self._pending_finish[task_id] = (generation, state, result_ref, error)
+
+    def retry_terminal_writes(self) -> int:
+        """Replay pending terminal writes; returns how many committed or were
+        fenced (either way the retry stops owning them).
+
+        Synchronous store I/O: an event-loop caller runs it through
+        :meth:`_db`, as :meth:`admit` does.
+        """
+        store = self.store
+        if store is None or not self._pending_finish:
+            return 0
+        settled = 0
+        for task_id, (generation, state, result_ref, error) in list(self._pending_finish.items()):
+            try:
+                store.finish(
+                    task_id, state, generation=generation, result_ref=result_ref, error=error
+                )
+            except TaskStoreUnavailable:
+                continue  # still down; keep owning the write
+            # Committed, or fenced by a newer generation (another owner ended
+            # the row): in both cases the row's state is someone's decision.
+            self._pending_finish.pop(task_id, None)
+            self._drop_wake(task_id)
+            settled += 1
+        return settled
+
+    # -- accept (write-before-ack) ------------------------------------------
+
+    def accept(
+        self,
+        *,
+        kind: str,
+        task_id: str,
+        session_key: str = "",
+        source: str = "",
+        params: dict[str, Any] | None = None,
+        workspace: str | None = None,
+        scope_ref: dict[str, Any] | None = None,
+        side_effect_class: str = SIDE_EFFECT_UNKNOWN,
+        parent_id: str | None = None,
+        deadline_at: float | None = None,
+        provider: str | None = None,
+    ) -> TaskRecord | None:
+        """Persist the row and return it; ``None`` when no store is attached.
+
+        A row that already exists and is still claimable is RETURNED, not
+        duplicated -- that is how a resumed run re-attaches to the row a
+        crashed incarnation left ``recovering``. A terminal row with the same
+        id (a step re-run after a failure) gets a ``~N`` suffix so the earlier
+        outcome stays on the record. Raises :class:`RunnerAdmissionRefused`
+        when the write fails: the caller has accepted nothing.
+
+        Several statements, one unit: the parent lookup, the terminal-suffix
+        scan, the re-adoption transition and the insert are one decision, so an
+        event-loop caller offloads the WHOLE method through :meth:`accept_async`
+        rather than each statement in it.
+        """
+        self._refuse_if_store_required()
+        store = self.store
+        if store is None:
+            return None
+        lane = lane_for(session_key, source)
+        body = dict(params or {})
+        body[PARAM_LANE] = lane
+        body[PARAM_ACCEPTED_BY] = store.incarnation
+        body.setdefault("source", str(source or ""))
+        root_id = ""
+        if parent_id:
+            try:
+                parent = store.get(parent_id)
+            except TaskStoreUnavailable:
+                parent = None
+            if parent is None:
+                parent_id = None
+            else:
+                root_id = parent.root_id or parent.id
+        chosen = task_id
+        try:
+            existing = store.get(task_id)
+            suffix = 1
+            while existing is not None and existing.state in TERMINAL:
+                suffix += 1
+                chosen = f"{task_id}~{suffix}"
+                existing = store.get(chosen)
+        except TaskStoreUnavailable as exc:
+            raise RunnerAdmissionRefused(str(exc)) from exc
+        if existing is not None:
+            if existing.state in CLAIMABLE or existing.state in WAITING:
+                # THIS incarnation owns the row from here on: the queued-orphan
+                # sweep tests ``params.accepted_by``, and a re-adopted row is one
+                # a live ``admit`` is about to park on. Leaving the first
+                # accepter's stamp there makes the sweep cancel it under us.
+                try:
+                    store.restamp_accepted_by(existing.id, store.incarnation)
+                except TaskStoreUnavailable as exc:
+                    raise RunnerAdmissionRefused(str(exc)) from exc
+                existing.params[PARAM_ACCEPTED_BY] = store.incarnation
+                return existing
+            if existing.lease_owner is None and existing.state in (STARTING, RUNNING):
+                # Left active by a dead incarnation and never reconciled; the
+                # adopter would move it, but a caller re-accepting it now is
+                # the same act: make it claimable and hand it back.
+                try:
+                    store.transition(existing.id, RECOVERING, detail={"readopted": True})
+                    refreshed = store.get(existing.id)
+                except TaskStoreUnavailable as exc:
+                    raise RunnerAdmissionRefused(str(exc)) from exc
+                return refreshed or existing
+            raise RunnerAdmissionRefused(
+                f"row {existing.id} is {existing.state} under another owner; not re-accepted"
+            )
+        record = TaskRecord(
+            id=chosen,
+            kind=kind,
+            session_key=str(session_key or ""),
+            parent_id=parent_id,
+            root_id=root_id,
+            provider=provider,
+            params=body,
+            workspace=workspace,
+            scope_ref=dict(scope_ref or {}),
+            side_effect_class=side_effect_class,
+            deadline_at=deadline_at,
+        )
+        try:
+            store.accept_one(record)
+        except TaskStoreUnavailable as exc:
+            raise RunnerAdmissionRefused(str(exc)) from exc
+        return record
+
+    async def accept_async(self, **kw: Any) -> TaskRecord | None:
+        """:meth:`accept` for an event-loop caller: the whole accept on the
+        store's writer thread. ``RunnerAdmissionRefused`` propagates unchanged."""
+        return await self._db(self.accept, **kw)
+
+    # -- admit ---------------------------------------------------------------
+
+    def _pressure_refusal(self) -> Any:
+        """The memory-pressure verdict when it refuses an admission now, else None.
+
+        Only reads the check; :meth:`_defer_for_pressure` acts on a refusal, so
+        a caller holding a lane slot can give it back in between.
+        """
+        if self._pressure is None:
+            return None
+        decision = self._pressure()
+        if getattr(decision, "admitted", True):
+            return None
+        return decision
+
+    async def _defer_for_pressure(
+        self, store: TaskStore | None, task_id: str, decision: Any
+    ) -> None:
+        """Defer *task_id* once on a refusing *decision*: count it, mark the row
+        and sleep the admit wait, so the caller loops back to its own top."""
+        self._deferred += 1
+        reason = str(getattr(decision, "reason", "") or "memory pressure")
+        if store is not None:
+            try:
+                await self._db(
+                    store.defer,
+                    task_id,
+                    wait=self._admit_wait,
+                    reason=reason,
+                )
+            except TaskStoreUnavailable:
+                logger.debug("taskq runner: defer of %s failed", task_id, exc_info=True)
+        logger.info("taskq runner: %s deferred (%s)", task_id, reason)
+        await self._sleep(min(self._admit_wait, _MAX_ADMIT_SLEEP_SECS))
+
+    async def admit(
+        self,
+        task_id: str,
+        *,
+        kind: str = KIND_TASKRUNNER_STEP,
+        lane: str = LANE_SYSTEM,
+        session_key: str = "",
+    ) -> Admitted:
+        """Bring *task_id* to ``starting`` under a lease, or raise.
+
+        Order (the subagent path's, minus the policy refusals that happened at
+        ``accept``): memory posture -> DEFER (row stays queued, eligible again
+        after ``admit_wait_secs``) -> a lane slot by effective cap -> ``claim``.
+        A row cancelled while it waited raises :class:`RunnerTaskCancelled`.
+        Without a store the lane slot is the whole admission.
+
+        A CALLER cancel delivered while this waits -- the pressure sleep, the
+        lane slot, a deferred row's re-check -- is this method's to clean up
+        (:meth:`_end_row_on_cancel` plus the lane slot). Nothing else would: the
+        runner kinds have no dispatcher, so a row left claimable here holds a
+        queue place for as long as the store lives.
+
+        A row whose own ANCESTRY holds every slot on the lane is refused
+        (:class:`RunnerLaneSelfBlocked`) and ended, rather than parked on a
+        release only that ancestry can make. The ancestor set is read only when
+        the lane is already saturated, so an idle lane costs no store read; a
+        lane that fills across that read leaves the descendant parked, which is
+        the same wait it would have had anyway, never a refusal it did not earn.
+        The fence sees the parentage the STORE recorded, so a nested entry
+        accepted with no ``parent_id`` is outside it.
+
+        Every store touch here goes through :meth:`_db`: the lane slot, the
+        futures and the handle stay on the loop, the SQLite calls do not.
+
+        A terminal write an earlier unit's :meth:`Admitted.settle` kept
+        (:meth:`defer_terminal_write`) is replayed FIRST, because this is the
+        runner's own next store touch and a kept write that nothing replays
+        leaves a finished unit's row ``running`` and leased for the life of the
+        process, which the next boot then reconciles as an interrupted run.
+        """
+        self._refuse_if_store_required()
+        store = self.store
+        if store is not None and self._pending_finish:
+            await self._db(self.retry_terminal_writes)
+        slot_held = False
+        claimed_generation: int | None = None
+        try:
+            while True:
+                if store is not None:
+                    await self._db(self._raise_if_ended, store, task_id)
+                refusal = self._pressure_refusal()
+                if refusal is not None:
+                    await self._defer_for_pressure(store, task_id, refusal)
+                    continue
+                ancestors: frozenset[str] = frozenset()
+                parks = self.lane.saturated
+                if store is not None and parks:
+                    ancestors = await self._db(self._ancestor_ids, store, task_id)
+                try:
+                    await self.lane.acquire(task_id, ancestors=ancestors)
+                except RunnerLaneSelfBlocked:
+                    if store is not None:
+                        await self._db(
+                            self._end_row_on_cancel,
+                            store,
+                            task_id,
+                            None,
+                            "self-blocked on the lane",
+                        )
+                    self.forget(task_id)
+                    raise
+                slot_held = True
+                # The lane does not pause on memory (the execution cap reads
+                # work evidence only), so a step that parked behind a full lane
+                # is granted whatever memory reads at the grant, and the check
+                # above predates the wait. Re-check it, and give the slot back
+                # BEFORE deferring while the host is still under pressure: the
+                # deferral sleeps, and a slot held through it blocks the lane.
+                refusal = self._pressure_refusal() if parks else None
+                if refusal is not None:
+                    self.lane.release(task_id)
+                    slot_held = False
+                    await self._defer_for_pressure(store, task_id, refusal)
+                    continue
+                if store is None:
+                    slot_held = False  # the handle owns the slot from here
+                    return Admitted(
+                        self, task_id, kind, lane, 0, session_key=session_key, _state=STARTING
+                    )
+                try:
+                    claimed = await self._db(store.claim, task_id)
+                except TaskStoreUnavailable as exc:
+                    self.lane.release(task_id)
+                    slot_held = False
+                    raise RunnerAdmissionRefused(str(exc)) from exc
+                if claimed is None:
+                    self.lane.release(task_id)
+                    slot_held = False
+                    rec = await self._db(store.get, task_id)
+                    if rec is None or rec.state in TERMINAL:
+                        raise RunnerTaskCancelled(
+                            f"{task_id} is {rec.state if rec else 'missing'}; not started"
+                        )
+                    if rec.state in CLAIMABLE:
+                        # Deferred, or in a recovery backoff: wait it out, then retry.
+                        wait = max(0.0, float(rec.next_run_at or 0.0) - self.now())
+                        await self._sleep(min(wait or self._admit_wait, _MAX_ADMIT_SLEEP_SECS))
+                        continue
+                    raise RunnerTaskCancelled(f"{task_id} is {rec.state} under another owner")
+                claimed_generation = claimed.generation
+                rec = claimed.record
+                handle = Admitted(
+                    self,
+                    task_id,
+                    rec.kind,
+                    str(rec.params.get(PARAM_LANE) or lane),
+                    claimed.generation,
+                    session_key=rec.session_key or session_key,
+                    side_effect_class=rec.side_effect_class,
+                    safe_retry=bool(rec.params.get(PARAM_SAFE_RETRY, False)),
+                )
+                if not await handle.write_async(STARTING):
+                    # PERSIST BEFORE PUBLISH, and the handle IS the publish:
+                    # ``admitted`` is the store's statement that no executor ever
+                    # held the row, which is what lets the boot reconciler requeue
+                    # one without asking its side-effect class. A start write that
+                    # did not commit therefore ends the admission here -- the
+                    # claim's capacity goes back and the row goes back to the
+                    # queue for a later dispatch -- rather than executing under a
+                    # row a restart cannot tell apart from one that never started.
+                    handle.release_slot()
+                    slot_held = False
+                    state = await self._db(
+                        self._requeue_unstarted, store, task_id, claimed.generation
+                    )
+                    if state is not None and state in TERMINAL:
+                        raise RunnerTaskCancelled(f"{task_id} is {state}; not started")
+                    raise RunnerAdmissionRefused(
+                        f"the {STARTING} write for {task_id} did not commit; nothing started"
+                    )
+                slot_held = False  # the handle owns the slot from here
+                return handle
+        except asyncio.CancelledError:
+            if slot_held:
+                self.lane.release(task_id)
+            if store is not None:
+                self._end_row_on_cancel(store, task_id, claimed_generation)
+            self.forget(task_id)
+            raise
+
+    @staticmethod
+    def _ancestor_ids(store: TaskStore, task_id: str, limit: int = 16) -> frozenset[str]:
+        """The ids *task_id* descends from, walking ``parent_id`` upwards.
+
+        Bounded twice over, because the walk reads rows a caller wrote: *limit*
+        steps, and an id already seen ends it, so a chain that points back at
+        itself cannot spin the writer thread. A row that cannot be read
+        contributes no ancestor, which leaves the lane PARKING a descendant
+        instead of refusing one -- the same wait it had before this fence.
+        """
+        seen: set[str] = set()
+        current = task_id
+        for _ in range(max(0, int(limit))):
+            try:
+                rec = store.get(current)
+            except TaskStoreUnavailable:
+                break
+            if rec is None or not rec.parent_id or rec.parent_id in seen:
+                break
+            seen.add(rec.parent_id)
+            current = rec.parent_id
+        return frozenset(seen)
+
+    @staticmethod
+    def _requeue_unstarted(store: TaskStore, task_id: str, generation: int) -> str | None:
+        """Put a row this call claimed but could not mark ``starting`` back in the
+        queue; returns the state it carries afterwards, or None when that state
+        could not be READ.
+
+        Generation-fenced, so a row another owner already ended -- a cancel
+        landing inside the claim window bumps the generation, which is the OTHER
+        reason a start write does not commit -- keeps that outcome, and the state
+        read back is what tells the caller which refusal it is. ``None`` names no
+        state because both refusals answer it and they leave DIFFERENT rows: the
+        requeue refused leaves ``admitted`` under a lapsing lease, the read-back
+        alone refused leaves the committed ``queued``. Both are what the boot
+        reconciler settles a claimed-but-never-started row to or from, and nothing
+        ran under either.
+        """
+        try:
+            store.transition(task_id, QUEUED, generation=generation, detail={"unstarted": True})
+            return store.state_of(task_id)
+        except TaskStoreUnavailable:
+            logger.warning(
+                "taskq runner: %s is unstarted and its state is unread -- %s if the requeue "
+                "committed, %s under a lapsing lease if the store refused that too. Claimable "
+                "either way, and nothing started under it.",
+                task_id,
+                QUEUED,
+                ADMITTED,
+            )
+            return None
+
+    def _end_row_on_cancel(
+        self,
+        store: TaskStore,
+        task_id: str,
+        generation: int | None,
+        why: str = "",
+    ) -> None:
+        """End a row whose :meth:`admit` gave up before a handle reached the
+        caller: nothing ran under it and nobody is left to settle it. *why*
+        names which give-up it was; the default is the caller's cancel.
+
+        Synchronous, like every other terminal write on an unwinding path: an
+        ``await`` inside an ``except CancelledError`` arm can be interrupted
+        before the write is submitted.
+
+        Two rows are this call's to end and no others. One it CLAIMED itself,
+        where *generation* fences the write against any later owner; and one
+        still ``queued`` and unleased, which no ``claim`` ever touched -- and
+        that one is cancelled ``only_from=UNCLAIMED`` under the generation the
+        read returned, never on the read alone, because a row another admission
+        claimed between the two is a row with a live executor on it.
+        ``retry_wait`` and ``recovering`` are deliberately excluded: the first
+        can carry the operator's persisted answer and the second an attempt
+        count, and ``accept`` re-attaches both when the run resumes, so ending
+        one here would make the resumed step ask again or restart its recovery
+        ladder from zero.
+        """
+        reason = why or "admission cancelled before the row started"
+        try:
+            if generation is not None:
+                store.finish(task_id, CANCELLED, generation=generation, error=reason)
+                return
+            rec = store.get(task_id)
+            if rec is not None and rec.state == QUEUED and rec.lease_owner is None:
+                store.cancel(task_id, reason=reason, only_from=UNCLAIMED, generation=rec.generation)
+        except Exception:  # noqa: BLE001 - the cancel must still propagate
+            # Any exception raised here would REPLACE the ``CancelledError`` the
+            # caller is unwinding on, which asyncio requires to reach it: a row
+            # the next boot's sweep can settle is the lesser loss.
+            logger.warning(
+                "taskq runner: %s stayed claimable after a cancelled admission",
+                task_id,
+                exc_info=True,
+            )
+
+    async def claim_only_async(
+        self, task_id: str, *, kind: str = KIND_TASKRUNNER_STEP, lane: str = LANE_SYSTEM
+    ) -> "Admitted | None":
+        """:meth:`claim_only` for an event-loop caller: the claim and the
+        ``starting`` write together on the store's writer thread."""
+        if self.store is None:
+            return None
+        result = await self._db(self.claim_only, task_id, kind=kind, lane=lane)
+        return result if isinstance(result, Admitted) else None
+
+    def claim_only(
+        self, task_id: str, *, kind: str = KIND_TASKRUNNER_STEP, lane: str = LANE_SYSTEM
+    ) -> Admitted | None:
+        """Claim a row WITHOUT taking a lane slot -- for a container row.
+
+        A TaskRunner run row groups its steps (parentage, one resume unit) but
+        executes nothing itself; its steps are what the lane meters. ``None``
+        when the row is not claimable (cancelled, owned elsewhere), when no store
+        is attached, or when the ``starting`` write did not commit -- the same
+        fence :meth:`admit` applies, because a run driven through a handle whose
+        row is still ``admitted`` is a run the reconciler requeues as one that
+        never started.
+        """
+        store = self.store
+        if store is None:
+            return None
+        try:
+            claimed = store.claim(task_id)
+        except TaskStoreUnavailable:
+            return None
+        if claimed is None:
+            return None
+        rec = claimed.record
+        handle = Admitted(
+            self,
+            task_id,
+            rec.kind or kind,
+            str(rec.params.get(PARAM_LANE) or lane),
+            claimed.generation,
+            session_key=rec.session_key,
+            side_effect_class=rec.side_effect_class,
+            safe_retry=bool(rec.params.get(PARAM_SAFE_RETRY, False)),
+            _slot_held=False,
+        )
+        if not handle._write(STARTING):
+            # The read-back names WHICH refusal this was, and both answer None,
+            # so it is logged rather than dropped: a container row that came back
+            # terminal was ended under the claim, while ``queued`` (or an unread
+            # state) is one this gateway's own sweep will not touch and the next
+            # boot's cancels as never started.
+            state = self._requeue_unstarted(store, task_id, claimed.generation)
+            logger.warning(
+                "taskq runner: %s took no container handle; the row is %s",
+                task_id,
+                state or "in an unread state (queued if the requeue committed)",
+            )
+            return None
+        return handle
+
+    @staticmethod
+    def _raise_if_ended(store: TaskStore, task_id: str) -> None:
+        try:
+            state = store.state_of(task_id)
+        except TaskStoreUnavailable:
+            return
+        if state is not None and state in TERMINAL:
+            raise RunnerTaskCancelled(f"{task_id} is {state}; not started")
+
+    # -- stop-reason recovery ------------------------------------------------
+
+    def decide_recovery(
+        self, handle: Admitted, *, unit: str, reason: str
+    ) -> RecoveryDecision | None:
+        """Consult the recovery ladder (L3: the ACP runtime) for one stalled turn.
+
+        ``None`` when no ladder is attached: the caller keeps its own bounded
+        retry. A ``retry`` decision carries the jittered delay; anything else
+        means the layer is exhausted and the step fails with its partial kept.
+        """
+        if self._ladder is None:
+            return None
+        return self._ladder.observe_failure(
+            L3_ACP_RUNTIME, unit, reason=reason, task_id=handle.task_id
+        )
+
+    def recovered(self, unit: str) -> None:
+        if self._ladder is not None:
+            self._ladder.observe_success(L3_ACP_RUNTIME, unit)
+
+    # -- waits ---------------------------------------------------------------
+
+    def _wake_event(self, task_id: str) -> asyncio.Event:
+        """The event *task_id*'s parked coroutine awaits, and the loop it is on.
+
+        Called from the parking coroutine itself, which is the one place the
+        owning loop is knowable: :meth:`on_wake` can arrive on any thread.
+        """
+        ev = self._wakes.get(task_id)
+        if ev is None:
+            ev = asyncio.Event()
+            self._wakes[task_id] = ev
+        try:
+            self._wake_loops[task_id] = asyncio.get_running_loop()
+        except RuntimeError:  # no loop here: the wake has to be made in place
+            self._wake_loops.pop(task_id, None)
+        return ev
+
+    def on_wake(self, task_id: str) -> None:
+        """Coordinator / ledger hook: the row's wait ended; resume its coroutine.
+
+        Safe from any thread. ``asyncio.Event.set`` is a LOOP operation -- it
+        resolves the waiter's future, which schedules that future's callbacks on
+        the loop -- and an operator's ``answer_input`` / ``cancel_wait`` arrives
+        on an ``asyncio.to_thread`` worker (``dashboard/handlers/tasks.py``), so
+        the set is posted to the loop the waiter parked on. Setting it in place
+        from a worker is the thread-unsafe operation asyncio names: it can land
+        between a coroutine's ``_value`` test and its own registration, and the
+        run then waits for a wake that was already spent. Same shape as
+        ``config.live.LiveConfig.notify_written``.
+        """
+        ev = self._wakes.get(task_id)
+        if ev is None:
+            return
+        loop = self._wake_loops.get(task_id)
+        try:
+            here = asyncio.get_running_loop()
+        except RuntimeError:
+            here = None
+        if loop is None or loop is here:
+            ev.set()
+            return
+        if loop.is_closed():
+            return  # the loop that would have resumed the run is gone
+        try:
+            loop.call_soon_threadsafe(ev.set)
+        except RuntimeError:
+            # Loop shut down between the check and the call: nothing to wake.
+            logger.debug("taskq runner: wake for %s not delivered", task_id, exc_info=True)
+
+    def signal(self, scope: str, *, reason: str = "") -> list[str]:
+        """A dependency recovered: wake every row waiting on *scope*."""
+        store = self.store
+        woken: list[str] = []
+        if self._coordinator is not None and self._coordinator.recovered(scope):
+            woken.extend(self._coordinator.tick())
+        elif store is not None:
+            try:
+                woken.extend(WaitLedger(store, clock=self._clock).signal(scope, reason=reason))
+            except TaskStoreUnavailable:
+                logger.debug("taskq runner: signal(%s) failed", scope, exc_info=True)
+        for task_id in woken:
+            self.on_wake(task_id)
+        return woken
+
+    def tick(self) -> list[str]:
+        """Wake due time-based waits (the coordinator's, or the ledger's) and
+        replay terminal writes the store refused earlier."""
+        self.retry_terminal_writes()
+        woken: list[str] = []
+        if self._coordinator is not None:
+            woken.extend(self._coordinator.tick())
+        store = self.store
+        if store is not None and self._coordinator is None:
+            ledger = WaitLedger(store, clock=self._clock)
+            try:
+                due = ledger.due_dependency_waits(self.now())
+            except TaskStoreUnavailable:
+                due = []
+            for rec in due:
+                try:
+                    if ledger.wake(rec.id, reason="retry_at reached") is not None:
+                        woken.append(rec.id)
+                except TaskStoreUnavailable:
+                    continue
+        for task_id in woken:
+            self.on_wake(task_id)
+        return woken
+
+    @staticmethod
+    def _cancel_woken_dependency(
+        store: TaskStore, task_id: str, generation: int, reason: str
+    ) -> None:
+        """End a dependency wake left unclaimed in ``retry_wait``.
+
+        A wake advances the handle's generation exactly once before its
+        coroutine reclaims the row. The state and generation fences identify
+        that handoff without reaching a later ``retry_wait`` epoch or a row an
+        admission moved to ``admitted``, ``starting`` or ``running``.
+        """
+        try:
+            store.cancel(
+                task_id,
+                reason=reason,
+                only_from=frozenset({RETRY_WAIT}),
+                generation=generation,
+            )
+        except Exception:  # noqa: BLE001 - the caller's cancellation must propagate
+            logger.warning(
+                "taskq runner: %s stayed in retry_wait after a cancelled dependency wait",
+                task_id,
+                exc_info=True,
+            )
+
+    async def yield_dependency(
+        self,
+        handle: Admitted,
+        signal: DependencySignal,
+        *,
+        deadline_at: float | None = None,
+    ) -> bool:
+        """Park *handle* until its dependency scope is retried; True to retry.
+
+        The lane slot is released for the whole wait (the session stays
+        resident -- the residency charge is the record's statement of that).
+        With a coordinator attached the scope's ONE schedule owns the retry
+        instant; without one the row carries ``retry_at`` and :meth:`tick`
+        wakes it. A terminal signal, a scope deadline or a cancel returns
+        False: the row is already ``failed``/``cancelled`` and the step must
+        not retry.
+
+        With the store reachable, a CALLER cancel delivered while the row is
+        parked ends it: the awaiting coroutine IS this incarnation's only wake
+        path, so the wait it leaves behind is one nothing can resume.
+        """
+        store = self.store
+        handle.release_slot()
+        ev = self._wake_event(handle.task_id)
+        ev.clear()
+        parked = True
+        owns_dependency_wake = False
+        try:
+            if self._coordinator is not None:
+                owns_dependency_wake = signal.retryable
+                verdict = await self._db(
+                    self._coordinator.report,
+                    handle.task_id,
+                    signal,
+                    generation=handle.generation,
+                    from_state=RUNNING,
+                )
+                owns_dependency_wake = verdict.outcome == "wait"
+                if verdict.outcome != "wait":
+                    self.forget(handle.task_id)
+                    await handle.reacquire_slot()
+                    return False
+            elif store is not None:
+                owns_dependency_wake = True
+                record = WaitRecord.dependency(
+                    signal.dependency_scope,
+                    since=self.now(),
+                    retry_at=signal.retry_at,
+                    reason=signal.detail or f"dependency {signal.dependency_scope} {signal.kind}",
+                    deadline_at=deadline_at,
+                )
+                try:
+                    parked = bool(
+                        await self._db(
+                            store.enter_wait,
+                            handle.task_id,
+                            record.to_dict(),
+                            generation=handle.generation,
+                        )
+                    )
+                except TaskStoreUnavailable:
+                    parked = False
+                owns_dependency_wake = parked
+            if store is None or not parked:
+                # Nothing persisted: honour the signal's own retry instant locally.
+                wait = (
+                    max(0.0, float(signal.retry_at or 0.0) - self.now()) if store is None else 0.0
+                )
+                if signal.retry_at is not None:
+                    await self._sleep(wait)
+                await handle.reacquire_slot()
+                return signal.retryable
+            handle._state = WAITING_DEPENDENCY
+            await ev.wait()
+            return await self._resume_after_wait(handle)
+        except asyncio.CancelledError:
+            # Synchronous, like every other terminal write on an unwinding path.
+            # :meth:`waiting_input` deliberately does NOT do this: its answer is
+            # persisted on the row's wake event and the claimable row is
+            # re-attached by ``accept``, so ending it would make the resumed
+            # step ask the operator a second time.
+            reason = "dependency wait cancelled"
+            wake_generation = handle.generation + 1
+            if not handle.cancel(reason) and store is not None and owns_dependency_wake:
+                self._cancel_woken_dependency(store, handle.task_id, wake_generation, reason)
+            raise
+
+    async def _resume_after_wait(self, handle: Admitted) -> bool:
+        """Re-attach *handle* to its row after a wake; True to carry the step on.
+
+        The re-admission's own ``running`` write is the resume fence, so it is
+        ``write_async`` and never ``running()``: the latter short-circuits on
+        ``_state == RUNNING`` WITHOUT touching the store, and a True from a
+        short-circuit is not a write result at all. ``admit`` has just committed
+        ``starting`` on the row it handed back, so ``starting -> running`` is the
+        edge that is always available here and the boolean is always the store's.
+        """
+        store = self.store
+        if store is None:
+            await handle.reacquire_slot()
+            return True
+        rec = await self._db(store.get, handle.task_id)
+        if rec is None or rec.state in TERMINAL:
+            self.forget(handle.task_id)
+            return False
+        # Re-admission goes through capacity like any other start.
+        await handle.reacquire_slot()
+        if rec.state in CLAIMABLE:
+            # Claimable again (retry_wait, queued or recovering): take it back under a
+            # new claim.
+            handle.release_slot()
+            fresh = await self.admit(handle.task_id, kind=handle.kind, lane=handle.lane)
+            handle.generation = fresh.generation
+            handle._slot_held = True
+            # A refused write (the row ended under a newer generation while the
+            # wait was being unwound) means the step must not carry on.
+            return await handle.write_async(RUNNING)
+        handle.generation = rec.generation
+        handle._state = rec.state
+        return rec.state == RUNNING
+
+    async def waiting_input(
+        self,
+        handle: Admitted,
+        *,
+        tool_call_id: str,
+        reason: str = "",
+        deadline_at: float | None = None,
+    ) -> str | None:
+        """Park *handle* in ``waiting_input`` until :meth:`answer_input`.
+
+        Returns the answer text, or ``None`` when the wait ended without one
+        (cancelled, failed, deadline) -- the caller then treats the step as
+        not completed. The lane slot is released for the wait.
+
+        The wait write is the PRECONDITION for parking, exactly as in
+        :meth:`yield_dependency`: ``answer_input`` wakes through
+        ``TaskStore.wake_wait``, which only moves a row the store has in
+        ``waiting_input``, so a handle that published ``waiting_input`` over a REFUSED write
+        would await an event nothing can set while the operator's answer is
+        refused against a row that is not waiting. A refused write therefore
+        ends the wait here with no answer instead of parking on it.
+        """
+        store = self.store
+        handle.release_slot()
+        ev = self._wake_event(handle.task_id)
+        ev.clear()
+        self._input_answers.pop(handle.task_id, None)
+        if store is not None:
+            record = WaitRecord.input(
+                tool_call_id,
+                since=self.now(),
+                reason=reason or "a command run by this step is waiting for input",
+                deadline_at=deadline_at,
+            )
+            parked = False
+            try:
+                parked = bool(
+                    await self._db(
+                        store.enter_wait,
+                        handle.task_id,
+                        record.to_dict(),
+                        generation=handle.generation,
+                    )
+                )
+            except TaskStoreUnavailable:
+                logger.debug("taskq runner: input wait write failed", exc_info=True)
+            if not parked:
+                logger.warning(
+                    "taskq runner: %s could not enter waiting_input; the step ends "
+                    "without an answer rather than awaiting a wake nothing can send",
+                    handle.task_id,
+                )
+                await handle.reacquire_slot()
+                return None
+        handle._state = WAITING_INPUT
+        await ev.wait()
+        answer = self._input_answers.pop(handle.task_id, None)
+        if answer is None:
+            # Woken without an answer in this process's memory (answered
+            # through another gateway instance, or after a rebuild): the
+            # answer is on the persisted wake event.
+            answer = await self.recorded_answer_async(handle.task_id)
+        if not await self._resume_after_wait(handle):
+            return None
+        return answer
+
+    def recorded_answer(self, task_id: str) -> str | None:
+        """The operator answer persisted on the row's latest ``wake`` event, if
+        the step has not consumed it yet.
+
+        ``answer_input`` writes the answer INTO the wake event before waking
+        anything, so a crash between the answer and the re-admission keeps
+        it: a rebuilt step (a new incarnation re-dispatching the ``retry_wait``
+        row) reads it from here instead of from the RAM the crash lost. An
+        answer is consumed once the step records it (:meth:`consume_answer`,
+        an ``input_consumed`` event); a wake older than that marker is not an
+        answer for the current turn.
+
+        A copy the durable bound CUT (:data:`ANSWER_TRUNCATED`) is refused, not
+        returned: the step then asks again, where handing back the fragment
+        would feed the model something the operator never wrote, with nothing on
+        the record saying it had been cut.
+        """
+        store = self.store
+        if store is None:
+            return None
+        try:
+            events = store.events(task_id)
+        except TaskStoreUnavailable:
+            return None
+        for event in reversed(events):
+            data = event.data if isinstance(event.data, dict) else {}
+            if event.kind == "input_consumed":
+                return None
+            if event.kind == "wake" and isinstance(data.get("answer"), str):
+                if data.get(ANSWER_TRUNCATED):
+                    logger.warning(
+                        "taskq runner: the persisted answer for %s is %d of %s characters; "
+                        "the step asks again rather than replaying a cut answer",
+                        task_id,
+                        _MAX_DURABLE_ANSWER_CHARS,
+                        data.get("answer_chars", "?"),
+                    )
+                    return None
+                return str(data["answer"])
+        return None
+
+    async def recorded_answer_async(self, task_id: str) -> str | None:
+        """:meth:`recorded_answer` for an event-loop caller: the event scan on
+        the store's writer thread."""
+        return await self._db(self.recorded_answer, task_id)
+
+    def consume_answer(self, task_id: str, question_id: str) -> bool:
+        """Record that the step took the persisted answer into its turn, so a
+        later rebuild does not replay it."""
+        store = self.store
+        if store is None:
+            return True
+        try:
+            store.append_event(task_id, "input_consumed", {"question_id": str(question_id)[:200]})
+        except TaskStoreUnavailable:
+            return False
+        return True
+
+    async def consume_answer_async(self, task_id: str, question_id: str) -> bool:
+        """:meth:`consume_answer` for an event-loop caller: the ``input_consumed``
+        append on the store's writer thread."""
+        return bool(await self._db(self.consume_answer, task_id, question_id))
+
+    def answer_input(self, task_id: str, answer: str, *, generation: int | None = None) -> bool:
+        """Deliver the user's answer to a row in ``waiting_input``; wakes it.
+
+        False when the store refused the wake, and the refusal is the STORE's,
+        under the same two fences :meth:`cancel_wait` uses: ``only_from`` is
+        ``waiting_input`` ALONE, and *generation* when the caller read one. An
+        answer answers ONE question, so a row that has moved to another wait
+        (``waiting_dependency`` / ``waiting_children``) between a caller's read
+        and this call is refused rather than having that other wait ended by an
+        answer to a question already over -- which would leave the row claimable
+        with its dependency still unmet. A caller holding only an id fences on
+        the state alone.
+
+        The answer is recorded on the wake event, so a crash between this write
+        and the re-admission does not lose it; the row is claimable
+        (``retry_wait``) until the lane is granted again.
+        """
+        store = self.store
+        woke = True
+        if store is not None:
+            try:
+                woke = (
+                    store.wake_wait(
+                        task_id,
+                        reason="input answered",
+                        generation=generation,
+                        only_from=INPUT_WAIT_ONLY,
+                        detail=_answer_detail(answer),
+                    )
+                    is not None
+                )
+            except TaskStoreUnavailable:
+                woke = False
+        if not woke:
+            return False
+        self._input_answers[task_id] = str(answer)
+        self.on_wake(task_id)
+        return True
+
+    def cancel_wait(
+        self, task_id: str, *, reason: str = "cancelled", generation: int | None = None
+    ) -> bool:
+        """End the wait of a PARKED row without an answer: the row is cancelled,
+        the coroutine resumes. False when the store refused the cancel.
+
+        The refusal is the point, and it is the STORE's: a row is cancellable
+        here only from :data:`model.PARKED`, and only under *generation* when the
+        caller read one, so the state test and the write share one transaction.
+        A row a concurrent admission took to ``starting`` / ``running`` between a
+        caller's read and this call is therefore never cancelled under its live
+        executor -- which the generation bump would then fence out of its own
+        settlement, leaving work running that nothing settles. A caller with a
+        row in hand passes its generation; one holding only an id fences on the
+        state alone.
+
+        No cancel, no wake: the wake this method delivers ENDS a wait (the
+        resumed coroutine re-reads the row and stops), so sending it for a
+        refused cancel would end a wait this call did not end.
+        """
+        store = self.store
+        if store is not None:
+            try:
+                if (
+                    store.cancel(task_id, reason=reason, only_from=PARKED, generation=generation)
+                    is None
+                ):
+                    return False
+            except TaskStoreUnavailable:
+                return False
+        self.on_wake(task_id)
+        return True
+
+
+# ── recovery adapter (adopt rows the reconciler could not settle) ─────────────
+
+
+@dataclass
+class AdoptReport:
+    examined: int = 0
+    resumed: list[str] = field(default_factory=list)
+    unknown_side_effect: list[str] = field(default_factory=list)
+    failed: list[str] = field(default_factory=list)
+    skipped: list[str] = field(default_factory=list)
+    #: Rows a dead incarnation accepted and never claimed; ended ``cancelled``.
+    cancelled: list[str] = field(default_factory=list)
+    #: Rows ended ``failed`` because their lost-owner recoveries were spent.
+    lost_owner_limit: list[str] = field(default_factory=list)
+
+
+#: Rows per page of the orphan sweep, never a ceiling on what it settles: the sweep
+#: PAGES until a kind is drained. A cap on the total would leave every row past it
+#: ``queued`` with no dispatcher and no reconciler (``queued`` is not ``ACTIVE``),
+#: so one restart behind a large backlog would strand accepted work permanently --
+#: the loss this store exists to prevent.
+_ADOPT_SCAN_PAGE = 1000
+#: Passes over one kind's ``queued`` rows. More than one because the pages are
+#: read by OFFSET while a live gateway is claiming rows, and every claim shifts
+#: the rows behind it under the cursor (see :func:`_orphaned_queued_rows`); a
+#: bound because each pass can also see rows a concurrent ``accept`` ADDED, so an
+#: "until nothing is new" loop with no ceiling would not be guaranteed to end,
+#: and a boot sweep that does not end is a boot that does not finish. A row a
+#: still-churning store displaces past the last pass stays ``queued`` for the
+#: next boot's sweep -- the same bounded cost a requeued container row carries.
+_ADOPT_SCAN_PASSES = 4
+
+_NEVER_STARTED = "never started: the gateway restarted before the row was claimed"
+
+
+def _orphaned_queued_rows(store: TaskStore, wanted: frozenset[str]) -> list[TaskRecord]:
+    """``queued`` rows of *wanted* kinds whose accepting incarnation is gone.
+
+    ``params.accepted_by`` is the owner test, and it has to be: a queued row
+    has never been claimed, so it carries no lease for the ACTIVE-row guard to
+    read, and a claimable row this incarnation just accepted is waiting for a
+    lane slot inside a live ``admit``.
+
+    ``retry_wait`` and ``recovering`` -- the other two claimable states -- are
+    deliberately not swept: the first can hold the operator's persisted answer,
+    the second an attempt count, and both are re-attached by ``accept`` when the
+    owning run resumes. A ``recovering`` row is also ACTIVE, so the boot
+    reconciler already sees it; ``queued`` is the one state no sweep reaches.
+
+    **A row a page skipped is found by a later pass, because OFFSET alone
+    cannot promise it was read.** This sweep runs BESIDE a live gateway, which
+    claims ``queued`` rows of these kinds through ``accept`` + ``admit``, and one
+    claim between two pages shifts every row behind it one place under the
+    cursor -- so the row that lands where the cursor already is is never
+    examined, and it would stay ``queued`` with nothing that ever looks at it
+    again. The pass therefore repeats while it discovers ids it had not read,
+    which the shift cannot hide (the displaced row is EARLIER than the cursor,
+    so the next pass reads it), de-duping by id so a row is judged once.
+    """
+    rows: list[TaskRecord] = []
+    for kind in sorted(wanted):
+        seen: set[str] = set()
+        for _ in range(_ADOPT_SCAN_PASSES):
+            before = len(seen)
+            offset = 0
+            while True:
+                page = store.list_rows(
+                    state=QUEUED, kind=kind, limit=_ADOPT_SCAN_PAGE, offset=offset
+                )
+                for rec in page:
+                    if rec.id in seen:
+                        continue
+                    seen.add(rec.id)
+                    if (
+                        rec.lease_owner is None
+                        and str(rec.params.get(PARAM_ACCEPTED_BY) or "") != store.incarnation
+                    ):
+                        rows.append(rec)
+                if len(page) < _ADOPT_SCAN_PAGE:
+                    break
+                offset += _ADOPT_SCAN_PAGE
+            if len(seen) == before:
+                break  # a whole pass read nothing this sweep had not already read
+    return rows
+
+
+def is_safe_retry(rec: TaskRecord) -> bool:
+    """Whether the interrupted step may be re-run from the runner's checkpoint.
+
+    True when the row says so (``params.safe_retry``) or when its side-effect
+    class is one the reconciler would itself re-dispatch (``none`` /
+    ``idempotent_key``). Class ``unknown`` with no explicit flag is NOT safe:
+    an external operation may have happened.
+    """
+    if bool(rec.params.get(PARAM_SAFE_RETRY, False)):
+        return True
+    return rec.side_effect_class in (SIDE_EFFECT_NONE, SIDE_EFFECT_IDEMPOTENT_KEY)
+
+
+def adopt_orphaned_rows(
+    store: TaskStore,
+    *,
+    kinds: Iterable[str] = RUNNER_RECOVERY_ADAPTERS,
+    resume: Callable[[TaskRecord], bool] | None = None,
+    now: float | None = None,
+) -> AdoptReport:
+    """Settle every runner row a dead incarnation left behind.
+
+    The boot reconciler leaves a kind it has no adapter for untouched except
+    for dropping the lease and stamping ``awaiting_adapter``; legacy
+    ``runs.json`` imports arrive as ``recovering``. This is that adapter:
+
+    * an unleased ACTIVE row (``starting``/``running``/``waiting_*``) or a
+      ``recovering`` row whose step is :func:`is_safe_retry` is handed to
+      *resume* (the runner's checkpoint restart); a resume that returns True
+      leaves the row claimable for the runner's own ``admit``. Each gateway
+      life that resumes a row spends one of its lost-owner recoveries, the
+      reconciler's ``RECOVERY_MAX_ATTEMPTS``; a row that has spent them ends
+      ``failed`` with the reason instead of being resumed again;
+    * one that is NOT safe to retry becomes ``unknown_side_effect`` -- the
+      run stays paused for a human, and nothing is re-run blind;
+    * a ``queued`` row of these kinds whose accepting incarnation is gone
+      (:func:`_orphaned_queued_rows`) is ``cancelled``: it was accepted, never
+      claimed, and these kinds have NO dispatcher, so nothing would ever pick
+      it up. Nothing ran under it either, which is why the verdict is
+      ``cancelled`` and not ``unknown_side_effect``. This is the sweep's own
+      half of the job -- the boot reconciler stays ACTIVE-only, because it is
+      kind-agnostic and a claimable ``subagent`` row is legitimately its
+      dispatcher's;
+    * a row still leased by THIS incarnation is live and skipped.
+    """
+    ts = store.now() if now is None else now
+    wanted = frozenset(kinds)
+    report = AdoptReport()
+    try:
+        rows = [r for r in store.active_rows() if r.kind in wanted]
+        orphaned_queued = _orphaned_queued_rows(store, wanted)
+    except TaskStoreUnavailable:
+        return report
+    for rec in orphaned_queued:
+        report.examined += 1
+        try:
+            # Still exactly the row the scan judged, or not this sweep's to end:
+            # ``accept`` re-stamps ``accepted_by`` and ``admit`` claims, and a
+            # sweep running beside a live gateway can be between the two.
+            if (
+                store.cancel(
+                    rec.id,
+                    reason=_NEVER_STARTED,
+                    only_from=UNCLAIMED,
+                    generation=rec.generation,
+                )
+                is not None
+            ):
+                report.cancelled.append(rec.id)
+        except TaskStoreUnavailable as exc:
+            logger.warning("taskq runner: cancel of never-started %s failed: %s", rec.id, exc)
+    for rec in rows:
+        report.examined += 1
+        if (
+            rec.lease_owner == store.incarnation
+            and rec.lease_expires_at
+            and (rec.lease_expires_at > ts)
+        ):
+            report.skipped.append(rec.id)
+            continue
+        if rec.parent_id:
+            # A step row: its run row decides whether the run resumes. The
+            # interrupted step itself is settled here -- a safe-retry step is
+            # ``failed`` (the run's resume re-runs it under a fresh row from
+            # the checkpoint), an unsafe one is ``unknown_side_effect``.
+            if is_safe_retry(rec):
+                if store.finish(
+                    rec.id, FAILED, error="interrupted by a gateway restart; re-run on resume"
+                ):
+                    report.failed.append(rec.id)
+            elif store.transition(rec.id, UNKNOWN_SIDE_EFFECT, detail={"adopted": "orphan_step"}):
+                report.unknown_side_effect.append(rec.id)
+            continue
+        if not is_safe_retry(rec):
+            if store.transition(rec.id, UNKNOWN_SIDE_EFFECT, detail={"adopted": "not_safe_retry"}):
+                report.unknown_side_effect.append(rec.id)
+            continue
+        if resume is not None:
+            recoveries = store.lost_owner_recoveries(rec.id)
+            if recovery_exhausted(recoveries):
+                # Every earlier gateway life that resumed this row stopped before
+                # the row finished: a step that takes its gateway down would
+                # otherwise restart it on every boot.
+                reason = (
+                    f"the gateway stopped during this task {recoveries + 1} times; "
+                    f"not resumed after {RECOVERY_MAX_ATTEMPTS} recoveries"
+                )
+                if store.transition(
+                    rec.id,
+                    FAILED,
+                    detail={
+                        "adopted": "lost_owner_limit",
+                        "lost_owner_recoveries": recoveries,
+                        "error": reason,
+                    },
+                ):
+                    report.lost_owner_limit.append(rec.id)
+                    logger.warning("taskq runner: %s failed: %s", rec.id, reason)
+                continue
+        if rec.state == ADMITTED:
+            # Claimed, never started: back to the queue, as the reconciler does.
+            if not store.transition(rec.id, QUEUED, detail={"adopted": "lost_owner"}):
+                report.skipped.append(rec.id)
+                continue
+        elif rec.state != RECOVERING:
+            if not store.transition(rec.id, RECOVERING, detail={"adopted": "lost_owner"}):
+                report.skipped.append(rec.id)
+                continue
+        elif rec.lease_owner is not None:
+            store.release_lease(rec.id)
+        if resume is None:
+            report.skipped.append(rec.id)
+            continue
+        # One lost-owner recovery granted to this gateway life, counted on the
+        # row so a restart cannot forget it (``TaskStore.lost_owner_recoveries``).
+        store.append_event(
+            rec.id, ADOPTED_RESUME_EVENT, {"incarnation": store.incarnation, "state": rec.state}
+        )
+        try:
+            ok = bool(resume(rec))
+        except Exception as exc:  # noqa: BLE001 - one bad row must not stop the sweep
+            logger.warning("taskq runner: resume of %s failed: %s", rec.id, exc)
+            store.finish(rec.id, FAILED, error=f"resume failed: {exc}")
+            report.failed.append(rec.id)
+            continue
+        if ok:
+            report.resumed.append(rec.id)
+        else:
+            store.finish(
+                rec.id,
+                FAILED,
+                error="not resumed from this row; the owning run restarts through its own registry",
+            )
+            report.failed.append(rec.id)
+    if report.examined:
+        logger.info(
+            "taskq runner adopt: examined=%d resumed=%d unknown_side_effect=%d failed=%d "
+            "cancelled=%d skipped=%d lost_owner_limit=%d",
+            report.examined,
+            len(report.resumed),
+            len(report.unknown_side_effect),
+            len(report.failed),
+            len(report.cancelled),
+            len(report.skipped),
+            len(report.lost_owner_limit),
+        )
+    return report
+
+
+# ── factory ───────────────────────────────────────────────────────────────────
+
+
+def runner_admission_for(
+    manager: Any,
+    *,
+    cfg: Any = None,
+    ladder: RecoveryLadder | None = None,
+    coordinator: DependencyCoordinator | None = None,
+    pressure: Callable[[], Any] | None = None,
+) -> RunnerAdmission:
+    """Build the runner admission over a ``SubagentManager``'s store and cap.
+
+    The lane's ceiling is the manager's ``max_concurrent`` -- already the
+    adaptive controller's effective cap clamped under the user's ceiling --
+    so one controller decision moves the subagent queue and the runner lane
+    together. ``agent.adaptive_concurrency_mode`` read live from *cfg*
+    selects ``fixed``; ``agent.admit_wait_secs`` is the defer interval.
+    """
+
+    def _store() -> TaskStore | None:
+        return getattr(manager, "_taskq", None)
+
+    def _cap() -> int:
+        return int(getattr(manager, "max_concurrent", 4) or 0)
+
+    def _mode() -> str:
+        agent = getattr(cfg, "agent", None)
+        return str(getattr(agent, "adaptive_concurrency_mode", MODE_AIMD) or MODE_AIMD)
+
+    agent_cfg = getattr(cfg, "agent", None)
+    wait = float(getattr(agent_cfg, "admit_wait_secs", _DEFAULT_ADMIT_WAIT_SECS) or 0.0)
+    if pressure is None:
+        try:
+            from kiro_crew.resource_status import cached_admission_check
+
+            pressure = cached_admission_check
+        except Exception:  # noqa: BLE001 - the probe is optional
+            pressure = None
+
+    def _store_error() -> str | None:
+        err = getattr(manager, "_taskq_unavailable", None)
+        return str(err) if err else None
+
+    return RunnerAdmission(
+        _store,
+        lane=RunnerLane(_cap, mode=_mode, name="runner-lane"),
+        pressure=pressure,
+        admit_wait_secs=wait or _DEFAULT_ADMIT_WAIT_SECS,
+        require_store=bool(getattr(agent_cfg, "task_queue_enabled", True)) if agent_cfg else False,
+        store_error=_store_error,
+        ladder=ladder,
+        coordinator=coordinator,
+    )
+
+
+__all__ = [
+    "LANE_SYSTEM",
+    "MODE_AIMD",
+    "MODE_FIXED",
+    "PARAM_ACCEPTED_BY",
+    "PARAM_LANE",
+    "PARAM_SAFE_RETRY",
+    "RUNNER_RECOVERY_ADAPTERS",
+    "SYSTEM_SOURCES",
+    "WORKFLOW_ID_PREFIX",
+    "AdoptReport",
+    "Admitted",
+    "RunnerAdmission",
+    "RunnerAdmissionRefused",
+    "RunnerLane",
+    "RunnerTaskCancelled",
+    "adopt_orphaned_rows",
+    "is_safe_retry",
+    "lane_for",
+    "run_task_id",
+    "runner_admission_for",
+    "step_task_id",
+    "workflow_task_id",
+]

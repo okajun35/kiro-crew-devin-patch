@@ -1,0 +1,655 @@
+/**
+ * LibraryPage — installed-app management, split out of the old AppsPage
+ * (PR1 App Store split; route `/apps/library`).
+ *
+ * The list presentation is a macOS-Launchpad-style icon grid (PR3, approved
+ * mockup frame #a), with enabled apps first and disabled apps in their own
+ * section below. Each installed app is a `LaunchpadTile` that opens on click;
+ * its overflow menu carries the management verbs, including Pin/Unpin, which
+ * toggles whether the app appears in the sidebar (persisted as the HIDDEN set
+ * under `mc-app-nav-hidden`, owned by `lib/appNavHidden.ts`).
+ * Search and the uninstall preview flow survive from the card list. Data
+ * identity (installed list, update map, mc:apps-changed announcement) lives
+ * in the shared `useAppsData` hook so this page and Discover cannot drift.
+ *
+ * Pending updates surface here as a light one-line hint linking to the
+ * Discover Updates sub-page (`/apps/-/updates`), which owns the update
+ * worklist and Update All (PR2 App Store split). Per-tile Update stays on
+ * the action bar via the shared `useAppUpdates` hook.
+ */
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { LayoutGroup, motion } from 'framer-motion'
+import { guideConfirm } from '../../uiLocations/targetRegistry'
+import { Link, useNavigate } from 'react-router-dom'
+import {
+  Package, Bot, Zap, Clock, Lock, Trash2, X, ArrowUp, Compass,
+  AlertTriangle, PowerOff,
+} from 'lucide-react'
+import { api } from '../../api/client'
+import { appNavTarget } from '../../appNav'
+import { Btn, EmptyState, PageHeader, PanelSectionHeader, SearchInput } from '../../components/ui'
+import { useReducedMotion } from '../../hooks/useReducedMotion'
+import { useConnected } from '../../hooks/useConnected'
+import { offlineProps } from '../../utils/offline'
+import { recordEvent } from '../../rum'
+import TrustAppModal, { isTrustDeniedError } from '../../components/appstore/TrustAppModal'
+import type { InstalledApp } from '../../components/appstore/types'
+import { i18nT } from '../../i18n/t'
+import ErrorNotice from '../../components/ErrorNotice'
+import ErrorBoundary from '../../components/ErrorBoundary'
+import { toggleAppNavHidden, useAppNavHidden } from '../../lib/appNavHidden'
+import useAppsData from './useAppsData'
+import type { LibraryApp } from './useAppsData'
+import { useAppActions } from './useAppActions'
+import { useAppUpdates } from './useAppUpdates'
+import { cardDataKey } from './cardDataKey'
+import LaunchpadTile from './LaunchpadTile'
+import { uiLocation } from '../../uiLocations/uiLocation'
+import { useGuideSelection } from '../../guide/guidePredicates'
+import { appDisplayName } from '../../components/appstore/appManifest'
+import AppStoreDialog from '../../components/appstore/AppStoreDialog'
+
+/** Uninstall preview payload (mirrors ``api.uninstallPreview`` return shape). */
+type UninstallPreview = Awaited<ReturnType<typeof api.uninstallPreview>>
+type RemovableDep = UninstallPreview['dependencies']['removable'][number]
+type SharedDep = UninstallPreview['dependencies']['shared'][number]
+type UserInstalledDep = UninstallPreview['dependencies']['userInstalled'][number]
+
+export default function LibraryPage() {
+  const navigate = useNavigate()
+  // Every management verb below writes to the gateway, so each one is refused
+  // while it is offline (offlineProps names why) instead of firing a doomed call.
+  const connected = useConnected()
+  const offlineVerb = i18nT('utils.offline.manage_apps')
+  const {
+    apps, appsLoading, appsError, registryError,
+    browseApps, installedApps, updatables, announceAppsChanged, sources,
+    registriesUnknown,
+  } = useAppsData()
+
+  const [query, setQuery] = useState('')
+  const [successMsg, setSuccessMsg] = useState('')
+  const [actionLoading, setActionLoading] = useState<string | null>(null)
+  // The app whose card ⋯ menu is open: a guide's "choose the app" step is done
+  // once it is the one the person named (its Details and Uninstall are there).
+  const [menuOpenFor, setMenuOpenFor] = useState<string | null>(null)
+  // `openCommand` apps opened from a remote/headless gateway cannot launch
+  // here — the backend answers `{remote: true, command}` and the user runs
+  // the command locally instead.
+  const [remoteCmd, setRemoteCmd] = useState('')
+
+  const {
+    setError, displayError, dismissError,
+    openDetail, updateApp, trustTarget, consentTarget, runEnable, trust,
+  } = useAppActions({
+    apps, browseApps, appsError, registryError, announceAppsChanged, sources, registriesUnknown,
+  })
+
+  // Transient success surface for the shared update hook: the hook reports
+  // outcomes, this page owns display + auto-dismiss (same 4s the other
+  // toasts here use).
+  // One timer at a time: a newer success restarts the 4s, so the timer an
+  // earlier success armed cannot wipe it early. Cleared on unmount too.
+  const successTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  useEffect(() => () => { if (successTimerRef.current) clearTimeout(successTimerRef.current) }, [])
+  const showSuccess = (msg: string) => {
+    setSuccessMsg(msg)
+    if (successTimerRef.current) clearTimeout(successTimerRef.current)
+    successTimerRef.current = setTimeout(() => {
+      successTimerRef.current = null
+      setSuccessMsg('')
+    }, 4000)
+  }
+
+  // Per-row update comes from the shared useAppUpdates hook (PR2), so this
+  // page and the Discover Updates sub-page cannot drift on how an update
+  // behaves. The recorded-source routing comment lives there. Update All is
+  // the Updates sub-page's affordance now — this page only hints (below).
+  const { updatingAll, updatePending, runUpdate } = useAppUpdates({
+    apps, updatables, announceAppsChanged, updateApp,
+    setError, setSuccess: showSuccess,
+  })
+
+  // Which sidebar rows the user unpinned (`mc-app-nav-hidden`) — held as
+  // React state, not a raw read, so a pin toggle repaints every tile's badge
+  // at once. The module's own event covers same-tab writes (this page's
+  // toggles included, via the module's dispatch-on-write); the `storage`
+  // listener covers a toggle made in ANOTHER tab — the same two-listener
+  // shape the sidebar filter in shell/nav/appRail.tsx uses.
+  const navHidden = useAppNavHidden()
+
+  // Pin toggle — resolve the tile's app to the SAME nav id the sidebar rows
+  // carry (`appNavTarget(app).id`, the rail's own derivation) and flip it in
+  // the persisted hidden set. The module's write dispatches the sync event,
+  // which feeds the state above and the sidebar filter in
+  // shell/nav/appRail.tsx — no local
+  // set-state here. A tile without a nav target never offers the toggle
+  // (`pinnable` below), so the null branch is only a race guard.
+  const togglePin = (name: string) => {
+    const app = installedApps.find(a => a.name === name)
+    const id = app ? appNavTarget(app)?.id : undefined
+    if (id) toggleAppNavHidden(id)
+  }
+
+  // Uninstall confirmation state
+  const [uninstallTarget, setUninstallTarget] = useState<InstalledApp | null>(null)
+  const [keepData, setKeepData] = useState(true)
+  const [uninstallPreview, setUninstallPreview] = useState<UninstallPreview | null>(null)
+  const [keepSpecific, setKeepSpecific] = useState<Set<string>>(new Set())
+  // The tile's ⋯ trigger the dialog was opened from, so closing it puts focus
+  // back there (the menu item that held focus is gone by then).
+  const uninstallOpenerRef = useRef<HTMLElement | null>(null)
+  // Resource lists the uninstall dialog itemises, derived once so the count it
+  // prints and the check that decides to print it read the same value. Reading
+  // the list twice — a `?.` gate here, a `!` assertion there — is the shape that
+  // produced #3689; `normalizeInstalledApp` means the fallback is now only for a
+  // record that never reached the fetch boundary.
+  const uninstallAgents = uninstallTarget?.manifest?.agents || []
+  const uninstallSkills = uninstallTarget?.manifest?.skills || []
+  const uninstallCrons = uninstallTarget?.manifest?.crons || []
+
+  const filteredInstalled = useMemo(() => {
+    const q = query.trim().toLowerCase()
+    if (!q) return installedApps
+    return installedApps.filter(a =>
+      a.name.toLowerCase().includes(q)
+      || (a.displayName || '').toLowerCase().includes(q)
+      || (a.manifest?.description || '').toLowerCase().includes(q)
+      || (a.manifest?.tags || []).some(t => t.toLowerCase().includes(q)))
+  }, [installedApps, query])
+  // Two sections, by live enabled state: enabling an app moves it up into
+  // Enabled and disabling one moves it down, so each section's heading always
+  // describes every tile under it. Search filters both.
+  const enabledApps = filteredInstalled.filter(a => a.enabled)
+  const disabledApps = filteredInstalled.filter(a => !a.enabled)
+  const reduceMotion = useReducedMotion()
+
+  // The app whose enable or disable the reader just ran, with the state it
+  // was in. When the refetch lands the tile changes section, which remounts
+  // it, so focus held inside the old tile falls to the page. Put it back on
+  // the tile's face, once, and only if nothing else took focus meanwhile.
+  const refocusApp = useRef<{ name: string; enabled: boolean } | null>(null)
+  useEffect(() => {
+    const pending = refocusApp.current
+    if (!pending) return
+    const app = installedApps.find(a => a.name === pending.name)
+    if (app && app.enabled === pending.enabled) return
+    refocusApp.current = null
+    if (!app || (document.activeElement && document.activeElement !== document.body)) return
+    document.querySelector<HTMLElement>(`[data-testid="launchpad-tile-${CSS.escape(app.name)}"] button`)?.focus()
+  }, [installedApps])
+  const menuApp = menuOpenFor !== null ? installedApps.find(a => appDisplayName(a) === menuOpenFor) : undefined
+  useGuideSelection('app_tile_menu_open', { selected: menuOpenFor !== null, available: installedApps.length > 0, name: menuOpenFor ?? undefined, alias: menuApp ? menuApp.displayName || menuApp.name : undefined })
+
+  // ---- Actions --------------------------------------------------------------
+  // Detail navigation, update routing, the trust-consent target, and the
+  // single enable path come from useAppActions — shared with DiscoverPage so
+  // the two pages cannot drift on how an action behaves.
+
+  const handleAction = async (name: string, action: 'enable' | 'disable' | 'uninstall' | 'update', opener?: HTMLElement | null) => {
+    if (!connected) return
+    // Intercept uninstall to show confirmation modal with preview
+    if (action === 'uninstall') {
+      const app = apps.find(a => a.name === name)
+      if (app) {
+        uninstallOpenerRef.current = opener ?? null
+        setUninstallTarget(app)
+        setKeepData(true)
+        setKeepSpecific(new Set())
+        // The preview is optional UI enrichment: when the request succeeds the
+        // dialog shows the dependency classification, and when it fails the
+        // dialog still works — just without the dependency panel. No error toast:
+        // the primary action must not depend on the preview.
+        try {
+          setUninstallPreview(await api.uninstallPreview(name))
+        } catch {
+          setUninstallPreview(null)
+        }
+      }
+      return
+    }
+    // Update routing (recorded-source dispatch, per-app pending state, the
+    // Update-All concurrency guard) is the shared hook's contract now.
+    if (action === 'update') return runUpdate(name)
+    setActionLoading(`${name}:${action}`)
+    setError('')
+    refocusApp.current = { name, enabled: action === 'disable' }
+    try {
+      if (action === 'enable') await runEnable(name)
+      else if (action === 'disable') await api.disableApp(name)
+      announceAppsChanged()
+    } catch (e) {
+      refocusApp.current = null
+      if (action === 'enable' && isTrustDeniedError(e)) trust.open(trustTarget(name))
+      // One whole sentence per verb: an English verb dropped into a translated
+      // frame ("Не удалось enable app") reads as a broken string.
+      else setError((e as Error)?.message || i18nT(action === 'enable' ? 'pages.appsPage.failed_to_enable' : 'pages.appsPage.failed_to_disable', { name }))
+    } finally {
+      setActionLoading(null)
+    }
+  }
+
+  const confirmUninstall = async () => {
+    if (!uninstallTarget) return
+    const name = uninstallTarget.name
+    setActionLoading(`${name}:uninstall`)
+    setError('')
+    try {
+      await api.uninstallApp(name, keepData, false, Array.from(keepSpecific))
+      recordEvent('app_uninstall', { app: name, version: uninstallTarget.version })
+      announceAppsChanged()
+    } catch (e) {
+      setError((e as Error)?.message || i18nT('pages.appsPage.failed_to_uninstall', { name }))
+    } finally {
+      setActionLoading(null)
+      setUninstallTarget(null)
+      setUninstallPreview(null)
+    }
+  }
+
+  // One tile, shared by both sections. A crashed tile falls back to a card
+  // that keeps one recovery verb, so a broken app is never stranded.
+  const renderTile = (app: LibraryApp) => {
+    // The sidebar's own eligibility/id derivation decides
+    // pinnability: a tile only offers a pin for a row the rail
+    // could actually show, under the byte-identical id the
+    // sidebar filter matches against.
+    const target = appNavTarget(app)
+    return (
+      <motion.div
+        /* Full-data key (cardDataKey): the boundary inside latches
+           its error state, so remount when the installed app or its
+           update availability changes — e.g. when an updated payload
+           fixes a broken tile (#3719). The layoutId is the app's name
+           alone, so a remount still reads as the same tile. */
+        key={cardDataKey(app)}
+        layoutId={`library-tile-${app.name}`}
+        layout="position"
+        transition={reduceMotion ? TILE_MOVE_REDUCED : TILE_MOVE}
+      >
+        <ErrorBoundary
+          scope="apps:installed-card"
+          fallback={
+            <div className="flex flex-col items-center gap-2 rounded-xl border border-border px-1.5 pt-3.5 pb-2.5 text-center">
+              <div className="w-[58px] h-[58px] rounded-[15px] bg-bg-elevated flex items-center justify-center">
+                <AlertTriangle aria-hidden className="lucide-inline text-[var(--warn)]" />
+              </div>
+              <span className="text-[12px] font-semibold text-text-strong max-w-full truncate">{appDisplayName(app)}</span>
+              <span className="text-[10.5px] text-muted leading-tight">{i18nT('pages.appsPage.this_app_could_not_be_displayed')}</span>
+              {/* The crashed tile removed the app's management surface, so the
+                  fallback must keep one recovery path: quiet a broken enabled
+                  app, or remove a disabled one entirely (locked apps cannot
+                  be uninstalled). Same handlers as the healthy tile. */}
+              {app.enabled ? (
+                <Btn
+                  onClick={() => handleAction(app.name, 'disable')}
+                  disabled={actionLoading === `${app.name}:disable` || !connected}
+                  {...offlineProps(connected, offlineVerb, i18nT('components.appstore.installedAppCard.disable'))}
+                >
+                  <PowerOff size={14} /> {i18nT('components.appstore.installedAppCard.disable')}
+                </Btn>
+              ) : app.lifecycle !== 'locked' && (
+                <Btn
+                  danger
+                  onClick={() => handleAction(app.name, 'uninstall')}
+                  disabled={!connected}
+                  {...offlineProps(connected, offlineVerb, i18nT('components.appstore.installedAppCard.uninstall'))}
+                >
+                  <Trash2 size={14} /> {i18nT('components.appstore.installedAppCard.uninstall')}
+                </Btn>
+              )}
+            </div>
+          }
+        >
+          <LaunchpadTile
+            app={app}
+            pinned={!!target && !navHidden.has(target.id)}
+            pinnable={!!target}
+            connected={connected}
+            actionLoading={updatingAll
+              ? `${app.name}:update`
+              : updatePending ? `${updatePending}:update` : actionLoading}
+            onTogglePin={togglePin}
+            onMenuOpenChange={open => setMenuOpenFor(prev => (open ? appDisplayName(app) : prev === appDisplayName(app) ? null : prev))}
+            onAction={handleAction}
+            onOpen={() => {
+              // An `openCommand` app opens by RUNNING its command
+              // never by
+              // routing — `appNavTarget` is null for it, and the
+              // `/apps/${name}` fallback would land on a detail page
+              // pretending to be the app. Remote gateways answer
+              // `{remote: true}` with the command to run locally.
+              // A refusal (the app is off, its code is not trusted
+              // to run, the launch failed) lands in the page's error
+              // notice: swallowed, the click looked like a no-op.
+              if (app.manifest?.openCommand) {
+                setError('')
+                api.openApp(app.name).then((res: { remote?: boolean; command?: string; message?: string } | null) => {
+                  if (res?.remote) setRemoteCmd(res.command || res.message || i18nT('components.appstore.installedAppCard.app_cannot_be_opened_kirocrew_is_running_in_a_he'))
+                }).catch((e: unknown) => {
+                  setError((e as Error)?.message || i18nT('pages.appsPage.failed_to_open', { name: app.name }))
+                })
+                return
+              }
+              navigate(target?.route || `/apps/${app.name}`)
+            }}
+            onDetail={() => openDetail(app.name)}
+          />
+        </ErrorBoundary>
+      </motion.div>
+    )
+  }
+
+  return (
+    <>
+      {/* Standard page header with a right-side actions slot: search only —
+          no SegmentedControl (the split made Discover and Library pages), and
+          the Sources gear stays on Discover (page-layout-pattern). */}
+      <PageHeader
+        title={i18nT('pages.appsPage.library')}
+        subtitle={i18nT('pages.appsPage.manage_your_installed_apps')}
+        actions={
+          <SearchInput
+            placeholder={i18nT('pages.appsPage.search_library')}
+            value={query}
+            onChange={(e: React.ChangeEvent<HTMLInputElement>) => setQuery(e.target.value)}
+            className="w-[220px]"
+            aria-label={i18nT('pages.appsPage.search_library')}
+          />
+        }
+      />
+
+      <div className="px-4 md:px-6 pb-8 overflow-y-auto flex-1 min-h-0">
+        {/* Notifications. askAgent on: this page holds no text draft — the search box
+            is a filter and the uninstall confirm's keep-data checkboxes reset on close —
+            so the hand-off destroys nothing. */}
+        {displayError && (
+          <ErrorNotice
+            message={displayError}
+            onDismiss={dismissError}
+            className="mb-4 animate-rise"
+            askAgent
+          />
+        )}
+        {/* Always mounted, so a screen reader hears the message when it lands:
+            a live region inserted already holding its text is not announced
+            by every reader. The visible card's copy is hidden from AT so the
+            message is read once. */}
+        <span role="status" className="sr-only">{successMsg}</span>
+        {successMsg && (
+          <div className="mb-4 bg-bg-elevated border rounded-lg p-3 flex items-center gap-3 animate-rise" style={{ borderColor: 'color-mix(in srgb, var(--ok) 45%, transparent)' }}>
+            <span aria-hidden="true" className="text-text text-sm flex-1">{successMsg}</span>
+            <button aria-label={i18nT('pages.appsPage.dismiss_message')} className="text-muted hover:text-text text-sm" onClick={() => setSuccessMsg('')}><X className="lucide-inline" /></button>
+          </div>
+        )}
+
+        {remoteCmd && (
+          <div
+            className="mb-4 bg-accent/10 border border-accent/20 rounded-lg p-3 text-[13px] animate-rise"
+            ref={el => {
+              // The clicked tile can be scrolled far below this notice; without
+              // bringing it into view the Open click looks like a no-op on a
+              // remote gateway (UX finding: off-locus feedback).
+              el?.scrollIntoView({ block: 'nearest' })
+            }}
+          >
+            <div className="flex items-start justify-between gap-2">
+              <div>
+                <span className="text-text font-medium">{i18nT('components.appstore.installedAppCard.remote_environment_detected')}</span>
+                <p className="text-muted mt-1">{i18nT('components.appstore.installedAppCard.run_this_on_your_local_machine')}</p>
+                <code className="block mt-1.5 bg-bg-elevated px-2 py-1 rounded text-[12px] font-mono select-all">{remoteCmd}</code>
+              </div>
+              <button aria-label={i18nT('components.appstore.installedAppCard.dismiss')} className="text-muted hover:text-text text-sm shrink-0" onClick={() => setRemoteCmd('')}><X className="lucide-inline" /></button>
+            </div>
+          </div>
+        )}
+
+        {/* Third-party execution-trust consent. Opened when an enable is
+            refused with code `app_execution_denied`, instead of surfacing the
+            raw backend string in the error card above. */}
+        <TrustAppModal
+          app={consentTarget}
+          pending={trust.pending}
+          failed={trust.failed}
+          detail={trust.detail}
+          detailCode={trust.detailCode}
+          granted={trust.granted}
+          onCancel={trust.cancel}
+          onConfirm={trust.confirm}
+        />
+
+        {/* Uninstall confirmation modal. The backdrop closes on click (mouse
+            convenience); keyboard users press Escape or the Cancel button
+            inside, and Tab stays inside the dialog (AppStoreDialog). The inner
+            card's onClick only stops propagation so a click inside doesn't
+            bubble to the backdrop-close — it is not a user interaction. */}
+        {uninstallTarget && (
+          <AppStoreDialog
+            className="fixed inset-0 z-[100] flex items-center justify-center bg-bg/60 backdrop-blur-xs animate-rise p-safe"
+            onClose={() => { setUninstallTarget(null); setUninstallPreview(null) }}
+            returnFocusTo={uninstallOpenerRef}
+            aria-label={i18nT('pages.appsPage.confirm_uninstall')}
+          >
+            {/* Stop clicks inside the dialog card from reaching the backdrop's
+                dismiss handler; presentation-only, no interaction of its own. */}
+            <div role="presentation" className="bg-card border border-border rounded-xl p-6 max-w-md w-full mx-4 shadow-xl" onClick={e => e.stopPropagation()}>
+              <div className="flex items-center gap-3 mb-4">
+                <div className="w-10 h-10 rounded-xl bg-danger/10 flex items-center justify-center">
+                  <Trash2 size={20} className="text-danger" />
+                </div>
+                <div>
+                  <div className="font-medium text-text">{i18nT('pages.appsPage.uninstall_app_title', { name: appDisplayName(uninstallTarget) })}</div>
+                  <div className="text-[12px] text-muted">{i18nT('pages.appsPage.v')}{uninstallTarget.version}</div>
+                </div>
+              </div>
+
+              <p className="text-[13px] text-muted mb-3">{i18nT('pages.appsPage.this_will_remove_all_resources_provided_by_this')}</p>
+              <div className="text-[13px] text-text mb-4 space-y-1">
+                {uninstallTarget.resources === 'app' && !uninstallTarget.manifest?.setup?.onUninstall && uninstallTarget.origin !== 'registry' && (
+                  <div className="bg-bg-elevated border border-border rounded-md px-2.5 py-2 text-[12px] text-muted mb-2">
+                    {i18nT('pages.appsPage.this_is_a_self_managed_app_only_kirocrew_metadat')}
+                  </div>
+                )}
+                {uninstallTarget.manifest?.setup?.onUninstall && (
+                  <div className="bg-danger/5 border border-danger/20 rounded-md px-2.5 py-2 text-[12px] text-muted mb-2">
+                    {i18nT('pages.appsPage.this_app_has_an_uninstall_script_that_will_run_b')}
+                  </div>
+                )}
+                {uninstallTarget.origin === 'registry' && (
+                  <div className="bg-bg-elevated border border-border rounded-md px-2.5 py-2 text-[12px] text-muted mb-2">
+                    {uninstallTarget.resources !== 'app'
+                      ? i18nT('pages.appsPage.uninstall_removes_metadata_and_source')
+                      : uninstallTarget.manifest?.setup?.onUninstall
+                        ? i18nT('pages.appsPage.uninstall_removes_metadata_secret_and_source')
+                        : i18nT('pages.appsPage.uninstall_removes_metadata_secret_and_source_managed_externally')}
+                  </div>
+                )}
+                {uninstallTarget.origin !== 'registry' && uninstallTarget.resources === 'app' && uninstallTarget.manifest?.setup?.onUninstall && (
+                  <div className="bg-bg-elevated border border-border rounded-md px-2.5 py-2 text-[12px] text-muted mb-2">
+                    {i18nT('pages.appsPage.not_installed_from_apps_your_local_source_code_w')}
+                  </div>
+                )}
+                {uninstallAgents.length > 0 && (
+                  <div className="flex items-center gap-2"><Bot size={12} className="text-muted" /> {i18nT('pages.appsPage.agent', { count: uninstallAgents.length })}</div>
+                )}
+                {uninstallSkills.length > 0 && (
+                  <div className="flex items-center gap-2"><Zap size={12} className="text-muted" /> {i18nT('pages.appsPage.skill', { count: uninstallSkills.length })}</div>
+                )}
+                {uninstallCrons.length > 0 && (
+                  <div className="flex items-center gap-2"><Clock size={12} className="text-muted" /> {i18nT('pages.appsPage.cron_job', { count: uninstallCrons.length })}</div>
+                )}
+              </div>
+
+              {/* Dependency preview */}
+              {uninstallPreview?.dependencies && (
+                (() => {
+                  const deps = uninstallPreview.dependencies
+                  const hasAny = (deps.removable?.length || 0) + (deps.shared?.length || 0) + (deps.userInstalled?.length || 0) > 0
+                  if (!hasAny) return null
+                  return (
+                    <div className="mb-4">
+                      <p className="text-[13px] text-muted mb-2">{i18nT('pages.appsPage.dependencies')}</p>
+                      <div className="space-y-2 text-[13px]">
+                        {(deps.removable || []).map((d: RemovableDep) => (
+                          <div key={d.id} className="flex items-start gap-2">
+                            <Trash2 size={12} className="text-danger mt-0.5 shrink-0" />
+                            <div className="flex-1">
+                              <div className="text-text">{d.id.split('/').pop()}</div>
+                              <div className="text-[11px] text-muted">{d.reason}</div>
+                              <label htmlFor={`keep-dep-${d.id}`} className="flex items-center gap-1.5 mt-1 text-[11px] text-muted cursor-pointer">
+                                <input
+                                  id={`keep-dep-${d.id}`}
+                                  type="checkbox"
+                                  aria-label={i18nT('pages.appsPage.keep_dependency', { name: d.id.split('/').pop() })}
+                                  checked={keepSpecific.has(d.id)}
+                                  onChange={e => {
+                                    const next = new Set(keepSpecific)
+                                    if (e.target.checked) next.add(d.id); else next.delete(d.id)
+                                    setKeepSpecific(next)
+                                  }}
+                                  className="rounded"
+                                />
+                                {i18nT('pages.appsPage.keep_this_dependency')}
+                              </label>
+                            </div>
+                          </div>
+                        ))}
+                        {(deps.shared || []).map((d: SharedDep) => (
+                          <div key={d.id} className="flex items-start gap-2">
+                            <Lock size={12} className="text-muted mt-0.5 shrink-0" />
+                            <div>
+                              <div className="text-text">{d.id.split('/').pop()}</div>
+                              <div className="text-[11px] text-muted">{i18nT('pages.appsPage.kept_reason', { reason: d.reason })}</div>
+                            </div>
+                          </div>
+                        ))}
+                        {(deps.userInstalled || []).map((d: UserInstalledDep) => (
+                          <div key={d.id} className="flex items-start gap-2">
+                            <Lock size={12} className="text-muted mt-0.5 shrink-0" />
+                            <div>
+                              <div className="text-text">{d.id.split('/').pop()}</div>
+                              <div className="text-[11px] text-muted">{i18nT('pages.appsPage.kept_installed_by_you')}</div>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )
+                })()
+              )}
+
+              <label htmlFor="uninstall-keep-data" className="flex items-center gap-2 text-[13px] text-muted mb-5 cursor-pointer select-none">
+                <input id="uninstall-keep-data" type="checkbox" aria-label={i18nT('pages.appsPage.keep_app_data')} checked={keepData} onChange={e => setKeepData(e.target.checked)} className="rounded" />
+                {i18nT('pages.appsPage.keep_app_data')}
+              </label>
+
+              <div className="flex items-center gap-2 justify-end">
+                <Btn onClick={() => { setUninstallTarget(null); setUninstallPreview(null) }}>{i18nT('pages.appsPage.cancel')}</Btn>
+                {/* The removal itself: a guide that led here ends when this is
+                    pressed, and goes back to its step on any other answer. */}
+                <Btn
+                  danger
+                  onClick={confirmUninstall}
+                  disabled={actionLoading === `${uninstallTarget.name}:uninstall` || !connected}
+                  {...offlineProps(connected, offlineVerb, i18nT('pages.appsPage.uninstall'))}
+                  {...guideConfirm()}
+                >
+                  {actionLoading === `${uninstallTarget.name}:uninstall` ? i18nT('pages.appsPage.removing') : i18nT('pages.appsPage.uninstall')}
+                </Btn>
+              </div>
+            </div>
+          </AppStoreDialog>
+        )}
+
+        {/* ---- Installed list ---- */}
+        {appsLoading ? (
+          <div className="text-center py-12 text-muted text-sm">{i18nT('pages.appsPage.loading_apps')}</div>
+        ) : filteredInstalled.length === 0 ? (
+          <EmptyState
+            icon={<Package size={36} />}
+            title={installedApps.length === 0 ? i18nT('pages.appsPage.no_apps_installed_yet') : i18nT('pages.appsPage.no_matching_apps')}
+            subtitle={installedApps.length === 0
+              ? i18nT('pages.appsPage.find_apps_in_the_discover_tab_or_install_from_a')
+              : i18nT('pages.appsPage.try_a_different_search_term')}
+            action={installedApps.length === 0
+              ? (
+                <Link to="/apps" className="text-accent text-sm font-medium hover:underline inline-flex items-center gap-1.5">
+                  <Compass size={14} className="lucide-inline" /> {i18nT('nav.discover')}
+                </Link>
+              )
+              : undefined}
+          />
+        ) : (
+          <>
+            {updatables.length > 0 && (
+              /* Light hint, not a banner: the update WORKLIST (rows, version
+                 diffs, Update All) lives on the Discover Updates sub-page —
+                 this row only says updates exist and hands off there. Per-row
+                 Update on the cards below still works via the shared hook. */
+              <div className="mb-4 flex items-center gap-2 text-[13px] text-muted animate-rise">
+                <ArrowUp size={13} className="shrink-0" aria-hidden />
+                <span>{i18nT('pages.appsPage.updates_hint', { count: updatables.length })}</span>
+                <Link to="/apps/-/updates" className="text-accent font-medium hover:underline shrink-0">
+                  {i18nT('pages.appsPage.updates_hint_link')}
+                </Link>
+              </div>
+            )}
+            {/* Launchpad grids (mockup frame #a): ~5 columns at desktop width,
+                stepping down responsively. Tiles come from `installedApps`
+                (GET /api/apps records) — the Discover/Library built-in
+                SURFACES are frontend nav entries, never installed-app
+                records, so they cannot appear as tiles. Disabled apps get
+                their own section BELOW the enabled ones, always shown: Library
+                is the only surface that can enable a locally-shipped builtin,
+                so those rows must never sit behind a toggle. Headings appear
+                only when there is a Disabled section to tell apart. */}
+            {/* One LayoutGroup over both sections: a tile that changes section
+                keeps its layoutId, so it travels to its new place instead of
+                vanishing from one grid and appearing in the other. */}
+            <LayoutGroup id="library-tiles">
+            <div
+              className="flex flex-col gap-8"
+              // A group, so the label is announced: assistive tech ignores
+              // aria-label on a div that has no role.
+              role="group"
+              aria-label={i18nT('pages.libraryPage.installed_apps')}
+              {...uiLocation('apps.library.app-list')}
+            >
+              {(enabledApps.length > 0 || (!query.trim() && disabledApps.length > 0)) && (
+                <section aria-label={disabledApps.length > 0 ? i18nT('pages.libraryPage.section_enabled') : undefined}>
+                  {disabledApps.length > 0 && (
+                    <PanelSectionHeader className="mb-4" label={i18nT('pages.libraryPage.section_enabled')} count={enabledApps.length} />
+                  )}
+                  {enabledApps.length > 0 ? (
+                    <div className={TILE_GRID} data-testid="library-section-enabled">
+                      {enabledApps.map(renderTile)}
+                    </div>
+                  ) : (
+                    // Nothing enabled yet (a fresh install enables nothing): say
+                    // so, and the Disabled section below holds every app.
+                    <p className="text-[13px] text-muted py-2">{i18nT('pages.appsPage.no_enabled_apps')}</p>
+                  )}
+                </section>
+              )}
+              {disabledApps.length > 0 && (
+                <section aria-label={i18nT('pages.libraryPage.section_disabled')}>
+                  <PanelSectionHeader className="mb-4" label={i18nT('pages.libraryPage.section_disabled')} count={disabledApps.length} />
+                  <div className={TILE_GRID} data-testid="library-section-disabled">
+                    {disabledApps.map(renderTile)}
+                  </div>
+                </section>
+              )}
+            </div>
+            </LayoutGroup>
+          </>
+        )}
+      </div>
+    </>
+  )
+}
+
+const TILE_GRID = 'grid grid-cols-3 sm:grid-cols-4 md:grid-cols-5 xl:grid-cols-6 gap-x-3 gap-y-7'
+
+/** How a tile travels to its new section; reduced motion drops the travel. */
+const TILE_MOVE = { type: 'spring', stiffness: 420, damping: 38 } as const
+const TILE_MOVE_REDUCED = { duration: 0 } as const

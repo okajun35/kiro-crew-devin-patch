@@ -1,0 +1,78 @@
+name: Sensitive Change Review
+
+# A PR that touches a sensitive path (sandbox, command floor, secret scrubbing,
+# redaction) needs a filled-in reasoning template for the CURRENT head: either
+# the PR author's own comment naming the head SHA, or a human approval on the
+# head carrying it. A bare "Approve" click stays red. The author's comment
+# re-runs this check through sensitive-change-review-comment.yml, and a review
+# through sensitive-change-review-approval.yml.
+#
+# Format only, on purpose: no model and no sandbox run. Whoever ran the real
+# sandbox writes what they checked; this gate makes sure it is written down for
+# this exact commit. It cannot tell a true reason from a false one.
+#
+# `pull_request_target` runs this FILE from the default branch, and the job
+# checks out only the default branch's checker, so a PR can change neither the
+# rule nor the verdict of this run. The job never checks out or runs PR code;
+# it reads the PR through the API. A review cannot start this workflow directly
+# (a `pull_request_review` run reads the file from the PR head), so the
+# approval workflow named above re-runs it instead. No waiver label.
+#
+# A fork PR that touches a sensitive path is refused: a maintainer takes it
+# over on a branch here. A same-repository PR gets one sticky comment with the
+# template to paste. `pull-requests: write` is for that comment only; the
+# checker writes nothing on a fork PR.
+
+on:
+  pull_request_target:
+    # `edited` covers a base-branch retarget, which changes the file set.
+    types: [opened, synchronize, reopened, edited]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: sensitive-change-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  sensitive-change-review:
+    name: Sensitive Change Review
+    # A 10-second check must not wait an hour behind the hosted queue, so a
+    # same-repository PR from a listed actor uses the fleet on every event.
+    # The job checks out only the default branch's scripts and never runs PR
+    # code, so the opened/synchronize limit other routes carry buys nothing.
+    #
+    # A run the fleet does not admit -- a fork pull request, or an actor outside
+    # CODEBUILD_ACTOR_IDS -- takes the larger-runner group when it executes
+    # HERE, and `ubuntu-latest` when it executes in a fork's own repository,
+    # where an organization runner group is unreachable.
+    runs-on: ${{ github.repository == 'kirodotdev/KiroCrew' && contains(fromJSON(vars.CODEBUILD_ACTOR_IDS || '[]'), github.actor_id) && github.event.pull_request.head.repo.full_name == github.repository && format('codebuild-kirocrew-gha-linux-{0}-{1}', github.run_id, github.run_attempt) || github.repository == 'kirodotdev/KiroCrew' && 'kirocrew-linux-4-core' || 'ubuntu-latest' }}
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: base
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+
+      - name: Require a reasoned human approval for sensitive paths
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          # The commit this check run lands on; the checker judges this SHA
+          # and fails if the API's head disagrees.
+          EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -uo pipefail
+          script="base/.github/scripts/sensitive_change_review.py"
+          # Never fall back to the PR's own copy: a missing base checker fails
+          # closed. Only the PR that adds this gate ever sees this branch.
+          if [ ! -f "$script" ]; then
+            echo "::error::No checker on the default branch yet, so this PR cannot be judged; a maintainer reviews it by hand."
+            exit 1
+          fi
+          python3 "$script"

@@ -1,0 +1,1528 @@
+"""The Discord renderer: streaming, finalization and what a landed message shows.
+
+``DiscordRenderer`` streams a turn into one live message, rotates it at the cap and
+seals it on finish; ``DiscordApprovalDecider`` turns a permission request into buttons.
+Redaction is checked where it lands, including across rotation seams.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+from discord_helpers import _drop_live_config_snapshot  # noqa: F401
+from discord_helpers import FakeClient
+
+from conftest import CREDENTIAL_STRADDLE_SHAPES
+from kiro_crew.discord import renderer as discord_renderer
+from kiro_crew.discord.client import DISCORD_MAX_TEXT
+from kiro_crew.discord.renderer import (
+    DiscordApprovalDecider,
+    DiscordRenderer,
+    _delivered_form,
+    _redact_all,
+    session_provenance_tag,
+)
+from kiro_crew.discord.transport import DISCORD_CAPABILITIES
+from kiro_crew.messaging.display_safety import canonicalize_display, severs_a_credential
+from kiro_crew.messaging.split import split_markdown_safe
+from kiro_crew.testing.wait import async_wait_until, await_until, finished
+
+# ── renderer.py streaming/finalization ───────────────────────────────────
+
+
+class TestRenderer:
+    def _renderer(self) -> tuple[DiscordRenderer, FakeClient]:
+        cli = FakeClient()
+        r = DiscordRenderer(cli, "chan1", DISCORD_CAPABILITIES, session_key="sk")  # type: ignore[arg-type]
+        return r, cli
+
+    @pytest.mark.asyncio
+    async def test_stream_and_finalize(self) -> None:
+        r, cli = self._renderer()
+        await r.on_turn_start()
+        await r.on_text_chunk("Hello ")
+        await r.on_text_chunk("world")
+        await r.on_done()
+        assert cli.final_text().startswith("Hello world")
+        # The turn footer is its own trailing subtext line, so the answer is a
+        # prefix of the message rather than the whole of it.
+        assert "\n\n-# Finished in " in cli.final_text()
+
+    @pytest.mark.asyncio
+    async def test_a_late_reasoning_note_does_not_duplicate_streamed_text(self) -> None:
+        """Reasoning after streamed text must not re-post the answer already shown.
+
+        ``_flush_thinking`` posts the note as its own message below the live answer
+        bubble, sealing that bubble's segment first so ``_buf`` is consumed and the
+        live id cleared. The streamed answer is therefore shown exactly once: the
+        sealed bubble holds it, and the chunk after the note carries only new text.
+        """
+        cli = FakeClient()
+        r = DiscordRenderer(
+            cli, "chan1", DISCORD_CAPABILITIES, session_key="sk", show_thinking=True  # type: ignore[arg-type]
+        )
+        await r.on_turn_start()
+        await r.on_text_chunk("The answer is Foo. ")
+        await r.on_thinking("some private reasoning")
+        await r.on_text_chunk("And here is more.")
+        await r.on_done()
+        # Reconstruct what the reader actually sees: each message id in send order,
+        # with its FINAL text after any in-place edits (an edit updates a message
+        # already delivered, it is not a second message). The streamed sentence is
+        # streamed into one bubble and sealed there, so it appears on screen once;
+        # a second bubble carrying it below the note would show it twice.
+        mids: list[str] = []
+        final: dict[str, str] = {}
+        mid = 100
+        for text, _ in cli.sent:
+            mid += 1
+            key = str(mid)
+            mids.append(key)
+            final[key] = text
+        for edit_mid, text, _ in cli.edits:
+            final[edit_mid] = text
+        on_screen = [final[m] for m in mids]
+        assert sum(t.count("The answer is Foo.") for t in on_screen) == 1
+        # The reasoning note is its own delivered message.
+        assert any("💭" in t for t in on_screen)
+        # The later text is delivered, and does not re-prepend the shown answer.
+        assert any("And here is more." in t and "The answer is Foo." not in t for t in on_screen)
+
+    @pytest.mark.asyncio
+    async def test_reasoning_as_the_last_event_still_finalizes_the_answer(self) -> None:
+        """Reasoning that is the last event before on_done must not un-finalize.
+
+        ``on_done`` still has to attach the footer, so the note flush must not seal the
+        answer; an early seal drops the footer and posts a spurious ``"…"`` message.
+        """
+        cli = FakeClient()
+        r = DiscordRenderer(
+            cli, "chan1", DISCORD_CAPABILITIES, session_key="sk", show_thinking=True  # type: ignore[arg-type]
+        )
+        await r.on_turn_start()
+        await r.on_text_chunk("The whole answer.")
+        await r.on_thinking("trailing reasoning")
+        await r.on_done()
+        mids: list[str] = []
+        final: dict[str, str] = {}
+        mid = 100
+        for text, _ in cli.sent:
+            mid += 1
+            mids.append(str(mid))
+            final[str(mid)] = text
+        for edit_mid, text, _ in cli.edits:
+            final[edit_mid] = text
+        on_screen = [final[m] for m in mids]
+        # The answer is delivered and carries the turn footer (it was finalized by
+        # on_done, not sealed early by the note flush).
+        assert any("The whole answer." in t and "\n\n-# Finished in " in t for t in on_screen)
+        # No spurious placeholder-only message.
+        assert not any(t.strip().startswith("…") for t in on_screen)
+        # The reasoning note is still delivered.
+        assert any("💭" in t for t in on_screen)
+
+    @pytest.mark.asyncio
+    async def test_a_trailing_note_is_not_the_predecessor_of_the_bubble_above_it(self) -> None:
+        """A note left above an un-sealed live bubble must not become its seam base.
+
+        The note sits below a still-live bubble. As ``_sent_tail`` it would make the
+        bubble's final edit grade against the note, and a note tail + answer head that
+        join into a key would redact valid answer text.
+        """
+        cli = FakeClient()
+        r = DiscordRenderer(
+            cli, "chan1", DISCORD_CAPABILITIES, session_key="sk", show_thinking=True  # type: ignore[arg-type]
+        )
+        await r.on_turn_start()
+        await r.on_text_chunk("The answer body.")
+        await r.on_thinking("reasoning that arrives last")
+        # At this point a live bubble is still open above the just-posted note.
+        assert r._stream_mid is not None
+        # The note did NOT displace the answer bubble as the graded predecessor.
+        assert "💭" not in r._sent_tail
+        await r.on_done()
+        # And the finalized answer is intact (not corrupted by a note-seam grade).
+        mids: list[str] = []
+        final: dict[str, str] = {}
+        mid = 100
+        for text, _ in cli.sent:
+            mid += 1
+            mids.append(str(mid))
+            final[str(mid)] = text
+        for edit_mid, text, _ in cli.edits:
+            final[edit_mid] = text
+        on_screen = [final[m] for m in mids]
+        assert any("The answer body." in t for t in on_screen)
+
+    @pytest.mark.asyncio
+    async def test_a_failed_seal_reports_not_landed_so_the_buffer_is_kept(self) -> None:
+        """A seal whose delivery fails must return False, not report success.
+
+        ``_flush_thinking`` (and any caller) discards ``_buf`` only on a True. If
+        ``_seal_current`` returned True after a chunk failed to land, the segment
+        the reader never saw would be dropped from any later delivery with no retry.
+        """
+        cli = FakeClient()
+        r = DiscordRenderer(cli, "chan1", DISCORD_CAPABILITIES, session_key="sk")  # type: ignore[arg-type]
+        r._buf = ["A segment that will fail to deliver."]
+        # No live message id: _seal_current takes the fresh-send path; force it to
+        # fail so nothing lands.
+        cli.fail_sends = True
+        landed = await r._seal_current(extract_uploads=False)
+        assert landed is False
+
+    @pytest.mark.asyncio
+    async def test_a_landed_seal_reports_true(self) -> None:
+        """The success path still returns True so the buffer is cleared normally."""
+        cli = FakeClient()
+        r = DiscordRenderer(cli, "chan1", DISCORD_CAPABILITIES, session_key="sk")  # type: ignore[arg-type]
+        r._buf = ["A segment that delivers cleanly."]
+        landed = await r._seal_current(extract_uploads=False)
+        assert landed is True
+
+    @pytest.mark.asyncio
+    async def test_options_become_buttons_and_never_stream(self) -> None:
+        r, cli = self._renderer()
+        await r.on_turn_start()
+        await r.on_text_chunk("Pick\n[OPTIONS: A | B]")
+        # Live frames must never show the raw directive.
+        for text, _ in cli.sent:
+            assert "[OPTIONS" not in text
+        await r.on_done()
+        comps = cli.final_components()
+        assert comps is not None
+        labels = [b["label"] for row in comps for b in row["components"]]
+        assert labels == ["A", "B"]
+        assert "[OPTIONS" not in cli.final_text()
+        # The sealed row is PROVENANCE-STAMPED with this renderer's session key —
+        # the producer half of the stale-press fix. Without this pin, reverting
+        # the call sites to untagged build_option_components(opts) keeps the
+        # whole suite green while every new button falls back to the legacy
+        # current-binding path, silently reopening cross-session injection.
+        ids = [b["custom_id"] for row in comps for b in row["components"]]
+        assert ids == [
+            f"opt:0:{session_provenance_tag('sk')}",
+            f"opt:1:{session_provenance_tag('sk')}",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_long_options_before_streamed_steer_ack_become_buttons(self) -> None:
+        r, cli = self._renderer()
+        await r.on_turn_start()
+        # The assistant's final line is a valid OPTIONS trailer. The provider's
+        # internal steer acknowledgment follows it and arrives across chunks,
+        # with the combined buffer well past Discord's message cap.
+        await r.on_text_chunk(
+            ("x" * 3800) + "\n\n[OPTIONS: Alpha | Bravo | Charlie]" + "\n\n[STEERING steer-7e6a4a0d"
+        )
+        await r.on_text_chunk("94314d2db: acknowledged]")
+        await r.on_done()
+
+        components = [c for _, c in cli.sent if c] + [c for _, _, c in cli.edits if c]
+        labels = [b["label"] for row in components[0] for b in row["components"]]
+        assert labels == ["Alpha", "Bravo", "Charlie"]
+        visible = "\n".join([t for t, _ in cli.sent] + [t for _, t, _ in cli.edits])
+        assert "[OPTIONS" not in visible
+        assert "[STEERING" not in visible
+        assert "steer-7e6a4a0d" not in visible
+        assert "94314d2db" not in visible
+
+    @pytest.mark.asyncio
+    async def test_long_output_rotates_messages(self) -> None:
+        r, cli = self._renderer()
+        await r.on_turn_start()
+        await r.on_text_chunk("A" * 5000)
+        await r.on_done()
+        # More than one message posted, none over the API cap.
+        assert len(cli.sent) >= 2
+        for text, _ in cli.sent:
+            assert len(text) <= 2000
+        for _, text, _c in cli.edits:
+            assert len(text) <= 2000
+
+    @pytest.mark.asyncio
+    async def test_rotation_mid_code_block_keeps_live_fence_open(self) -> None:
+        r, cli = self._renderer()
+        await r.on_turn_start()
+        # Open a fence and stream past one message's worth of code so rotation
+        # fires while the model's closing ``` has NOT arrived yet.
+        await r.on_text_chunk("```py\n" + "x = 1\n" * 400)
+        # The SEALED chunk is self-contained (synthetic closer appended)…
+        sealed = cli.sent[0][0]
+        assert sealed.count("```") % 2 == 0
+        assert sealed.rstrip().endswith("```")
+        # …but the retained live buffer must keep its fence OPEN, or everything
+        # streamed afterwards renders as prose outside the code block.
+        assert "".join(r._buf).count("```") % 2 == 1
+        assert "".join(r._buf).startswith("```")  # continuation reopens the fence
+        # The model's real closer finally streams in.
+        await r.on_text_chunk("y = 2\n```")
+        await r.on_done()
+        final = cli.final_text()
+        assert final.count("```") % 2 == 0  # balanced -> no stray backticks
+        # The fence must CLOSE, which the balance check above already proves;
+        # the message does not END on the closer because the turn footer is
+        # appended as a trailing subtext line after it.
+        assert final.startswith("```")
+        assert final.split("-# Finished in ")[0].rstrip().endswith("```")
+        assert "y = 2" in final.split("```")[1]  # post-rotation code stays inside
+
+    @pytest.mark.asyncio
+    async def test_rotation_mid_code_block_keeps_line_break(self) -> None:
+        r, cli = self._renderer()
+        await r.on_turn_start()
+        # The retained tail's content ends with a newline; dropping the
+        # synthetic closer must not eat it, or the next streamed line lands on
+        # the previous one ("x = 1y = 2") and both code lines are corrupted.
+        await r.on_text_chunk("```py\n" + "x = 1\n" * 400)
+        assert "".join(r._buf).endswith("\n")
+        await r.on_text_chunk("y = 2\n```")
+        await r.on_done()
+        final = cli.final_text()
+        assert "x = 1y = 2" not in final
+        assert "x = 1\ny = 2" in final
+
+    @pytest.mark.asyncio
+    async def test_rotation_keeps_blank_code_lines(self) -> None:
+        r, cli = self._renderer()
+        await r.on_turn_start()
+        # The rotation boundary lands on the blank lines the model just emitted
+        # INSIDE the open fence, leaving a newline-only remainder. Dropping it
+        # pulls the next code line up onto the last one.
+        await r.on_text_chunk("```py\n" + "x = 1\n" * 299 + "\n\n")
+        assert "".join(r._buf).endswith("\n\n\n")
+        await r.on_text_chunk("y = 2\n```")
+        await r.on_done()
+        final = cli.final_text()
+        assert "x = 1\ny = 2" not in final  # later code did not shift up
+        assert "\n\ny = 2" in final  # the blank code line survived
+
+    @pytest.mark.asyncio
+    async def test_rotation_keeps_blank_code_lines_before_more_code(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        r, cli = self._renderer()
+        monkeypatch.setattr(r, "_limit", lambda: 60)
+        await r.on_turn_start()
+        # Blank code lines straddling the rotation cut, with more code AFTER
+        # them. The all-newline-tail case is already pinned above; this is the
+        # one the round-2 remainder deleted -- the cut lands on the run, the
+        # sealed side keeps the code, and the blank lines belong to the tail.
+        await r.on_text_chunk("```py\n" + "x = 1\n" * 6 + "\n\n" + "y = 2\n" * 6)
+        sealed = cli.sent[0][0]
+        assert sealed.endswith("```")  # code sealed, synthetic closer on
+        # The retained tail reopens the fence with the AUTHORED opener (language
+        # tag and all, where a bare ``` reopen would have lost it).
+        assert "".join(r._buf).startswith("```py\n")
+        await r.on_text_chunk("```")
+        await r.on_done()
+        # The blank code line survived to what the user reads and the later code
+        # did not shift up. Only ONE blank line is asserted here: _strip_steering
+        # collapses every run of 3+ newlines to 2 on EVERY render, so the visible
+        # cap is that normalizer's, not the splitter's.
+        visible = "".join([t for t, _ in cli.sent] + [t for _, t, _c in cli.edits])
+        assert "\n\n" in visible
+        assert "x = 1y = 2" not in visible
+
+    @pytest.mark.asyncio
+    async def test_rotation_ignores_inline_backticks_in_prose(self) -> None:
+        r, cli = self._renderer()
+        await r.on_turn_start()
+        # Prose ABOUT fencing: the ``` sits mid-line, so it opens nothing. A
+        # ``` SUBSTRING count reads the stream as "inside a code block", so the
+        # splitter invents a closer for the sealed chunk, reopens the fence on
+        # the retained tail, and the rotation then deletes that tail's closer --
+        # leaving the live buffer inside an UNCLOSED code block, so every later
+        # sentence renders as code.
+        await r.on_text_chunk(
+            "To open a code block you type ``` at the start of a line. "
+            + ("Ordinary prose about how chat surfaces render markdown. " * 45)
+        )
+        buf = "".join(r._buf)
+        assert "```" not in buf  # no reopen, no synthetic closer
+        await r.on_text_chunk("Final sentence, outside any code block.")
+        await r.on_done()
+        # The author wrote no fence LINE anywhere, so any bare ``` line in any
+        # frame -- live or sealed -- is one this renderer invented.
+        for text in [t for t, _ in cli.sent] + [t for _, t, _c in cli.edits]:
+            assert not any(ln.strip() == "```" for ln in text.split("\n"))
+        assert "Final sentence, outside any code block." in cli.final_text()
+
+    @pytest.mark.asyncio
+    async def test_rotation_keeps_the_tail_open_behind_inline_backticks(self) -> None:
+        r, cli = self._renderer()
+        await r.on_turn_start()
+        # The mirror miscount: one literal ``` in the prose plus a genuinely
+        # OPEN fence makes a ``` SUBSTRING count even, so a parity-based
+        # splitter seals the retained tail shut around a live code block.
+        await r.on_text_chunk(
+            "You type ``` to open a block, like this:\n\n```py\n" + "x = 1\n" * 400
+        )
+        buf = "".join(r._buf)
+        assert buf.startswith("```py\n")  # continuation reopens the live fence
+        assert not buf.rstrip().endswith("```")  # and it is left OPEN
+        await r.on_text_chunk("y = 2\n```")
+        await r.on_done()
+        final = cli.final_text()
+        assert final.count("```") % 2 == 0
+        assert "x = 1\ny = 2" in final  # post-rotation code stayed in the block
+
+    @pytest.mark.asyncio
+    async def test_authored_trailing_backticks_survive_when_nothing_split(self) -> None:
+        r, cli = self._renderer()
+        await r.on_turn_start()
+        # Prose about fencing ends with a literal ``` and is itself UNDER the
+        # cap -- only the long [OPTIONS:] trailer pushes the buffer over it. The
+        # trailer is detached before splitting, so the splitter hands back a
+        # lone chunk, which is the final chunk and therefore untouched: the
+        # author's backticks survive.
+        body = ("To fence a block in Discord, open the line with " * 36) + "type ```"
+        assert len(body) < r._limit()
+        trailer = "\n\n[OPTIONS: " + ("Yes " * 20) + " | " + ("No " * 20) + "]"
+        await r.on_text_chunk(body + trailer)
+        await r.on_done()
+        visible = "\n".join([t for t, _ in cli.sent] + [t for _, t, _c in cli.edits])
+        assert "type ```" in visible
+
+    @pytest.mark.asyncio
+    async def test_rotation_keeps_authored_inner_fence_line_in_4_backtick_block(self) -> None:
+        r, cli = self._renderer()
+        await r.on_turn_start()
+        # A 4-backtick block holding 3-backtick examples. Per CommonMark the inner
+        # ``` closes nothing, so the fence is still open at the cut. The reopen must
+        # carry the 4-backtick opener verbatim, or the inner ``` would close it.
+        src = "````markdown\n" + "Nest a block:\n\n```py\nx = 1\n```\n\n" * 90
+        assert len(src) > r._limit()
+        await r.on_text_chunk(src)
+        buf = "".join(r._buf)
+        assert len(buf) < len(src)  # the rotation really fired
+        assert buf.startswith("````markdown\n")  # run length and info string kept
+        # The author's inner closer is the last thing they wrote; it must still
+        # be there, with the blank line that followed it.
+        assert buf.endswith("```\n\n")
+        # Stronger: the retained tail IS the source's own tail (modulo the
+        # continuation reopen) -- not a shortened copy of it.
+        assert src.endswith(buf[len("````markdown\n") :])
+        # It survives all the way to what the user reads.
+        await r.on_text_chunk("Done.\n````")
+        await r.on_done()
+        frames = [t for t, _ in cli.sent] + [t for _, t, _c in cli.edits]
+        authored = src.count("\n```\n")
+        assert sum(f.count("\n```\n") for f in frames) >= authored
+
+    @pytest.mark.asyncio
+    async def test_tool_footer_transient(self) -> None:
+        r, cli = self._renderer()
+        await r.on_turn_start()
+        await r.on_tool_call("t1", "grep")
+        assert any("grep" in text for text, _ in cli.sent)
+        await r.on_text_chunk("Result body")
+        await r.on_done()
+        assert "grep" not in cli.final_text()
+
+    @pytest.mark.asyncio
+    async def test_error_placeholder_when_no_output(self) -> None:
+        r, cli = self._renderer()
+        await r.on_turn_start()
+        await r.on_done(stop_reason="error")
+        assert "⚠️" in cli.final_text()
+
+    @pytest.mark.asyncio
+    async def test_prompt_choice_sends_separate_approval_message(self) -> None:
+        r, cli = self._renderer()
+        await r.on_turn_start()
+        await r.on_prompt_choice([], request_id="req9")
+        text, comps = cli.sent[-1]
+        assert "Approve" in text
+        ids = [b["custom_id"] for row in comps for b in row["components"]]
+        # a:<rid>:<nonce>:<flag> — nonce guards against reused request IDs.
+        assert len(ids) == 2
+        assert ids[0].startswith("a:req9:") and ids[0].endswith(":1")
+        assert ids[1].startswith("a:req9:") and ids[1].endswith(":0")
+        from kiro_crew.messaging.renderer import new_approval_nonce
+
+        nonce = ids[0].split(":")[2]
+        # Length is the shared minter's, not a Discord-local literal: three channels
+        # mint approval nonces and a per-channel copy is how one gets a weaker one.
+        assert len(nonce) == len(new_approval_nonce()) > 10
+        DiscordApprovalDecider._NONCES.pop(DiscordApprovalDecider.key("sk", "req9"), None)
+
+    @pytest.mark.asyncio
+    async def test_prompt_names_the_tool_the_request_is_about(self) -> None:
+        """`_last_tool` is never cleared, so it names the PREVIOUS tool.
+
+        A permission that arrives without its own titled tool_call would otherwise
+        ask the operator to approve something other than what is about to run.
+        """
+        r, cli = self._renderer()
+        await r.on_turn_start()
+        await r.on_tool_call("t1", "fs_read")
+        await r.on_prompt_choice([], request_id="req1", tool_title="execute_bash")
+        text, _ = cli.sent[-1]
+        assert "execute_bash" in text
+        assert "fs_read" not in text
+        DiscordApprovalDecider._NONCES.pop(DiscordApprovalDecider.key("sk", "req1"), None)
+
+    @pytest.mark.asyncio
+    async def test_prompt_falls_back_to_the_last_tool_without_a_title(self) -> None:
+        """Non-vacuity: the fallback still runs when the event carried no name."""
+        r, cli = self._renderer()
+        await r.on_turn_start()
+        await r.on_tool_call("t1", "fs_read")
+        await r.on_prompt_choice([], request_id="req2")
+        text, _ = cli.sent[-1]
+        assert "fs_read" in text
+        DiscordApprovalDecider._NONCES.pop(DiscordApprovalDecider.key("sk", "req2"), None)
+
+    @pytest.mark.asyncio
+    async def test_steer_marker_rotates_message_with_chip(self) -> None:
+        r, cli = self._renderer()
+        await r.on_turn_start()
+        await r.on_text_chunk("first part [STEERING steer-ab12: focus on Y] second part")
+        await r.on_done()
+        all_texts = [t for t, _ in cli.sent] + [t for _, t, _ in cli.edits]
+        # Marker never shown raw; chip carries the summary.
+        assert all("[STEERING" not in t for t in all_texts)
+        assert any("focus on Y" in t for t in all_texts)
+
+    @pytest.mark.asyncio
+    async def test_close_finalizes_unfinished_turn(self) -> None:
+        r, cli = self._renderer()
+        await r.on_turn_start()
+        await r.on_text_chunk("partial")
+        await r.close()
+        assert cli.final_text().startswith("partial")
+        assert "\n\n-# Finished in " in cli.final_text()
+
+    @pytest.mark.asyncio
+    async def test_no_rotation_steer_summary_chip(self) -> None:
+        r, cli = self._renderer()
+        await r.on_turn_start()
+        r.note_steer("my steer words")
+        await r.on_text_chunk("answer body")
+        await r.on_done()
+        assert "my steer words" in cli.final_text()
+        assert "answer body" in cli.final_text()
+
+
+# ── DiscordApprovalDecider ───────────────────────────────────────────────
+
+
+async def _registered(decider_task: "asyncio.Future[bool]", key: str) -> None:
+    """Wait until the decider's own call has put its future in the registry."""
+    await async_wait_until(
+        lambda: key in DiscordApprovalDecider._REGISTRY,
+        describe=lambda: f"no future registered under {key!r}; decider task: {decider_task!r}",
+    )
+
+
+class TestApprovalDecider:
+    @pytest.mark.asyncio
+    async def test_resolve_approves_with_valid_nonce(self) -> None:
+        decider = DiscordApprovalDecider(session_key="sk")
+        ev = SimpleNamespace(request_id="r1")
+        key = DiscordApprovalDecider.key("sk", "r1")
+        task = asyncio.ensure_future(decider(ev))
+        await _registered(task, key)
+        nonce = DiscordApprovalDecider.register_nonce(key)
+        assert DiscordApprovalDecider.resolve_global(key, True, nonce=nonce)
+        assert await await_until(task, what="the decider returning the approval") is True
+
+    @pytest.mark.asyncio
+    async def test_stale_nonce_fails_closed(self) -> None:
+        """A button from an earlier prompt (reused request ID) cannot resolve
+        a new pending request — the nonce must match the CURRENT prompt's."""
+        decider = DiscordApprovalDecider(session_key="sk")
+        ev = SimpleNamespace(request_id="r1")
+        key = DiscordApprovalDecider.key("sk", "r1")
+        task = asyncio.ensure_future(decider(ev))
+        await _registered(task, key)
+        DiscordApprovalDecider.register_nonce(key)  # current prompt's nonce
+        # Press carries an OLD nonce (from a prompt before a restart).
+        assert not DiscordApprovalDecider.resolve_global(key, True, nonce="deadbeefdeadbeef")
+        assert not task.done()  # still pending — stale press had no effect
+        # A missing nonce also fails closed.
+        assert not DiscordApprovalDecider.resolve_global(key, True)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await await_until(task, what="the cancelled decider ending")
+        DiscordApprovalDecider._NONCES.pop(key, None)
+
+    @pytest.mark.asyncio
+    async def test_resolve_unknown_key_returns_false(self) -> None:
+        assert not DiscordApprovalDecider.resolve_global("sk:none", True, nonce="x")
+
+    @pytest.mark.asyncio
+    async def test_timeout_records_the_stall_for_a_bound_loop(self, monkeypatch) -> None:
+        """A Discord nudge cycle stalls here, not in the dashboard runner.
+
+        Without this the loop keeps waking, is denied by default, and spends its
+        whole cycle cap accomplishing nothing.
+        """
+        from kiro_crew import autonudge as _an
+        from kiro_crew.discord import renderer as _rend
+
+        recorded: list[str] = []
+        monkeypatch.setattr(
+            _an,
+            "get_instance",
+            lambda: SimpleNamespace(notify_approval_stalled=recorded.append),
+        )
+        # Nobody resolves the decider's future, so the 10 ms window always expires,
+        # however slow the host is.
+        monkeypatch.setattr(_rend, "_APPROVAL_TIMEOUT_S", 0.01)
+
+        decider = DiscordApprovalDecider(session_key="discord:a:direct:7")
+        ev = SimpleNamespace(request_id="r-timeout")
+        assert await finished(decider(ev), "the approval window expiring") is False
+
+        assert recorded == ["discord:a:direct:7"], "the stall was not recorded"
+
+    @pytest.mark.asyncio
+    async def test_a_pressed_deny_is_not_recorded_as_a_stall(self, monkeypatch) -> None:
+        """An explicit deny is a decision, not evidence that nobody is present.
+
+        Recording it would stop a loop whose operator is right there declining
+        one tool.
+        """
+        from kiro_crew import autonudge as _an
+
+        recorded: list[str] = []
+        monkeypatch.setattr(
+            _an,
+            "get_instance",
+            lambda: SimpleNamespace(notify_approval_stalled=recorded.append),
+        )
+
+        decider = DiscordApprovalDecider(session_key="discord:a:direct:7")
+        ev = SimpleNamespace(request_id="r-deny")
+        key = DiscordApprovalDecider.key("discord:a:direct:7", "r-deny")
+        task = asyncio.ensure_future(decider(ev))
+        await _registered(task, key)
+        nonce = DiscordApprovalDecider.register_nonce(key)
+        assert DiscordApprovalDecider.resolve_global(key, False, nonce=nonce)
+
+        assert await await_until(task, what="the decider returning the denial") is False
+        assert recorded == [], "a pressed deny must not count as an unanswered prompt"
+
+
+# ── an approval press that lands before the waiter is registered ─────────
+#
+# ``TurnDriver`` dispatches ``PROMPT_CHOICE`` to the renderer and only then awaits
+# the decider. The renderer suspends in between (a thread hop for the
+# display-safety scan, then the send), so a press can be processed while no future
+# is registered yet. The decision window opens when the nonce is armed; a press
+# with no armed nonce, a foreign nonce, or a decision left unawaited must still be
+# unable to answer a request the user was never asked about.
+
+
+class _SendCapture:
+    """Minimal outbound capture: only the approval prompt's own send is used."""
+
+    def __init__(self) -> None:
+        self.sent: list[tuple[str, str, object]] = []
+        self.raise_on_send = False
+        #: When set, every send returns None, which is how the real client reports
+        #: a failure: a revoked token, a channel it cannot write to, a rate limit
+        #: or 5xx past its retries. It does NOT raise for those.
+        self.fail_sends = False
+
+    async def send_message(
+        self,
+        channel_id: str,
+        text: str,
+        *,
+        components: object = None,
+        reply_to_message_id: object = None,
+    ) -> str | None:
+        if self.raise_on_send:
+            raise RuntimeError("send exploded")
+        self.sent.append((channel_id, text, components))
+        return None if self.fail_sends else "m1"
+
+
+class _PressDuringSend(_SendCapture):
+    """Presses Approve from inside the send, the widest part of the early-press gap.
+
+    The press runs while the renderer is suspended on the send and before the
+    driver has reached the decider.
+    """
+
+    def __init__(self, key: str, *, approved: bool = True) -> None:
+        super().__init__()
+        self._key = key
+        self._approved = approved
+        #: What ``resolve_global`` answered the presser. False would mean the
+        #: handler reports the approval as expired.
+        self.press_resolved: bool | None = None
+
+    async def send_message(
+        self,
+        channel_id: str,
+        text: str,
+        *,
+        components: object = None,
+        reply_to_message_id: object = None,
+    ) -> str | None:
+        nonce = _nonce_from(components)
+        self.press_resolved = DiscordApprovalDecider.resolve_global(
+            self._key, self._approved, nonce=nonce
+        )
+        return await super().send_message(
+            channel_id, text, components=components, reply_to_message_id=reply_to_message_id
+        )
+
+
+def _nonce_from(components: object) -> str:
+    """The nonce Discord would send back with a press on these buttons."""
+    assert isinstance(components, list) and components
+    row = components[0]
+    assert isinstance(row, dict)
+    approve = row["components"][0]
+    # ``a:<request_id>:<nonce>:<1|0>``
+    return str(approve["custom_id"]).split(":")[2]
+
+
+@pytest.fixture
+def _clean_approval_registry():
+    """No cross-test bleed through the decider's process-global maps."""
+    DiscordApprovalDecider._REGISTRY.clear()
+    DiscordApprovalDecider._NONCES.clear()
+    yield
+    DiscordApprovalDecider._REGISTRY.clear()
+    DiscordApprovalDecider._NONCES.clear()
+
+
+def _approval_renderer(client: object) -> DiscordRenderer:
+    return DiscordRenderer(
+        client,  # type: ignore[arg-type]
+        "chan1",
+        DISCORD_CAPABILITIES,
+        session_key="sk",
+    )
+
+
+@pytest.mark.usefixtures("_clean_approval_registry")
+class TestPressBeforeTheWaiter:
+    """A press in the gap is honoured, not dropped and reported as expired."""
+
+    @pytest.mark.asyncio
+    async def test_press_while_the_prompt_is_being_sent_is_honored(self) -> None:
+        key = DiscordApprovalDecider.key("sk", "r1")
+        cli = _PressDuringSend(key)
+        await _approval_renderer(cli).on_prompt_choice([], "r1", tool_title="shell")
+        # The presser was told the decision landed, not that it had expired.
+        assert cli.press_resolved is True
+        # And the driver's later wait reads that decision instead of denying.
+        decider = DiscordApprovalDecider(session_key="sk")
+        assert await decider(SimpleNamespace(request_id="r1")) is True
+        assert decider.last_deny_cause == ""
+
+    @pytest.mark.asyncio
+    async def test_deny_press_in_the_gap_is_honored_as_a_denial(self) -> None:
+        key = DiscordApprovalDecider.key("sk", "r2")
+        cli = _PressDuringSend(key, approved=False)
+        await _approval_renderer(cli).on_prompt_choice([], "r2", tool_title="shell")
+        assert cli.press_resolved is True
+        decider = DiscordApprovalDecider(session_key="sk")
+        assert await decider(SimpleNamespace(request_id="r2")) is False
+
+    @pytest.mark.asyncio
+    async def test_the_recorded_decision_is_consumed_once(self) -> None:
+        """A second request reusing the id gets its own window, not this answer."""
+        key = DiscordApprovalDecider.key("sk", "r3")
+        cli = _PressDuringSend(key)
+        await _approval_renderer(cli).on_prompt_choice([], "r3", tool_title="shell")
+        decider = DiscordApprovalDecider(session_key="sk")
+        assert await decider(SimpleNamespace(request_id="r3")) is True
+        assert key not in DiscordApprovalDecider._REGISTRY
+        assert key not in DiscordApprovalDecider._NONCES
+
+
+@pytest.mark.usefixtures("_clean_approval_registry")
+class TestWindowStillFailsClosed:
+    """Opening the window earlier must not widen what a press can reach."""
+
+    @pytest.mark.asyncio
+    async def test_press_before_the_nonce_is_armed_is_refused(self) -> None:
+        key = DiscordApprovalDecider.key("sk", "r4")
+        assert DiscordApprovalDecider.resolve_global(key, True, nonce="whatever") is False
+
+    @pytest.mark.asyncio
+    async def test_foreign_nonce_in_the_gap_is_refused_and_leaves_the_window_live(
+        self,
+    ) -> None:
+        key = DiscordApprovalDecider.key("sk", "r5")
+        DiscordApprovalDecider.register_nonce(key)
+        assert DiscordApprovalDecider.resolve_global(key, True, nonce="deadbeefdeadbeef") is False
+        reserved = DiscordApprovalDecider._REGISTRY.get(key)
+        assert reserved is not None and not reserved.done()
+
+    @pytest.mark.asyncio
+    async def test_a_decision_left_unawaited_cannot_answer_the_next_request(self) -> None:
+        """The replay bound. Same key, new prompt, so the old answer is void."""
+        key = DiscordApprovalDecider.key("sk", "r6")
+        stale_nonce = DiscordApprovalDecider.register_nonce(key)
+        assert DiscordApprovalDecider.resolve_global(key, True, nonce=stale_nonce) is True
+        # The turn died before the driver reached the decider: nobody read it.
+        fresh_nonce = DiscordApprovalDecider.register_nonce(key)
+        assert fresh_nonce != stale_nonce
+        # The old press cannot reach the new prompt.
+        assert DiscordApprovalDecider.resolve_global(key, True, nonce=stale_nonce) is False
+        # Nor can the recorded approval be adopted by the new request's wait.
+        reserved = DiscordApprovalDecider._REGISTRY.get(key)
+        assert reserved is not None and not reserved.done()
+
+    @pytest.mark.asyncio
+    async def test_a_second_arm_does_not_orphan_a_live_waiter(self) -> None:
+        """Re-arming keeps the future the waiter is blocked on."""
+        decider = DiscordApprovalDecider(session_key="sk")
+        key = DiscordApprovalDecider.key("sk", "r7")
+        task = asyncio.ensure_future(decider(SimpleNamespace(request_id="r7")))
+        await _registered(task, key)
+        nonce = DiscordApprovalDecider.register_nonce(key)
+        assert DiscordApprovalDecider.resolve_global(key, True, nonce=nonce) is True
+        assert await await_until(task, what="the decider returning the approval") is True
+
+
+@pytest.mark.usefixtures("_clean_approval_registry")
+class TestPromptThatNeverWentOut:
+    @pytest.mark.asyncio
+    async def test_retire_closes_the_window(self) -> None:
+        key = DiscordApprovalDecider.key("sk", "r8")
+        nonce = DiscordApprovalDecider.register_nonce(key)
+        DiscordApprovalDecider.retire(key)
+        assert DiscordApprovalDecider.resolve_global(key, True, nonce=nonce) is False
+        assert key not in DiscordApprovalDecider._REGISTRY
+        # Idempotent: a caller that retires twice is not an error.
+        DiscordApprovalDecider.retire(key)
+
+    @pytest.mark.asyncio
+    async def test_a_failed_send_retires_the_window_and_raises(self) -> None:
+        cli = _SendCapture()
+        cli.raise_on_send = True
+        key = DiscordApprovalDecider.key("sk", "r9")
+        with pytest.raises(RuntimeError):
+            await _approval_renderer(cli).on_prompt_choice([], "r9", tool_title="shell")
+        assert key not in DiscordApprovalDecider._NONCES
+        assert key not in DiscordApprovalDecider._REGISTRY
+
+    @pytest.mark.asyncio
+    async def test_a_send_that_returns_no_id_denies_at_once(self) -> None:
+        """The failure the real client actually reports: no id, no exception.
+
+        Dropping the reservation here would look tidy and still cost the user the
+        whole decision window on a prompt nobody can see, so the refusal is
+        recorded for the wait to adopt.
+        """
+        cli = _SendCapture()
+        cli.fail_sends = True
+        await _approval_renderer(cli).on_prompt_choice([], "r11", tool_title="shell")
+        decider = DiscordApprovalDecider(session_key="sk")
+        # No timeout patch: a window that is waited out would hang this test.
+        assert await finished(decider(SimpleNamespace(request_id="r11")), "the decision") is False
+        key = DiscordApprovalDecider.key("sk", "r11")
+        assert key not in DiscordApprovalDecider._REGISTRY
+        assert key not in DiscordApprovalDecider._NONCES
+
+    @pytest.mark.asyncio
+    async def test_refuse_undelivered_cannot_overwrite_a_real_decision(self) -> None:
+        """A press that already landed outranks a later delivery verdict."""
+        key = DiscordApprovalDecider.key("sk", "r12")
+        nonce = DiscordApprovalDecider.register_nonce(key)
+        assert DiscordApprovalDecider.resolve_global(key, True, nonce=nonce) is True
+        DiscordApprovalDecider.refuse_undelivered(key)
+        decider = DiscordApprovalDecider(session_key="sk")
+        assert await finished(decider(SimpleNamespace(request_id="r12")), "the decision") is True
+
+    @pytest.mark.asyncio
+    async def test_no_press_still_denies_when_the_window_elapses(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Nobody presses the prompt's buttons, so the 10 ms window always expires,
+        # however slow the host is.
+        monkeypatch.setattr(discord_renderer, "_APPROVAL_TIMEOUT_S", 0.01)
+        cli = _SendCapture()
+        key = DiscordApprovalDecider.key("sk", "r10")
+        await _approval_renderer(cli).on_prompt_choice([], "r10", tool_title="shell")
+        decider = DiscordApprovalDecider(session_key="sk")
+        ev = SimpleNamespace(request_id="r10")
+        assert await finished(decider(ev), "the approval window expiring") is False
+        assert key not in DiscordApprovalDecider._REGISTRY
+        assert key not in DiscordApprovalDecider._NONCES
+
+
+@pytest.mark.usefixtures("_clean_approval_registry")
+class TestTurnTeardown:
+    """A reservation must not outlive the turn that opened it."""
+
+    @pytest.mark.asyncio
+    async def test_discard_session_closes_a_window_no_wait_ever_adopted(self) -> None:
+        """The prompt went out, then the turn ended before the decider."""
+        cli = _SendCapture()
+        key = DiscordApprovalDecider.key("sk", "r13")
+        await _approval_renderer(cli).on_prompt_choice([], "r13", tool_title="shell")
+        nonce = _nonce_from(cli.sent[0][2])
+        DiscordApprovalDecider.discard_session("sk")
+        assert key not in DiscordApprovalDecider._REGISTRY
+        assert key not in DiscordApprovalDecider._NONCES
+        # The buttons left in the channel resolve nothing.
+        assert DiscordApprovalDecider.resolve_global(key, True, nonce=nonce) is False
+
+    @pytest.mark.asyncio
+    async def test_discard_session_does_not_reach_a_sibling_key(self) -> None:
+        """``sk`` must not match ``sk2``: the prefix carries its own separator."""
+        mine = DiscordApprovalDecider.key("sk", "r14")
+        other = DiscordApprovalDecider.key("sk2", "r14")
+        DiscordApprovalDecider.register_nonce(mine)
+        DiscordApprovalDecider.register_nonce(other)
+        DiscordApprovalDecider.discard_session("sk")
+        assert mine not in DiscordApprovalDecider._REGISTRY
+        assert other in DiscordApprovalDecider._REGISTRY
+
+    @pytest.mark.asyncio
+    async def test_discard_session_keeps_a_decision_already_recorded(self) -> None:
+        """A press that landed is a delivered decision, not a stale reservation."""
+        key = DiscordApprovalDecider.key("sk", "r15")
+        nonce = DiscordApprovalDecider.register_nonce(key)
+        assert DiscordApprovalDecider.resolve_global(key, True, nonce=nonce) is True
+        DiscordApprovalDecider.discard_session("sk")
+        decider = DiscordApprovalDecider(session_key="sk")
+        assert await finished(decider(SimpleNamespace(request_id="r15")), "the decision") is True
+
+
+def _future_on_a_closed_loop() -> "asyncio.Future[bool]":
+    """A future whose loop is gone, as a turn on an earlier loop leaves behind."""
+    dead = asyncio.new_event_loop()
+    try:
+        return dead.create_future()
+    finally:
+        dead.close()
+
+
+@pytest.mark.usefixtures("_clean_approval_registry")
+class TestAReservationFromAClosedLoop:
+    """A registry entry outliving its event loop is not a reservation.
+
+    The registry is process-global and outlives any one loop. Awaiting a future
+    from a closed loop raises ``attached to a different loop``, and a verdict on
+    it belongs to an ended turn, so both adoption sites must open a fresh window.
+    """
+
+    @pytest.mark.asyncio
+    async def test_arming_replaces_a_reservation_from_a_dead_loop(self) -> None:
+        key = DiscordApprovalDecider.key("sk", "r20")
+        DiscordApprovalDecider._REGISTRY[key] = _future_on_a_closed_loop()
+        nonce = DiscordApprovalDecider.register_nonce(key)
+        assert DiscordApprovalDecider._REGISTRY[key].get_loop() is asyncio.get_running_loop()
+        decider = DiscordApprovalDecider(session_key="sk")
+        task = asyncio.ensure_future(decider(SimpleNamespace(request_id="r20")))
+        await asyncio.sleep(0)
+        assert DiscordApprovalDecider.resolve_global(key, True, nonce=nonce) is True
+        assert await finished(task, "the decision") is True
+
+    @pytest.mark.asyncio
+    async def test_the_wait_denies_rather_than_raising_on_a_dead_reservation(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """With no arm on this loop, the wait still must not await the foreign future."""
+        monkeypatch.setattr(discord_renderer, "_APPROVAL_TIMEOUT_S", 0.01)
+        key = DiscordApprovalDecider.key("sk", "r21")
+        DiscordApprovalDecider._REGISTRY[key] = _future_on_a_closed_loop()
+        decider = DiscordApprovalDecider(session_key="sk")
+        assert await finished(decider(SimpleNamespace(request_id="r21")), "the denial") is False
+
+    @pytest.mark.asyncio
+    async def test_a_verdict_recorded_on_a_dead_loop_is_not_adopted(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A decision belongs to the turn that asked for it, not a later request."""
+        monkeypatch.setattr(discord_renderer, "_APPROVAL_TIMEOUT_S", 0.01)
+        key = DiscordApprovalDecider.key("sk", "r22")
+        stale = _future_on_a_closed_loop()
+        stale.set_result(True)
+        DiscordApprovalDecider._REGISTRY[key] = stale
+        decider = DiscordApprovalDecider(session_key="sk")
+        assert await finished(decider(SimpleNamespace(request_id="r22")), "the denial") is False
+
+
+class TestTheSweepReachesTheRealRegistry:
+    """The end-of-turn sweep must not travel through the construction seam."""
+
+    def test_the_discord_sweep_is_the_class_that_holds_the_reservations(self) -> None:
+        from kiro_crew.discord import transport_dispatch as discord_dispatch
+
+        assert discord_dispatch._APPROVAL_REGISTRY is DiscordApprovalDecider
+
+    def test_the_dispatcher_does_not_sweep_through_its_construction_seam(self) -> None:
+        import inspect
+
+        from kiro_crew.discord import transport_dispatch as discord_dispatch
+
+        source = inspect.getsource(discord_dispatch)
+        assert "DiscordApprovalDecider.discard_session" not in source
+        assert "_APPROVAL_REGISTRY.discard_session" in source
+
+
+class TestRedactionNotice:
+    """When redaction rewrote what landed, one follow-up notice says so.
+
+    Discord edits its answer in place and rotates segments, so the tally counts
+    each LANDED message's final state and the notice goes out once, at the end
+    of ``on_done``. The shared wording is pinned in
+    ``test_credential_redaction_notice.py``.
+    """
+
+    _SECRET_URI = "postgresql://user:SuperSecret123@db.example.com:5432/prod"
+
+    @pytest.mark.asyncio
+    async def test_redacted_answer_is_followed_by_one_notice(self) -> None:
+        cli = FakeClient()
+        r = DiscordRenderer(cli, "chan1", DISCORD_CAPABILITIES, session_key="sk")  # type: ignore[arg-type]
+        await r.on_text_chunk(f"Run: psql {self._SECRET_URI}")
+        await r.on_done()
+
+        texts = [t for t, _c in cli.sent] + [t for _i, t, _c in cli.edits]
+        assert not any("SuperSecret123" in t for t in texts)
+        notices = [t for t, _c in cli.sent if "Security notice" in t]
+        assert len(notices) == 1
+        assert "SuperSecret123" not in notices[0]
+
+    @pytest.mark.asyncio
+    async def test_clean_answer_sends_no_notice(self) -> None:
+        cli = FakeClient()
+        r = DiscordRenderer(cli, "chan1", DISCORD_CAPABILITIES, session_key="sk")  # type: ignore[arg-type]
+        await r.on_text_chunk("All green, deploy finished.")
+        await r.on_done()
+
+        assert not any("Security notice" in t for t, _c in cli.sent)
+
+    @pytest.mark.asyncio
+    async def test_notice_send_failure_does_not_fail_a_delivered_turn(self) -> None:
+        cli = FakeClient()
+        real_send = cli.send_message
+
+        async def send_but_fail_the_notice(channel_id, text, **kw):
+            if "Security notice" in text:
+                raise RuntimeError("discord down after the answer")
+            return await real_send(channel_id, text, **kw)
+
+        cli.send_message = send_but_fail_the_notice  # type: ignore[method-assign]
+        r = DiscordRenderer(cli, "chan1", DISCORD_CAPABILITIES, session_key="sk")  # type: ignore[arg-type]
+        await r.on_text_chunk(f"Run: psql {self._SECRET_URI}")
+        await r.on_done()  # must not raise
+        # The answer itself landed.
+        assert any("[REDACTED: credential]" in t for t, _c in cli.sent) or any(
+            "[REDACTED: credential]" in t for _i, t, _c in cli.edits
+        )
+
+
+class TestRotationSeamCredentialSafety:
+    """A rotation must not hand the reader a key by putting two frames in a row.
+
+    Each frame is redacted alone, so a key split by markup across the cut matches in
+    neither frame, yet reads as one key once the client renders the markup away.
+    Assertions read the frames actually sent, both ways a reader can join them.
+    """
+
+    def _renderer(
+        self, monkeypatch: pytest.MonkeyPatch, limit: int
+    ) -> tuple[DiscordRenderer, FakeClient]:
+        cli = FakeClient()
+        r = DiscordRenderer(cli, "chan1", DISCORD_CAPABILITIES, session_key="sk")  # type: ignore[arg-type]
+        monkeypatch.setattr(r, "_limit", lambda: limit)
+        monkeypatch.setattr("kiro_crew.discord.renderer._EDIT_THROTTLE_S", 1e9)
+        return r, cli
+
+    #: A cut inside an unbroken run of non-space characters is a HARD cut at the
+    #: budget, which is what puts the boundary inside the credential rather than at
+    #: some paragraph break the splitter would have preferred.
+    _LIMIT = 200
+
+    def _straddling_source(self, head: str, tail: str) -> str:
+        """One long word whose character at offset ``_LIMIT`` splits *head*/*tail*."""
+        return "a" * (self._LIMIT - len(head)) + head + tail + "b" * self._LIMIT
+
+    async def _screen(self, monkeypatch: pytest.MonkeyPatch, src: str) -> list[str]:
+        """Every frame the reader ends up with, rotation then final seal."""
+        r, cli = self._renderer(monkeypatch, self._LIMIT)
+        r._buf = [src]
+        await r._rotate_on_length()
+        await r._seal_current(extract_uploads=False)
+        return [text for text, _ in cli.sent]
+
+    @pytest.mark.asyncio
+    async def test_a_cut_after_trailing_space_is_graded_on_the_trimmed_form(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Discord shows the reader the trimmed text, so the grade must trim too.
+
+        The raw halves are safe because spaces sit between them; the delivered forms sit
+        flush and read as one key. So the check is on delivered forms, not raw frames.
+        """
+        head, tail = "AKIAIOSF", "ODNN7EXAMPLE"
+        prefix = "word " * 20
+        src = prefix + head + "   " + tail + " trailing prose here"
+        r, cli = self._renderer(monkeypatch, len(prefix + head) + 3)
+        r._buf = [src]
+
+        await r._rotate_on_length()
+        await r._seal_current(extract_uploads=False)
+
+        frames = [text for text, _ in cli.sent]
+        assert len(frames) >= 2, f"fixture delivered {len(frames)} frame(s), so it grades no seam"
+        self._assert_no_key_on_screen([_delivered_form(f) for f in frames])
+
+    @staticmethod
+    def _assert_no_key_on_screen(frames: list[str]) -> None:
+        for reading in (
+            canonicalize_display("".join(frames)),
+            "".join(canonicalize_display(f) for f in frames),
+        ):
+            assert _redact_all(reading) == reading, f"key readable across frames: {frames}"
+
+    @pytest.mark.asyncio
+    async def test_a_held_image_ref_cannot_be_re_delivered_as_the_rejected_pair(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The offset search grades the source; the rotation delivers source PLUS held.
+
+        A held image ref leaves the source under budget, so the search returns the whole
+        string and the frames rebuild the pair the gate just rejected. The delivered pair
+        is graded again, and the rotation sends nothing.
+        """
+        limit = 100
+        head = "prose " * 10 + "SecretAccessKey="
+        held = "![my-secret-value](/tmp/kc-13494-missing.png)"
+        src = head + held
+        assert len(src) > limit, "fixture does not rotate"
+        assert len(head) <= limit, "fixture does not reach the search's early return"
+        assert _redact_all(head) == head and _redact_all(held) == held, "fixture leaks alone"
+        assert severs_a_credential(
+            [head, held], _redact_all, _delivered_form
+        ), "fixture is not a straddle, so the rotation never consults the search"
+
+        r, cli = self._renderer(monkeypatch, limit)
+        r._buf = [src]
+        await r._rotate_on_length()
+
+        assert cli.sent == [], "the rotation delivered the pair the gate rejected"
+        assert "".join(r._buf) == src, "withheld text must ride the next rotation intact"
+
+        await r._seal_current(extract_uploads=False)
+        self._assert_no_key_on_screen([_delivered_form(t) for t, _ in cli.sent])
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("head", "tail"), CREDENTIAL_STRADDLE_SHAPES)
+    async def test_a_straddled_credential_never_reaches_two_frames(
+        self, monkeypatch: pytest.MonkeyPatch, head: str, tail: str
+    ) -> None:
+        rejoined = (
+            canonicalize_display(head + tail),
+            canonicalize_display(head) + canonicalize_display(tail),
+        )
+        assert any(_redact_all(r) != r for r in rejoined), "fixture is not a straddle"
+
+        frames = await self._screen(monkeypatch, self._straddling_source(head, tail))
+        assert frames, "nothing was delivered at all"
+        self._assert_no_key_on_screen(frames)
+
+    @pytest.mark.asyncio
+    async def test_an_innocent_body_still_rotates(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Control: the grading refuses boundaries, it does not stop rotating."""
+        r, cli = self._renderer(monkeypatch, self._LIMIT)
+        r._buf = ["word " * 200]
+        await r._rotate_on_length()
+        assert cli.sent, "an innocent body was withheld"
+
+    @pytest.mark.asyncio
+    async def test_no_safe_offset_withholds_the_text_instead_of_sending_it(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The failure direction: nothing safe to cut means nothing goes out.
+
+        With no sampled offset safe, the rotation must not fall back on the cut it
+        already refused. It delivers NOTHING, keeps the buffer whole, and the final
+        seal then redacts that buffer as one string -- where the key is intact and
+        matches, so it is replaced rather than shown.
+        """
+        head, tail = "AKIAIOSF", "ODNN7EXAMPLE"
+        src = self._straddling_source(head, tail)
+        monkeypatch.setattr("kiro_crew.discord.renderer.safe_split_offset", lambda *a, **k: 0)
+        r, cli = self._renderer(monkeypatch, self._LIMIT)
+        r._buf = [src]
+
+        await r._rotate_on_length()
+
+        assert cli.sent == [], "text went out on a cut the grading had refused"
+        assert "".join(r._buf) == src, "the withheld text was not kept whole"
+
+    @pytest.mark.asyncio
+    async def test_a_presentation_fallback_retains_no_piece_over_the_budget(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A graded cut must not buy one safe boundary with every later one.
+
+        The retained ``_delivery_text`` is bounded only by the seal's re-split, which
+        grades no boundary, so the retained piece must fit the budget.
+
+        Sealed frames are not size-checked: a redaction tag is longer than the key it
+        replaces, so a frame can exceed the budget.
+        """
+        head, tail = "AKIAIOSF", "ODNN7EXAMPLE"
+        # One unbroken word, so the splitter cuts hard at the budget and the first
+        # cut lands inside the credential. Several budgets wide, so a single graded
+        # offset would leave a remainder many times the budget.
+        src = "a" * (self._LIMIT - len(head)) + head + tail + "b" * (self._LIMIT * 6)
+        assert severs_a_credential(
+            await asyncio.to_thread(split_markdown_safe, src, self._LIMIT),
+            _redact_all,
+            _delivered_form,
+        ), "fixture does not sever, so it never reaches the graded fallback"
+
+        r, cli = self._renderer(monkeypatch, self._LIMIT)
+        r._delivery_text = src
+        await r._rotate_on_length()
+
+        retained = r._delivery_text or ""
+        assert len(cli.sent) > 1, "one frame only, so the fallback carved nothing"
+        assert len(retained) <= self._LIMIT, (
+            f"a {len(retained)}-char piece is retained against a {self._LIMIT} budget; "
+            "the seal's own re-split is the next cut and it grades no boundary"
+        )
+
+        await r._seal_current(extract_uploads=False)
+        self._assert_no_key_on_screen([_delivered_form(t) for t, _ in cli.sent])
+
+        await r._seal_current(extract_uploads=False)
+        delivered = "".join(text for text, _ in cli.sent)
+        assert head + tail not in delivered, "the final seal shipped the key"
+
+    @pytest.mark.asyncio
+    async def test_a_markup_span_covering_a_whole_piece_is_caught(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Piece length is no defence: canonicalising DROPS a link's target.
+
+        Three pieces, where no neighbouring PAIR reveals anything -- the link needs
+        its closing bracket, which is in the third piece -- while the full join
+        collapses the url to its label and puts that label against ``AKIA``. So the
+        middle piece is swallowed whole, which a pairwise grade cannot see.
+        """
+        key_head, key_tail = "AKIA", "IOSFODNN7EXAMPLE"
+        src = (
+            "a" * (self._LIMIT - len(key_head))
+            + key_head
+            + "["
+            + key_tail
+            + "](http://q/"
+            + "b" * self._LIMIT
+            + ") rest"
+        )
+        frames = await self._screen(monkeypatch, src)
+        assert frames, "nothing was delivered at all"
+        self._assert_no_key_on_screen(frames)
+
+    @pytest.mark.asyncio
+    async def test_a_retained_buffer_holds_only_source_text(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Whatever is kept live must be a SLICE of the source, never rejoined chunks.
+
+        ``split_markdown_safe`` chunks are rstripped and fence-closed, so rejoining them
+        glues words together or invents fences the model never wrote.
+        """
+        src = (
+            "a" * (self._LIMIT - 8)
+            + "AKIAIOSF"
+            + "ODNN7EXAMPLE"
+            + "\n\npara two\n\n```py\nx = 1\n```\n\npara three "
+            + "c" * self._LIMIT
+        )
+        r, _cli = self._renderer(monkeypatch, self._LIMIT)
+        r._buf = [src]
+        await r._rotate_on_length()
+        retained = "".join(r._buf)
+        assert retained in src, "retained buffer is not a slice of the source"
+
+    @pytest.mark.asyncio
+    async def test_a_boundary_is_graded_on_the_text_the_seal_delivers(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A steering marker between the halves vanishes at the seal.
+
+        The grade must run on the delivered form. Graded raw, the marker separates
+        the halves and no credential pattern matches; delivered, the seal removes it
+        and the two messages sit flush together.
+        """
+        r, cli = self._renderer(monkeypatch, self._LIMIT)
+        r._buf = ["a" * (self._LIMIT - 8) + "AKIAIOSF" + "ODNN7EXAMPLE" + "b" * self._LIMIT]
+        await r._rotate_on_length()
+        await r._seal_current(extract_uploads=False)
+        self._assert_no_key_on_screen([text for text, _ in cli.sent])
+
+    @pytest.mark.asyncio
+    async def test_the_seals_own_split_grades_its_boundary(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The last cut before the wire is the one nothing rotates behind.
+
+        A withheld buffer reaches the seal over the cap, and the seal splits it again;
+        that split must grade its boundary too. The link target has no space, so the
+        cut lands inside the credential.
+        """
+        # Narrow the screen to the plain reading. The key hides in the link target,
+        # broken by a run of ``*``, so neither whole-text reading sees it; only the
+        # seal's split grading catches it.
+        from kiro_crew.messaging import display_safety
+        from kiro_crew.messaging import split as messaging_split
+
+        further_readings = (display_safety._plain_reading,)
+        monkeypatch.setattr(display_safety, "FURTHER_READINGS", further_readings)
+        monkeypatch.setattr(
+            messaging_split,
+            "_RENDERINGS",
+            (display_safety.canonicalize_display, *further_readings),
+        )
+        src = (
+            "a" * (DISCORD_MAX_TEXT - 100)
+            + "[l](https://x/AKIA"
+            + "*" * 300
+            + "IOSFODNN7EXAMPLE)"
+            + "b" * 400
+        )
+        assert len(src) > DISCORD_MAX_TEXT, "fixture does not reach the platform cap"
+        assert (
+            discord_renderer._redact_transformed(src) == src
+        ), "the seal's own redaction already catches it"
+        assert severs_a_credential(
+            split_markdown_safe(src, DISCORD_MAX_TEXT), _redact_all, _delivered_form
+        ), "an ungraded split of this fixture no longer severs"
+
+        r, cli = self._renderer(monkeypatch, self._LIMIT)
+        r._buf = [src]
+        await r._seal_current(extract_uploads=False)
+
+        frames = [text for text, _ in cli.sent]
+        assert len(frames) >= 2, f"fixture did not split at the seal: {len(frames)}"
+        self._assert_no_key_on_screen(frames)
+
+
+class TestTheLiveBubbleSeamSurvivesItsEditLifecycle:
+    """A live bubble's seam grade must persist across its edits and its seal.
+
+    ``_record_sent`` overwrites ``_sent_tail`` with the bubble's own frame, so edits
+    and the seal grade against ``_bubble_above``, the message above the bubble.
+    Assertions read the frames the fake client received.
+    """
+
+    @staticmethod
+    def _assert_no_key_on_screen(frames: list[str]) -> None:
+        for reading in (
+            canonicalize_display("".join(frames)),
+            "".join(canonicalize_display(f) for f in frames),
+        ):
+            assert _redact_all(reading) == reading, f"key readable across frames: {frames}"
+
+    def _renderer(self, monkeypatch: pytest.MonkeyPatch) -> tuple[DiscordRenderer, FakeClient]:
+        cli = FakeClient()
+        r = DiscordRenderer(
+            cli, "chan1", DISCORD_CAPABILITIES, session_key="sk", show_thinking=True  # type: ignore[arg-type]
+        )
+        # No throttle: every chunk becomes its own live frame, so the bubble is
+        # edited more than once.
+        monkeypatch.setattr("kiro_crew.discord.renderer._EDIT_THROTTLE_S", 0.0)
+        return r, cli
+
+    @staticmethod
+    def _screen(cli: FakeClient) -> list[str]:
+        """Every message's FINAL delivered form (the last edit wins per bubble)."""
+        final: dict[str, str] = {}
+        order: list[str] = []
+        mid = 100
+        for text, _ in cli.sent:
+            mid += 1
+            key = str(mid)
+            order.append(key)
+            final[key] = text
+        for edit_mid, text, _ in cli.edits:
+            final[edit_mid] = text
+        return [final[k] for k in order]
+
+    @pytest.mark.asyncio
+    async def test_an_edit_of_the_open_bubble_is_graded_against_the_message_above(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A note ends in a key prefix and the answer bubble below completes it.
+
+        The second chunk EDITS the bubble, and that edit must be graded against
+        ``_bubble_above`` like the first send was.
+        """
+        r, cli = self._renderer(monkeypatch)
+        await r.on_turn_start()
+        # Reasoning note whose tail is a credential PREFIX (matches nothing alone).
+        await r.on_thinking("here is the reasoning and the key is AKIA")
+        await r._flush_thinking()
+        # The note is now a delivered message; a fresh answer lands below it.
+        await r.on_text_chunk("IOSFODNN7EXAMPLE")
+        # A SECOND chunk edits that same open bubble.
+        await r.on_text_chunk(" and some more answer text after the key")
+        await r.on_done()
+
+        frames = self._screen(cli)
+        assert any("💭" in f for f in frames), "the reasoning note must be delivered"
+        assert len(frames) >= 2, f"fixture delivered {len(frames)} frame(s); it grades no seam"
+        self._assert_no_key_on_screen([_delivered_form(f) for f in frames])
+
+    @pytest.mark.asyncio
+    async def test_the_final_seal_edit_does_not_restore_the_key(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``on_done``'s seal edits the open bubble in place -- graded, not raw.
+
+        The seal reaches ``_land_sealed`` with ``_stream_mid`` set, so it EDITS the
+        bubble. That edit must be graded against the bubble's predecessor, or the
+        final frame the reader keeps can restore the credential.
+        """
+        r, cli = self._renderer(monkeypatch)
+        await r.on_turn_start()
+        await r.on_thinking("reasoning ending in AKIA")
+        await r._flush_thinking()
+        # A single answer chunk: fresh send opens the bubble, then on_done seals it
+        # by EDITING that same bubble -- the seal-edit path.
+        await r.on_text_chunk("IOSFODNN7EXAMPLE is the completing half")
+        await r.on_done()
+
+        frames = self._screen(cli)
+        self._assert_no_key_on_screen([_delivered_form(f) for f in frames])
+
+    @pytest.mark.asyncio
+    async def test_the_record_still_lets_the_next_fresh_message_grade(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``_sent_tail`` still records the delivered frame for the next fresh message.
+
+        That cross-bubble seam is what ``_sent_tail`` guards.
+        """
+        r, cli = self._renderer(monkeypatch)
+        await r.on_turn_start()
+        await r.on_text_chunk("the answer ends in AKIA")
+        await r.on_done()
+        # Record must have captured the delivered frame (not stayed empty), so the
+        # next fresh message has a real predecessor to grade against.
+        assert r._sent_tail, "the delivered frame must be recorded for the next seam"
+        assert "AKIA" in r._sent_tail or _redact_all(r._sent_tail) != r._sent_tail
+
+    @pytest.mark.asyncio
+    async def test_a_transient_edit_failure_grades_the_fallback_against_sent_tail(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A failed seal-edit falls to a fresh POST below the STILL-VISIBLE bubble.
+
+        On a transient 429/5xx the bubble is still on screen, so the fallback lands
+        right below it and must grade against ``_sent_tail``, not ``_bubble_above``.
+        """
+        r, cli = self._renderer(monkeypatch)
+        await r.on_turn_start()
+        # Fresh send opens a bubble whose delivered frame ends in a credential PREFIX.
+        await r.on_text_chunk("the streamed answer so far AKIA")
+        assert r._stream_mid is not None, "a live bubble must be open"
+        # The seal will EDIT that open bubble; force a TRANSIENT edit failure so it
+        # falls through to a fresh POST while the bubble stays visible. The POST
+        # completes the key.
+        r._buf = ["IOSFODNN7EXAMPLE and the rest of the finalized answer"]
+        r._delivery_text = None
+
+        async def _edit_fails(*_a: Any, **_k: Any) -> bool:
+            return False
+
+        monkeypatch.setattr(r._client, "edit_message_with_files", _edit_fails)
+        await r._seal_current(extract_uploads=False)
+
+        frames = self._screen(cli)
+        assert len(frames) >= 2, f"fixture delivered {len(frames)} frame(s); it grades no seam"
+        self._assert_no_key_on_screen([_delivered_form(f) for f in frames])
+
+    @pytest.mark.asyncio
+    async def test_a_successful_live_edit_records_the_frame_it_put_on_screen(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A live EDIT is what the reader sees, so it must become ``_sent_tail``.
+
+        A later failed seal-edit falls to a POST graded against ``_sent_tail``; a stale
+        first frame there would leave the seam to the frame on screen ungraded.
+        """
+        r, cli = self._renderer(monkeypatch)
+        await r.on_turn_start()
+        # Fresh send opens the bubble (frame 1).
+        await r.on_text_chunk("frame one opening text")
+        first_frame = r._sent_tail
+        assert first_frame, "the fresh send must record the opening frame"
+        # A second chunk EDITS the same open bubble (no throttle) -> frame 2.
+        await r.on_text_chunk(" and now considerably more streamed answer text")
+        assert r._stream_mid is not None, "the bubble must still be open (an edit, not a send)"
+        # _sent_tail must now be the EDITED frame the reader sees, not frame 1.
+        assert r._sent_tail != first_frame, (
+            "the successful live edit did not record what it put on screen -- a later "
+            "failed-seal fallback would grade against the stale opening frame"
+        )
+        assert r._sent_tail == r._shown, "the recorded frame must be the one shown"
+
+    @pytest.mark.asyncio
+    async def test_a_failed_live_edit_does_not_record_the_unsent_frame(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A live edit that FAILS must not poison ``_sent_tail`` with an unsent frame.
+
+        ``_record_sent`` runs only after a send or edit succeeds; a frame no reader saw
+        would become the graded predecessor of a later fallback POST.
+        """
+        r, cli = self._renderer(monkeypatch)
+        await r.on_turn_start()
+        # Fresh send opens the bubble (recorded frame 1 = what is on screen).
+        await r.on_text_chunk("frame one opening text")
+        on_screen_frame = r._sent_tail
+        assert on_screen_frame, "the fresh send must record the opening frame"
+
+        # The next chunk EDITS the bubble, but the edit FAILS.
+        async def _edit_fails(*_a: Any, **_k: Any) -> bool:
+            return False
+
+        monkeypatch.setattr(r._client, "edit_message", _edit_fails)
+        await r.on_text_chunk(" a second chunk whose edit will fail to land")
+        # _sent_tail must NOT have advanced to the unsent (failed) frame.
+        assert r._sent_tail == on_screen_frame, (
+            "a failed live edit recorded an unsent frame as _sent_tail -- a later "
+            "fallback POST would grade against a message no reader ever saw"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_deleted_bubble_grades_the_fallback_against_the_visible_neighbour(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A moderator-deleted bubble: the fallback POST lands below _bubble_above.
+
+        With the bubble deleted (EDIT_GONE), the visible neighbour is ``_bubble_above``,
+        not the deleted ``_sent_tail``. Here ``_sent_tail`` is innocuous and
+        ``_bubble_above`` ends in a key prefix, so grading the wrong one leaks the key.
+        """
+        r, cli = self._renderer(monkeypatch)
+        await r.on_turn_start()
+        r._stream_mid = "99"  # a live bubble exists...
+        r._bubble_above = "the visible neighbour above ends in AKIA"  # ...below THIS
+        r._record_sent("an innocuous deleted-bubble frame")  # _sent_tail = deleted frame
+        r._pending_note_tail = ""
+        cli.edit_gone = True  # the edit finds the bubble DELETED (404)
+        # The fallback POST completes the key begun in the visible neighbour.
+        await r._land_sealed("IOSFODNN7EXAMPLE completes the credential", [], None)
+
+        frames = [t for t, _ in cli.sent] + [t for _m, t, _c in cli.edits]
+        # The visible neighbour is what the reader sees above the POST; read them
+        # together the way the grader must have accounted for.
+        neighbour = "the visible neighbour above ends in AKIA"
+        self._assert_no_key_on_screen(
+            [_delivered_form(neighbour)] + [_delivered_form(f) for f in frames]
+        )

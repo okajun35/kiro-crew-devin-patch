@@ -1,0 +1,666 @@
+"""The deferred reset of a dashboard session: consuming a pending reset before the next turn
+allocates, and the retry armed while the reset cannot run yet; and the hand-back of the
+session when a turn ends, on any exit path (``_turn_release_session``): the deferred OPTIONS
+expiry, the mirror stream's close, the reset or conversation discard the turn asked for, the
+session permit's release, the turn identity's clear and the unclaimed-directive report."""
+
+from __future__ import annotations
+
+import asyncio
+from typing import TYPE_CHECKING
+
+from kiro_crew.dashboard.chat_utils import _broadcast_expired_oauth_banners
+
+if TYPE_CHECKING:
+    from kiro_crew.dashboard.chat_runner import (
+        STOP_REASON_CANCELLED,
+        STOP_REASON_END_TURN,
+        DashboardState,
+        _ChatSlot,
+        effective_session_key,
+        expire_slack_options,
+        idle_slot_admits_drain,
+        logger,
+        notify_code_channel_turn_end,
+        subagents_attached_async,
+        teardown_hold_active,
+    )
+    from kiro_crew.dashboard.chat_turn.directives import _report_unclaimed_directives
+    from kiro_crew.dashboard.chat_turn.eager_spawn import schedule_eager_spawn
+    from kiro_crew.dashboard.chat_turn.queue_cycle import _arm_synthesis_recheck
+    from kiro_crew.dashboard.chat_turn.queue_drain import _start_next_queued_turn
+    from kiro_crew.dashboard.chat_turn.recipient import (
+        _retire_mirror_thinking,
+        cross_surface_withheld,
+        slack_publication_withheld,
+    )
+    from kiro_crew.dashboard.chat_turn.turn_locals import _ChatTurn
+
+# Retry cadence for a deferred project-change reset or conversation discard
+# whose consume DECLINED (busy channel turn, attached children, a pending
+# question) or raised. A dashboard slot gets its retry for
+# free at the next turn boundary, but a channel-linked slot's turns do not
+# pass through those boundaries — without an owned retry, a decline against a
+# busy channel session would leave the flag armed forever while the live
+# session keeps serving the old CWD, and an idle slot holding its queue behind
+# a discard would hold it for good. The retry consumes with ``allow_discard``,
+# which is safe off a turn end for the atomic refusals ``_consume_pending_reset``
+# names. The retry of the project RESET is deliberately COEXTENSIVE
+# with that flag's lifetime: it exits only when the flag clears or the slot is
+# replaced, never on a clock — a channel turn can outlast any fixed budget,
+# and a timed-out retry would strand the old project permanently on a slot
+# with no other consume boundary. One sleep per tick per armed slot is the
+# whole cost; a stuck consume is surfaced by the periodic warning below.
+_PENDING_RESET_RETRY_DELAY_SECS = 5.0
+
+
+_PENDING_RESET_RETRY_WARN_EVERY = 120  # one warning per ~10 minutes armed
+
+
+# The retry is unbounded, but the QUEUE HOLD a pending discard imposes is not: an
+# unlanded reset still answers, a held queue answers nothing. Only a REFUSAL (a
+# raise, or ``skip_if_busy`` declining) counts; children and cards end on their own.
+_TEARDOWN_HOLD_MAX_TICKS = 60  # ~5 minutes of refusals before the hold is given up
+
+
+_pending_reset_wakeups: dict[asyncio.Task, asyncio.Event] = {}
+
+
+def _a_foreign_turn_owns_the_slot(slot: "_ChatSlot", *, own_turn: bool) -> bool:
+    """Whether a turn OTHER than this caller holds or has reserved *slot*.
+
+    ``slot.task`` is the outer ``spawn_guarded_turn`` task and the turn runs two
+    tasks further in, so a turn-path caller must SAY it is the slot's own turn
+    (``own_turn``). A reservation defers either way: ``chat_send`` clears its own
+    before the turn body runs, so a turn never observes its own.
+    """
+    if slot._turn_admission_reserved:
+        return True
+    if own_turn:
+        return False
+    task = slot.task
+    return bool(task is not None and not task.done())
+
+
+def _arm_pending_reset_retry(state: "DashboardState", slot: "_ChatSlot") -> None:
+    """Own the retry of a declined deferred reset (channel slots have no
+    turn-boundary consume, so somebody must).
+
+    Deduped by OWNER IDENTITY, not just key: a decline observed by the retry
+    task itself re-enters here and must not stack a second task, while a
+    REPLACEMENT slot under the same key must not be suppressed by a retiring
+    owner's still-live task — that task exits on its own identity check, and
+    its compare-and-pop cleanup cannot remove a successor's registration.
+    """
+    entry = state._pending_reset_retries.get(slot.key)
+    if entry is not None and entry[0] is slot and not entry[1].done():
+        return
+
+    def _teardown_owed() -> bool:
+        return (
+            slot._pending_reset_history_key is not None
+            or slot._pending_discard_conversation_key is not None
+        )
+
+    async def _release_and_drain() -> None:
+        """Hand the floor back to whatever the hold was keeping from running.
+
+        Keyed on the DISCARD clearing: an unlandable reset would strand the queue.
+        No turn end is coming here, and the consume yields, so re-check the slot.
+        ``_start_next_queued_turn`` has no auth check (callers gate on
+        ``_last_turn_auth_required``), and a signed-out drain drops a person's
+        prompt from the post-login resume, so this caller gates too.
+        """
+        async with slot._lock:
+            if teardown_hold_active(state, slot) or not idle_slot_admits_drain(state, slot):
+                return
+            if slot._queue:
+                slot._turn_admission_reserved = True
+                try:
+                    started = await _start_next_queued_turn(state, slot)
+                finally:
+                    slot._turn_admission_reserved = False
+                if started:
+                    return
+            # The drain can start nothing on a non-empty queue, and the hold also
+            # withheld synthesis, whose only other trigger is a fresh send.
+            if slot._pending_synthesis and not slot._synthesis_inflight:
+                _arm_synthesis_recheck(state, slot)
+
+    async def _wait_is_structural() -> bool:
+        """Whether the discard waits on something that ends on its own (children, a card).
+
+        Re-derived per attempt so no stored copy of the reason can go stale.
+        """
+        key = slot._pending_discard_conversation_key
+        if key is None:
+            return False
+        if await subagents_attached_async(state, slot, key, "teardown_hold_budget"):
+            return True
+        if not getattr(slot, "_pending_discard_from_wake", False):
+            return False
+        # deferred: session_directive_apply loads autonudge and the monitor
+        # stack at import.
+        from kiro_crew.dashboard.session_directive_apply import _slot_has_pending_interaction
+
+        return _slot_has_pending_interaction(state, slot)
+
+    def _the_hold_is_withholding_something() -> bool:
+        """Whether giving the hold up would release anything; a busy linked session
+        refuses every attempt, and giving up then throws the reset away for nothing."""
+        if slot._queue:
+            return True
+        return bool(slot._pending_synthesis and not slot._synthesis_inflight)
+
+    def _give_up_the_hold(attempts: int) -> None:
+        """Stop holding *slot*'s queue behind a discard that will not land.
+
+        Clears the key, since every reader derives the hold from it; the row says
+        replies may now come from the conversation the person asked to drop.
+        """
+        if slot._pending_discard_conversation_key is None:
+            return
+        released_entries = bool(slot._queue)
+        slot._pending_discard_conversation_key = None
+        slot._pending_discard_from_wake = False
+        logger.warning(
+            "Giving up the queue hold on slot %s: the queued conversation discard "
+            "was refused or raised on %d attempts with nothing left to wait for",
+            slot.key,
+            attempts,
+        )
+        released = (
+            "your queued messages have been released and may be answered from it"
+            if released_entries
+            else "the reply it was holding back may come from it"
+        )
+        slot.append(
+            "system",
+            f"⚠️ Could not drop the previous conversation, so {released}. Start a "
+            "new chat if the replies look like they came from the wrong "
+            "conversation.",
+            "msg msg-info",
+        )
+
+    wake = asyncio.Event()
+
+    async def _retry() -> None:
+        ticks = 0
+        refusals = 0
+        counting_for: str | None = None
+        try:
+            while True:
+                try:
+                    await asyncio.wait_for(wake.wait(), _PENDING_RESET_RETRY_DELAY_SECS)
+                except TimeoutError:
+                    pass
+                wake.clear()
+                if state.get_slot(slot.key) is not slot:
+                    return  # slot deleted or replaced; nothing owed BY US
+                held = slot._pending_discard_conversation_key
+                if not _teardown_owed():
+                    await _release_and_drain()
+                    return  # consumed by a turn boundary or eager consume
+                if _a_foreign_turn_owns_the_slot(slot, own_turn=False):
+                    # `skip_if_busy` cannot see a reserved-but-unacquired turn, which
+                    # would then lose its context. Its own end is the boundary.
+                    ticks += 1
+                    continue
+                await _consume_pending_reset(state, slot, allow_discard=True)
+                if held is not None and slot._pending_discard_conversation_key is None:
+                    # The hold is over even if the reset is still owed. Respawn the
+                    # dropped session as the turn-path consume does for its own.
+                    schedule_eager_spawn(state, slot)
+                    await _release_and_drain()
+                if not _teardown_owed():
+                    return
+                ticks += 1
+                # The budget belongs to ONE discard (reset when the key changes) and
+                # counts only while that discard is armed AND withholding something.
+                armed = slot._pending_discard_conversation_key
+                if armed != counting_for:
+                    counting_for = armed
+                    refusals = 0
+                if (
+                    armed is not None
+                    and _the_hold_is_withholding_something()
+                    and not await _wait_is_structural()
+                ):
+                    refusals += 1
+                    if refusals >= _TEARDOWN_HOLD_MAX_TICKS:
+                        _give_up_the_hold(refusals)
+                        counting_for = None
+                        refusals = 0
+                        await _release_and_drain()
+                        if not _teardown_owed():
+                            return
+                if ticks % _PENDING_RESET_RETRY_WARN_EVERY == 0:
+                    logger.warning(
+                        "Pending project-change reset for slot %s still armed "
+                        "after %d retries; the owning session has stayed busy "
+                        "(or kept children attached) the whole time",
+                        slot.key,
+                        ticks,
+                    )
+        finally:
+            # Compare-and-pop: only remove OUR OWN registration — a
+            # replacement slot may have overwritten it while this task was
+            # winding down, and popping unconditionally would orphan the
+            # successor's dedupe entry.
+            own = asyncio.current_task()
+            if own is not None:
+                _pending_reset_wakeups.pop(own, None)
+            current = state._pending_reset_retries.get(slot.key)
+            if current is not None and current[1] is own:
+                state._pending_reset_retries.pop(slot.key, None)
+
+    task = asyncio.create_task(_retry())
+    _pending_reset_wakeups[task] = wake
+    state._pending_reset_retries[slot.key] = (slot, task)
+
+
+def _wake_pending_reset_retry(state: "DashboardState", slot: "_ChatSlot") -> None:
+    """Run *slot*'s armed retry now instead of at its next tick, with every guard it has."""
+    entry = state._pending_reset_retries.get(slot.key)
+    if entry is None or entry[0] is not slot:
+        return
+    wake = _pending_reset_wakeups.get(entry[1])
+    if wake is not None:
+        wake.set()
+
+
+async def _consume_pending_reset(
+    state: DashboardState, slot: _ChatSlot, *, allow_discard: bool = False, own_turn: bool = False
+) -> bool:
+    """Apply a deferred session reset queued on *slot*, if any.
+
+    Returns whether a teardown actually ran, so a caller can decide whether a
+    respawn is owed. A deferral left armed returns False.
+
+    Two independent deferrals share this consumer, and both are queued rather
+    than applied inline because their producer runs INSIDE the turn they would
+    tear down: a project change (set_project) and a conversation discard
+    (reset_conversation).
+
+    They are not alternatives and neither subsumes the other, so when both are
+    eligible both run, project change first. ``reset`` recreates the session but
+    leaves replay suppression alone, so a discard that asked for
+    ``replay=False`` still has to run to suppress the ``[CONVERSATION HISTORY]``
+    rebuild — dropping it because a reset had already torn the session down
+    would hand the next turn a reconstruction of the conversation the caller
+    discarded.
+
+    ``allow_discard`` IS THE BOUNDARY. Three callers set it: the end-of-turn one,
+    a no-channel ``/clear`` (``_answer_slash_without_channel``), and the
+    armed-reset retry below. The retry runs whether or not a turn is in flight,
+    so what makes it safe is not a turn end but the two atomic
+    refusals described below: ``skip_if_busy`` under the session lock, and the
+    attached-children wait. A turn end is simply the boundary that comes for
+    free on a dashboard slot.
+    The project reset is consumed at three points including the one just before
+    ``get_or_create``, and that pre-acquire point is safe for it only in the
+    narrow sense its own comment claims: no lock is held by THIS turn, so
+    ``reset`` cannot self-kill. It says nothing about another actor on the same
+    session — a channel (Slack, Discord) turn runs on the linked session with no
+    dashboard task at all, so a discard consumed there tears the provider down
+    under a channel response that is still streaming and the reply is lost. The
+    discard therefore waits for a moment when no turn is running on this
+    session. A turn end is one such moment; the retry finds others, and checks
+    each atomically rather than assuming it.
+
+    Even there the boundary is checked atomically, not assumed: the discard goes
+    through ``discard_conversation(..., skip_if_busy=True)``, which refuses under
+    the same session lock that pops the session. Probing from here and tearing
+    down afterwards would leave a window between the two — long enough for a
+    channel message to acquire the session's semaphore and begin streaming a
+    reply the teardown would then destroy. The semaphore is also a stricter
+    signal than ``has_active_turn``, which cannot see a turn that holds the
+    semaphore but has not yet put a prompt in flight.
+
+    The discard additionally waits on sub-agent children.
+    ``discard_conversation`` releases the shared runtime those children run on,
+    and turn end is exactly when they are most likely to outlive their parent:
+    ``slot.running`` is already False while they keep going, and the last child
+    can still have a ``[Subagent completion event]`` injection in flight. So a
+    slot with attached children leaves the flag ARMED and the discard lands at a
+    later consume instead — the caller waits, the child's work survives. That is
+    the same policy the immediate route enforces as a 409, applied through the
+    same shared predicate rather than a second copy of the probes.
+
+    Each flag is cleared only after its own effect succeeds, and compare-and-
+    cleared so a key queued by a concurrent producer during the await is not
+    clobbered.
+    """
+    torn_down = False
+    if slot._pending_reset_history_key:
+        pending_key = slot._pending_reset_history_key
+        current_key = effective_session_key(slot)
+        if pending_key != current_key:
+            # The slot REBOUND after the flag was armed (a cron/workflow slot
+            # gets linked when its first result is injected; a channel link can
+            # land between arming and this consume). Resetting the stale key and
+            # clearing the flag would tear down a session nobody is on and let
+            # the slot's ACTUAL session keep the old CWD forever — the exact
+            # stale-binding class this deferral exists to remove. Re-arm to the
+            # current session so the reset lands where the turns run; the
+            # producer already validated the project change belongs to this
+            # slot, and re-pointing the key needs no re-authorization (it names
+            # the slot's own live session, not a new authority).
+            slot._pending_reset_history_key = current_key
+            _arm_pending_reset_retry(state, slot)
+            return torn_down
+        if await subagents_attached_async(state, slot, pending_key, "consume_pending_reset"):
+            # Left armed on purpose, same as the discard branch below: the
+            # reset releases the shared runtime attached children run on, so
+            # applying it now would discard their work. The retry task owns
+            # the follow-up — children can outlive every turn boundary.
+            logger.debug(
+                "Deferring queued project-change reset for slot %s: sub-agents attached",
+                slot.key,
+            )
+            _arm_pending_reset_retry(state, slot)
+        else:
+            try:
+                # skip_if_busy, for the same reason the discard branch below
+                # gives: the pending key can name a LIVE channel session (a
+                # linked slot's project change arms `slack:<ts>`), and a force
+                # reset here would tear the provider down under a streaming
+                # channel reply. The check and the teardown must be one atomic
+                # step under the session lock.
+                #
+                # The flag is spent ONLY on a real teardown (reset returned
+                # True). A False return cannot distinguish "nothing registered
+                # under the key" from a busy decline or a session that is
+                # COLD-STARTING and not yet registered — clearing on a probe
+                # that answered None would let a concurrent cold start carrying
+                # the old CWD register afterwards and serve the stale project
+                # with the flag already gone. Leaving it armed is always safe:
+                # the next consume lands it, at worst costing one redundant
+                # cold start after the reset tears down an already-correct
+                # idle session.
+                reset_ok = await state.sessions.reset(pending_key, skip_if_busy=True)
+            except Exception:
+                # A teardown that raised leaves the session in a state this
+                # slot cannot vouch for — neither is its withhold verdict, so
+                # drop it ("unknown" fails open), mirroring
+                # `_reset_slot_session`'s BaseException path. This reset does
+                # not go through that helper, so it owns the drop itself.
+                slot.forget_session_model_state()
+                logger.warning(
+                    "Failed to consume pending project-change reset for slot %s",
+                    slot.key,
+                    exc_info=True,
+                )
+            else:
+                if reset_ok:
+                    # The verdict describes the session that advertised the
+                    # model list, and that session is gone. Dropped only on a
+                    # REAL teardown (or the raise above): a busy decline
+                    # leaves the session — and therefore its verdict — live
+                    # and accurate, and erasing it would let the dashboard
+                    # show a withheld model as available.
+                    slot.forget_session_model_state()
+                    torn_down = True
+                    if slot._pending_reset_history_key == pending_key:
+                        slot._pending_reset_history_key = None
+                    # Freshness push for open tabs; verdict-driven (see
+                    # _broadcast_expired_oauth_banners).
+                    _broadcast_expired_oauth_banners(state, slot)
+                else:
+                    logger.debug(
+                        "Deferring queued project-change reset for slot %s: "
+                        "no teardown landed (busy, cold-starting, or no session)",
+                        slot.key,
+                    )
+                    # A channel-linked slot's turns never pass a dashboard
+                    # turn boundary, so a decline here would otherwise never
+                    # be retried and the live channel session would keep the
+                    # old CWD indefinitely. The bounded retry task owns the
+                    # follow-up (deduped; a decline observed by the task
+                    # itself does not stack a second one).
+                    _arm_pending_reset_retry(state, slot)
+    if allow_discard and slot._pending_discard_conversation_key:
+        discard_key = slot._pending_discard_conversation_key
+        if await subagents_attached_async(state, slot, discard_key, "consume_pending_discard"):
+            # Left armed on purpose: releasing the shared runtime now would kill
+            # children that are still running, queued, or delivering a result.
+            logger.debug(
+                "Deferring queued conversation discard for slot %s: sub-agents attached",
+                slot.key,
+            )
+            _arm_pending_reset_retry(state, slot)
+            return torn_down
+        from kiro_crew.dashboard.session_directive_apply import _slot_has_pending_interaction
+
+        if getattr(slot, "_pending_discard_from_wake", False) and _slot_has_pending_interaction(
+            state, slot
+        ):
+            # A patrol wake's reset never lands while a person is being asked
+            # something: the answer would reach a chat with no memory of it.
+            logger.debug(
+                "Deferring queued conversation discard for slot %s: question or approval pending",
+                slot.key,
+            )
+            _arm_pending_reset_retry(state, slot)
+            return torn_down
+        if _a_foreign_turn_owns_the_slot(slot, own_turn=own_turn):
+            # Re-read AFTER the awaited probe: a turn can reserve admission during it,
+            # and `skip_if_busy` cannot see a reserved-but-unacquired turn.
+            logger.debug(
+                "Deferring queued conversation discard for slot %s: another turn admitted",
+                slot.key,
+            )
+            _arm_pending_reset_retry(state, slot)
+            return torn_down
+        try:
+            # ``skip_if_busy`` rather than a busy-probe here: the check and the
+            # teardown have to be ONE atomic step under the session lock. A
+            # caller-side probe leaves a window in which a channel turn acquires
+            # the session's semaphore and starts streaming, and the teardown then
+            # takes its provider away. False means it refused — leave the flag
+            # armed and let a later boundary apply it.
+            #
+            # ``refuse_if`` re-asks under that lock: acquiring it can wait behind
+            # another key's ``record_session_ended``, and a turn can reserve meanwhile.
+            #
+            # ``replay=False`` is the only value this path ever wants: replaying
+            # the transcript into the fresh conversation returns most of what the
+            # reset reclaimed. The flag exists on the manager for the HTTP route,
+            # which does let a caller choose.
+            discarded = await state.sessions.discard_conversation(
+                discard_key,
+                replay=False,
+                skip_if_busy=True,
+                refuse_if=lambda: _a_foreign_turn_owns_the_slot(slot, own_turn=own_turn),
+            )
+            if not discarded:
+                logger.debug(
+                    "Deferring queued conversation discard for slot %s: a turn holds or"
+                    " has been admitted to the session",
+                    slot.key,
+                )
+                _arm_pending_reset_retry(state, slot)
+                return torn_down
+            torn_down = True
+            # The discarded conversation is the one that advertised the model
+            # list, so its verdict goes with it. AFTER the await here, unlike the
+            # reset above: a refusal is a normal outcome on this path (turn in
+            # flight -> flag stays armed, session untouched), so dropping before
+            # would forget a verdict that is still accurate.
+            slot.forget_session_model_state()
+            if slot._pending_discard_conversation_key == discard_key:
+                slot._pending_discard_conversation_key = None
+                slot._pending_discard_from_wake = False
+            # The discarded conversation's MCP report describes a session that no
+            # longer exists; the fresh one will report for itself.
+            if slot.clear_mcp_report():
+                state.broadcast_ws("mcp_report_update", {"slot": slot.key, "mcp_report": None})
+            # Freshness push for open tabs (verdict-driven — see
+            # _broadcast_expired_oauth_banners).
+            _broadcast_expired_oauth_banners(state, slot)
+        except Exception:
+            logger.warning(
+                "Failed to consume pending conversation discard for slot %s",
+                slot.key,
+                exc_info=True,
+            )
+            _arm_pending_reset_retry(state, slot)
+    return torn_down
+
+
+async def _turn_release_session(turn: _ChatTurn) -> None:
+    """Hand the session back: OPTIONS expiry, mirror close, reset or discard, permit."""
+    _acquired = turn._acquired
+    _deferred_options_expiry = turn._deferred_options_expiry
+    _mirror_active_task = turn._mirror_active_task
+    _mirror_active_task_title = turn._mirror_active_task_title
+    _mirror_chan = turn._mirror_chan
+    _mirror_stream_ts = turn._mirror_stream_ts
+    _mirror_thread = turn._mirror_thread
+    _seen_tool_identity = turn._seen_tool_identity
+    _turn_started = turn._turn_started
+    session_key = turn.session_key
+    slot = turn.slot
+    state = turn.state
+    # Clean up mirror stream on any exit path.
+    #
+    # The release below MUST happen however this block exits. Each await in
+    # here is already guarded against ``Exception``, but ``CancelledError``
+    # derives from ``BaseException`` (since 3.8), so a cancellation
+    # delivered while one of them is suspended slips past every
+    # ``except Exception`` and skips the release entirely.
+    #
+    # The permit is keyed by SESSION, so leaking it does not merely lose
+    # this turn: the session reads as permanently busy, every later turn for
+    # it blocks forever, no queued turn drains, and only a gateway restart
+    # clears it. The nested try/finally makes the release unconditional
+    # while preserving the reset-then-release ordering.
+    try:
+        if turn._code_channel_turn:
+            # Exactly one end per start, on every exit path: the channel's
+            # status goes back to ready and subscribers settle the turn.
+            # First in this block and shielded, so a cancel landing in the
+            # cleanup below still lets it finish.
+            turn._code_channel_turn = False
+            try:
+                if turn._stop_reason == STOP_REASON_CANCELLED:
+                    outcome = "stopped"
+                elif turn._stop_reason == STOP_REASON_END_TURN:
+                    outcome = "ok"
+                else:
+                    outcome = "error"
+                await asyncio.shield(
+                    notify_code_channel_turn_end(
+                        _mirror_chan,
+                        _mirror_thread,
+                        session_key,
+                        source="slack" if slot._turn_channel_origin else "dashboard",
+                        outcome=outcome,
+                    )
+                )
+            except Exception:
+                logger.debug("code channel turn-end hooks failed", exc_info=True)
+        if _deferred_options_expiry:
+            _deferred_options_expiry = False
+            turn._deferred_options_expiry = _deferred_options_expiry
+            await expire_slack_options(state, session_key)
+        if _mirror_stream_ts and state.slack_client and _mirror_chan:
+            try:
+                # Fenced for the same reason _on_tool_call's in-progress append is:
+                # if that one was withheld, marking it complete here would publish the
+                # title for the first time. This runs BEFORE the fence is
+                # cleared in _end_turn_tail (chat_turn/queue_cycle.py), so it still
+                # sees the turn's own records.
+                if (
+                    _mirror_active_task
+                    and not cross_surface_withheld(state, slot)
+                    and not slack_publication_withheld(state, slot, _mirror_chan, _mirror_thread)
+                ):
+                    await state.slack_client.append_task(
+                        _mirror_chan,
+                        _mirror_stream_ts,
+                        _mirror_active_task,
+                        _mirror_active_task_title,
+                        "complete",
+                    )
+            except Exception:
+                logger.debug("Task append cleanup failed", exc_info=True)
+            try:
+                await state.slack_client.stop_stream(_mirror_chan, _mirror_stream_ts)
+            except Exception:
+                logger.debug("Stream cleanup failed", exc_info=True)
+        if turn._mirror_thinking_ts and state.slack_client and _mirror_chan:
+            # A turn that ended with neither a tool nor a mirrored answer
+            # (an error, a cancel, a withheld reply) still owes the thread
+            # its placeholder's removal. Best-effort and never raises.
+            turn._mirror_thinking_ts = await _retire_mirror_thinking(
+                state.slack_client, _mirror_chan, turn._mirror_thinking_ts
+            )
+        if _acquired and (turn.needs_session_reset or turn.needs_conversation_discard):
+            # Neither branch below goes through `_reset_slot_session`, so the
+            # withhold verdict is dropped here: both replace the session that
+            # advertised the model list (an agent switch can even change the
+            # provider), and the verdict describes that session. Dropped for
+            # both branches and before the await, so a failed teardown leaves
+            # the slot at "unknown" rather than carrying a verdict it can no
+            # longer vouch for.
+            slot.forget_session_model_state()
+            try:
+                if turn.needs_conversation_discard:
+                    # Poisoned-conversation escalation: clear ONLY the
+                    # resume sid (keeping the session-map entry with its
+                    # Slack thread/channel linkage), so the re-queued
+                    # recovery turn cold-starts a fresh native
+                    # conversation instead of session/load-ing the same
+                    # rejected one (which reset() would do).
+                    await state.sessions.discard_conversation(session_key)
+                else:
+                    await state.sessions.reset(session_key)
+            except Exception:
+                logger.warning("Failed to reset session %s after agent switch", session_key)
+            # Freshness push for open tabs. Unconditional where the old
+            # write-time retirement needed an outcome gate: the helper
+            # re-resolves the live child at call time, so a swallowed
+            # teardown failure leaves the child alive, the stamps still
+            # match, and nothing is broadcast (see
+            # _broadcast_expired_oauth_banners).
+            _broadcast_expired_oauth_banners(state, slot)
+    finally:
+        if _acquired:
+            # A successful reset() above already popped the key under its
+            # own lock, so this is a no-op on that path (the popped
+            # session's semaphore is discarded with it). Kept unconditional
+            # so a reset that failed or was cancelled still hands back the
+            # permit rather than stranding the session.
+            state.sessions.release(session_key)
+        # This turn's identity dies WITH its session, and inside the same
+        # finally for the same reason the release is: the reset above can be
+        # cancelled, and CancelledError derives from BaseException, so a
+        # clear placed after this block is simply skipped and the slot keeps
+        # advertising a turn that is gone.
+        #
+        # It must also land before `_start_next_queued_turn` in `_end_turn_tail`'s hand-off
+        # can install the SUCCESSOR's key — a clear after that would wipe a
+        # live turn's identity and drop the cancel routes back to mutable
+        # routing. Compare-and-clear keeps that true if the ordering is ever
+        # rearranged: only the turn that installed a key may retire it.
+        #
+        # Outside the `_acquired` guard: the identity is published before
+        # the permit is taken, so a cold start that never acquired one still
+        # has something to retire.
+        if slot._active_turn_session_key == session_key:
+            slot._active_turn_session_key = ""
+        # Spelling-independent backstop for a directive call whose tool
+        # identity and result marker were both lost by the backend. The
+        # validated payload reached the gateway, but no frame claimed it,
+        # so every per-frame diagnostic in _on_tool_result was structurally unreachable.
+        # Inspect only records parked during THIS turn: residue from an
+        # earlier abandoned turn must not blame the current one. Diagnostic
+        # only — claim, refusal, and expiry semantics stay unchanged.
+        await _report_unclaimed_directives(
+            state,
+            slot,
+            session_key,
+            _turn_started=_turn_started,
+            _seen_tool_identity=_seen_tool_identity,
+        )

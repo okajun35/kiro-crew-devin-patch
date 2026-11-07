@@ -1,0 +1,1365 @@
+"""The subagent force-stop path publishes ONE terminal report, once its kill has decided.
+
+The reap names the run's own session, the run's report waits for its teardown, the record
+carries the kill before it is published and is not rewritten once delivered, a stop cancelled
+mid-teardown still reports, concurrent stops coalesce into one reap, and the reap fences the
+key against a start racing it.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import time
+from collections.abc import Iterator
+from contextlib import contextmanager
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+import subagent_force_stop_audit_helpers
+from subagent_force_stop_audit_helpers import (
+    _REFUSAL,
+    _audit,
+    _hanging_reset,
+    _kill_path_stubs,
+    _mock_ctx_builder,
+    _overdue_run,
+    _session_with_pid,
+)
+from test_subagent_continuable import _mock_sessions as _completing_sessions
+
+from kiro_crew import platform_compat, process_identity
+from kiro_crew.acp.client import AcpProcessDied
+from kiro_crew.config import KiroCrewConfig
+from kiro_crew.session import SessionManager
+from kiro_crew.slack.gateway import _compose_subagent_completion
+from kiro_crew.subagent import SubagentInfo, SubagentManager
+from kiro_crew.testing.wait import async_wait_until, await_until
+
+# The shared fixtures, bound here by name so pytest registers them for this module.
+_kill_seam = subagent_force_stop_audit_helpers._kill_seam
+_leads_its_own_group = subagent_force_stop_audit_helpers._leads_its_own_group
+_no_tree_behind_the_leader = subagent_force_stop_audit_helpers._no_tree_behind_the_leader
+
+
+# ── The reap names the run's own session ──
+
+
+class TestTheReapNamesTheRunsOwnSession:
+    """A continuation lives under its conversation's key, not ``subagent:<run id>``.
+
+    ``spawn_continue`` mints a new run id on the original ``info.conversation_key``. A key
+    derived from the run id names no session, so the stop would touch nothing yet read
+    ``reaped``.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_continuation_run_is_stopped_under_its_conversation_key(self) -> None:
+        manager, info, _run_key = _overdue_run("cont-run", pid=None)
+        info.conversation_key = "subagent:cont-orig"
+        _session_with_pid(manager, "subagent:cont-orig", 7373)
+        _hanging_reset(manager)
+        children, alive, start_id, sweep = _kill_path_stubs()
+
+        with (
+            patch("kiro_crew.subagent.Stats"),
+            patch("kiro_crew.subagent.sel") as mock_sel,
+            patch("kiro_crew.subagent._RESET_TIMEOUT", 0.05),
+            children,
+            alive,
+            start_id,
+            sweep,
+            patch("kiro_crew.platform_compat.kill_process_group") as group_kill,
+        ):
+            await manager._force_reap("cont-run", info, 7200.0)
+
+        # The reset, the kill and the release all name the conversation's key.
+        manager._sessions.reset.assert_awaited_once()
+        assert manager._sessions.reset.await_args.args == ("subagent:cont-orig",)
+        group_kill.assert_called_once_with(7373, platform_compat.SIGKILL)
+        row = _audit(mock_sel, "reaper_force_kill")
+        assert row["outcome"] == "reaped"
+        assert row["session_key"] == "subagent:cont-orig"
+        manager._sessions.release.assert_called_once_with("subagent:cont-orig", cleanup=False)
+        assert manager._process_handles == {}
+
+
+# ── The run's own report publishes only once its teardown has decided ──
+
+
+def _completing_run(
+    seen: list[Any],
+) -> SubagentManager:
+    """A manager whose provider stream ends at once, so a spawned run completes on its own.
+
+    ``on_done`` records the run's error text AT THE MOMENT the completion is
+    handed to the parent -- the object is mutated later, so only a reading taken
+    then can say what the parent actually received.
+    """
+    sessions = _completing_sessions()
+    sessions._sessions = {}
+    sessions.tearing_down = MagicMock(return_value=[])
+    return SubagentManager(
+        sessions=sessions,
+        ctx_builder=_mock_ctx_builder(),
+        on_done=AsyncMock(side_effect=lambda info: seen.append(info.error)),
+        on_event=AsyncMock(),
+        is_yolo=lambda: True,
+    )
+
+
+@pytest.mark.usefixtures("healthy_host_memory")
+class TestTheRunsOwnReportWaitsForItsTeardown:
+    """A run that completes publishes its record only once its own teardown has decided the kill.
+
+    The report is spawned ahead of the teardown (so a cancel cannot strand it) but waits,
+    bounded, for it; a clean ``delivered`` tombstone would hide a leaked process from the next
+    start. A completed run keeps its result and is flagged ``_leaked_process``, so its
+    tombstone carries ``leaked_process``.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_completed_run_whose_kill_failed_stays_completed_and_flags_the_survivor(
+        self,
+    ) -> None:
+        seen: list[Any] = []
+        manager = _completing_run(seen)
+        children, alive, start_id, sweep = _kill_path_stubs()
+
+        with (
+            patch("kiro_crew.subagent.Stats"),
+            patch("kiro_crew.subagent.sel") as mock_sel,
+            patch("kiro_crew.subagent.mark_delivered") as delivered,
+            children,
+            alive,
+            start_id,
+            sweep,
+            patch(
+                "kiro_crew.platform_compat.kill_process_group",
+                MagicMock(side_effect=_REFUSAL),
+            ),
+        ):
+            info = manager.spawn("finish, and leave the process standing", keep=True)
+            assert info is not None and not info.error
+            # The run's session, live under its key when the teardown snapshots
+            # it; its reset completes but the process stands and the kill is
+            # refused.
+            _session_with_pid(manager, f"subagent:{info.id}", 9911)
+            await await_until(manager._tasks[info.id], what="the run finishing")
+            await await_until(
+                asyncio.gather(*manager._report_tasks, return_exceptions=True),
+                what="the report tasks finishing",
+            )
+
+        assert len(seen) == 1, f"the parent received {len(seen)} completions"
+        assert not seen[0], f"a completed run reached the parent as a failure: {seen!r}"
+        assert info.outcome == "completed"
+        assert info._leaked_process is True
+        events = _done_events(manager)
+        assert len(events) == 1 and events[0]["outcome"] == "completed"
+        assert events[0]["error"] is None
+        # The parent acknowledged it: delivered, with the survivor handed to the next start.
+        delivered.assert_called_once()
+        assert delivered.call_args.kwargs["leaked_process"] is True
+        assert delivered.call_args.kwargs["outcome"] == "completed"
+        # The failure is kept where it is still true: the audit row.
+        row = _audit(mock_sel, "run_finally_force_kill")
+        assert row["outcome"] == "failed"
+        assert "ValueError: kill_process_group: refusing" in row["error"]
+
+    @pytest.mark.asyncio
+    async def test_a_completed_run_whose_reset_ended_the_process_is_delivered_clean(
+        self,
+    ) -> None:
+        """Control: the reset did its job, so the record is clean and the run is marked delivered."""
+        seen: list[Any] = []
+        manager = _completing_run(seen)
+
+        with (
+            patch("kiro_crew.subagent.Stats"),
+            patch("kiro_crew.subagent.sel") as mock_sel,
+            patch("kiro_crew.subagent.mark_delivered") as delivered,
+            patch("kiro_crew.platform_compat.get_process_start_id", return_value=None),
+            patch("kiro_crew.platform_compat.pid_exists", return_value=False),
+            patch("kiro_crew.platform_compat.kill_process_group") as group_kill,
+        ):
+            info = manager.spawn("finish cleanly", keep=True)
+            assert info is not None and not info.error
+            _session_with_pid(manager, f"subagent:{info.id}", 9912)
+            await await_until(manager._tasks[info.id], what="the run finishing")
+            await await_until(
+                asyncio.gather(*manager._report_tasks, return_exceptions=True),
+                what="the report tasks finishing",
+            )
+
+        assert seen == [None] or seen == [""], f"a clean completion carried an error: {seen!r}"
+        assert info.outcome == "completed"
+        group_kill.assert_not_called()
+        delivered.assert_called_once_with(info.id, elapsed=info.elapsed, credits=info.credits)
+        assert not [
+            call
+            for call in mock_sel().log_tool_invocation.call_args_list
+            if call.kwargs.get("tool_name") == "run_finally_force_kill"
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_record_the_run_already_wrote_is_re_written_with_the_failure(self) -> None:
+        """An errored run's tombstone (written by its own arm) is re-written under its cause, naming the kill."""
+        manager, info, key = _overdue_run("fin5", pid=7474)
+        info.error = "the stream raised"
+        _hanging_reset(manager)
+        children, alive, start_id, sweep = _kill_path_stubs()
+
+        with (
+            patch("kiro_crew.subagent.sel"),
+            patch("kiro_crew.subagent._RESET_TIMEOUT", 0.05),
+            patch("kiro_crew.subagent.read_tombstone", return_value={"cause": "error"}),
+            patch("kiro_crew.subagent.write_tombstone") as tombstones,
+            children,
+            alive,
+            start_id,
+            sweep,
+            patch(
+                "kiro_crew.platform_compat.kill_process_group",
+                MagicMock(side_effect=_REFUSAL),
+            ),
+        ):
+            await manager._teardown_run_session(info, key)
+
+        assert info.error.startswith(
+            "the stream raised; kill failed: ValueError: kill_process_group"
+        )
+        assert tombstones.call_count == 1, "the record on disk does not name the survivor"
+        assert tombstones.call_args.kwargs["cause"] == "error"
+        assert "; kill failed:" in tombstones.call_args.kwargs["detail"]
+        assert tombstones.call_args.kwargs["leaked_process"] is True
+
+    @pytest.mark.asyncio
+    async def test_a_completed_run_whose_kill_failed_is_flagged_for_its_report(
+        self,
+    ) -> None:
+        """A completed run's failed kill is flagged for its report, not folded into its record.
+
+        The run stays ``completed`` with its result: the failure is on the
+        ``run_finally_force_kill`` audit row. The ``delivered`` tombstone its
+        acknowledged report writes carries the flag; until then the folder
+        stays in orphan reconciliation.
+        """
+        manager, info, key = _overdue_run("fin6", pid=7575)
+        info.result = "the answer"
+        _hanging_reset(manager)
+        children, alive, start_id, sweep = _kill_path_stubs()
+
+        with (
+            patch("kiro_crew.subagent.sel") as mock_sel,
+            patch("kiro_crew.subagent._RESET_TIMEOUT", 0.05),
+            patch("kiro_crew.subagent.read_tombstone", return_value=None),
+            patch("kiro_crew.subagent.write_tombstone") as tombstones,
+            children,
+            alive,
+            start_id,
+            sweep,
+            patch(
+                "kiro_crew.platform_compat.kill_process_group",
+                MagicMock(side_effect=_REFUSAL),
+            ),
+        ):
+            await manager._teardown_run_session(info, key)
+
+        assert not info.error, f"a completed run's record took the kill failure: {info.error!r}"
+        assert info.outcome == "completed"
+        assert info.result == "the answer"
+        row = _audit(mock_sel, "run_finally_force_kill")
+        assert row["outcome"] == "failed"
+        assert row["error"].startswith("ValueError: kill_process_group: refusing")
+        # Not tombstoned until the parent acknowledges the completion: a restart
+        # before that must still find the folder and re-deliver it.
+        tombstones.assert_not_called()
+        assert info._leaked_process is True
+
+        # What the parent is told: a completion carrying the result, not ``Error: …``.
+        report = _compose_subagent_completion(info, _flush_only=False)
+        assert report.status == "completed"
+        assert "the answer" in report.detail
+        assert "kill failed" not in report.announce
+
+    @pytest.mark.asyncio
+    async def test_a_stopped_run_whose_kill_failed_still_names_the_failure(self) -> None:
+        """Control: only a COMPLETED run keeps a clean record; a stop still gains the suffix."""
+        manager, info, key = _overdue_run("fin7", pid=7676, user_stopped=True)
+        _hanging_reset(manager)
+        children, alive, start_id, sweep = _kill_path_stubs()
+
+        with (
+            patch("kiro_crew.subagent.sel"),
+            patch("kiro_crew.subagent._RESET_TIMEOUT", 0.05),
+            patch("kiro_crew.subagent.read_tombstone", return_value=None),
+            patch("kiro_crew.subagent.write_tombstone"),
+            children,
+            alive,
+            start_id,
+            sweep,
+            patch(
+                "kiro_crew.platform_compat.kill_process_group",
+                MagicMock(side_effect=_REFUSAL),
+            ),
+        ):
+            await manager._teardown_run_session(info, key)
+
+        assert info.error.startswith("kill failed: ValueError: kill_process_group: refusing")
+        assert info.outcome == "stopped"
+        assert info._leaked_process is True
+
+    @pytest.mark.asyncio
+    async def test_a_teardown_cancelled_before_its_kill_decided_names_it_and_is_not_delivered(
+        self,
+    ) -> None:
+        """A shutdown cancels the run task inside its reset: the kill never decided, and the record says so.
+
+        The report this teardown gates is released by the run's ``finally``
+        whatever the teardown did, so an undecided kill that recorded nothing
+        published a clean completion and wrote the ``delivered`` tombstone that
+        hid a process nothing had stopped from orphan reconciliation.
+        """
+        seen: list[Any] = []
+        manager = _completing_run(seen)
+        reset_entered = asyncio.Event()
+
+        async def _reset_that_hangs(session_key: str, **_: Any) -> bool:
+            reset_entered.set()
+            await asyncio.Event().wait()  # parked until the test cancels the run
+            return True
+
+        manager._sessions.reset = AsyncMock(side_effect=_reset_that_hangs)
+
+        with (
+            patch("kiro_crew.subagent.Stats"),
+            patch("kiro_crew.subagent.sel"),
+            patch("kiro_crew.subagent.mark_delivered") as delivered,
+            patch("kiro_crew.platform_compat.kill_process_group") as group_kill,
+        ):
+            info = manager.spawn("finish, then be cancelled in the teardown", keep=True)
+            assert info is not None and not info.error
+            _session_with_pid(manager, f"subagent:{info.id}", 9913)
+            await await_until(reset_entered, what="the reset entering")
+            # A gateway shutdown: the run task is cancelled while its reset hangs.
+            manager._shutting_down = True
+            manager._tasks[info.id].cancel()
+            await asyncio.gather(manager._tasks[info.id], return_exceptions=True)
+            await await_until(
+                asyncio.gather(*manager._report_tasks, return_exceptions=True),
+                what="the report tasks finishing",
+            )
+
+        group_kill.assert_not_called()  # the kill never ran: nothing was signalled
+        assert len(seen) == 1, f"the parent received {len(seen)} completions"
+        assert (
+            "kill failed: CancelledError: the teardown was cancelled before its kill decided"
+            in (seen[0] or "")
+        ), (f"the completion the parent received said the run ended clean: {seen!r}")
+        assert info.outcome == "failed"
+        delivered.assert_not_called()  # the folder stays visible to orphan reconciliation
+
+    @pytest.mark.asyncio
+    async def test_a_teardown_the_reap_cancelled_leaves_the_record_to_the_reap(self) -> None:
+        """Control: the reap consumed the handle and cancels the run task; its own arm names the kill, not this one."""
+        manager, info, key = _overdue_run("fin7", pid=7676)
+        info._reap_started = True  # the reap is in flight and owns the record
+        reset_entered = _hanging_reset(manager)
+
+        task = asyncio.ensure_future(manager._teardown_run_session(info, key))
+        # Cancel inside the reset, so a clean record means the run's own arm left
+        # it to the reap, not that the teardown never started.
+        await await_until(reset_entered, what="the teardown's reset")
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await await_until(task, what="the cancelled teardown")
+
+        assert not info.error, f"the run's finally named a kill the reap owns: {info.error!r}"
+
+    @pytest.mark.asyncio
+    async def test_a_teardown_undecided_when_the_reports_wait_runs_out_is_published_as_such(
+        self,
+    ) -> None:
+        """A kill still undecided when the report's wait expires is named, never published clean.
+
+        The wait bounds only the reset half; the fallback kill's executor hop can sit behind a
+        wedged close past it.
+        """
+        seen: list[Any] = []
+        manager = _completing_run(seen)
+        _hanging_reset(manager)
+        children, alive, start_id, sweep = _kill_path_stubs()
+        kill_may_decide = asyncio.Event()
+        real_signal = process_identity._signal_retained_group
+
+        async def _held_signal(*args: Any, **kwargs: Any) -> Any:
+            # The kill half outlasts the grace: it decides (the group signal is
+            # refused) only once the test has seen the report published.
+            await await_until(kill_may_decide, what="the test releasing the kill")
+            return await real_signal(*args, **kwargs)
+
+        with (
+            patch("kiro_crew.subagent.Stats"),
+            patch("kiro_crew.subagent.sel") as mock_sel,
+            patch("kiro_crew.subagent.mark_delivered") as delivered,
+            patch("kiro_crew.subagent._RESET_TIMEOUT", 0.05),
+            patch("kiro_crew.subagent._TEARDOWN_REPORT_GRACE", 0.05),
+            children,
+            alive,
+            start_id,
+            sweep,
+            patch("kiro_crew.process_identity._signal_retained_group", _held_signal),
+            patch("kiro_crew.platform_compat.kill_process_group", MagicMock(side_effect=_REFUSAL)),
+        ):
+            info = manager.spawn("finish, then hang in the reset and stall in the kill", keep=True)
+            assert info is not None and not info.error
+            run_task = manager._tasks[info.id]  # popped by the run's own finally later
+            _session_with_pid(manager, f"subagent:{info.id}", 9914)
+            # The report publishes once its grace runs out, with the kill undecided.
+            try:
+                await async_wait_until(lambda: seen, describe=lambda: f"error={info.error!r}")
+            finally:
+                kill_may_decide.set()
+            published = seen[0]
+            await await_until(run_task, what="the run finishing")
+            await await_until(
+                asyncio.gather(*manager._report_tasks, return_exceptions=True),
+                what="the report tasks finishing",
+            )
+
+        assert len(seen) == 1, f"the parent received {len(seen)} completions"
+        assert "kill failed: the teardown had not decided its kill" in (published or ""), (
+            "the report published before the kill decided and said the run ended clean: "
+            f"{published!r}"
+        )
+        delivered.assert_not_called()  # no delivered tombstone precedes the decision
+        # The decision that came in afterwards joined the record instead of being lost.
+        assert "kill failed: ValueError: kill_process_group: refusing" in info.error
+        assert info.outcome == "failed"
+        assert _audit(mock_sel, "run_finally_force_kill")["outcome"] == "failed"
+
+
+# ── The record is persisted before it is published ──
+
+
+class TestTheRecordCarriesTheKillBeforeItIsPublished:
+    """A failed kill reaches the ONE terminal report and the tombstone, not memory.
+
+    The reap's reset makes the run's stream raise ``AcpProcessDied``, and the run writes its
+    record while the reap still awaits the kill. Once a reap has started it owns the report:
+    it claims after the kill decides, appending the failure and re-writing the tombstone.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_failed_kill_reaches_the_report_when_the_stream_dies_under_the_reset(
+        self,
+    ) -> None:
+        manager, info, _key = _overdue_run("pub1", pid=9191)
+        info._session_sharing = False
+        reset_started = asyncio.Event()
+        hang = asyncio.Event()
+
+        async def _reset(session_key: str, **_: Any) -> bool:
+            if manager._sessions._sessions.pop(session_key, None) is not None:
+                # The reap's reset: pops the session, then hangs in the
+                # provider shutdown; the run's stream dies under it (below).
+                reset_started.set()
+                await hang.wait()
+                return True
+            # The run's own teardown, arriving second: the key is already gone.
+            return False
+
+        async def _stream(_info: SubagentInfo, _session_key: str) -> None:
+            await reset_started.wait()
+            raise AcpProcessDied("Runtime process died during prompt — killed (provider shutdown)")
+
+        manager._sessions.reset = AsyncMock(side_effect=_reset)
+        children, alive, start_id, sweep = _kill_path_stubs()
+
+        with (
+            patch("kiro_crew.subagent.Stats"),
+            patch("kiro_crew.subagent.sel") as mock_sel,
+            patch("kiro_crew.subagent._RESET_TIMEOUT", 0.05),
+            patch("kiro_crew.subagent.write_tombstone") as tombstones,
+            patch.object(manager, "_run_inner", AsyncMock(side_effect=_stream)),
+            children,
+            alive,
+            start_id,
+            sweep,
+            patch(
+                "kiro_crew.platform_compat.kill_process_group",
+                MagicMock(side_effect=_REFUSAL),
+            ),
+            patch("kiro_crew.platform_compat.kill_pid_async", AsyncMock()),
+        ):
+            run_task = asyncio.create_task(manager._run(info))
+            manager._tasks["pub1"] = run_task
+            await asyncio.sleep(0)
+
+            await manager._force_reap("pub1", info, 7200.0)
+
+            hang.set()
+            await await_until(
+                asyncio.gather(run_task, return_exceptions=True), what="the run finishing"
+            )
+
+        assert _audit(mock_sel, "reaper_force_kill")["outcome"] == "failed"
+        # ONE terminal report, published after the kill decided, naming the failure.
+        done_events = [
+            call.args
+            for call in manager._on_event.await_args_list
+            if call.args[0] == "subagent_done"
+        ]
+        assert len(done_events) == 1, f"expected one subagent_done event, saw {len(done_events)}"
+        published_error = done_events[0][2]["error"] or ""
+        assert "; kill failed: ValueError: kill_process_group: refusing" in published_error, (
+            "the parent was told the run was reaped while its process is still alive: "
+            f"{published_error!r}"
+        )
+        assert manager._on_done.await_count == 1
+        # The tombstone on disk carries the failure too: the record was
+        # re-written after the kill decided, not left as the run's arm wrote it.
+        assert tombstones.call_args is not None, "no tombstone was written"
+        assert "; kill failed: ValueError: kill_process_group: refusing" in (
+            tombstones.call_args.kwargs["detail"]
+        ), "the tombstone says the run was reaped while its process is still alive"
+        assert (
+            tombstones.call_args.kwargs["leaked_process"] is True
+        ), "the survivor is not flagged for the next start to end"
+        assert info.done and info.reaped
+        assert manager._process_handles == {}
+
+
+# ── A report the run already delivered is not contradicted by the reap ──
+
+
+class TestADeliveredRecordIsNotRewrittenByTheReap:
+    """A run that completed and reported under its own reap keeps the record it delivered.
+
+    ``done`` is also set by a run that finishes on its own at the deadline and publishes its
+    own report. The finalize token tells this apart from a stream that died under the reset:
+    once taken, the record stands and the kill failure stays on the reap's audit row, so disk
+    and the delivered completion agree.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_run_that_completed_and_reported_keeps_its_record(self) -> None:
+        manager, info, _key = _overdue_run("late1", pid=9393)
+        info._session_sharing = False
+        # The run finished on its own inside the reap window and ``_run``
+        # published: ``done`` set, a result, no error, the report claimed.
+        info.done = True
+        info.result = "the answer"
+        info.error = ""
+        assert manager._claim_finalize(info)
+        _hanging_reset(manager)
+        children, alive, start_id, sweep = _kill_path_stubs()
+
+        with (
+            patch("kiro_crew.subagent.Stats"),
+            patch("kiro_crew.subagent.sel") as mock_sel,
+            patch("kiro_crew.subagent._RESET_TIMEOUT", 0.05),
+            patch("kiro_crew.subagent.write_tombstone") as tombstones,
+            children,
+            alive,
+            start_id,
+            sweep,
+            patch(
+                "kiro_crew.platform_compat.kill_process_group",
+                MagicMock(side_effect=_REFUSAL),
+            ),
+        ):
+            await manager._force_reap("late1", info, 7200.0)
+            await await_until(
+                asyncio.gather(*manager._report_tasks, return_exceptions=True),
+                what="the report tasks finishing",
+            )
+
+        # The delivered record stands: no failure appended, no tombstone written
+        # over a completion the parent already holds.
+        assert info.error == "", (
+            "the reap re-wrote a record whose report the run had already delivered: "
+            f"{info.error!r}"
+        )
+        assert info.outcome == "completed"
+        tombstones.assert_not_called()
+        # The reap publishes nothing of its own: the claim was the run's.
+        assert _done_events(manager) == []
+        assert manager._on_done.await_count == 0
+        # The failure is kept where it is still true: the audit row.
+        audit = _audit(mock_sel, "reaper_force_kill")
+        assert audit["outcome"] == "failed"
+        assert "kill_process_group: refusing" in audit["metadata"]["kill_failed"], (
+            "the audit row lost the only record of the kill failure: " f"{audit['metadata']!r}"
+        )
+        assert info.reaped and manager._reaps_in_flight == {}
+
+    @pytest.mark.asyncio
+    async def test_a_record_the_reap_still_owns_the_report_of_is_re_written(self) -> None:
+        """Control: ``done`` set by the reap-echo arm (no claim) still gets the failure appended."""
+        manager, info, _key = _overdue_run("late2", pid=9494)
+        info._session_sharing = False
+        # The reap-echo arm's record: ``done`` and an error, the report left to the reap.
+        info.done = True
+        info.error = "Runtime process died during prompt — killed (provider shutdown)"
+        assert not info._finalized
+        _hanging_reset(manager)
+        children, alive, start_id, sweep = _kill_path_stubs()
+
+        with (
+            patch("kiro_crew.subagent.Stats"),
+            patch("kiro_crew.subagent.sel") as mock_sel,
+            patch("kiro_crew.subagent._RESET_TIMEOUT", 0.05),
+            patch("kiro_crew.subagent.write_tombstone") as tombstones,
+            children,
+            alive,
+            start_id,
+            sweep,
+            patch(
+                "kiro_crew.platform_compat.kill_process_group",
+                MagicMock(side_effect=_REFUSAL),
+            ),
+        ):
+            await manager._force_reap("late2", info, 7200.0)
+            await await_until(
+                asyncio.gather(*manager._report_tasks, return_exceptions=True),
+                what="the report tasks finishing",
+            )
+
+        assert "; kill failed: ValueError: kill_process_group: refusing" in info.error
+        assert tombstones.call_count == 1
+        assert "; kill failed:" in tombstones.call_args.kwargs["detail"]
+        # The reap took the claim and published the one report, carrying the failure.
+        done_events = _done_events(manager)
+        assert len(done_events) == 1 and done_events[0]["error"] == info.error
+        assert _audit(mock_sel, "reaper_force_kill")["metadata"]["kill_failed"].startswith(
+            "ValueError: kill_process_group: refusing"
+        )
+
+
+# ── A stop cancelled mid-teardown still owes the report ──
+
+
+def _shutdown_mid_reset(manager: SubagentManager) -> tuple[asyncio.Event, asyncio.Event]:
+    """The reap's reset pops the session and then hangs until ``hang`` is set.
+
+    Returns ``(reset_started, hang)``. The run's own teardown, arriving second
+    under the popped key, returns False at once.
+    """
+    reset_started = asyncio.Event()
+    hang = asyncio.Event()
+
+    async def _reset(session_key: str, **_: Any) -> bool:
+        if manager._sessions._sessions.pop(session_key, None) is not None:
+            reset_started.set()
+            await hang.wait()
+            return True
+        return False
+
+    manager._sessions.reset = AsyncMock(side_effect=_reset)
+    return reset_started, hang
+
+
+def _done_events(manager: SubagentManager) -> list[dict[str, Any]]:
+    """The payloads of every ``subagent_done`` event the manager fired."""
+    return [
+        call.args[2]
+        for call in manager._on_event.await_args_list
+        if call.args[0] == "subagent_done"
+    ]
+
+
+def _pending_reports_for(manager: SubagentManager, agent_id: str) -> list[Any]:
+    """The live terminal-report tasks owned by ``agent_id`` (the ones ``cancel_all`` drains)."""
+    return [
+        task
+        for task, owner in manager._report_owners.items()
+        if owner.id == agent_id and not task.done()
+    ]
+
+
+class TestAStopCancelledMidTeardownStillReports:
+    """A reap cancelled before its kill decided still publishes the ONE terminal report.
+
+    ``cancel_all()`` at shutdown cancels the reaper mid-reset or mid-kill. The report task
+    exists (held, drained by ``cancel_all``) before the reap's first await, and the
+    ``CancelledError`` arm records the undecided kill as a failure, releases the report, then
+    re-raises.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_reap_cancelled_at_shutdown_mid_reset_still_publishes_the_report(
+        self,
+    ) -> None:
+        manager, info, _key = _overdue_run("shut1", pid=9292)
+        info._session_sharing = False
+        reset_started, _hang = _shutdown_mid_reset(manager)
+
+        async def _stream(_info: SubagentInfo, _session_key: str) -> None:
+            # The run's runtime dies under the reap's reset: the reap-echo arm
+            # writes the record and leaves the report to the reap.
+            await reset_started.wait()
+            raise AcpProcessDied("Runtime process died during prompt — killed (provider shutdown)")
+
+        children, alive, start_id, sweep = _kill_path_stubs()
+
+        with (
+            patch("kiro_crew.subagent.Stats"),
+            patch("kiro_crew.subagent.sel") as mock_sel,
+            patch("kiro_crew.subagent._REPORT_DRAIN_TIMEOUT", 5.0),
+            patch("kiro_crew.subagent.write_tombstone") as tombstones,
+            patch("kiro_crew.subagent.clear_tombstone") as cleared,
+            patch.object(manager, "_run_inner", AsyncMock(side_effect=_stream)),
+            children,
+            alive,
+            start_id,
+            sweep,
+            patch("kiro_crew.platform_compat.kill_process_group"),
+            patch("kiro_crew.platform_compat.kill_pid_async", AsyncMock()),
+        ):
+            run_task = asyncio.create_task(manager._run(info))
+            manager._tasks["shut1"] = run_task
+            await asyncio.sleep(0)
+
+            reap = asyncio.create_task(manager._force_reap("shut1", info, 7200.0))
+            manager._reaper_task = reap
+            # The run's arm has written its record and its own teardown has
+            # finished; the reap is still parked in its reset.
+            await await_until(
+                asyncio.gather(run_task, return_exceptions=True), what="the run finishing"
+            )
+            assert info.done and not reap.done()
+            # The report already exists while the reap sits inside its window --
+            # the task a cancellation anywhere in that window has to complete --
+            # and has not published: the kill has not decided.
+            assert _pending_reports_for(
+                manager, "shut1"
+            ), "no terminal report task exists while the reap sits inside its reset window"
+            assert _done_events(manager) == []
+            tombstones_before_shutdown = tombstones.call_count
+
+            await await_until(
+                asyncio.create_task(manager.cancel_all()), what="the shutdown finishing"
+            )
+
+            # The cancellation still goes through the reap.
+            with pytest.raises(asyncio.CancelledError):
+                await reap
+            await await_until(
+                asyncio.gather(*manager._report_tasks, return_exceptions=True),
+                what="the report tasks finishing",
+            )
+
+        # The parent still receives the ONE terminal report, and it names the
+        # outcome: the deadline reap (the run's arm wrote that record when its
+        # stream died under the reset), and the kill the cancellation cut short.
+        done_events = _done_events(manager)
+        assert len(done_events) == 1, f"expected one subagent_done event, saw {len(done_events)}"
+        assert manager._on_done.await_count == 1
+        published_error = done_events[0]["error"] or ""
+        assert published_error.startswith(
+            "reaped after 7200s (deadline) — the runtime was torn down before the run finished"
+        ), published_error
+        assert (
+            "; kill failed: CancelledError: the stop was cancelled before its kill decided"
+            in published_error
+        ), f"the report does not say the kill was cut short: {published_error!r}"
+        assert done_events[0]["outcome"] == "failed"
+        # The kill never decided, so the audit never says ``reaped``.
+        assert _audit(mock_sel, "reaper_force_kill")["outcome"] == "failed"
+        # The tombstone still excludes the run from orphan recovery -- re-written
+        # with the failure, never cleared: the completion reached the parent.
+        assert tombstones.call_count == tombstones_before_shutdown + 1
+        assert tombstones.call_args.kwargs["cause"] == "reaped"
+        assert (
+            "; kill failed: CancelledError: the stop was cancelled before its kill decided"
+            in tombstones.call_args.kwargs["detail"]
+        )
+        cleared.assert_not_called()
+        assert info.done and info.reaped
+        assert manager._running_count == 0
+        assert manager._process_handles == {}
+        assert manager._report_owners == {}
+
+    @pytest.mark.asyncio
+    async def test_a_reap_cancelled_inside_the_fallback_kill_still_publishes_the_report(
+        self,
+    ) -> None:
+        """The other cancellation point in the window: the reset timed out, the kill is in flight."""
+        manager, info, _key = _overdue_run("shut3", pid=9494)
+        info._session_sharing = False
+        _hanging_reset(manager)
+        kill_started = asyncio.Event()
+        never = asyncio.Event()
+
+        async def _hanging_kill(*_: Any, **__: Any) -> None:
+            kill_started.set()
+            await never.wait()
+
+        async def _stream(_info: SubagentInfo, _session_key: str) -> None:
+            await never.wait()
+
+        children, alive, start_id, sweep = _kill_path_stubs()
+
+        with (
+            patch("kiro_crew.subagent.Stats"),
+            patch("kiro_crew.subagent.sel") as mock_sel,
+            patch("kiro_crew.subagent._RESET_TIMEOUT", 0.05),
+            patch("kiro_crew.subagent._REPORT_DRAIN_TIMEOUT", 5.0),
+            patch("kiro_crew.subagent.write_tombstone") as tombstones,
+            patch.object(manager, "_run_inner", AsyncMock(side_effect=_stream)),
+            children,
+            alive,
+            start_id,
+            sweep,
+            # The group signal fails; the kill's pid-scoped fallback is the await
+            # the cancellation lands in.
+            patch(
+                "kiro_crew.platform_compat.kill_process_group",
+                MagicMock(side_effect=PermissionError("[Errno 1] Operation not permitted")),
+            ),
+            patch("kiro_crew.platform_compat.kill_pid_async", AsyncMock(side_effect=_hanging_kill)),
+        ):
+            run_task = asyncio.create_task(manager._run(info))
+            manager._tasks["shut3"] = run_task
+            await asyncio.sleep(0)
+
+            reap = asyncio.create_task(manager._force_reap("shut3", info, 7200.0))
+            manager._reaper_task = reap
+            await await_until(kill_started, what="the kill starting")
+            assert not info.done and not reap.done()
+            assert _pending_reports_for(
+                manager, "shut3"
+            ), "no terminal report task exists while the reap sits inside its kill"
+
+            await await_until(
+                asyncio.create_task(manager.cancel_all()), what="the shutdown finishing"
+            )
+
+            with pytest.raises(asyncio.CancelledError):
+                await reap
+            await await_until(
+                asyncio.gather(run_task, return_exceptions=True), what="the run finishing"
+            )
+            await await_until(
+                asyncio.gather(*manager._report_tasks, return_exceptions=True),
+                what="the report tasks finishing",
+            )
+
+        done_events = _done_events(manager)
+        assert len(done_events) == 1, f"expected one subagent_done event, saw {len(done_events)}"
+        assert manager._on_done.await_count == 1
+        published_error = done_events[0]["error"] or ""
+        assert published_error.startswith("Reaped after"), published_error
+        assert (
+            "; kill failed: CancelledError: the stop was cancelled before its kill decided"
+            in published_error
+        )
+        assert _audit(mock_sel, "reaper_force_kill")["outcome"] == "failed"
+        assert tombstones.call_count == 1
+        assert info.done and info.reaped
+        assert manager._process_handles == {}
+        assert manager._report_owners == {}
+
+    @pytest.mark.asyncio
+    async def test_a_reap_cancelled_while_the_run_is_still_live_reports_exactly_once(
+        self,
+    ) -> None:
+        """The cancel lands before the run's stream died: the reap's record wins, once."""
+        manager, info, _key = _overdue_run("shut2", pid=9393)
+        info._session_sharing = False
+        reset_started, _hang = _shutdown_mid_reset(manager)
+        never = asyncio.Event()
+
+        async def _stream(_info: SubagentInfo, _session_key: str) -> None:
+            await never.wait()
+
+        children, alive, start_id, sweep = _kill_path_stubs()
+
+        with (
+            patch("kiro_crew.subagent.Stats"),
+            patch("kiro_crew.subagent.sel") as mock_sel,
+            patch("kiro_crew.subagent._REPORT_DRAIN_TIMEOUT", 5.0),
+            patch("kiro_crew.subagent.write_tombstone") as tombstones,
+            patch.object(manager, "_run_inner", AsyncMock(side_effect=_stream)),
+            children,
+            alive,
+            start_id,
+            sweep,
+            patch("kiro_crew.platform_compat.kill_process_group"),
+            patch("kiro_crew.platform_compat.kill_pid_async", AsyncMock()),
+        ):
+            run_task = asyncio.create_task(manager._run(info))
+            manager._tasks["shut2"] = run_task
+            await asyncio.sleep(0)
+
+            reap = asyncio.create_task(manager._force_reap("shut2", info, 7200.0))
+            manager._reaper_task = reap
+            await await_until(reset_started, what="the reset starting")
+            assert not info.done and not reap.done()
+
+            await await_until(
+                asyncio.create_task(manager.cancel_all()), what="the shutdown finishing"
+            )
+
+            with pytest.raises(asyncio.CancelledError):
+                await reap
+            await await_until(
+                asyncio.gather(run_task, return_exceptions=True), what="the run finishing"
+            )
+            await await_until(
+                asyncio.gather(*manager._report_tasks, return_exceptions=True),
+                what="the report tasks finishing",
+            )
+
+        done_events = _done_events(manager)
+        assert len(done_events) == 1, f"expected one subagent_done event, saw {len(done_events)}"
+        assert manager._on_done.await_count == 1
+        published_error = done_events[0]["error"] or ""
+        assert published_error.startswith("Reaped after"), published_error
+        assert (
+            "; kill failed: CancelledError: the stop was cancelled before its kill decided"
+            in published_error
+        )
+        assert _audit(mock_sel, "reaper_force_kill")["outcome"] == "failed"
+        # One record: the run's cancel arm deferred to the reap that owns it.
+        assert tombstones.call_count == 1
+        assert tombstones.call_args.kwargs["cause"] == "reaped"
+        assert info.done and info.reaped
+        assert manager._running_count == 0
+        assert manager._tasks == {}
+
+    @pytest.mark.asyncio
+    async def test_a_user_stop_parked_in_its_reset_at_shutdown_still_publishes_the_report(
+        self,
+    ) -> None:
+        """The reap a dashboard Stop runs lives in the REQUEST task, not the reaper task.
+
+        Cancelling ``_reaper_task`` alone would leave a Stop's reap hung until the shutdown
+        budget hard-exits, so ``cancel_all`` tracks and cancels every in-flight reap.
+        """
+        manager, info, _key = _overdue_run("shut4", pid=9595)
+        info._session_sharing = False
+        reset_started, _hang = _shutdown_mid_reset(manager)
+
+        async def _stream(_info: SubagentInfo, _session_key: str) -> None:
+            await reset_started.wait()
+            raise AcpProcessDied("Runtime process died during prompt — killed (provider shutdown)")
+
+        children, alive, start_id, sweep = _kill_path_stubs()
+
+        with (
+            patch("kiro_crew.subagent.Stats"),
+            patch("kiro_crew.subagent.sel") as mock_sel,
+            patch("kiro_crew.subagent._REPORT_DRAIN_TIMEOUT", 0.5),
+            patch("kiro_crew.subagent.write_tombstone") as tombstones,
+            patch("kiro_crew.subagent.clear_tombstone") as cleared,
+            patch.object(manager, "_run_inner", AsyncMock(side_effect=_stream)),
+            children,
+            alive,
+            start_id,
+            sweep,
+            patch("kiro_crew.platform_compat.kill_process_group"),
+            patch("kiro_crew.platform_compat.kill_pid_async", AsyncMock()),
+        ):
+            run_task = asyncio.create_task(manager._run(info))
+            manager._tasks["shut4"] = run_task
+            await asyncio.sleep(0)
+
+            # The dashboard Stop: ``cancel()`` awaits the reap inside the request's
+            # own task; ``_reaper_task`` is not involved.
+            stop = asyncio.create_task(manager.cancel("shut4"))
+            await await_until(
+                asyncio.gather(run_task, return_exceptions=True), what="the run finishing"
+            )
+            assert info.done and not stop.done()
+            assert _pending_reports_for(
+                manager, "shut4"
+            ), "no terminal report task exists while the stop sits inside its reset window"
+            assert _done_events(manager) == []
+            tombstones_before_shutdown = tombstones.call_count
+
+            await await_until(
+                asyncio.create_task(manager.cancel_all()), what="the shutdown finishing"
+            )
+
+            done_events = _done_events(manager)
+            if not stop.done():
+                stop.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await stop
+            await await_until(
+                asyncio.gather(*manager._report_tasks, return_exceptions=True),
+                what="the report tasks finishing",
+            )
+
+        assert (
+            len(done_events) == 1
+        ), f"expected one subagent_done event after cancel_all, saw {len(done_events)}"
+        assert manager._on_done.await_count == 1
+        # A user stop stays neutral and still names the kill the shutdown cut short.
+        assert done_events[0]["outcome"] == "stopped"
+        assert "kill failed: CancelledError: the stop was cancelled before its kill decided" in (
+            done_events[0]["error"] or ""
+        ), done_events[0]["error"]
+        assert _audit(mock_sel, "reaper_force_kill")["outcome"] == "failed"
+        # Re-written with the failure, never cleared: the completion reached the parent.
+        assert tombstones.call_count == tombstones_before_shutdown + 1
+        assert tombstones.call_args.kwargs["cause"] == "user_stop"
+        cleared.assert_not_called()
+        assert info.done and info.reaped
+        assert manager._reap_tasks == set()
+        assert manager._report_owners == {}
+
+
+class TestConcurrentStopsCoalesceIntoOneReap:
+    """Two stop paths over one run are one reap: one kill, one suffix, one report.
+
+    A Stop racing a deadline reap joins the reap in flight and returns once the record is
+    final, so the ``; kill failed: …`` suffix is appended once.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_stop_racing_a_deadline_reap_joins_it(self) -> None:
+        manager, info, _key = _overdue_run("race1", pid=7171)
+        info._session_sharing = False
+        _hanging_reset(manager)
+        children, alive, start_id, sweep = _kill_path_stubs()
+
+        with (
+            patch("kiro_crew.subagent.Stats"),
+            patch("kiro_crew.subagent.sel") as mock_sel,
+            patch("kiro_crew.subagent._RESET_TIMEOUT", 0.05),
+            patch("kiro_crew.subagent.write_tombstone") as tombstones,
+            children,
+            alive,
+            start_id,
+            sweep,
+            patch(
+                "kiro_crew.platform_compat.kill_process_group",
+                MagicMock(side_effect=_REFUSAL),
+            ) as group_kill,
+        ):
+            # The deadline reap starts first and parks in its reset.
+            deadline = asyncio.create_task(manager._force_reap("race1", info, 7200.0))
+            await asyncio.sleep(0)
+            assert info._reap_started and not deadline.done()
+            # The user presses Stop while it is in flight.
+            stop = asyncio.create_task(manager.cancel("race1"))
+
+            await await_until(
+                asyncio.gather(deadline, stop), what="the reap and the stop finishing"
+            )
+            await await_until(
+                asyncio.gather(*manager._report_tasks, return_exceptions=True),
+                what="the report tasks finishing",
+            )
+
+        assert stop.result() is True
+        # One kill decided once: the failure is on the record exactly once.
+        suffixes = (info.error or "").count("kill failed:")
+        assert suffixes == 1, f"the kill failure was recorded {suffixes} times: {info.error!r}"
+        assert group_kill.call_count == 1
+        # The record follows the FIRST stopper: the deadline, a failure.
+        assert info.outcome == "failed"
+        assert info.error.startswith("Reaped after 7200s")
+        # One audit row, one tombstone, one published report.
+        assert _audit(mock_sel, "reaper_force_kill")["outcome"] == "failed"
+        assert tombstones.call_count == 1
+        done_events = _done_events(manager)
+        assert len(done_events) == 1, f"expected one subagent_done event, saw {len(done_events)}"
+        assert done_events[0]["error"] == info.error
+        assert manager._on_done.await_count == 1
+        assert manager._reaps_in_flight == {}
+        assert manager._report_owners == {}
+
+    @pytest.mark.asyncio
+    async def test_a_joiner_returns_once_the_record_is_final_not_after_the_delivery(
+        self,
+    ) -> None:
+        """The join waits for the record, not for the parent injection behind it.
+
+        The delivery can take up to ``_ON_DONE_TIMEOUT`` (20 minutes); a joiner behind it
+        would hang the Stop and freeze every deadline in the reaper's sweep.
+        """
+        manager, info, _key = _overdue_run("race3", pid=7373)
+        info._session_sharing = False
+        _hanging_reset(manager)
+        children, alive, start_id, sweep = _kill_path_stubs()
+        delivering = asyncio.Event()
+        delivered = asyncio.Event()
+
+        async def _slow_delivery(report_task: Any) -> None:
+            delivering.set()
+            await delivered.wait()
+            await report_task
+
+        with (
+            patch("kiro_crew.subagent.Stats"),
+            patch("kiro_crew.subagent.sel"),
+            patch("kiro_crew.subagent._RESET_TIMEOUT", 0.05),
+            patch("kiro_crew.subagent.write_tombstone"),
+            patch.object(manager, "_await_report", AsyncMock(side_effect=_slow_delivery)),
+            children,
+            alive,
+            start_id,
+            sweep,
+            patch(
+                "kiro_crew.platform_compat.kill_process_group",
+                MagicMock(side_effect=_REFUSAL),
+            ),
+        ):
+            deadline = asyncio.create_task(manager._force_reap("race3", info, 7200.0))
+            await asyncio.sleep(0)
+            assert info._reap_started and not deadline.done()
+            stop = asyncio.create_task(manager.cancel("race3"))
+            # The first reap has written its record and is inside the delivery.
+            await await_until(delivering, what="the delivery starting")
+            assert info.done and info.reaped and not deadline.done()
+
+            try:
+                # The delivery is still held: a stop that waited for it never returns.
+                await await_until(stop, what="the stop that joined the reap returning")
+            except AssertionError:
+                delivered.set()
+                pytest.fail(
+                    "the stop that joined the reap waited for the report's delivery, "
+                    "not for the record"
+                )
+            assert stop.result() is True
+
+            delivered.set()
+            await await_until(deadline, what="the deadline reap finishing")
+            await await_until(
+                asyncio.gather(*manager._report_tasks, return_exceptions=True),
+                what="the report tasks finishing",
+            )
+
+        assert (info.error or "").count("kill failed:") == 1
+        assert manager._reaps_in_flight == {}
+
+    @pytest.mark.asyncio
+    async def test_a_reap_asked_for_again_after_it_finished_is_a_no_op(self) -> None:
+        """Control: a late second caller finds the run reaped and touches nothing."""
+        manager, info, _key = _overdue_run("race2", pid=7272)
+        info._session_sharing = False
+        _hanging_reset(manager)
+        children, alive, start_id, sweep = _kill_path_stubs()
+
+        with (
+            patch("kiro_crew.subagent.Stats"),
+            patch("kiro_crew.subagent.sel") as mock_sel,
+            patch("kiro_crew.subagent._RESET_TIMEOUT", 0.05),
+            children,
+            alive,
+            start_id,
+            sweep,
+            patch(
+                "kiro_crew.platform_compat.kill_process_group",
+                MagicMock(side_effect=_REFUSAL),
+            ) as group_kill,
+        ):
+            await manager._force_reap("race2", info, 7200.0)
+            await manager._force_reap("race2", info, 7200.0, reason="user_stop")
+
+        assert group_kill.call_count == 1
+        assert (info.error or "").count("kill failed:") == 1
+        assert _audit(mock_sel, "reaper_force_kill")["outcome"] == "failed"
+
+
+# ── The reap fences the key: a start racing it is held, refused, or named ──
+
+
+class TestTheReapFencesTheKey:
+    """The reap holds the key's ending fence from before its first read through the record and the audit.
+
+    Twin of ``test_cron_reaper_ending_fence.py``: a new start is held at ``get_or_create``
+    until the run is recorded. A start already inside ``provider.start()`` is refused at
+    registration, hard-killed, and named as a kill failure: nothing else would reclaim it.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_fence_is_up_before_the_snapshot_and_down_only_after_the_record_and_audit(
+        self,
+    ) -> None:
+        """Order and report, on a manager double: fence up before the first read, the start past its spawn door named, the fence down only after the record, the audit and the release."""
+        manager, info, key = _overdue_run("fence1", pid=4242)
+        events: list[str] = []
+
+        @contextmanager
+        def _fence(session_key: str) -> Iterator[None]:
+            events.append(f"fence up {session_key}")
+            try:
+                yield
+            finally:
+                events.append(f"fence down {session_key}")
+
+        async def _reset(session_key: str, **_: Any) -> bool:
+            events.append("reset")
+            return True
+
+        real_sessions_under = manager._sessions_under
+
+        def _snapshot(session_key: str) -> list[Any]:
+            # The first read of the key: the pairs the reap's snapshot is built on.
+            events.append("snapshot")
+            return real_sessions_under(session_key)
+
+        manager._sessions.ending_key = _fence
+        manager._sessions.reset = AsyncMock(side_effect=_reset)
+        manager._sessions._spawn_in_flight = MagicMock(
+            side_effect=lambda session_key: events.append(f"spawn in flight? {session_key}")
+            or "refused at registration, its provider hard-killed there"
+        )
+        manager._sessions.release = MagicMock(
+            side_effect=lambda *_a, **_k: events.append("release")
+        )
+        children, _alive, _start_id, sweep = _kill_path_stubs()
+
+        with (
+            patch("kiro_crew.subagent.Stats"),
+            patch("kiro_crew.subagent.sel") as mock_sel,
+            patch.object(manager, "_sessions_under", side_effect=_snapshot),
+            patch.object(
+                manager, "_write_tombstone", side_effect=lambda *_a, **_k: events.append("record")
+            ),
+            children,
+            sweep,
+            # The reset stopped the process: gone by identity and by liveness,
+            # its group empty (the autouse pin), so nothing survives to kill.
+            patch("kiro_crew.platform_compat.get_process_start_id", return_value=None),
+            patch("kiro_crew.platform_compat.pid_exists", return_value=False),
+            patch("kiro_crew.platform_compat.kill_process_group") as group_kill,
+        ):
+            mock_sel().log_tool_invocation.side_effect = lambda **_: events.append("audit")
+            await manager._force_reap("fence1", info, 7200.0)
+
+        assert events == [
+            f"fence up {key}",
+            "snapshot",
+            "reset",
+            f"spawn in flight? {key}",
+            "record",
+            "audit",
+            "release",
+            f"fence down {key}",
+        ], "the ending fence was not up from before the snapshot until after the record and audit"
+        group_kill.assert_not_called()
+        assert (
+            _audit(mock_sel, "reaper_force_kill")["outcome"] == "failed"
+        ), "the audit says reaped while a cold start under the key was past its spawn door"
+        assert (
+            "; kill failed: a cold start under the key was past its spawn door when the run was "
+            "ended (fenced: refused at registration, its provider hard-killed there); not signalled"
+        ) in info.error
+
+    @pytest.mark.asyncio
+    async def test_a_manager_without_the_fence_is_not_fenced_and_reports_nothing(self) -> None:
+        """A double with neither ``ending_key`` nor a string ``_spawn_in_flight``: the passes are the whole answer."""
+        manager, info, _key = _overdue_run("fence3", pid=4242)
+        del manager._sessions.ending_key
+        del manager._sessions._spawn_in_flight
+        children, _alive, _start_id, sweep = _kill_path_stubs()
+
+        with (
+            patch("kiro_crew.subagent.Stats"),
+            patch("kiro_crew.subagent.sel") as mock_sel,
+            children,
+            sweep,
+            patch("kiro_crew.platform_compat.get_process_start_id", return_value=None),
+            patch("kiro_crew.platform_compat.pid_exists", return_value=False),
+        ):
+            await manager._force_reap("fence3", info, 7200.0)
+
+        assert _audit(mock_sel, "reaper_force_kill")["outcome"] == "reaped"
+        assert "kill failed" not in (info.error or "")
+
+    @pytest.mark.asyncio
+    async def test_through_the_real_manager_a_start_in_flight_is_named_refused_hard_killed_and_lands_after(
+        self,
+    ) -> None:
+        """A cold start inside ``provider.start()`` under the run's key when the reap fires: named, refused at registration, hard-killed, and its call lands after the record."""
+        inside_start = asyncio.Event()
+        gate = asyncio.Event()
+        started: list[Any] = []
+
+        def _factory(
+            session_key: Any = None, agent: Any = None, channel_id: Any = None, **_: Any
+        ) -> Any:
+            provider = AsyncMock()
+            provider.memory_mode = "persistent"
+            provider.is_process_alive = lambda: True
+            provider.context_usage_pct = lambda: 0.0
+            provider.context_window_tokens = lambda: 0
+            provider.has_active_turn = lambda: False
+            provider.runtime_abort_target = lambda: None
+            provider.shutdown = AsyncMock()
+
+            async def _gated_start(*_args: Any, **_kwargs: Any) -> None:
+                started.append(provider)
+                inside_start.set()
+                await gate.wait()
+
+            provider.start = AsyncMock(side_effect=_gated_start)
+            return provider
+
+        mgr = SessionManager(KiroCrewConfig(), provider_factory=_factory)
+        key = "subagent:fence2"
+        cold_start = asyncio.create_task(mgr.get_or_create(key))
+        await await_until(inside_start, what="start() being entered")
+        assert not mgr.has_session(key), "nothing is published while start() runs"
+
+        manager = SubagentManager(
+            sessions=mgr,
+            ctx_builder=_mock_ctx_builder(),
+            on_done=AsyncMock(),
+            on_event=AsyncMock(),
+            is_yolo=lambda: True,
+        )
+        info = SubagentInfo(
+            id="fence2",
+            task="stuck task",
+            parent_session_key="dashboard:test-slot",
+            started=time.time() - 7200,
+        )
+        manager._agents["fence2"] = info
+        manager._running_count = 1
+        children, alive, start_id, sweep = _kill_path_stubs()
+
+        with (
+            patch("kiro_crew.subagent.Stats"),
+            patch("kiro_crew.subagent.sel") as mock_sel,
+            patch.object(mgr, "_dispatch_hard_kill") as hard_kill,
+            children,
+            alive,
+            start_id,
+            sweep,
+            patch("kiro_crew.platform_compat.kill_process_group", return_value=True) as group_kill,
+        ):
+            assert manager._retain_process_handles("fence2", key) == []
+            await manager._force_reap("fence2", info, 7200.0)
+            assert _audit(mock_sel, "reaper_force_kill")["outcome"] == "failed", (
+                "the audit says the run was reaped while a cold start under the key was still "
+                "inside provider.start()"
+            )
+            # The record is written and the fence has lifted; only now does the
+            # start return: refused at registration, its provider hard-killed,
+            # and the call allocates again -- the caller lands after the record.
+            gate.set()
+            provider, is_new, _ = await await_until(cold_start, what="the cold start landing")
+
+        group_kill.assert_not_called()  # nothing was published for the passes to kill
+        assert (
+            "; kill failed: a cold start under the key was past its spawn door when the run was "
+            "ended"
+        ) in (info.error or "")
+        assert len(started) == 2, "the refused call did not allocate again after the lift"
+        hard_kill.assert_called_once_with(started[0])
+        assert is_new and provider is started[1] and mgr.has_session(key), (
+            "the caller whose start the fence caught was dropped instead of landing after the "
+            "record"
+        )
+        assert not mgr._has_allocation_reservation(key)
+        mgr.release(key)
+        await mgr.reset(key)

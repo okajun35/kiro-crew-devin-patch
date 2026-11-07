@@ -1,0 +1,861 @@
+"""What a dashboard turn writes as its reply: the partial reply a dying turn persists, the
+abnormal end's usage row, the text and thinking stream flushes, the segment cut at a tool call or
+an approval prompt and the run it holds across it, the steer's segment cut, the error rows the
+stream watchdogs post, and the whole reply read back from its rows (``_turn_full_reply_text``)."""
+
+from __future__ import annotations
+
+import asyncio
+import string
+import time
+from typing import TYPE_CHECKING, Literal
+from urllib.parse import quote
+
+from kiro_crew.constants import reflow_and_label_glued_option_marker
+from kiro_crew.dashboard.chat_utils import TRANSIENT_RETRY_KIND, chunk_generation, slot_history_key
+from kiro_crew.dashboard.state import row_mid
+from kiro_crew.notifications.bus import NotificationValidationError, payload_from_legacy
+from kiro_crew.security import redact
+
+if TYPE_CHECKING:
+    from kiro_crew.dashboard.chat_runner import (
+        STOP_REASON_CANCELLED,
+        TurnUsage,
+        crew_log_emit,
+        logger,
+        provider_last_turn_usage,
+        read_turn_model,
+        run_to_completion,
+        save_slot_off_loop,
+    )
+    from kiro_crew.dashboard.chat_turn.file_changes import _note_reply_row
+    from kiro_crew.dashboard.chat_turn.segment_flush import (
+        _cleared_segment_text,
+        _flush_segment,
+        _give_back_run,
+        _hold_segment_tail,
+        _open_segment_with,
+        _redact_segment,
+        _segment_row_meta,
+    )
+    from kiro_crew.dashboard.chat_turn.turn_locals import _ChatTurn
+    from kiro_crew.dashboard.chat_turn.turn_marker import _gateway_shutdown_requested
+    from kiro_crew.dashboard.chat_turn.turn_stats import (
+        _broadcast_turn_stats,
+        _last_reply_row,
+        _persist_abnormal_turn_usage,
+        _session_selected_auto,
+        turn_stats_meta,
+    )
+
+
+async def _persist_partial_reply(turn, reason: str = "") -> None:
+    """Persist the partial reply of a turn that is ending abnormally.
+
+    ONE helper for every recovery path, so the log copy cannot be forgotten by
+    the next path added -- the same reason redaction lives at the emitter's
+    boundary rather than at its call sites. Four handlers had this block
+    inline and none of them reached the crew log, so a turn that streamed text
+    the user watched got a closer saying it ended and nothing saying what it
+    had produced.
+
+    ``_flush_segment`` is deliberately not reused: these paths purge the chunk
+    rows first and must not broadcast a segment, and the turn is not
+    continuing. What they share with it is the obligation to record the body.
+    ``interrupted`` is what makes the entry honest -- this text is what the
+    turn had produced when it died, not a reply it finished.
+
+    The usage row is the same obligation at the same seam: a turn ending here
+    usually reached neither ``EVENT_COMPLETE`` (the dashboard's one
+    ``persist_token_record_async`` call) nor its ``_attach_turn_stats``, so
+    its credits go unrecorded however much it billed. It is written whether or
+    not the turn produced partial text -- a turn cut after 91 tool calls bills
+    credits with no final assistant segment -- so it sits outside the
+    ``assistant_text`` guard, and the client is still live here because the
+    ``finally`` that drops ``slot._acp_client`` runs only after this returns.
+    The text is saved BEFORE the usage write: the text save is synchronous
+    but the usage write awaits a cancellable provider call, and a shutdown
+    that interrupts that await must not also drop the body the user watched
+    stream. The row is the recoverable loss (a continuation re-reads provider
+    stats; the streamed text does not re-materialise), so it goes last.
+
+    Every recovery seam records the row, including the post-token transient
+    seam: a transient attempt's spend lives only in the live session's
+    ``last_prompt_stats``, which the next prompt ``carry_over()``-zeroes, so
+    no continuation can carry it forward and the seam is the only place that
+    can bill it. The once-per-turn ``_turn_usage_persisted`` guard keeps a
+    second seam on the same turn from double-billing, and the recovery
+    continuation is a separate turn with its own fresh stats and guard.
+
+    The reply also gets the completed-turn footer here, ahead of the shutdown
+    save, so a restart keeps it. A cancel delivered on that save is swallowed,
+    as ``_persist_abnormal_turn_usage`` swallows one on the usage write in the
+    same teardown: re-raised, it would skip the usage row and cost the arm
+    that called this its card, its recovery and the ``finally``'s completion.
+    """
+    slot = turn.slot
+    state = turn.state
+    # Save the interrupted text FIRST, then write the usage row. The text
+    # save is synchronous (append + crew-log emit); the usage write awaits a
+    # provider call that can be cancelled by a shutdown mid-await. Doing the
+    # text save first means a shutdown that interrupts the usage write cannot
+    # also drop the body the user watched stream. The usage row is the
+    # recoverable loss (a continuation re-reads provider stats; the text does
+    # not re-materialise), so it goes last.
+    #
+    # ``_reply_flushed``: the end-of-turn flush already saved this text and
+    # leaves it in ``assistant_text``, so a cancel landing after it (a late
+    # Stop, the turn ceiling's task cancel) must not save it a second time.
+    #
+    # A run the live stream held at the turn's last display boundary is
+    # settled first: back on its row, or into this text when it is part of it.
+    rows_changed = _drop_wire_tail(turn)
+    if turn.assistant_text and not turn._reply_flushed:
+        slot.purge_chunks()
+        # Same glued-marker repair and whole-text redaction as
+        # _flush_segment (both inside _redact_segment): the interrupted body
+        # is the same accumulated text, rendered by the same grammar.
+        # Records come out of the same pass for the reason _redact_segment
+        # gives: after this line only the placeholder exists, so an
+        # interrupted reply would otherwise lose what it explains for good.
+        _ordered: list[bool] = []
+        _redacted, _blocked, _redactions = _redact_segment(
+            slot, turn.assistant_text, _ordered_out=_ordered
+        )
+        _note_reply_row(
+            slot,
+            slot.append(
+                "assistant",
+                _redacted,
+                "msg msg-a",
+                meta=_segment_row_meta(
+                    slot,
+                    _blocked,
+                    _redactions,
+                    links_ordered=_ordered == [True],
+                    text=_redacted,
+                ),
+            ),
+        )
+        # Saved once per turn: a recovery arm saves it here, and a cancel
+        # landing on the usage write below re-enters this helper.
+        turn._reply_flushed = True
+        crew_log_emit.on_message_sent(
+            turn._crew_log_sid,
+            turn._crew_log_turn_no,
+            step=turn._crew_log_step,
+            text=_redacted,
+            interrupted=True,
+        )
+        rows_changed = True
+    # The footer goes on before the shutdown save below, so a restart shows
+    # it too. It takes the turn's one billing read, which the usage row at
+    # the end reuses; the read is synchronous, so the order "text first,
+    # usage write last" still holds. Guarded because it runs ahead of that
+    # save: a raise in the billing read costs the footer and the row, and must
+    # not also cost the text its save at shutdown.
+    try:
+        _stamped, _billing = _stamp_abnormal_turn_footer(turn)
+    except Exception:
+        logger.debug("Stamping the reply footer failed for slot %s", slot.key, exc_info=True)
+        _stamped, _billing = False, None
+    if (rows_changed or _stamped) and _gateway_shutdown_requested(state):
+        # The graceful save ran before these rows changed (this text's row, its
+        # footer, or a row the held run just went back on, which can happen with
+        # no text after the last tool call or approval prompt), and the turn's
+        # teardown skips its own save while the process is going away, so
+        # without this the change dies with the process. Saved with the
+        # in-flight marker still set: the next start shows this text with its
+        # interruption row and the Resume button. Before the usage write and
+        # the recovery rows below, so the restart reconciles exactly the text
+        # the user watched stream.
+        try:
+            await run_to_completion(
+                save_slot_off_loop(
+                    state,
+                    slot,
+                    force=True,
+                    expected_history_key=slot_history_key(slot),
+                    expected_slot_name=slot.key,
+                )
+            )
+        except (Exception, asyncio.CancelledError):
+            # A cancel delivered on this await is swallowed for the reason
+            # _persist_abnormal_turn_usage swallows one: re-raised, it skips
+            # the usage row below and the calling arm's card and recovery.
+            # ``run_to_completion`` ensures the executor thread finishes the
+            # transcript rename before the cancel re-raises here; without it
+            # the thread could still hold the jsonl open via ``os.replace``
+            # when the turn's reset reads the file back (Windows: sharing
+            # violation → PermissionError on the read).
+            logger.debug("Saving the partial reply at shutdown failed", exc_info=True)
+    # The usage row is written whether or not the turn produced partial text
+    # -- a turn cut after many tool calls bills credits with no final
+    # assistant segment -- so it sits outside the ``assistant_text`` guard.
+    await _record_abnormal_turn_usage(turn, reason, _billing)
+
+
+async def _record_abnormal_turn_usage(
+    turn, reason: str, billing: tuple[TurnUsage, int] | None
+) -> None:
+    """Write this turn's usage row once, when EVENT_COMPLETE did not.
+
+    ``billing`` is the turn's one billing read and its elapsed time, taken by
+    ``_stamp_abnormal_turn_footer``, which also feeds the footer from it when
+    it puts one on, so the row and the footer share one value; ``None`` when
+    no row is owed.
+
+    Idempotent across the seam's callers via ``_turn_usage_persisted``: more
+    than one recovery handler can fire in a turn's teardown, and the row must
+    be written once. ``reason`` is the recovery arm's own classification --
+    an ``error:``-shaped reason for a process-died / auth-required / terminal
+    AcpError end, and ``cancelled`` only for a genuine Stop press -- so
+    ``turn_outcome`` sorts dying runtimes into the fault bucket and keeps
+    ``cancelled`` reserved for the one end the operator causes deliberately.
+    An involuntary cancel that is not a Stop (tab close, idle-slot sweep,
+    shutdown, or the turn ceiling) is labelled the neutral
+    ``error: cancelled`` by its arm: telling the ceiling apart from the other
+    involuntary cancels is a separate concern no row consumer here needs, so
+    there is deliberately no distinct ``timeout:`` ceiling label. A caller
+    that cannot name a cause (the plain CancelledError arm reached without a
+    Stop press) falls back to the turn's own provider stop reason, then
+    ``cancelled``.
+
+    The usage row is attributed from the OUTER provider wrapper (``client``),
+    not the inner ``AcpClient`` handle: ``provider_seam`` and the
+    context-window read live on the wrapper, so the inner handle alone would
+    stamp every row ``provider="acp"`` with a ``(0, 0)`` window.
+    """
+    session_key = turn.session_key
+    slot = turn.slot
+    if billing is None or turn._turn_usage_persisted:
+        return
+    _usage, _elapsed_ms = billing
+    if await _persist_abnormal_turn_usage(
+        slot,
+        turn.client,
+        session_key,
+        elapsed_ms=_elapsed_ms,
+        stop_reason=reason or turn._stop_reason or STOP_REASON_CANCELLED,
+        since=turn._turn_stats0,
+        usage=_usage,
+    ):
+        turn._turn_usage_persisted = True
+
+
+def _stamp_abnormal_turn_footer(turn) -> tuple[bool, tuple[TurnUsage, int] | None]:
+    """Give an abnormally ended turn's reply its footer, and take its billing read.
+
+    Returns whether this call put a footer on, and the billing the usage row
+    is still owed: ``None`` once the row is written, or when the client is
+    gone. The inner handle (``slot._acp_client``) is read only to gate on
+    liveness -- it is the ref ``_turn_release_handles`` drops, so a non-None read
+    means the credits are still reachable. Synchronous, so the caller can run it
+    ahead of the shutdown save.
+    """
+    _ttft_visible = turn._ttft_visible
+    slot = turn.slot
+    if turn._turn_usage_persisted:
+        # Only the figures EVENT_COMPLETE captured are attached here, once
+        # (``_turn_footer_attached``, which a stamp from the seam's own live
+        # read also sets), and only to this turn's rows: a turn without a
+        # boundary has no rows of its own to stamp.
+        if not (
+            turn._turn_stats_captured and turn._turn_boundary_set and not turn._turn_footer_attached
+        ):
+            return False, None
+        # EVENT_COMPLETE billed this turn and was then cut off before its own
+        # end-of-turn attach: the ceiling's native stop was acknowledged, so
+        # the turn completed as ``cancelled``, and the task cancel that
+        # follows landed on an await in between; or a recovery arm returns
+        # before reaching it. The row is written, so the seam must not read or
+        # bill again; the reply still gets its footer, from the figures that
+        # row was billed with.
+        stamped = _attach_abnormal_turn_stats(
+            turn,
+            TurnUsage(credits=turn._turn_credits, cost_usd=turn._turn_cost_usd),
+            turn._turn_elapsed_ms,
+            model=turn._turn_model,
+            ttft_ms=_ttft_visible.ms,
+        )
+        return stamped, None
+    if slot._acp_client is None:
+        return False, None
+    _elapsed_ms = int((time.monotonic() - turn._turn_t0) * 1000)
+    # Read the turn's billing ONCE: ``provider_last_turn_usage`` consumes the
+    # accumulated multi-attempt total, so a second read for the footer would
+    # see only the last attempt. The row and the footer share this value.
+    _usage = provider_last_turn_usage(turn.client, since=turn._turn_stats0)
+    if not turn._turn_boundary_set or turn._turn_footer_attached:
+        # A turn that ends before dispatch has no boundary yet, and attaching
+        # then would overwrite the previous turn's footer, so it writes only
+        # the row; a reply that already has its footer keeps it.
+        return False, (_usage, _elapsed_ms)
+    # However the turn ended -- a Stop press, an error, a transient retry such
+    # as a model at capacity, a stall recovery, an involuntary cancel -- the
+    # reply it leaves is one the user read: give it the same footer a
+    # completed turn gets, so the model that served it and what it cost are
+    # visible where the turn ended, and a recovery or a later turn drawn below
+    # it does not take the reply's footer away.
+    return _attach_abnormal_turn_stats(turn, _usage, _elapsed_ms), (_usage, _elapsed_ms)
+
+
+def _attach_abnormal_turn_stats(
+    turn, usage: TurnUsage, elapsed_ms: int, *, model: str | None = None, ttft_ms: int = 0
+) -> bool:
+    """Put ``meta.turn_stats`` on the last reply row of a turn that ended abnormally.
+
+    Same shape as a completed turn (``turn_stats_meta``), so the footer
+    renders exactly what it renders for a finished turn: elapsed always,
+    credits or cost only when the provider reported a non-zero figure. The
+    row is the last one the user reads as this turn's reply
+    (``_last_reply_row``), which is not always the last assistant-role row: a
+    failed compaction appends its notice after the text, and another writer
+    can inject an envelope mid-turn. Scoped to this turn's rows by
+    ``_turn_start_mid`` and ``_turn_msg_boundary``, which the caller only
+    trusts once dispatch has set it; a turn that ended before it wrote any
+    reply row gets no footer, because there is no row to carry one. ``model``
+    and ``ttft_ms`` are the served model and first-output latency
+    EVENT_COMPLETE already read, when it did: a cut after the completion keeps
+    the footer the completion would have written, both included. A turn the
+    seam bills itself reads the model here and, as before, records no
+    ``ttft_ms``. Returns whether a row received the footer.
+
+    The row is mutated in place, so this marks the slot dirty itself, as every
+    in-place row edit must: the periodic flush writes only a dirty slot, and
+    one that ran after the reply was saved would otherwise leave the footer
+    off disk. It reaches open clients at once (``_broadcast_turn_stats``)
+    rather than at the end of a recovery the slot may hand off to next.
+    Best-effort: a failure never disturbs the turn's teardown or the usage
+    row.
+    """
+    slot = turn.slot
+    state = turn.state
+    turn._turn_footer_attached = True
+    try:
+        stats = turn_stats_meta(
+            elapsed_ms,
+            float(usage.credits or 0.0),
+            float(usage.cost_usd or 0.0),
+            (
+                (read_turn_model(turn.client) or _session_selected_auto(slot))
+                if model is None
+                else model
+            )
+            or "",
+        )
+        row = _last_reply_row(slot, turn._turn_msg_boundary, turn._turn_start_mid)
+        if stats is None or row is None:
+            return False
+        if ttft_ms > 0:
+            stats["ttft_ms"] = int(ttft_ms)
+        row.setdefault("meta", {})["turn_stats"] = stats
+        slot._dirty = True
+    except Exception:
+        logger.debug(
+            "Failed to attach abnormal-end turn stats for slot %s", slot.key, exc_info=True
+        )
+        return False
+    _broadcast_turn_stats(state, slot, row, stats)
+    return True
+
+
+def _flush_text_stream(turn) -> None:
+    """Emit the redactor's withheld tail as a final chat_chunk before a
+    segment is finalized, so WS/SSE viewers see the complete (redacted) text
+    and never a truncated stream. No-op when the buffer is empty."""
+    _ttft_visible = turn._ttft_visible
+    _wsred = turn._wsred
+    slot = turn.slot
+    state = turn.state
+    continued = _held_continued(turn)
+    wire = _settle_held(turn, _wsred.flush(), continued=continued)
+    if not wire:
+        return
+    _ttft_visible.mark(wire)
+    turn.chunk_seq += 1
+    slot._chunk_seq = turn.chunk_seq
+    # The window row carries the same seq (and process generation) as the
+    # wire frame so a slot snapshot taken mid-stream can tell the client how
+    # far the stream it already contains has advanced (see
+    # chat_utils._collapse_wire_rows / chunk_generation).
+    row = slot.append("chunk", wire, "chunk")
+    row["seq"] = turn.chunk_seq
+    row["gen"] = chunk_generation()
+    state.broadcast_ws(
+        "chat_chunk",
+        {"slot": slot.key, "content": wire, "seq": turn.chunk_seq, "gen": chunk_generation()},
+    )
+
+
+# A tool call or an approval prompt is a display boundary INSIDE the reply, not
+# its end: the text after it can finish a credential the text before it began,
+# and two redaction windows cut there emit and save both halves unmatched. So
+# the cut there (_cut_segment) leaves the run _wsred still withholds in the
+# redactor, where the next text joins it, and off the row it was cut from. The
+# first output that holds the run settles it (_settle_held), judged on the raw
+# text: a run that redacts together with the raw text after it exactly as the
+# two redact apart is a word of its own and goes back on its row; otherwise it
+# opens the segment it continued into and is saved with it, redacted as one
+# text. One entry per cut crossed before that output (``turn._held_runs``) --
+# the row, the raw run cut off it, the variant the row showed then and the
+# crew-log model call the row's text came from -- so a run held over several
+# cuts goes back piece by piece. The Slack stream carries its held run across a
+# `wait` the same way (slack/handler_runtime/stream.py: move_back, _give_back).
+
+
+#: The letters of one short plain word closing a sentence ("settled.", "they've.").
+#: The text before a tool call usually ends this way, and holding the word made
+#: every such row show without its last word until the model wrote again, often
+#: minutes later. No credential can start in or run through such a word: a
+#: credential's run either begins with a mixed-case, digit or symbol prefix this
+#: shape excludes (``AKIA``, ``eyJ``, ``SG.``, ``ghp_``, ``?token=``), or is an
+#: unbroken base64-class run, which a ``.`` ends. The length cap keeps the
+#: Discord shape ([MNO] then 22 or more characters, then ``.``) out as well.
+_ASCII_LETTERS = frozenset(string.ascii_letters)
+_ASCII_LOWERCASE = frozenset(string.ascii_lowercase)
+
+
+def _ends_plain_sentence(run: str) -> bool:
+    """Whether *run*, the raw run the redactor withholds at a boundary, is one
+    plain word ending a sentence, which no text after the boundary can turn into
+    part of a credential, so the cut saves and streams it at once: an ASCII
+    letter, at most 18 lowercase letters, optionally ``'`` and 1 to 3 lowercase
+    letters, then one ``.``."""
+    stem, apostrophe, suffix = run[:-1].partition("'")
+    return (
+        run.endswith(".")
+        and 0 < len(stem) < 20
+        and stem[0] in _ASCII_LETTERS
+        and _ASCII_LOWERCASE.issuperset(stem[1:])
+        and (not apostrophe or 0 < len(suffix) < 4)
+        and _ASCII_LOWERCASE.issuperset(suffix)
+        and redact(run) == run
+    )
+
+
+def _held_continued(turn) -> bool:
+    """Whether text reached _wsred after the run it holds for a boundary."""
+    _wsred = turn._wsred
+    held = "".join(run for _, run, _, _ in turn._held_runs)
+    return bool(held) and (_wsred.discarding or _wsred.held != held)
+
+
+def _stands_alone(run: str, after: str) -> bool:
+    """Whether raw *run* redacts together with *after*, the raw text that
+    followed it, exactly as *run* unchanged followed by *after* redacted alone:
+    then no value starts in one and ends in the other."""
+    return redact(run + after) == run + redact(after)
+
+
+def _settle_held(turn, wire: str, *, continued: bool) -> str:
+    """Settle the run held at a boundary against *wire*, the redactor's next
+    output, and return what is left of *wire* for the current segment.
+    *continued* says whether text after the boundary reached the redactor too;
+    that text is the slot's raw segment copy, which the cut began afresh."""
+    slot = turn.slot
+    state = turn.state
+    if not turn._held_runs:
+        return wire
+    held = list(turn._held_runs)
+    turn._held_runs.clear()
+    run = "".join(piece for _, piece, _, _ in held)
+    after = slot.segment_raw_text if continued else ""
+    if after is not None and wire.startswith(run) and _stands_alone(run, after):
+        for row, piece, variant_idx, step in held:
+            _give_back_run(state, slot, row, piece, variant_idx)
+            _log_given_back(turn, piece, step)
+        return wire[len(run) :]
+    if not continued:
+        # Nothing followed the run, so what it redacts to is its own row's.
+        row, _, variant_idx, step = held[0]
+        _give_back_run(state, slot, row, wire, variant_idx)
+        _log_given_back(turn, wire, step)
+        return ""
+    turn.assistant_text = _open_segment_with(slot, turn.assistant_text, run)
+    return wire
+
+
+def _log_given_back(turn, text: str, step: int) -> None:
+    """Record *text*, given back to a row after its cut, in the crew log.
+
+    The row's ``message/sent`` went out at the cut, ahead of the tool call or
+    approval prompt, without the run held then. This entry carries the run under
+    the same turn and the same model call (*step*), so a model call's text is
+    its ``message/sent`` entries joined in order."""
+    crew_log_emit.on_message_sent(turn._crew_log_sid, turn._crew_log_turn_no, step=step, text=text)
+
+
+def _cut_segment(turn, *, broadcast: bool = True) -> None:
+    """Finalize the accumulated text as a segment at a display boundary inside
+    the reply, holding back the run _wsred still withholds (see _held_runs).
+
+    Held only while the whole segment saves that run as it was written: a run
+    the segment already redacts ends a value it holds whole, so the window
+    ends here as it does at the reply's end. Nor is a run held when it is one
+    plain word ending a sentence (_ends_plain_sentence) and no earlier cut
+    holds a run for it to join: no later text can make it part of a credential,
+    and holding it hid the row's last word until the model wrote again."""
+    _wsred = turn._wsred
+    slot = turn.slot
+    state = turn.state
+    run = "" if _wsred.discarding else _wsred.held
+    before = "".join(piece for _, piece, _, _ in turn._held_runs)
+    own = run[len(before) :] if run.startswith(before) else ""
+    raw = slot.segment_raw_text
+    kept = None
+    if (
+        own
+        and (before or not _ends_plain_sentence(own))
+        and raw is not None
+        and redact(reflow_and_label_glued_option_marker(raw)[0]).endswith(own)
+    ):
+        kept = _hold_segment_tail(slot, turn.assistant_text, own)
+    if kept is None:
+        if not _wsred.discarding:
+            _flush_text_stream(turn)
+        _flush_segment(state, slot, turn.assistant_text, broadcast=broadcast)
+    else:
+        row = _flush_segment(state, slot, kept, broadcast=broadcast)
+        turn._held_runs.append((row, own, row.get("variant_idx"), turn._crew_log_step))
+    turn.assistant_text = _cleared_segment_text(slot)
+
+
+def _drop_wire_tail(turn) -> bool:
+    """Discard what _wsred withholds without streaming it, settling a run it
+    holds for a boundary first. Call it BEFORE the segment it drops is
+    cleared, so a run that belongs to that segment is dropped with it.
+
+    True when it settled such a run: back on its row, which changes a row
+    already in the window, or into the current segment's text."""
+    _wsred = turn._wsred
+    settled = bool(turn._held_runs)
+    if settled:
+        continued = _held_continued(turn)
+        _settle_held(turn, _wsred.flush(), continued=continued)
+    _wsred.reset()
+    return settled
+
+
+def _flush_thinking_stream(turn) -> None:
+    """Emit the thinking redactor's withheld tail when the thinking phase
+    ends (any non-thinking event) or the turn completes. No-op when empty."""
+    _thinkred = turn._thinkred
+    _ttft_visible = turn._ttft_visible
+    slot = turn.slot
+    state = turn.state
+    wire = _thinkred.flush()
+    if wire:
+        _ttft_visible.mark(wire)
+        state.broadcast_ws("chat_thinking", {"slot": slot.key, "content": wire})
+
+
+def _steer_segment_cut(turn, *, interrupted: bool = True) -> None:
+    """Finalize the accumulated text as a segment at a mid-turn steer.
+
+    ``interrupted=False`` is the crewmate send that waits behind this turn
+    (``responsive_chat.accept``): the segment is cut so the person's row
+    lands where they sent it, but the reply goes on, so it is not marked
+    cut off.
+
+    Published on the slot (next to ``_acp_client``) so the dashboard steer
+    handler can cut the segment right BEFORE it persists the steer user
+    message. Without the cut, kiro-cli keeps the segment open across the
+    steer, so ``_flush_segment`` at end-of-segment appends the WHOLE text
+    (pre-steer + post-steer) BELOW the steer bubble — the reply the user
+    watched stream above their steer jumps to the bottom when the chat_done
+    refresh rebuilds from server history — and the pre-steer ``chunk``
+    entries are stranded above the bubble forever (the trailing-run walk in
+    ``_flush_segment`` stops at the first non-chunk message).
+
+    ``broadcast=False``: the initiating tab already froze its streaming
+    message when it pushed the optimistic bubble, and other tabs freeze on
+    the ``steer_push`` echo (appendSlotMessage finalize-on-steer). A
+    chat_segment broadcast here could instead finalize a NEWER post-steer
+    streaming message that raced ahead on the initiating tab.
+
+    Sync on purpose — the handler and this turn share the event loop, so
+    the flush cannot interleave with chunk processing.
+    """
+    slot = turn.slot
+    state = turn.state
+    # Drop the wire redactor's withheld tail instead of emitting it: a
+    # chat_chunk broadcast here would arrive AFTER the clients froze their
+    # streaming message at the steer boundary, opening a phantom streaming
+    # bubble below the steer card. No text is lost — assistant_text
+    # accumulates the full segment independently of the wire buffer, and
+    # _flush_segment persists (and re-redacts) that full text. A run held at
+    # an earlier tool call is settled into its row or into this segment.
+    _drop_wire_tail(turn)
+    if turn.assistant_text.strip():
+        # The persisted row may hold text the redactor never broadcast (a
+        # fully withheld first chunk). It is published quietly, so it is
+        # timed at the turn-end refresh, not here.
+        turn._ttft_quiet_text = True
+        # quiet_persist: the clients already hold this text in their
+        # frozen (pre-steer) message; the append's chat_message broadcast
+        # would render a duplicate copy below the steer bubble.
+        #
+        # `interrupted`: this text was CUT OFF, and this site is the one that
+        # knows it -- it is cutting the segment precisely because a steer
+        # arrived. Without the mark the log cannot tell a reply the user
+        # interrupted from one the model finished. It needs no coordination
+        # with the echo that proves consumption, which is why this fact is
+        # recordable where a steer entry of its own is not.
+        _flush_segment(
+            state,
+            slot,
+            turn.assistant_text,
+            broadcast=False,
+            quiet_persist=True,
+            interrupted=interrupted,
+        )
+        # The flushed segment IS visible output. Every other mid-turn site
+        # that resets assistant_text (compaction, clear, agent switch,
+        # /compact) sets this flag too; without it, a turn that streamed
+        # text, got steered, and then ended with no further text would hit
+        # the empty-response branch and requeue the ORIGINAL prompt —
+        # re-running its side effects.
+        turn._produced_visible_output = True
+    # The flush consumes the raw copy; a blank segment does not.
+    turn.assistant_text = _cleared_segment_text(slot)
+
+
+def _emit_stale(
+    turn, msg: str, *, will_retry: bool = False, notice: str = "", **args: str | int
+) -> None:
+    # *notice* is the row's gateway notice token, *args* its interpolation values.
+    from kiro_crew.dashboard.gateway_notice import gateway_notice_meta
+
+    slot = turn.slot
+    meta: dict = {"kind": TRANSIENT_RETRY_KIND} if will_retry else {}
+    if notice:
+        meta.update(gateway_notice_meta(notice, **args))
+    slot.append("error", msg, "msg msg-err", meta=meta or None)
+    # No explicit chat_message: slot.append already emits ONE, and it
+    # carries `meta` -- a second frame here would arrive untagged.
+
+
+def _emit_stall(
+    turn, msg: str, *, will_retry: bool = False, notice: str = "", **args: str | int
+) -> None:
+    # *notice* is the row's gateway notice token, *args* its interpolation values.
+    from kiro_crew.dashboard.gateway_notice import gateway_notice_meta
+
+    slot = turn.slot
+    meta: dict = {"kind": TRANSIENT_RETRY_KIND} if will_retry else {}
+    if notice:
+        meta.update(gateway_notice_meta(notice, **args))
+    slot.append("error", msg, "msg msg-err", meta=meta or None)
+    # No explicit chat_message: slot.append already emits ONE, and it
+    # carries `meta` -- a second frame here would arrive untagged.
+
+
+def _emit_error(
+    turn, msg: str, *, will_retry: bool = False, notice: str = "", **args: str | int
+) -> None:
+    # *notice* is the row's gateway notice token, *args* its interpolation values.
+    from kiro_crew.dashboard.gateway_notice import gateway_notice_meta
+
+    slot = turn.slot
+    meta: dict = {"kind": TRANSIENT_RETRY_KIND} if will_retry else {}
+    if notice:
+        meta.update(gateway_notice_meta(notice, **args))
+    slot.append("error", msg, "msg msg-err", meta=meta or None)
+    # No explicit chat_message: slot.append already emits ONE, and it
+    # carries `meta` -- a second frame here would arrive untagged.
+
+
+def _turn_full_reply_text(turn: "_ChatTurn") -> tuple[str, str]:
+    """The turn's COMPLETE answer and its FINAL segment, as the transcript shows.
+
+    Returns ``(full_body, final_segment)``. ``full_body`` is everything to
+    mirror; ``final_segment`` is the newest reply row's text, the one an OPTIONS
+    control must be built from (and only from).
+
+    ``turn.assistant_text`` holds only the segment since the last tool call: a
+    tool boundary flushes the text so far to a finalized assistant row and
+    resets the accumulator (``_on_tool_call``), so a turn that answers and then
+    calls one more tool leaves only the trailing fragment -- or nothing -- in
+    it. Mirroring that fragment would publish a truncated reply, or none, on a
+    turn whose answer precedes its last tool call, while the dashboard keeps the
+    whole thing from the transcript. Reading the final segment from the newest
+    row rather than from ``turn.assistant_text`` also keeps a final OPTIONS ask
+    whose row was flushed before a text-less last tool call, which empties
+    ``turn.assistant_text`` -- the dashboard shows those choices from the same
+    row, so the mirror must too.
+
+    The body and the final segment both come from THIS turn's own reply rows
+    (filled by ``_note_reply_row`` at every segment flush including the
+    end-of-turn one), in window order. Identity, not position: a workflow or
+    sub-agent result is appended into the same window by another writer while
+    the turn runs and must not be folded into this reply. The rows are already
+    redacted and OPTIONS-reflow-repaired by ``_flush_segment``, which is what the
+    transcript renders too.
+
+    The ids come from ``turn._reply_mids_snapshot`` when it is set:
+    ``_flush_file_changes`` clears the live ``slot._turn_reply_mids`` on exit and
+    runs BEFORE this leg, so a turn that wrote a file would otherwise find the
+    live list already empty. The snapshot is taken just before that flush. When
+    no snapshot was taken (the flush did not run this turn) the live list is
+    read. Falls back to ``turn.assistant_text`` for both values when neither
+    names a row -- a slot double in a test with no id list, or a turn whose
+    single segment has not been flushed into the window.
+    """
+    trailing = turn.assistant_text
+    non_empty = _turn_reply_segments(turn)
+    if not non_empty:
+        return trailing, trailing
+    return "\n\n".join(non_empty), non_empty[-1]
+
+
+def _turn_reply_segments(turn: "_ChatTurn") -> list[str]:
+    """THIS turn's non-empty reply rows, in window order; ``[]`` when none is named.
+
+    The row ids and why they come from the snapshot: :func:`_turn_full_reply_text`.
+    """
+    slot = turn.slot
+    snapshot = turn._reply_mids_snapshot
+    mids = snapshot if isinstance(snapshot, list) else getattr(slot, "_turn_reply_mids", None)
+    if not isinstance(mids, list) or not mids:
+        return []
+    wanted = set(mids)
+    parts = [
+        row.get("content", "")
+        for row in slot.messages
+        if row_mid(row) in wanted and row.get("role") == "assistant"
+    ]
+    return [p for p in parts if p]
+
+
+#: Channel for the bell entry a dying turn raises (notifications/bus.py).
+_TURN_DIED_CHANNEL = "system.turn"
+#: Legacy ``kind`` on the note. NOT "turn": the frontend's per-kind sound
+#: selector reads ``kind`` (``presetForKind``), and "turn" is the
+#: conversation-ready chime category, so a dead-turn alert would play the
+#: hand-back sound (or none, if that category is muted) rather than being
+#: controlled by its own ``system.turn`` channel. "agent" is the neutral kind
+#: ``system.monitor`` and ``system.member`` notes use for the same reason; the
+#: mute/priority that actually govern this note travel on the channel.
+_TURN_DIED_KIND = "agent"
+#: Why a terminal arm says the turn died: the copy id the bell renders the note
+#: from in the reader's language (``SYSTEM_NOTE_BODY_KEY`` in ``notifMeta.tsx``).
+_TurnDiedNote = Literal[
+    "chat_stopped_signed_out",
+    "chat_stopped_error",
+    "chat_stopped_connection_dropped",
+    "chat_stopped_agent_restarting",
+    "chat_stopped_unrecovered",
+    "chat_stopped_busy",
+    "chat_stopped_refused",
+    "chat_stopped_stalled",
+]
+#: Each one's English body, kept on the note for every reader with no catalog.
+_TURN_DIED_BODIES: dict[_TurnDiedNote, str] = {
+    "chat_stopped_signed_out": (
+        "The chat stopped because the agent is signed out. Open the chat to sign in."
+    ),
+    "chat_stopped_error": "The chat stopped with an error. Open the chat to see what happened.",
+    "chat_stopped_connection_dropped": (
+        "The connection to the agent kept dropping. Open the chat to start a new one."
+    ),
+    "chat_stopped_agent_restarting": (
+        "The agent process kept restarting and the turn did not finish. Open the chat to retry."
+    ),
+    "chat_stopped_unrecovered": (
+        "The chat stopped and could not recover. Open the chat to start a new one."
+    ),
+    "chat_stopped_busy": (
+        "The chat stayed busy and could not recover. Open the chat to start a new one."
+    ),
+    "chat_stopped_refused": (
+        "The model declined to answer and the chat stopped. Open the chat to see why."
+    ),
+    "chat_stopped_stalled": (
+        "The chat stalled and could not recover. Open the chat to start a new one."
+    ),
+}
+
+
+def _notify_turn_died(turn, note: _TurnDiedNote) -> None:
+    """Raise a notification-bell entry for a turn that DIED and needs the user.
+
+    *note* names why, as a key of :data:`_TURN_DIED_BODIES`. When a turn ends in
+    an error the user must act on -- a provider 5xx / throttle, a content-filter refusal, or a
+    terminal transport death -- the transcript shows the inline error card with
+    its Resume/Continue control, but nothing reaches the bell, so an operator
+    working in another session learns work has stopped only by opening it. This
+    reuses the one notification-bus publish path (``state.notify`` ->
+    ``payload_from_legacy`` -> ``NotificationBus.push``, the same path
+    ``send_notification`` uses) rather than adding a new surface.
+
+    Called ONLY from the TERMINAL arms (never a ``will_retry`` recovery, which
+    needs nothing from the user): the turn is over and the next move is the
+    operator's. Minimal by design -- a default-priority bell entry on
+    ``system.turn`` with a deep link to the session. "When/how loud" the issue
+    left open, so there is no new sound category or settings beyond the channel
+    itself; a user who wants it louder (or muted) raises (or mutes) the channel
+    in Settings -> Notifications.
+
+    Two scopings keep it from firing where it is not wanted:
+
+    * An APP-owned chat (``slot._app``) is skipped -- an app owns its chat's
+      continuation, so a dead turn there is the app's to handle, not an
+      operator's to be alerted to.
+    * ``group_key`` is one entry per session, so a session that dies, is
+      resumed, and dies again stacks into a single bell row instead of a pile;
+      ``publisher_session`` attributes the note to the session so THAT session's
+      own mute applies -- a session the user has muted is silenced, which is the
+      honest answer to "only when it is not the session in focus" without the
+      backend inventing per-client focus tracking the bell has never had.
+
+    Best-effort: ``state.notify`` already swallows a validation error, and the
+    whole call is guarded so a notification failure never disturbs the dying
+    turn's teardown, which owns the recoverable work.
+    """
+    slot = turn.slot
+    state = turn.state
+    # An app owns its chat's continuation; a human-created session has _app "".
+    if getattr(slot, "_app", ""):
+        return
+    session_key = turn.session_key
+    try:
+        # A dashboard-internal path (NotificationBus validates: leading "/",
+        # no scheme, no protocol-relative "//"). ``sid`` keys on the slot, the
+        # shape the SPA reads (chat_backfill.session_deep_link); quoted because
+        # a channel/cron session key is not guaranteed URL-safe.
+        url = f"/chat?sid={quote(slot.key, safe='')}" if slot.key else None
+        # Build the payload and set group_key on it, the way every other legacy
+        # producer stacks a note (member_message_notes._publish,
+        # terminal_lifecycle, member_goals): group_key is a schema field the bus
+        # drops from meta, and threading a second way to pass it through the
+        # adapter layers would be a duplicate mechanism.
+        payload = payload_from_legacy(
+            _TURN_DIED_KIND,
+            "⚠️ A chat stopped",
+            _TURN_DIED_BODIES[note],
+            # Name the dying slot so the banner gate scopes to it: a banner is
+            # suppressed only while the operator is viewing THAT slot
+            # (targetsCurrentView's n.slot === activeSlot branch), not whenever
+            # they are on any /chat page -- which is the whole "in another
+            # session" case this exists for. Same key member_message_notes uses.
+            {"slot": slot.key} if slot.key else None,
+            url=url,
+            channel=_TURN_DIED_CHANNEL,
+            # The session's own mute applies to its dead-turn alert. Keyed on
+            # slot.key, NOT session_key: session_is_muted resolves the publisher
+            # through caller_slot_key, which matches a slot's key / history key /
+            # stem -- never an unbound channel-born slot's effective session key
+            # (`dashboard:slack_<ts>`), which would read as unmuted. Same key
+            # member_message_notes publishes under.
+            publisher_session=slot.key or None,
+            i18n={"id": note},
+        )
+        # One stacked bell row per session, not one per death.
+        if session_key:
+            payload.group_key = f"turn-died:{session_key}"
+        state.notification_bus.push(payload)
+    except NotificationValidationError:
+        logger.debug("Dead-turn notification dropped for slot %s", slot.key, exc_info=True)
+    except Exception:
+        logger.debug("Dead-turn notification failed for slot %s", slot.key, exc_info=True)

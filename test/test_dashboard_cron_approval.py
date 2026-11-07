@@ -1,0 +1,362 @@
+"""Tests for dashboard cron handler approval_mode and silent fields."""
+
+from __future__ import annotations
+
+import json
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+from body_stream_helpers import attach_body
+
+from kiro_crew.cron import CronJob, CronSchedule
+from kiro_crew.dashboard.handlers import api_crons, api_crons_create
+
+
+class TestCronCreateApprovalMode:
+    def _make_request(self, body: dict) -> MagicMock:
+        mock_state = MagicMock()
+        mock_state.has_slot.return_value = False
+        mock_job = MagicMock()
+        mock_job.id = "abc"
+        mock_job.agent_id = ""
+        mock_job.approval_mode = ""
+        mock_job.silent = False
+        mock_state.crons.add_job_async = AsyncMock(return_value=mock_job)
+        request = MagicMock()
+        request.app = {"state": mock_state}
+        attach_body(request, body)
+        return request
+
+    @pytest.mark.asyncio
+    async def test_valid_approval_mode_auto(self):
+        request = self._make_request(
+            {"name": "t", "message": "m", "every": 300, "approval_mode": "auto"}
+        )
+        resp = await api_crons_create(request)
+        assert resp.status == 200
+        _, kwargs = request.app["state"].crons.add_job_async.call_args
+        assert kwargs.get("approval_mode") == "auto"
+
+    @pytest.mark.asyncio
+    async def test_invalid_approval_mode_rejected(self):
+        request = self._make_request(
+            {"name": "t", "message": "m", "every": 300, "approval_mode": "evil"}
+        )
+        resp = await api_crons_create(request)
+        assert resp.status == 400
+        request.app["state"].crons.add_job_async.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_silent_flag_set(self):
+        request = self._make_request({"name": "t", "message": "m", "every": 300, "silent": True})
+        resp = await api_crons_create(request)
+        assert resp.status == 200
+        _, kwargs = request.app["state"].crons.add_job_async.call_args
+        assert kwargs.get("silent") is True
+
+    @pytest.mark.asyncio
+    async def test_no_approval_mode_accepted(self):
+        request = self._make_request({"name": "t", "message": "m", "every": 300})
+        resp = await api_crons_create(request)
+        assert resp.status == 200
+
+    @pytest.mark.asyncio
+    async def test_enabled_false_creates_the_job_paused_in_the_one_write(self):
+        """An imported crewmate's cron lands paused (rfc-crewmate-share.md §5.4 step 4)."""
+        request = self._make_request({"name": "t", "message": "m", "every": 300, "enabled": False})
+        resp = await api_crons_create(request)
+        assert resp.status == 200
+        _, kwargs = request.app["state"].crons.add_job_async.call_args
+        assert kwargs.get("enabled") is False
+        # The fingerprint of the job as made: an import card's Undo baseline.
+        from kiro_crew.dashboard.change_cards import cron_job_revision
+
+        made = await request.app["state"].crons.add_job_async()
+        assert json.loads(resp.body)["revision"] == cron_job_revision(made)
+
+    @pytest.mark.asyncio
+    async def test_an_absent_enabled_keeps_creating_running_jobs(self):
+        request = self._make_request({"name": "t", "message": "m", "every": 300})
+        resp = await api_crons_create(request)
+        assert resp.status == 200
+        _, kwargs = request.app["state"].crons.add_job_async.call_args
+        assert "enabled" not in kwargs
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("bad", ["false", 0, None])
+    async def test_a_non_bool_enabled_is_refused(self, bad):
+        request = self._make_request({"name": "t", "message": "m", "every": 300, "enabled": bad})
+        resp = await api_crons_create(request)
+        assert resp.status == 400
+        request.app["state"].crons.add_job_async.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_null_agent_does_not_crash(self):
+        """JSON null for 'agent' is coerced to empty string, not AttributeError on .strip()."""
+        request = self._make_request({"name": "t", "message": "m", "every": 300, "agent": None})
+        resp = await api_crons_create(request)
+        assert resp.status == 200
+
+
+class TestCronCreateTimezonePersistenceOwner:
+    """The dashboard create path passes ``timezone`` through ``add_job_async``.
+
+    Setting it after create with a second ``_save()`` leaves a window where the job
+    persists without its timezone, so no handler-side ``_save()`` may exist.
+    """
+
+    def _make_request(self, body: dict):
+        mock_state = MagicMock()
+        mock_state.has_slot.return_value = False
+        mock_job = MagicMock()
+        mock_job.id = "abc"
+        mock_state.crons.add_job_async = AsyncMock(return_value=mock_job)
+        request = MagicMock()
+        request.app = {"state": mock_state}
+        attach_body(request, body)
+        return request, mock_state
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "schedule, timezone",
+        [
+            pytest.param(
+                {"every": 300}, "America/New_York", id="timezone_passed_through_add_job_every"
+            ),
+            pytest.param(
+                {"cron": "0 9 * * *"},
+                "Europe/London",
+                id="timezone_passed_through_add_job_cron_expr",
+            ),
+        ],
+    )
+    async def test_timezone_passed_through_add_job(self, schedule, timezone):
+        request, state = self._make_request(
+            {"name": "t", "message": "m", **schedule, "timezone": timezone}
+        )
+        resp = await api_crons_create(request)
+        assert resp.status == 200
+        # timezone reaches the create call (folded into the single first _save),
+        # NOT a post-hoc job.timezone assignment.
+        _, kwargs = state.crons.add_job_async.call_args
+        assert kwargs.get("timezone") == timezone
+
+    @pytest.mark.asyncio
+    async def test_no_post_hoc_timezone_only_save_not_called_for_tz_alone(self):
+        """When timezone is the ONLY non-schedule field, the handler must not
+        fire a post-hoc ``_save()`` (timezone is folded into the single locked
+        ``add_job_async`` build+persist)."""
+        request, state = self._make_request(
+            {"name": "t", "message": "m", "every": 300, "timezone": "UTC"}
+        )
+        resp = await api_crons_create(request)
+        assert resp.status == 200
+        state.crons._save.assert_not_called()
+
+
+class TestCronCreateModel:
+    """Test model validation on cron create (dashboard handler)."""
+
+    def _make_request(self, body: dict) -> MagicMock:
+        mock_state = MagicMock()
+        mock_state.has_slot.return_value = False
+        mock_job = MagicMock()
+        mock_job.id = "abc"
+        mock_job.agent_id = ""
+        mock_job.approval_mode = ""
+        mock_job.silent = False
+        mock_job.model = ""
+        mock_state.crons.add_job_async = AsyncMock(return_value=mock_job)
+        request = MagicMock()
+        request.app = {"state": mock_state}
+        attach_body(request, body)
+        return request
+
+    @pytest.mark.asyncio
+    async def test_valid_model_accepted(self):
+        request = self._make_request({"name": "t", "message": "m", "every": 300, "model": "sonnet"})
+        resp = await api_crons_create(request)
+        assert resp.status == 200
+        _, kwargs = request.app["state"].crons.add_job_async.call_args
+        assert kwargs.get("model", "") != ""
+
+    @pytest.mark.asyncio
+    async def test_empty_model_accepted(self):
+        request = self._make_request({"name": "t", "message": "m", "every": 300, "model": ""})
+        resp = await api_crons_create(request)
+        assert resp.status == 200
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "model",
+        [
+            pytest.param("../../etc/passwd", id="invalid_model_format_rejected"),
+            # A value that violates _MODEL_NAME_RE (contains a space and "!") is
+            # still rejected by the FORMAT gate -- that gate is retained.
+            pytest.param("bad model!", id="malformed_model_rejected"),
+            # Brackets alone are not a free pass: an id that keeps an illegal
+            # character inside the qualifier is still refused by the format gate.
+            pytest.param("gpt-6-astra[high]!", id="qualified_model_with_illegal_char_rejected"),
+            # A numeric/bool JSON `model` must be rejected as a clean 400, not raise
+            # AttributeError on .strip() and leak an HTTP 500.
+            pytest.param(123, id="non_string_model_rejected"),
+        ],
+    )
+    async def test_model_rejected(self, model):
+        request = self._make_request({"name": "t", "message": "m", "every": 300, "model": model})
+        resp = await api_crons_create(request)
+        assert resp.status == 400
+        body = json.loads(resp.body)
+        assert "invalid model format" in body["error"]
+
+    @pytest.mark.asyncio
+    async def test_arbitrary_kiro_model_accepted(self):
+        # There is no membership gate against the claude_code registry: the
+        # model dropdown is sourced from the live kiro-cli --list-models, so an
+        # arbitrary well-formed kiro id (not in the claude_code family) is
+        # accepted and persisted verbatim. Matches the chat model path.
+        request = self._make_request(
+            {"name": "t", "message": "m", "every": 300, "model": "glm-4.7"}
+        )
+        resp = await api_crons_create(request)
+        assert resp.status == 200
+        _, kwargs = request.app["state"].crons.add_job_async.call_args
+        assert kwargs.get("model") == "glm-4.7"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "model",
+        [
+            "gpt-6-astra[high]",
+            "global.anthropic.claude-opus-4-8[1m]",
+            "model[A1._-]",
+            "model_1.v2-fast",
+        ],
+    )
+    async def test_provider_qualified_model_accepted(self, model):
+        # The cron model dropdown is sourced from the live kiro-cli
+        # --list-models, so a provider-qualified effort id it advertises
+        # (e.g. gpt-6-astra[high]) must be accepted and persisted verbatim.
+        request = self._make_request({"name": "t", "message": "m", "every": 300, "model": model})
+        resp = await api_crons_create(request)
+        assert resp.status == 200
+        _, kwargs = request.app["state"].crons.add_job_async.call_args
+        assert kwargs.get("model") == model
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "model",
+        [
+            "model[]",
+            "model[high",
+            "modelhigh]",
+            "model[[high]]",
+            "model[high][low]",
+            "model[high]suffix",
+            "[high]model",
+            "model[hi;gh]",
+            "model[$x]",
+        ],
+    )
+    async def test_malformed_qualifier_rejected(self, model):
+        request = self._make_request({"name": "t", "message": "m", "every": 300, "model": model})
+        resp = await api_crons_create(request)
+        assert resp.status == 400
+        assert "invalid model format" in json.loads(resp.body)["error"]
+        request.app["state"].crons.add_job_async.assert_not_awaited()
+
+
+class TestCronListFields:
+    @pytest.mark.asyncio
+    async def test_response_includes_approval_mode_and_silent(self):
+        mock_job = MagicMock()
+        mock_job.id = "j1"
+        mock_job.name = "test"
+        mock_job.message = "msg"
+        mock_job.enabled = True
+        # Serialized alongside `enabled`, because the two together are what tell a
+        # user pause apart from an execution auto-pause.
+        mock_job.user_paused = False
+        # Read to derive the owning `app`; a MagicMock here would flow into the
+        # payload as one, which is the failure this stub's comment below describes.
+        mock_job.created_by = ""
+        mock_job.last_status = "ok"
+        mock_job.agent_id = ""
+        mock_job.channel = "C123"
+        mock_job.approval_mode = "auto"
+        mock_job.silent = True
+        mock_job.strict_schedule = False
+        mock_job.hide_in_chat = False
+        mock_job.minimal_context = False
+        mock_job.persistent_session = True
+        mock_job.auto_pause_after_failures = 5
+        mock_job.alert_after_failures = 1
+        mock_job.schedule = CronSchedule(kind="every", every_secs=300)
+        mock_job.last_run_ts = None
+        mock_job.last_result = None
+        mock_job.last_retry_count = 0
+        # Set explicitly, like every other field here: an unset attribute on a
+        # MagicMock answers with a MagicMock, which the JSON response cannot
+        # serialize — so a field added to the payload fails this test until the
+        # stub names it.
+        mock_job.last_retry_run_ts = 0.0
+        mock_job.consecutive_failures = 0
+        mock_job.failure_backoff_until.return_value = None
+        mock_job.created_ts = None
+        mock_job.timezone = ""
+        mock_job.skip_dates = []
+        mock_job.script = ""
+        mock_job.command = ""
+        mock_job.secret_env = {}
+        mock_job.secret_env_pending = {}
+        mock_job.secret_env_pending_ts = 0.0
+        mock_job.last_error = ""
+        mock_job.model = ""
+        mock_job.folder_id = ""
+        mock_job.chat_folder_id = ""
+        mock_job.session_key = ""
+        mock_job.source_preset = ""
+        mock_job.source_template_prompt = ""
+        mock_job.member_id = ""
+        mock_job.memory_store = ""
+
+        mock_state = MagicMock()
+        mock_state.has_slot.return_value = False
+        mock_state.crons.list_jobs.return_value = [mock_job]
+        mock_state.crons.list_jobs_async = AsyncMock(return_value=[mock_job])
+        mock_state.crons.running_since.return_value = None
+        mock_state.crons.is_running.return_value = False
+
+        request = MagicMock()
+        request.app = {"state": mock_state}
+
+        resp = await api_crons(request)
+
+        data = json.loads(resp.body)
+        job_data = data["jobs"][0]
+        assert job_data["approval_mode"] == "auto"
+        assert job_data["silent"] is True
+        assert job_data["hide_in_chat"] is False
+        assert job_data["minimal_context"] is False
+        assert job_data["persistent_session"] is True
+        assert job_data["channel"] == "C123"
+        assert job_data["skip_dates"] is None
+        # server_tz top-level field exposes the dashboard's local TZ for client rendering
+        assert "server_tz" in data
+
+    @pytest.mark.asyncio
+    async def test_a_default_approval_mode_lists_as_the_stored_empty_string(self):
+        job = CronJob(
+            id="j1", name="t", message="m", schedule=CronSchedule(kind="every", every_secs=300)
+        )
+        mock_state = MagicMock()
+        mock_state.has_slot.return_value = False
+        mock_state.crons.list_jobs_async = AsyncMock(return_value=[job])
+        mock_state.crons.running_since.return_value = None
+        mock_state.crons.is_running.return_value = False
+        request = MagicMock()
+        request.app = {"state": mock_state}
+
+        resp = await api_crons(request)
+
+        assert json.loads(resp.body)["jobs"][0]["approval_mode"] == ""

@@ -1,0 +1,168 @@
+/**
+ * The chat's "Sign in to Kiro" link, end to end through the REAL Agent Harness tab.
+ *
+ * `SettingsPage.agentHarness.test.tsx` pins routing and landing with the tab
+ * replaced by a sentinel that mounts the anchor by itself. Since the redesign the
+ * anchor lives INSIDE the KAS row's detail, which is open only when KAS is the
+ * checked row -- so landing depends on the tab reading the highlight and opening
+ * that row, which a sentinel cannot prove. This renders the real tab (Kiro CLI
+ * configured, so KAS is NOT the row that opens by default) and asserts the whole
+ * chain: the KAS row is checked, the anchor mounts in its detail, the highlight
+ * hook rings it and strips the parameter.
+ */
+import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { render, screen, waitFor } from '@testing-library/react'
+import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom'
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+
+vi.mock('../api/client', async importOriginal => {
+  const mod = await importOriginal<typeof import('../api/client')>()
+  return {
+    ...mod,
+    api: {
+      ...mod.api,
+      kirocrewConfig: vi.fn(() => Promise.resolve({ agent: { acp_backend: 'kiro' } })),
+      patchConfig: vi.fn(() => Promise.resolve({})),
+      acpBackends: vi.fn(() =>
+        Promise.resolve({
+          backends: ['kiro', 'kas', 'claude'].map(id => ({
+            id,
+            policy_id: id || 'kiro',
+            selectable: true,
+            independent_setup: id === 'claude',
+            installed: 'installed',
+            missing_components: [],
+            install_command: '',
+            restart_required: false,
+          })),
+        }),
+      ),
+      acpBackendRecheck: vi.fn(),
+      // Never settles: the card shows its loader, which is enough for the anchor
+      // to exist. The sign-in flow itself is pinned in KiroSignInCard.test.tsx.
+      kasLoginStatus: vi.fn(() => new Promise(() => {})),
+    },
+  }
+})
+
+vi.mock('../components/settingRef/useConfigSchema', () => ({
+  useConfigSchema: () =>
+    new Map([['agent.acp_backend', { path: 'agent.acp_backend', type: 'enum', enum: ['kiro', 'claude', 'kas'] }]]),
+}))
+
+// The run cards beside the switch (Subagent Settings + Warm Pool) read a config
+// shape this suite does not seed; they are pinned in CfgTabCoverage.test.tsx.
+vi.mock('../pages/overview/KiroCrewCfgTab', () => ({ AgentRunSettings: () => <div /> }))
+
+// Settings panels: heavy and irrelevant here.
+vi.mock('../pages/settings/OverviewPanel', () => ({ OverviewPanel: () => <div data-testid="overview-panel" /> }))
+vi.mock('../pages/settings/ChatPanel', () => ({ ChatPanel: () => <div data-testid="chat-panel" /> }))
+vi.mock('../pages/settings/DisplayPanel', () => ({ DisplayPanel: () => <div /> }))
+vi.mock('../pages/settings/BrowserPanel', () => ({ BrowserPanel: () => <div /> }))
+vi.mock('../pages/settings/ComputerUsePanel', () => ({ ComputerUsePanel: () => <div /> }))
+vi.mock('../pages/settings/WebhooksPanel', () => ({ WebhooksPanel: () => <div /> }))
+vi.mock('../pages/settings/RemoteCrewPanel', () => ({ RemoteCrewPanel: () => <div /> }))
+vi.mock('../pages/settings/SecurityPanel', () => ({ SecurityPanel: () => <div /> }))
+vi.mock('../pages/settings/PrivacyPanel', () => ({ PrivacyPanel: () => <div /> }))
+vi.mock('../pages/settings/NotificationsPanel', () => ({ NotificationsPanel: () => <div /> }))
+vi.mock('../pages/settings/DeveloperPanel', () => ({ DeveloperPanel: () => <div /> }))
+vi.mock('../pages/settings/ReleasesPanel', () => ({ default: () => <div /> }))
+vi.mock('../pages/settings/ChannelsPanel', () => ({ ChannelsPanel: () => <div />, CHANNEL_KEYS: [] }))
+
+vi.mock('../store', () => ({ useAppSelector: () => '1.0.0' }))
+vi.mock('../hooks/useIsMobile', () => ({ useIsMobile: () => false }))
+
+import SettingsPage from '../pages/SettingsPage'
+import { KIRO_SIGN_IN_PATH, KIRO_SIGN_IN_SETTING_ID } from '../pages/developer/kiroSignInLink'
+import { createSettingsProvider } from '../components/commandPalette/providers/settingsProvider'
+import type { NavigateFunction } from 'react-router-dom'
+import { KIRO_SIGN_IN_HIGHLIGHT_ANCHOR } from '../hooks/useSettingHighlight'
+
+function LocationProbe() {
+  const { pathname, search } = useLocation()
+  return <div data-testid="loc">{pathname + search}</div>
+}
+
+function renderAt(route: string) {
+  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+  return render(
+    <QueryClientProvider client={qc}>
+      <MemoryRouter initialEntries={[route]}>
+        <Routes>
+          <Route path="/settings/*" element={<SettingsPage />} />
+        </Routes>
+        <LocationProbe />
+      </MemoryRouter>
+    </QueryClientProvider>,
+  )
+}
+
+const loc = () => screen.getByTestId('loc').textContent ?? ''
+
+/** Waits that cross SettingsPage's lazy `AgentBackendTab` import (and the
+ *  KAS row's detail that mounts after it): a cold worker can take past the
+ *  default 1 s to load that chunk, so these carry an explicit deadline. */
+const LAZY_TAB = { timeout: 10_000 }
+
+beforeEach(() => {
+  sessionStorage.clear()
+  // Not available in jsdom; the hook scrolls the anchor into view.
+  Element.prototype.scrollIntoView = vi.fn()
+})
+
+describe('Settings > Agent Harness sign-in deep link, through the real tab', () => {
+  it('opens the KAS row, mounts the sign-in inside its detail, and rings it', async () => {
+    renderAt(KIRO_SIGN_IN_PATH)
+    // Kiro CLI is the configured harness, so the tab would open on it by itself;
+    // the highlight is what moves the check to KAS.
+    const kas = await screen.findByRole('radio', { name: 'Kiro Agent' })
+    await waitFor(() => expect(kas).toBeChecked())
+    expect(screen.getByRole('radio', { name: 'Kiro CLI' })).toHaveAttribute('aria-current', 'true')
+
+    const anchor = await screen.findByTestId('kiro-sign-in-card')
+    expect(anchor).toHaveAttribute('data-setting-key', KIRO_SIGN_IN_HIGHLIGHT_ANCHOR)
+    expect(screen.getByTestId('agent-harness-detail').contains(anchor)).toBe(true)
+    // The compact, in-detail form: a section with its own heading, not a Card.
+    expect(anchor.tagName).toBe('SECTION')
+    expect(anchor).toHaveTextContent('Kiro sign-in')
+
+    // Rung by the Settings highlight hook, and the parameter consumed.
+    await waitFor(() => expect(anchor.scrollIntoView).toHaveBeenCalledTimes(1))
+    expect(anchor.style.outlineOffset).toBe('4px')
+    await waitFor(() => expect(loc()).toBe('/settings/agent'))
+  })
+
+  it('without the highlight, opens on the configured harness and shows no sign-in', async () => {
+    renderAt('/settings/agent')
+    const kiro = await screen.findByRole('radio', { name: 'Kiro CLI' })
+    await waitFor(() => expect(kiro).toBeChecked())
+    expect(screen.getByRole('radio', { name: 'Kiro Agent' })).not.toBeChecked()
+    expect(screen.queryByTestId('kiro-sign-in-card')).toBeNull()
+  })
+
+  it.each(['sign out', 'switch account', 'logout', 'log out'])(
+    'Settings search for "%s" lands on the sign-in card through the real tab',
+    async query => {
+      const nav = vi.fn()
+      const provider = createSettingsProvider(nav as unknown as NavigateFunction, {
+        decisionsEnabled: true,
+        tipsEnabled: true,
+        updateSwitches: { app: true, gateway: true },
+      })
+      const results = await Promise.resolve(provider.search(query))
+      const hit = results.find(r => r.id === `settings:${KIRO_SIGN_IN_SETTING_ID}`)
+      expect(hit, `no sign-in hit for "${query}"`).toBeTruthy()
+      // Among the first results a user sees, not buried.
+      expect(results.indexOf(hit!)).toBeLessThan(5)
+      hit!.onActivate?.()
+      const route = nav.mock.calls[0][0] as string
+
+      renderAt(route)
+      const kas = await screen.findByRole('radio', { name: 'Kiro Agent' }, LAZY_TAB)
+      await waitFor(() => expect(kas).toBeChecked(), LAZY_TAB)
+      const anchor = await screen.findByTestId('kiro-sign-in-card', {}, LAZY_TAB)
+      await waitFor(() => expect(anchor.scrollIntoView).toHaveBeenCalledTimes(1), LAZY_TAB)
+      await waitFor(() => expect(loc()).toBe('/settings/agent'))
+    },
+  )
+})

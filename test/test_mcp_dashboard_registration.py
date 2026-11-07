@@ -1,0 +1,434 @@
+"""Managed-MCP registration for ``kirocrew-dashboard``, and why it is its own server.
+
+The tools are NOT in ``kirocrew-core``, which every session carries, so an occasional
+grant does not spend context in every request. Pinned here:
+
+* **The default agent's spec does not carry the server** (no ``mcpServers`` entry, no
+  ``@kirocrew-dashboard`` ref); an unreferenced server costs zero context.
+* **A refresh never re-grants it**, so a gateway restart cannot bring it back.
+* **The managed spec carries NO ``autoApprove`` key**: an autoApproved tool never
+  reaches ``hooks.on_tool_call``, bypassing the deny floor and governance ceiling.
+
+The registry assertions mirror ``test_computer_use_registration.py``: a
+half-registered server is the failure mode.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+import pytest
+
+from kiro_crew import agent, mcp_cleanup, mcp_discovery, onboarding_import
+
+DASH_SERVER = "kirocrew-dashboard"
+DASH_SUBCOMMAND = "mcp-dashboard"
+
+
+class TestRegistryParity:
+    def test_named_in_every_managed_registry(self) -> None:
+        assert DASH_SERVER in agent._MANAGED_MCP_SERVERS
+        assert DASH_SERVER in mcp_cleanup.KIROCREW_BIN_MCP_SERVERS
+        assert mcp_discovery._MANAGED_SERVER_SUBCOMMANDS.get(DASH_SERVER) == DASH_SUBCOMMAND
+        assert DASH_SERVER in mcp_discovery._MANAGED_SERVER_NAMES
+        assert DASH_SERVER in onboarding_import._managed_mcp_names()
+
+    def test_tool_module_is_mapped_for_in_process_listing(self) -> None:
+        """Discovery reads tool names in-process; an unmapped server lists zero."""
+        assert (
+            mcp_discovery._MANAGED_SERVER_TOOL_MODULES.get(DASH_SERVER) == "kiro_crew.mcp_dashboard"
+        )
+
+    def test_spec_carries_no_auto_approve(self) -> None:
+        assert "autoApprove" not in agent._MANAGED_MCP_SERVERS[DASH_SERVER]
+
+    def test_server_key_is_slash_free(self) -> None:
+        """A slash in the key would be rewritten by the alias normalization pass."""
+        assert "/" not in DASH_SERVER and "\\" not in DASH_SERVER
+
+    def test_it_is_marked_as_an_assignable_set(self) -> None:
+        """``opt_in`` is what makes the two spec writers skip it."""
+        assert agent._MANAGED_MCP_SERVERS[DASH_SERVER].get("opt_in") is True
+
+    def test_the_cleanup_split_tracks_the_opt_in_flags(self) -> None:
+        """Two sources name the same fact, so pin them together.
+
+        ``mcp_cleanup`` splits always-on from opt-in for doctor's benefit, while
+        ``agent`` owns the ``opt_in`` flag the spec writers read. A server added
+        to one and not the other would either be demanded in every spec or
+        silently granted, so neither may drift.
+        """
+        flagged = {n for n, s in agent._MANAGED_MCP_SERVERS.items() if s.get("opt_in")}
+        assert set(mcp_cleanup.OPT_IN_BIN_MCP_SERVERS) == flagged
+        assert (
+            set(mcp_cleanup.ALWAYS_ON_BIN_MCP_SERVERS) == set(agent._MANAGED_MCP_SERVERS) - flagged
+        )
+        assert set(mcp_cleanup.KIROCREW_BIN_MCP_SERVERS) == set(agent._MANAGED_MCP_SERVERS)
+
+
+class TestDoctorTreatsItAsAssignedNotMissing:
+    """`kirocrew doctor` must not undo the assignment, in either direction."""
+
+    def test_it_is_never_blanket_auto_approved(self) -> None:
+        """``allowedTools`` skips the PreToolUse gate, so doctor may not mint one.
+
+        Doctor mints a blanket grant for every managed server outside this set.
+        For tools that rewrite the user's session layout that would delete the
+        deny floor and the governance ceiling in one step.
+        """
+        from kiro_crew import cli_doctor
+
+        assert DASH_SERVER in cli_doctor._NO_BLANKET_ALLOW_MCPS
+
+    def test_a_half_grant_is_reported_not_repaired(self, tmp_path: Any, capsys: Any) -> None:
+        """An entry with no ref is unreachable, and doctor must say so.
+
+        kiro-cli loads a server only when ``tools`` references it, so an entry
+        the user wrote without the ref yields tools that never appear — the same
+        silent unreachability the opt-in shape exists to avoid. Doctor reports it
+        and leaves it alone: mounting it would decide the grant for the user.
+        """
+        import json
+
+        from kiro_crew import cli_doctor
+
+        spec_path = tmp_path / "kirocrew.json"
+        spec = {
+            "mcpServers": {
+                n: {"command": "/usr/local/bin/kirocrew", "args": [f"mcp-{n.split('-', 1)[1]}"]}
+                for n in mcp_cleanup.KIROCREW_BIN_MCP_SERVERS
+            },
+            "tools": [f"@{n}" for n in mcp_cleanup.ALWAYS_ON_BIN_MCP_SERVERS],
+            "allowedTools": [],
+        }
+        spec_path.write_text(json.dumps(spec), encoding="utf-8")
+        issues: list[str] = []
+        cli_doctor._doctor_mcp_tools(spec_path, issues)
+        out = capsys.readouterr().out
+        assert "not referenced in tools" in out
+        # Reported, never repaired: the ref must not have been added for us.
+        after = json.loads(spec_path.read_text(encoding="utf-8"))
+        assert f"@{DASH_SERVER}" not in after.get("tools", [])
+
+    def test_a_ref_without_an_entry_is_also_reported(self, tmp_path: Any, capsys: Any) -> None:
+        """The mirror half: a ref mounting a server the spec never defines."""
+        import json
+
+        from kiro_crew import cli_doctor
+
+        spec_path = tmp_path / "kirocrew.json"
+        spec = {
+            "mcpServers": {
+                n: {"command": "/usr/local/bin/kirocrew", "args": [f"mcp-{n.split('-', 1)[1]}"]}
+                for n in mcp_cleanup.ALWAYS_ON_BIN_MCP_SERVERS
+            },
+            "tools": [f"@{n}" for n in mcp_cleanup.KIROCREW_BIN_MCP_SERVERS],
+            "allowedTools": [],
+        }
+        spec_path.write_text(json.dumps(spec), encoding="utf-8")
+        issues: list[str] = []
+        cli_doctor._doctor_mcp_tools(spec_path, issues)
+        out = capsys.readouterr().out
+        assert "absent from mcpServers" in out
+
+    def test_its_absence_is_not_a_doctor_issue(self, tmp_path: Any, capsys: Any) -> None:
+        """A default install has no grant, and that is the healthy state."""
+        import json
+
+        from kiro_crew import cli_doctor
+
+        spec = tmp_path / "kirocrew.json"
+        spec.write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        n: {
+                            "command": "/usr/local/bin/kirocrew",
+                            "args": [f"mcp-{n.split('-', 1)[1]}"],
+                        }
+                        for n in mcp_cleanup.ALWAYS_ON_BIN_MCP_SERVERS
+                    },
+                    "tools": [f"@{n}" for n in mcp_cleanup.ALWAYS_ON_BIN_MCP_SERVERS],
+                    "allowedTools": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        issues: list[str] = []
+        cli_doctor._doctor_mcp_governance(spec, issues)
+        assert f"@{DASH_SERVER} config" not in issues
+        out = capsys.readouterr().out
+        assert "markers missing" not in out
+
+
+class TestTheDefaultAgentIsNotGrantedTheSet:
+    """A fresh install must not spend context on a set nobody assigned."""
+
+    def test_a_fresh_spec_does_not_define_the_server(self) -> None:
+        config = agent.build_agent_config()
+        assert DASH_SERVER not in config.get("mcpServers", {})
+
+    def test_a_fresh_spec_does_not_reference_the_server(self) -> None:
+        """The ``@`` ref is the actual mount: without it kiro-cli never loads it."""
+        config = agent.build_agent_config()
+        assert f"@{DASH_SERVER}" not in config.get("tools", [])
+
+    def test_the_always_on_servers_are_still_granted(self) -> None:
+        """The skip is scoped to opt-in sets, not to managed servers at large."""
+        config = agent.build_agent_config()
+        mcp = config.get("mcpServers", {})
+        assert "kirocrew-core" in mcp
+        assert "kirocrew-cron" in mcp
+
+    def test_a_refresh_does_not_introduce_the_server(self) -> None:
+        config: dict[str, Any] = {"mcpServers": {}}
+        agent._refresh_dynamic_fields(config)
+        assert DASH_SERVER not in config["mcpServers"]
+
+    def test_a_refresh_keeps_an_existing_grant_current(self) -> None:
+        """An agent the user granted the set to must survive an upgrade."""
+        config: dict[str, Any] = {"mcpServers": {DASH_SERVER: {"command": "stale"}}}
+        agent._refresh_dynamic_fields(config)
+        entry = config["mcpServers"][DASH_SERVER]
+        assert entry["command"] != "stale"
+        assert DASH_SUBCOMMAND in entry["args"]
+
+
+class TestAHandWrittenGrantIsUserInput:
+    """The grant path is hand-edited, so it must tolerate hand-edit mistakes.
+
+    Two passes read these entries — the spec refresh and doctor — and both used
+    to assume every value is an object. A hand-written string crashed refresh
+    (`TypeError`) and doctor (`AttributeError`). Neither may crash, and neither
+    may quietly rewrite what the user wrote.
+    """
+
+    def test_refresh_leaves_a_malformed_entry_untouched(self) -> None:
+        config: dict[str, Any] = {"mcpServers": {DASH_SERVER: "broken"}}
+        agent._refresh_dynamic_fields(config)
+        assert config["mcpServers"][DASH_SERVER] == "broken"
+
+    def test_a_malformed_ALWAYS_ON_entry_still_triggers_recovery(self) -> None:
+        """Preservation is for hand-written entries only.
+
+        A malformed always-on server is corruption, so it raises and the caller
+        rebuilds from defaults; swallowing it would silently drop every tool on it.
+        """
+        always_on = mcp_cleanup.ALWAYS_ON_BIN_MCP_SERVERS[0]
+        config: dict[str, Any] = {"mcpServers": {always_on: "broken"}}
+        with pytest.raises((TypeError, AttributeError)):
+            agent._refresh_dynamic_fields(config)
+
+    def test_doctor_reports_a_malformed_entry_without_dying(
+        self, tmp_path: Any, capsys: Any
+    ) -> None:
+        import json
+
+        from kiro_crew import cli_doctor
+
+        spec_path = tmp_path / "kirocrew.json"
+        spec_path.write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        **{
+                            n: {
+                                "command": "/usr/local/bin/kirocrew",
+                                "args": [f"mcp-{n.split('-', 1)[1]}"],
+                            }
+                            for n in mcp_cleanup.ALWAYS_ON_BIN_MCP_SERVERS
+                        },
+                        DASH_SERVER: "broken",
+                    },
+                    "tools": [f"@{n}" for n in mcp_cleanup.ALWAYS_ON_BIN_MCP_SERVERS],
+                    "allowedTools": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        issues: list[str] = []
+        cli_doctor._doctor_mcp_tools(spec_path, issues)
+        out = capsys.readouterr().out
+        assert "malformed entry" in out
+        # An opt-in name is hand-typed, so a malformed one is reported, not
+        # counted as a broken install.
+        assert f"@{DASH_SERVER} config" not in issues
+
+
+class TestTheNameAloneIsNotOwnership:
+    """A global entry under an opt-in name is never Kiro Crew's to delete.
+
+    Kiro Crew never writes an opt-in server to the global ``mcp.json``, so an entry
+    there is the user's hand-written grant, even one spelled exactly as we would.
+    """
+
+    def test_an_opt_in_name_is_not_in_the_purge_set(self) -> None:
+        assert DASH_SERVER not in mcp_cleanup.STALE_MANAGED_MCP_SERVERS
+        for name in mcp_cleanup.ALWAYS_ON_BIN_MCP_SERVERS:
+            # The guide and member sets became always-on after the last install
+            # method that wrote the global file, so no residue of ours can carry
+            # their names.
+            assert (name in mcp_cleanup.STALE_MANAGED_MCP_SERVERS) is (
+                name not in ("kirocrew-guide", "kirocrew-mate")
+            )
+
+    def test_a_hand_written_grant_survives_cleanup(self, tmp_path: Any, monkeypatch: Any) -> None:
+        """Including one whose invocation is byte-for-byte what we would write."""
+        import json
+
+        mcp_json = tmp_path / "mcp.json"
+        mcp_json.write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        # The user's grant, spelled the only way that works.
+                        DASH_SERVER: {
+                            "command": "/usr/local/bin/kirocrew",
+                            "args": ["mcp-dashboard"],
+                        },
+                        # A genuinely stale always-on entry, for contrast.
+                        "kirocrew-core": {
+                            "command": "/usr/local/bin/kirocrew",
+                            "args": ["mcp-core"],
+                        },
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(mcp_cleanup, "_kiro_mcp_json", lambda: mcp_json)
+
+        removed = mcp_cleanup.clean_stale_managed_mcp()
+
+        assert removed == ["kirocrew-core"]
+        left = json.loads(mcp_json.read_text(encoding="utf-8"))["mcpServers"]
+        assert DASH_SERVER in left, "deleted a grant only a human could have written"
+
+
+class TestWhatThisSetGrants:
+    """Assignment is per SERVER, so the set is the unit of authorization.
+
+    A spec referencing this server gets every tool in it. The current tools grant no
+    new read and delete only empty folders (``chat_folder_delete``); a tool with real
+    blast radius belongs in its own server with its own gate.
+    """
+
+    FOLDER_TOOLS = {
+        "chat_folder_tree",
+        "chat_folder_create",
+        "chat_folder_move",
+        # Rename / icon / color only; the fields that would reach every future
+        # session in the folder are refused by name (see test_mcp_dashboard_folder_update).
+        "chat_folder_update",
+        "chat_folder_move_session",
+        # Empty-only and creator-only: the endpoint's ``if_empty`` mode refuses
+        # a folder holding a subfolder or a live or archived session instead of
+        # unfiling it, refuses a folder the calling session did not create or
+        # the person has touched, and refuses every app and crew-member caller.
+        "chat_folder_delete",
+    }
+    #: The tag half of sidebar organization. Same posture as the folder tools —
+    #: read, create, update (rename/recolor/status) and assign; no delete — so
+    #: the same assignment grants it: an agent told to organize sessions files
+    #: them AND labels them, and a label is the smaller of the two writes (a
+    #: folder move changes what the person sees where; a tag adds a chip).
+    TAG_TOOLS = {
+        "chat_tag_list",
+        "chat_tag_create",
+        "chat_tag_update",
+        "chat_tag_assign",
+    }
+    #: Pinning and pinned-session ordering. Same posture as tag assignment:
+    #: one metadata flag, or the display order the person already sees, on a
+    #: live session the caller may already file and tag; nothing deleted. The
+    #: gateway refuses a reorder from app and crew-member callers.
+    PIN_TOOLS = {"chat_session_pin", "chat_session_pin_move"}
+    #: Board columns. Same posture as the tag tools: read, append and reorder;
+    #: no delete and no retag, so nothing the person put on the board is lost.
+    COLUMN_TOOLS = {"chat_tag_column_list", "chat_tag_column_create", "chat_tag_column_move"}
+    #: Moving a card between columns. Same posture as tag assignment: it is the
+    #: status-tag swap chat_tag_assign could send, through the board's own route.
+    MOVE_TOOLS = {"session_move_to_column"}
+    #: The session-control half. Granted by the SAME assignment as the folder
+    #: half — see ``test_session_driving_tools_ship_with_the_folder_tools`` for
+    #: why the two classes ride together rather than in two servers.
+    SESSION_TOOLS = {
+        "session_create",
+        "session_fork",
+        "session_stop",
+        # Wakes a created session from `wait` through the same parked request
+        # the End-wait button writes; nothing discarded, same target fence.
+        "session_end_wait",
+        "session_retry",
+        "session_continue",
+        "session_set_model",
+        # Tints only a session the caller created; the route's creator
+        # fence is narrower than the rest of this group's.
+        "session_set_color",
+        "session_reload",
+        # Relabels a session the caller may already stop, or itself; same gate.
+        "session_rename",
+        # Regenerates a title on a session the caller created; same gate, narrower.
+        "session_generate_title",
+        "session_close",
+        "session_revive",
+        "session_history_list",
+        "session_send",
+        # The fan-out verb. In the SAME granted set as `session_send` and not a
+        # server of its own, because it grants no reach that one does not: it
+        # calls the same delivery per target under the same gate, so the
+        # capability already assigned here is what it exercises.
+        "session_broadcast",
+        # The roster verb, granted with the rest for the same reason: it reports
+        # liveness for sessions the caller created, which `session_read_message`
+        # already returns one at a time.
+        "session_status",
+        "session_adopt",
+        "session_handoff",
+        "session_release",
+        "session_read_message",
+        "session_summary",
+        # Create, open, bind and seed in one call: no route the four-call path
+        # does not already reach, called as the same caller (rfc-work-dispatch.md).
+        "work_dispatch",
+    }
+    GRANTED_TOOLS = FOLDER_TOOLS | TAG_TOOLS | COLUMN_TOOLS | MOVE_TOOLS | PIN_TOOLS | SESSION_TOOLS
+
+    def test_the_set_is_exactly_the_folder_tools(self) -> None:
+        from kiro_crew import mcp_dashboard
+
+        assert {t["name"] for t in mcp_dashboard._tool_definitions()} == self.GRANTED_TOOLS
+
+    def test_the_advertised_list_is_the_set(self) -> None:
+        """Reaching the process means the set was assigned; nothing is hidden."""
+        from kiro_crew import mcp_dashboard
+
+        assert {t["name"] for t in mcp_dashboard._list_tools()} == self.GRANTED_TOOLS
+
+    def test_session_driving_tools_ship_with_the_folder_tools(self) -> None:
+        """This set deliberately bundles two capability classes.
+
+        One assignable set, so an agent told to organize sessions can also hand work
+        between them. If either class leaves the server, this fails, so dropping one
+        stays a decision.
+        """
+        from kiro_crew import mcp_dashboard
+
+        names = {t["name"] for t in mcp_dashboard._tool_definitions()}
+        folder = {n for n in names if n.startswith("chat_folder_")}
+        tags = {n for n in names if n.startswith("chat_tag_")}
+        pins = {n for n in names if n.startswith("chat_session_")}
+        session = {n for n in names if n.startswith("session_")}
+        # The one dispatch verb: session control's create and send, with the ledger's
+        # create and bind, in one call (rfc-work-dispatch.md).
+        session |= {n for n in names if n == "work_dispatch"}
+        assert folder, "the folder-organization tools left this set"
+        assert tags, "the tag-organization tools left this set"
+        assert pins, "the pin and pinned-order tools left this set"
+        assert session, "the session-control tools left this set"
+        # Nothing else rides along unannounced.
+        assert names == folder | tags | pins | session, (
+            f"{sorted(names - folder - tags - pins - session)} is neither folder "
+            "organization, tag organization, pinning nor session control — name the "
+            "class it belongs to before adding it here"
+        )

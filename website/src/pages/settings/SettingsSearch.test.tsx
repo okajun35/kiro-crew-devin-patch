@@ -1,0 +1,273 @@
+import { describe, it, expect, vi, afterEach } from 'vitest'
+import { render, screen, fireEvent, waitFor, act } from '@testing-library/react'
+import { MemoryRouter, useLocation } from 'react-router-dom'
+import { PREVIEW_EXPLORE, setPreviewFlag } from '../../utils/previewFlags'
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { Provider } from 'react-redux'
+
+import { api } from '../../api/client'
+import { createTestStore } from '../../test/helpers'
+
+import { SidePanelDockContext } from '../../components/SidePanelLayout'
+import SettingsSearch from './SettingsSearch'
+
+/**
+ * The in-page settings search: typing filters SETTINGS_REGISTRY, activation
+ * hands off to useSettingHighlight via a FRESH path URL
+ * (/settings/<tab>[/<sub>]?highlight=<id>), so stale params from the previous
+ * tab can never block the target panel from mounting.
+ *
+ * Queries pin against long-stable registry entries (the Display tab's
+ * zoom-level toggle) rather than enumerating the registry, so routine
+ * regeneration does not churn this file.
+ */
+
+/** Renders the live location so assertions read what activation wrote. */
+function ParamsProbe() {
+  const location = useLocation()
+  return (
+    <>
+      <div data-testid="pathname">{location.pathname}</div>
+      <div data-testid="params">{new URLSearchParams(location.search).toString()}</div>
+    </>
+  )
+}
+
+function setup(
+  initialEntry = '/settings?tab=chat&channel=slack',
+  dock: 'header' | 'bottom-float' | 'nav' = 'header',
+) {
+  // A QueryClient because the search reads `['dashboardConfig']` to learn whether a
+  // governance-gated entry may be offered at all. The cases below are about ranking
+  // and activation and query nothing governed, so an unresolved read is fine here;
+  // `settingsSearchGovernance.test.ts` owns the offered/withheld behaviour.
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+  render(
+    <Provider store={createTestStore()}>
+      <QueryClientProvider client={client}>
+        <MemoryRouter initialEntries={[initialEntry]}>
+          <SidePanelDockContext.Provider value={dock}>
+            <SettingsSearch />
+          </SidePanelDockContext.Provider>
+          <ParamsProbe />
+        </MemoryRouter>
+      </QueryClientProvider>
+    </Provider>,
+  )
+  return client
+}
+
+const input = () => screen.getByRole('combobox')
+
+describe('SettingsSearch', () => {
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  it('shows matching rows for a query against a stable registry entry', () => {
+    setup()
+    fireEvent.change(input(), { target: { value: 'zoom' } })
+    expect(screen.getByRole('listbox')).toBeInTheDocument()
+    expect(screen.getAllByRole('option').length).toBeGreaterThan(0)
+    expect(screen.getByText('Zoom Level')).toBeInTheDocument()
+  })
+
+  it('activation writes a fresh path URL: tab segment + highlight, dropping stale params', () => {
+    setup('/settings?tab=chat&channel=slack')
+    fireEvent.change(input(), { target: { value: 'zoom' } })
+    fireEvent.mouseDown(screen.getByText('Zoom Level'))
+    expect(screen.getByTestId('pathname').textContent).toBe('/settings/display/zoom')
+    const params = new URLSearchParams(screen.getByTestId('params').textContent ?? '')
+    expect(params.get('highlight')).toBe('display.zoom-level')
+    // The stale legacy params from the previous URL must not ride along.
+    expect(params.get('tab')).toBeNull()
+    expect(params.get('channel')).toBeNull()
+    // Input clears and the dropdown closes after activation.
+    expect(input()).toHaveValue('')
+    expect(screen.queryByRole('listbox')).not.toBeInTheDocument()
+  })
+
+  it('carries an entry\u2019s own params into the deep link — as the second path segment', () => {
+    setup()
+    fireEvent.change(input(), { target: { value: 'auto-approve stays on' } })
+    fireEvent.mouseDown(screen.getByText('How long auto-approve stays on'))
+    // The registry entry carries the legacy `section` key; settingsRoute
+    // mints it as the second PATH segment, so the navigation shell's level
+    // test sees the drill-in (one back bar, not two).
+    expect(screen.getByTestId('pathname').textContent).toBe('/settings/security/approval')
+    const params = new URLSearchParams(screen.getByTestId('params').textContent ?? '')
+    expect(params.get('sub')).toBeNull()
+    expect(params.get('section')).toBeNull()
+    expect(params.get('highlight')).toBe('security.how-long-auto-approve-stays-on')
+  })
+
+  it('ranks the yolo duration setting first for its keyword query', () => {
+    // Not just present but TOP: selection resets to row 0 on each keystroke,
+    // so Enter takes rows[0]. "Your Role" (y-o-l-o as a scattered label
+    // subsequence) used to outrank the entry carrying the literal keyword,
+    // sending Enter to an unrelated Chat setting.
+    setup()
+    fireEvent.change(input(), { target: { value: 'yolo' } })
+    const rows = screen.getAllByRole('option')
+    expect(rows[0]).toHaveTextContent('How long auto-approve stays on')
+    expect(rows[0]).toHaveAttribute('aria-selected', 'true')
+  })
+
+  it('in the nav rail, clamps each row (2-line label, 1-line subtitle) and keeps the full text', () => {
+    // The 200px rail wraps instead of truncating; unbounded wrapping let a long
+    // help text turn each hit into ~150px, so "tool" showed two rows.
+    setup('/settings?tab=chat', 'nav')
+    fireEvent.change(input(), { target: { value: 'tool' } })
+    const listbox = screen.getByRole('listbox')
+    expect(listbox.className).toContain('max-h-[min(60vh,28rem)]')
+    expect(listbox.className).not.toContain('max-h-80')
+    const rows = screen.getAllByRole('option')
+    expect(rows.length).toBeGreaterThan(1)
+    for (const row of rows) {
+      const [label, subtitle] = Array.from(row.children) as HTMLElement[]
+      expect(label.className).toContain('line-clamp-2')
+      expect(subtitle.className).toContain('line-clamp-1')
+      expect(label.className).not.toContain('truncate')
+      // The clamp is visual only: the full text is still the row's content
+      // (its accessible name) and is offered on hover.
+      expect(label.getAttribute('title')).toBe(label.textContent)
+      expect(subtitle.getAttribute('title')).toBe(subtitle.textContent)
+      expect(subtitle.textContent).not.toBe('')
+    }
+  })
+
+  it('in the header, rows still truncate to one line with the w-80 panel height', () => {
+    setup('/settings?tab=chat', 'header')
+    fireEvent.change(input(), { target: { value: 'tool' } })
+    expect(screen.getByRole('listbox').className).toContain('max-h-80')
+    const [label, subtitle] = Array.from(screen.getAllByRole('option')[0].children) as HTMLElement[]
+    expect(label.className).toContain('truncate')
+    expect(subtitle.className).toContain('truncate')
+    expect(label.className).not.toContain('line-clamp')
+    expect(label).not.toHaveAttribute('title')
+  })
+
+  it('in the floating capsule, rows truncate and the panel keeps its height', () => {
+    setup('/settings?tab=chat', 'bottom-float')
+    fireEvent.change(input(), { target: { value: 'tool' } })
+    const listbox = screen.getByRole('listbox')
+    expect(listbox.className).toContain('max-h-80')
+    expect(listbox.className).toContain('bottom-full')
+    const [label] = Array.from(screen.getAllByRole('option')[0].children) as HTMLElement[]
+    expect(label.className).toContain('truncate')
+  })
+
+  it('Escape closes the dropdown and keeps the typed query', () => {
+    setup()
+    fireEvent.change(input(), { target: { value: 'zoom' } })
+    expect(screen.getByRole('listbox')).toBeInTheDocument()
+    fireEvent.keyDown(input(), { key: 'Escape' })
+    expect(screen.queryByRole('listbox')).not.toBeInTheDocument()
+    expect(input()).toHaveValue('zoom')
+  })
+
+  it('withdraws Display > Explore from an open search once the Explore preview turns off', () => {
+    const displayExplore = () => screen.queryAllByRole('option').filter(o => /Display/.test(o.textContent ?? '') && /Explore/.test(o.textContent ?? ''))
+    try {
+      setPreviewFlag(PREVIEW_EXPLORE, true)
+      setup()
+      fireEvent.change(input(), { target: { value: 'Explore' } })
+      expect(displayExplore()).toHaveLength(1)
+      act(() => { setPreviewFlag(PREVIEW_EXPLORE, false) })
+      expect(displayExplore()).toHaveLength(0)
+    } finally {
+      setPreviewFlag(PREVIEW_EXPLORE, false)
+    }
+  })
+
+  it('shows the no-results row for a nonsense query', () => {
+    setup()
+    fireEvent.change(input(), { target: { value: 'zzqqxxnothing' } })
+    expect(screen.getByText('No matching settings')).toBeInTheDocument()
+    expect(screen.queryByRole('option')).not.toBeInTheDocument()
+  })
+
+  it('arrow keys move aria-selected through the options', () => {
+    setup()
+    fireEvent.change(input(), { target: { value: 'model' } })
+    const before = screen.getAllByRole('option')
+    expect(before.length).toBeGreaterThan(1)
+    expect(before[0]).toHaveAttribute('aria-selected', 'true')
+    fireEvent.keyDown(input(), { key: 'ArrowDown' })
+    const after = screen.getAllByRole('option')
+    expect(after[0]).toHaveAttribute('aria-selected', 'false')
+    expect(after[1]).toHaveAttribute('aria-selected', 'true')
+  })
+
+  it('a new query keeps the top match selected under a resting pointer', () => {
+    setup()
+    fireEvent.change(input(), { target: { value: 'model' } })
+    // The reader points at the second row with real motion.
+    fireEvent.mouseMove(screen.getAllByRole('option')[1], { clientX: 40, clientY: 60 })
+    fireEvent.mouseMove(screen.getAllByRole('option')[1], { clientX: 41, clientY: 60 })
+    expect(screen.getAllByRole('option')[1]).toHaveAttribute('aria-selected', 'true')
+
+    // Typing re-ranks the rows and resets the selection to the top match. The
+    // browser then fires enter, over and move events at the unchanged position
+    // on the row that landed under the resting pointer. None of them is the
+    // reader pointing, so Enter must still take the top match.
+    fireEvent.change(input(), { target: { value: 'mode' } })
+    const rows = screen.getAllByRole('option')
+    expect(rows.length).toBeGreaterThan(1)
+    fireEvent.mouseEnter(rows[1], { clientX: 41, clientY: 60 })
+    fireEvent.mouseMove(rows[1], { clientX: 41, clientY: 60 })
+    expect(screen.getAllByRole('option')[0]).toHaveAttribute('aria-selected', 'true')
+    expect(screen.getAllByRole('option')[1]).toHaveAttribute('aria-selected', 'false')
+  })
+
+  it('still offers the governed entry when the ceiling read FAILED', async () => {
+    // This component resolves the governance answer itself
+    // (`!isSuccess || data?.decisions_enabled === true`), so the case belongs here
+    // rather than against a restatement of that expression. A failed read is not a
+    // denial: the Decisions card this row navigates to renders the read-failed notice,
+    // so withholding the row would report the setting as absent on a host that merely
+    // could not check.
+    vi.spyOn(api, 'dashboardConfig').mockRejectedValue(new Error('offline'))
+    setup()
+    fireEvent.change(input(), { target: { value: 'Decisions' } })
+    await waitFor(() => {
+      expect(
+        screen.getAllByRole('option').some(o => /Decisions/i.test(o.textContent ?? '')),
+      ).toBe(true)
+    })
+  })
+
+  it('offers only the update switch About draws in this window', async () => {
+    // A browser window: About draws the gateway's switch and no app updater.
+    setup()
+    fireEvent.change(input(), { target: { value: 'auto-update' } })
+    await waitFor(() => {
+      const options = screen.getAllByRole('option').map(o => o.textContent ?? '')
+      expect(options.some(o => /Update the gateway automatically/.test(o))).toBe(true)
+      expect(options.some(o => /Install app updates automatically/.test(o))).toBe(false)
+    })
+  })
+
+  it('withholds Feature Tips once the tips read says the instance config is off', async () => {
+    // With tips off the Chat rail can drop its Discovery group, and the sub-nav
+    // self-heals `sub=discovery` to the first group -- the hit would land nowhere.
+    vi.spyOn(api, 'tipsStatus').mockResolvedValue({ enabled_config: false, opted_out: false, cadence_hours: 24 })
+    setup()
+    fireEvent.change(input(), { target: { value: 'Feature Tips' } })
+    await waitFor(() => {
+      expect(api.tipsStatus).toHaveBeenCalled()
+      expect(screen.queryByText('Feature Tips')).not.toBeInTheDocument()
+    })
+  })
+
+  it('still offers Feature Tips while the tips read is pending or has failed', async () => {
+    vi.spyOn(api, 'tipsStatus').mockRejectedValue(new Error('offline'))
+    const client = setup()
+    fireEvent.change(input(), { target: { value: 'Feature Tips' } })
+    // Pending: offered on first paint.
+    expect(screen.getByText('Feature Tips')).toBeInTheDocument()
+    // Failed: a read that did not succeed is not a denial.
+    await waitFor(() => expect(client.getQueryState(['tipsStatus'])?.status).toBe('error'))
+    expect(screen.getByText('Feature Tips')).toBeInTheDocument()
+  })
+})

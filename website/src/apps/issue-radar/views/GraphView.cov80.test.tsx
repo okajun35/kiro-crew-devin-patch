@@ -1,0 +1,618 @@
+/**
+ * GraphView — the dependency dashboard tab (#5187), FRONTIER + FOCUS rewrite.
+ *
+ * Covers the states a viewer reaches: loading, unavailable (retry), empty, the
+ * FRONTIER list (newly-unlocked + waiting rows, expandable WHY, open-tree), the
+ * FOCUS tree (component render, re-root on click, Enter opens in-app, jump-to
+ * input), and the narrow branch (defaults to FRONTIER, tree still reachable).
+ * The deps fetch and app context are mocked; the layout math is covered by
+ * lib/deps.test.ts.
+ */
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+
+import { GitLabGroupError, type DepsResponse } from '../api'
+
+const openRef = vi.hoisted(() => vi.fn())
+const depsFn = vi.hoisted(() => vi.fn())
+const roCallbacks = vi.hoisted(() => ({ current: [] as Array<(entries: unknown[]) => void> }))
+const activeRef = vi.hoisted(() => ({
+  current: { owner: 'zzq', repo: 'fabric', provider: 'github', host: 'github.com' },
+}))
+
+vi.mock('../context', () => ({
+  useIssueRadar: () => ({
+    active: activeRef.current,
+    issues: [
+      { number: 10, title: 'dependent issue', state: 'open' },
+      { number: 20, title: 'ready issue', state: 'open' },
+      { number: 30, title: 'downstream issue', state: 'open' },
+    ],
+    pulls: [
+      // 5 is merged, so 10's only blocker is satisfied → 10 is newly unlocked.
+      { number: 5, title: 'blocker PR', url: '', state: 'closed', draft: false, labels: [], updated_at: '', merged_at: '2026-08-23T01:00:00Z' },
+    ],
+    openRef,
+    refreshPrefs: { staleTimeMs: 60000, listPollMs: 0, pollInBackground: false },
+  }),
+}))
+
+vi.mock('../api', async (importOriginal) => {
+  const mod = await importOriginal<typeof import('../api')>()
+  return { ...mod, issueRadarApi: { ...mod.issueRadarApi, deps: depsFn } }
+})
+
+import GraphView from './GraphView'
+
+// 5 (merged PR) blocks 10; 10 blocks 30; 20 blocks 30 and 20 is open.
+// So: 10 newly unlocked (blocker 5 merged), 30 waiting (blockers 10 & 20 open).
+function fixture(): DepsResponse {
+  return {
+    schema: 1,
+    edges: [
+      { blocked: 10, blocker: 5, source: 'native' },
+      { blocked: 30, blocker: 10, source: 'native' },
+      { blocked: 30, blocker: 20, source: 'inferred' },
+    ],
+    nodes: {
+      '5': { kind: 'pull', state: 'merged', title: 'blocker PR' },
+      '10': { kind: 'issue', state: 'open', title: 'dependent issue' },
+      '20': { kind: 'issue', state: 'open', title: 'ready issue' },
+      '30': { kind: 'issue', state: 'open', title: 'downstream issue' },
+    },
+  }
+}
+
+function renderView() {
+  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+  return render(
+    <QueryClientProvider client={qc}>
+      <GraphView />
+    </QueryClientProvider>,
+  )
+}
+
+async function frontierReady() {
+  await waitFor(() =>
+    expect(screen.getByRole('tab', { name: /FRONTIER/i })).toHaveAttribute('aria-selected', 'true'),
+  )
+}
+
+beforeEach(() => {
+  activeRef.current = { owner: 'zzq', repo: 'fabric', provider: 'github', host: 'github.com' }
+  // jsdom reports zero-size boxes; the shell reads its width to pick the narrow
+  // branch, so a wide default keeps the tab full-width. The narrow test drives
+  // the ResizeObserver callback with a small width instead.
+  vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockReturnValue({
+    width: 1280, height: 800, top: 0, left: 0, right: 1280, bottom: 800, x: 0, y: 0,
+    toJSON: () => ({}),
+  } as DOMRect)
+  vi.stubGlobal(
+    'ResizeObserver',
+    class {
+      cb: (entries: unknown[]) => void
+      constructor(cb: (entries: unknown[]) => void) {
+        this.cb = cb
+        roCallbacks.current.push(cb)
+      }
+      observe() {}
+      disconnect() {}
+    },
+  )
+  vi.stubGlobal(
+    'matchMedia',
+    vi.fn().mockReturnValue({ matches: false, addEventListener: vi.fn(), removeEventListener: vi.fn() }),
+  )
+  depsFn.mockReset()
+  openRef.mockReset()
+  roCallbacks.current = []
+})
+
+afterEach(() => {
+  cleanup()
+  vi.unstubAllGlobals()
+})
+
+describe('GraphView states', () => {
+  it('shows the loading line while the deps query is in flight', () => {
+    depsFn.mockReturnValue(new Promise(() => {}))
+    renderView()
+    expect(screen.getByText(/Loading dependencies/i)).toBeInTheDocument()
+  })
+
+  it('renders the unavailable board on error and retries on the button', async () => {
+    depsFn.mockRejectedValueOnce(new Error('zzq boom')).mockResolvedValueOnce(fixture())
+    renderView()
+    await waitFor(() =>
+      expect(screen.getByText(/Dependency data unavailable/i)).toBeInTheDocument(),
+    )
+    // No route code: the generic line stays, rendered through the shared
+    // ErrorNotice (errors-use-error-notice) with the raw message as detail.
+    expect(screen.getByRole('alert')).toHaveTextContent(/deps route may not be enabled/i)
+    expect(screen.getByText('zzq boom')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: /RETRY/i }))
+    await frontierReady()
+    expect(depsFn).toHaveBeenCalledTimes(2)
+  })
+
+  it('maps a GitLab majority-link-failure to an outage next step, not a sign-in prompt', async () => {
+    // GitLab is the one forge whose "most issues" wording is backed by a real
+    // majority-failure rule in gitlab_queries.fetch_dependency_edges.
+    activeRef.current = { owner: 'zzq', repo: 'fabric', provider: 'gitlab', host: 'gitlab.example.com' }
+    depsFn.mockRejectedValue(
+      new GitLabGroupError('gitlab issue links unavailable for zzq/fabric: 7 of 10 /links calls failed', 'deps_fetch_failed'),
+    )
+    renderView()
+    await waitFor(() =>
+      expect(screen.getByText(/Dependency data unavailable/i)).toBeInTheDocument(),
+    )
+    expect(screen.getByText(/GitLab didn't answer for most issues/)).toBeInTheDocument()
+    expect(screen.queryByText(/not signed in/i)).not.toBeInTheDocument()
+    expect(screen.getByText(/7 of 10 \/links calls failed/)).toBeInTheDocument()
+    expect(screen.queryByText(/deps route may not be enabled/i)).not.toBeInTheDocument()
+  })
+
+  it('keeps GitHub on the generic blurb for a fetch failure, with no "most issues" claim', async () => {
+    // A GitHub edge fetch is one GraphQL call that raises on any single failure,
+    // so GitHub keeps the generic unavailable blurb it showed before this change;
+    // the surface is the shared ErrorNotice with the raw error as detail.
+    activeRef.current = { owner: 'zzq', repo: 'fabric', provider: 'github', host: 'github.com' }
+    depsFn.mockRejectedValue(
+      new GitLabGroupError('github graphql error for zzq/fabric', 'deps_fetch_failed'),
+    )
+    renderView()
+    await waitFor(() =>
+      expect(screen.getByText(/Dependency data unavailable/i)).toBeInTheDocument(),
+    )
+    expect(screen.getByRole('alert')).toHaveTextContent(/deps route may not be enabled/i)
+    expect(screen.queryByText(/most issues/i)).not.toBeInTheDocument()
+    expect(screen.getByText('github graphql error for zzq/fabric')).toBeInTheDocument()
+  })
+
+  it('tells an unauthenticated user to sign in and shows the auth command as a copyable code block', async () => {
+    depsFn.mockRejectedValue(
+      new GitLabGroupError('the `glab` CLI is not authenticated for gitlab.example.com — run `glab auth login --hostname gitlab.example.com`', 'deps_auth_required', 'glab auth login --hostname gitlab.example.com'),
+    )
+    activeRef.current = { owner: 'zzq', repo: 'fabric', provider: 'gitlab', host: 'gitlab.example.com' }
+    const write = vi.fn().mockResolvedValue(undefined)
+    Object.defineProperty(navigator, 'clipboard', { value: { writeText: write }, configurable: true })
+    renderView()
+    await waitFor(() =>
+      expect(screen.getByText(/not signed in to the GitLab CLI \(glab\)/)).toBeInTheDocument(),
+    )
+    // The exact command is lifted out of the server sentence into its own
+    // <code> block (no backticks, left-aligned, one line) with a copy control,
+    // so the next step can be pasted as-is. The cause sentence stays underneath
+    // as the detail, minus its "run `…`" clause, so the command appears exactly
+    // once on the board (UX review).
+    const code = screen.getByText('glab auth login --hostname gitlab.example.com', { selector: 'code' })
+    expect(code.className).toContain('whitespace-pre-wrap')
+    expect(code.className).toContain('break-normal')
+    expect(code.className).toContain('text-text')
+    expect(screen.getByText(/CLI is not authenticated for gitlab.example.com/)).toBeInTheDocument()
+    expect(screen.getAllByText(/glab auth login --hostname gitlab\.example\.com/)).toHaveLength(1)
+    expect(screen.queryByText(/run `glab auth login/)).not.toBeInTheDocument()
+    // The copy control is the shared CopyCommandButton (settingRef): one
+    // clipboard path, with its own copied / failed feedback.
+    fireEvent.click(screen.getByRole('button', { name: /Copy command/i }))
+    await waitFor(() => expect(write).toHaveBeenCalledWith('glab auth login --hostname gitlab.example.com'))
+    await waitFor(() => expect(screen.getByRole('button', { name: /Copied/i })).toBeInTheDocument())
+  })
+
+  it('tells a user whose glab is missing to install it, with no sign-in command', async () => {
+    // `not_installed` is its own route code: a sign-in command cannot run
+    // without the binary, so the board names the install step and offers no
+    // command block (Opus review). The server sentence with its install hint
+    // stays as the detail.
+    depsFn.mockRejectedValue(
+      new GitLabGroupError('the `glab` CLI was not found on this host — install it (`brew install glab`)', 'deps_cli_missing'),
+    )
+    activeRef.current = { owner: 'zzq', repo: 'fabric', provider: 'gitlab', host: 'gitlab.example.com' }
+    renderView()
+    await waitFor(() =>
+      expect(screen.getByText(/GitLab CLI \(glab\) isn't installed on this host/)).toBeInTheDocument(),
+    )
+    expect(screen.queryByText(/not signed in/i)).not.toBeInTheDocument()
+    expect(screen.queryByText(/glab auth login/, { selector: 'code' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /Copy command/i })).not.toBeInTheDocument()
+    expect(screen.getByText(/brew install glab/)).toBeInTheDocument()
+  })
+
+  it('offers the bare sign-in command when the body carries no host-scoped one, never text from the message', async () => {
+    // The command is the gateway's own `loginCommand`, built from the connected
+    // host. Message text is provider-controlled, so a body without that field
+    // falls back to the bare command even when the sentence names a host.
+    depsFn.mockRejectedValue(
+      new GitLabGroupError('the `glab` CLI is not authenticated for evil.example — run `glab auth login --hostname evil.example`', 'deps_auth_required'),
+    )
+    activeRef.current = { owner: 'zzq', repo: 'fabric', provider: 'gitlab', host: 'gitlab.example.com' }
+    renderView()
+    await waitFor(() =>
+      expect(screen.getByText(/not signed in to the GitLab CLI \(glab\)/)).toBeInTheDocument(),
+    )
+    expect(screen.getByText('glab auth login', { selector: 'code' })).toBeInTheDocument()
+    expect(screen.queryByText(/--hostname evil\.example/)).not.toBeInTheDocument()
+  })
+
+  it('renders the raw server detail as a left-aligned monospace block that never breaks mid-word', async () => {
+    // The issue-scope detail is a glab URL with a query string: an unbreakable
+    // token that the notice's default overflow-wrap:anywhere splits into
+    // "iss / ues?" (UX review). The detail class wraps at spaces only and lets
+    // the block scroll sideways instead.
+    activeRef.current = { owner: 'zzq', repo: 'fabric', provider: 'gitlab', host: 'gitlab.example.com' }
+    depsFn.mockRejectedValue(new GitLabGroupError(
+      'glab api https://gitlab.example.com/api/v4/projects/zzq%2Ffabric/issues?order_by=updated_at&state=opened failed',
+      'deps_issue_scope_unavailable',
+    ))
+    renderView()
+    const detail = await screen.findByText(/projects\/zzq%2Ffabric\/issues\?order_by=updated_at/)
+    expect(detail.className).toContain('break-normal')
+    expect(detail.className).toContain('overflow-x-auto')
+    expect(detail.className).toContain('text-left')
+    expect(detail.className).toContain('font-mono')
+    expect(detail.className).not.toContain('break-words')
+  })
+
+  it('names the issue-scope cause when the route says the open-issue list is unavailable', async () => {
+    activeRef.current = { owner: 'zzq', repo: 'fabric', provider: 'gitlab', host: 'gitlab.example.com' }
+    depsFn.mockRejectedValue(new GitLabGroupError('open issues unavailable', 'deps_issue_scope_unavailable'))
+    renderView()
+    await waitFor(() => expect(screen.getByText(/Open the Issues tab to cache it/)).toBeInTheDocument())
+    // The raw error travels as the detail line, so an actual fetch error (e.g. a
+    // 500) is visible rather than hidden behind a flat "not cached" claim.
+    expect(screen.getByText('open issues unavailable')).toBeInTheDocument()
+  })
+
+  it('renders the empty board when the repo has no edges', async () => {
+    depsFn.mockResolvedValue({ schema: 1, edges: [], nodes: {} })
+    renderView()
+    await waitFor(() => expect(screen.getByText(/No dependencies yet/i)).toBeInTheDocument())
+    // GitHub repo: the hint names the gh command.
+    expect(screen.getByText(/gh issue edit --add-blocked-by/)).toBeInTheDocument()
+  })
+
+  it('tells a GitLab project about Linked items, not the gh command', async () => {
+    activeRef.current = { owner: 'zzq', repo: 'fabric', provider: 'gitlab', host: 'gitlab.example.test' }
+    depsFn.mockResolvedValue({ schema: 1, edges: [], nodes: {} })
+    renderView()
+    await waitFor(() => expect(screen.getByText(/No dependencies yet/i)).toBeInTheDocument())
+    expect(screen.getByText(/Linked items/)).toBeInTheDocument()
+    expect(screen.queryByText(/gh issue edit/)).not.toBeInTheDocument()
+  })
+})
+
+describe('GraphView FRONTIER', () => {
+  it('lists newly unlocked and waiting rows and expands the WHY line', async () => {
+    depsFn.mockResolvedValue(fixture())
+    renderView()
+    await frontierReady()
+    // newly unlocked: IS-10 (blocker 5 merged)
+    const unlocked = screen.getByRole('button', { name: /IS-10/ })
+    expect(unlocked).toBeInTheDocument()
+    // waiting: IS-30
+    expect(screen.getByRole('button', { name: /IS-30/ })).toBeInTheDocument()
+    // expand the unlocked row's WHY line
+    fireEvent.click(unlocked)
+    await waitFor(() =>
+      expect(screen.getByText(/All blockers satisfied/i)).toBeInTheDocument(),
+    )
+    // the WHY line offers an open-tree affordance
+    expect(screen.getByRole('button', { name: /open tree/i })).toBeInTheDocument()
+  })
+
+  it('expands a waiting row and shows what it is waiting on', async () => {
+    depsFn.mockResolvedValue(fixture())
+    renderView()
+    await frontierReady()
+    fireEvent.click(screen.getByRole('button', { name: /IS-30/ }))
+    await waitFor(() => expect(screen.getByText(/Waiting on/i)).toBeInTheDocument())
+  })
+
+  it('opens the FOCUS tree from a row and refreshes on the header button', async () => {
+    depsFn.mockResolvedValue(fixture())
+    renderView()
+    await frontierReady()
+    fireEvent.click(screen.getByRole('button', { name: /IS-10/ }))
+    fireEvent.click(await screen.findByRole('button', { name: /open tree/i }))
+    // FOCUS renders an SVG tree
+    await waitFor(() => expect(screen.getByRole('img')).toBeInTheDocument())
+    fireEvent.click(screen.getByRole('button', { name: /Refresh dependency data/i }))
+    await waitFor(() => expect(depsFn.mock.calls.length).toBeGreaterThan(1))
+  })
+
+  it('keeps keyboard focus on the header Refresh while it runs, and ignores a second press', async () => {
+    // A native `disabled` takes the focused button out of the tab order, so a
+    // keyboard press dropped focus to the page for the whole refetch.
+    depsFn.mockResolvedValue(fixture())
+    renderView()
+    await frontierReady()
+    let release: (v: DepsResponse) => void = () => {}
+    depsFn.mockReturnValueOnce(new Promise<DepsResponse>(resolve => { release = resolve }))
+    const calls = depsFn.mock.calls.length
+
+    const button = screen.getByRole('button', { name: /Refresh dependency data/i })
+    button.focus()
+    fireEvent.click(button)
+    await waitFor(() => expect(button).toHaveAttribute('aria-disabled', 'true'))
+    expect(button).not.toBeDisabled()
+    expect(button).toHaveFocus()
+
+    fireEvent.click(button)
+    expect(depsFn.mock.calls.length).toBe(calls + 1)
+
+    await act(async () => { release(fixture()) })
+    await waitFor(() => expect(button).not.toHaveAttribute('aria-disabled'))
+    expect(button).toHaveFocus()
+  })
+
+  it('keeps the cached graph but surfaces an ErrorNotice when a refresh fails', async () => {
+    // A nonempty graph is cached, then a refresh 502s. hasGraph keeps the graph
+    // and skips EmptyBoard, so the failure would be invisible without the banner.
+    activeRef.current = { owner: 'zzq', repo: 'fabric', provider: 'gitlab', host: 'gitlab.example.com' }
+    depsFn
+      .mockResolvedValueOnce(fixture())
+      .mockRejectedValueOnce(
+        new GitLabGroupError('gitlab issue links unavailable: 7 of 10 /links calls failed', 'deps_fetch_failed'),
+      )
+    renderView()
+    await frontierReady()
+    // Graph is drawn: a FRONTIER row from the fixture is present.
+    expect(screen.getByRole('button', { name: /IS-10/ })).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: /Refresh dependency data/i }))
+    // The banner's bold lead says the graph shown is the last good copy (never
+    // the empty-board "could not be loaded" line), the coded cause is named, the
+    // server detail is shown, and the graph row is STILL there.
+    await waitFor(() =>
+      expect(screen.getByText(/last loaded graph/i)).toBeInTheDocument(),
+    )
+    // The failure text (lead + backend-derived cause + raw detail) renders THROUGH
+    // the shared ErrorNotice (role="alert"), not a bare paragraph — the
+    // errors-use-error-notice contract. Reverting to a <p> fails this.
+    const alert = screen.getByRole('alert')
+    expect(alert).toHaveTextContent(/last loaded graph/i)
+    expect(alert).toHaveTextContent(/didn't answer for most issues/i)
+    expect(alert).toHaveTextContent(/7 of 10 .*calls failed/i)
+    expect(screen.queryByText(/could not be loaded/i)).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /IS-10/ })).toBeInTheDocument()
+  })
+
+  it('on GitLab a user Refresh asks for a synchronous rebuild; the first load and the banner RETRY follow the same rule', async () => {
+    // The default read is cache-first and answers a stale cache with 200 while
+    // only logging the background rebuild's failure, so a user-initiated
+    // Refresh/Retry sends refresh=1 to make the failure reach the banner. The
+    // mount read stays cache-first (GPT review, errors-use-error-notice).
+    activeRef.current = { owner: 'zzq', repo: 'fabric', provider: 'gitlab', host: 'gitlab.example.com' }
+    depsFn
+      .mockResolvedValueOnce(fixture())
+      .mockRejectedValueOnce(new GitLabGroupError('gitlab issue links unavailable: 7 of 10 /links calls failed', 'deps_fetch_failed'))
+      .mockResolvedValueOnce(fixture())
+    renderView()
+    await frontierReady()
+    expect(depsFn).toHaveBeenCalledTimes(1)
+    expect(depsFn.mock.calls[0][1]).toBeUndefined()
+    fireEvent.click(screen.getByRole('button', { name: /Refresh dependency data/i }))
+    await waitFor(() => expect(depsFn).toHaveBeenCalledTimes(2))
+    expect(depsFn.mock.calls[1][1]).toEqual({ refresh: true })
+    const alert = await screen.findByRole('alert')
+    fireEvent.click(within(alert).getByRole('button', { name: /RETRY/i }))
+    await waitFor(() => expect(depsFn).toHaveBeenCalledTimes(3))
+    expect(depsFn.mock.calls[2][1]).toEqual({ refresh: true })
+  })
+
+  it('on GitHub a user Refresh and the banner RETRY stay the cache-first read they were', async () => {
+    // The synchronous rebuild is GitLab-only: forcing it on GitHub would turn
+    // the header Refresh from a cache-first read into a synchronous rebuild,
+    // a GitHub success-path change this PR rules out (First Principles review).
+    activeRef.current = { owner: 'zzq', repo: 'fabric', provider: 'github', host: 'github.com' }
+    depsFn
+      .mockResolvedValueOnce(fixture())
+      .mockRejectedValueOnce(new GitLabGroupError('github graphql error for zzq/fabric', 'deps_fetch_failed'))
+      .mockResolvedValueOnce(fixture())
+    renderView()
+    await frontierReady()
+    fireEvent.click(screen.getByRole('button', { name: /Refresh dependency data/i }))
+    await waitFor(() => expect(depsFn).toHaveBeenCalledTimes(2))
+    expect(depsFn.mock.calls[1][1]).toBeUndefined()
+    const alert = await screen.findByRole('alert')
+    fireEvent.click(within(alert).getByRole('button', { name: /RETRY/i }))
+    await waitFor(() => expect(depsFn).toHaveBeenCalledTimes(3))
+    expect(depsFn.mock.calls[2][1]).toBeUndefined()
+  })
+
+  it('the stale-graph banner has its own retry action, not only the header icon', async () => {
+    // The blurb ends "Wait a moment, then retry"; the retry must be where that
+    // sentence is read (UX review). Clicking it refetches, and a successful
+    // refetch clears the banner.
+    activeRef.current = { owner: 'zzq', repo: 'fabric', provider: 'gitlab', host: 'gitlab.example.com' }
+    depsFn
+      .mockResolvedValueOnce(fixture())
+      .mockRejectedValueOnce(
+        new GitLabGroupError('gitlab issue links unavailable: 7 of 10 /links calls failed', 'deps_fetch_failed'),
+      )
+      .mockResolvedValueOnce(fixture())
+    renderView()
+    await frontierReady()
+    fireEvent.click(screen.getByRole('button', { name: /Refresh dependency data/i }))
+    const alert = await screen.findByRole('alert')
+    const retry = within(alert).getByRole('button', { name: /RETRY/i })
+    // The header icon is outside the alert; the banner's own control is inside it.
+    expect(alert.contains(screen.getByRole('button', { name: /Refresh dependency data/i }))).toBe(false)
+    fireEvent.click(retry)
+    await waitFor(() => expect(depsFn).toHaveBeenCalledTimes(3))
+    await waitFor(() => expect(screen.queryByRole('alert')).not.toBeInTheDocument())
+    expect(screen.getByRole('button', { name: /IS-10/ })).toBeInTheDocument()
+  })
+
+  it('on GitHub a failed refresh keeps the cached graph and shows the stale banner with the raw detail', async () => {
+    // A silent failure over a retained graph is the hidden error the
+    // errors-use-error-notice rule exists for (Opus review), so GitHub gets the
+    // banner too. GitHub has no coded cause to name, so the banner carries only
+    // the lead, the server's own detail and the retry: never the empty board's
+    // "could not be loaded / route may not be enabled" line over a graph that
+    // is on screen (UX review).
+    activeRef.current = { owner: 'zzq', repo: 'fabric', provider: 'github', host: 'github.com' }
+    depsFn
+      .mockResolvedValueOnce(fixture())
+      .mockRejectedValueOnce(new GitLabGroupError('github graphql error for zzq/fabric', 'deps_fetch_failed'))
+    renderView()
+    await frontierReady()
+    expect(screen.getByRole('button', { name: /IS-10/ })).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: /Refresh dependency data/i }))
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent(/last loaded graph/i)
+    expect(alert).toHaveTextContent(/github graphql error for zzq\/fabric/)
+    expect(within(alert).getByRole('button', { name: /RETRY/i })).toBeInTheDocument()
+    expect(screen.queryByText(/could not be loaded/i)).not.toBeInTheDocument()
+    expect(screen.queryByText(/deps route may not be enabled/i)).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /IS-10/ })).toBeInTheDocument()
+  })
+})
+
+describe('GraphView FOCUS tree', () => {
+  async function goFocus() {
+    depsFn.mockResolvedValue(fixture())
+    renderView()
+    await frontierReady()
+    fireEvent.click(screen.getByRole('tab', { name: /FOCUS TREE/i }))
+    await waitFor(() => expect(screen.getByRole('img')).toBeInTheDocument())
+  }
+
+  it('renders the component nodes and re-roots on a node click', async () => {
+    await goFocus()
+    const nodes = screen.getAllByRole('button', { name: /IS-10|IS-20|IS-30/ })
+    expect(nodes.length).toBeGreaterThan(0)
+    fireEvent.click(nodes[0]) // re-root, still an SVG tree
+    expect(screen.getByRole('img')).toBeInTheDocument()
+  })
+
+  it('opens a node in-app on Enter', async () => {
+    await goFocus()
+    const node = screen.getAllByRole('button', { name: /IS-10/ })[0]
+    fireEvent.keyDown(node, { key: 'Enter' })
+    expect(openRef).toHaveBeenCalled()
+  })
+
+  it('re-roots from the jump-to-issue input on Enter', async () => {
+    await goFocus()
+    const input = screen.getByRole('combobox', { name: /Jump to issue/i })
+    fireEvent.change(input, { target: { value: '30' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    // still rendering a tree after the jump
+    expect(screen.getByRole('img')).toBeInTheDocument()
+  })
+})
+
+describe('GraphView FRONTIER overflow + jump', () => {
+  // One shared open blocker (900) gates N downstream issues, so every downstream
+  // is a WAITING row. With N > WAITING_CAP (30) the tail is hidden until the
+  // disclosure control expands the list.
+  function bigWaitingFixture(n: number): DepsResponse {
+    const edges: DepsResponse['edges'] = []
+    const nodes: DepsResponse['nodes'] = {
+      '900': { kind: 'issue', state: 'open', title: 'shared blocker' },
+    }
+    for (let i = 0; i < n; i++) {
+      const id = 100 + i
+      nodes[String(id)] = { kind: 'issue', state: 'open', title: `waiting item ${id}` }
+      edges.push({ blocked: id, blocker: 900, source: 'native' })
+    }
+    return { schema: 1, edges, nodes }
+  }
+
+  it('expands the waiting list to reveal a row beyond the cap', async () => {
+    // 40 waiting rows: ids 100..139. WAITING_CAP is 30, so IS-135 is hidden.
+    depsFn.mockResolvedValue(bigWaitingFixture(40))
+    renderView()
+    await frontierReady()
+    // a row within the cap is present; a row past it is not, until expanded
+    expect(screen.getByRole('button', { name: /IS-100\b/ })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /IS-135\b/ })).not.toBeInTheDocument()
+    // the overflow control is a real button reporting collapsed state
+    const disclosure = screen.getByRole('button', { name: /\+\d+ more/ })
+    expect(disclosure).toHaveAttribute('aria-expanded', 'false')
+    fireEvent.click(disclosure)
+    // the hidden row is now revealed, and the control flips to expanded
+    await waitFor(() => expect(screen.getByRole('button', { name: /IS-135\b/ })).toBeInTheDocument())
+    expect(screen.getByRole('button', { name: /Show fewer/i })).toHaveAttribute('aria-expanded', 'true')
+  })
+
+  it('FRONTIER jump reaches a waiting row that sits inside the overflow', async () => {
+    Element.prototype.scrollIntoView = vi.fn()
+    depsFn.mockResolvedValue(bigWaitingFixture(40))
+    renderView()
+    await frontierReady()
+    // IS-138 is past the cap and hidden on load
+    expect(screen.queryByRole('button', { name: /IS-138\b/ })).not.toBeInTheDocument()
+    const input = screen.getByRole('combobox', { name: /Jump to issue/i })
+    fireEvent.change(input, { target: { value: '138' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    // the jump expands the overflow so the target row is now in the DOM
+    await waitFor(() => expect(screen.getByRole('button', { name: /IS-138\b/ })).toBeInTheDocument())
+    expect(Element.prototype.scrollIntoView).toHaveBeenCalled()
+  })
+
+  it('FRONTIER jump falls back to the tree for an item with no frontier row', async () => {
+    // The picker's datalist is every OPEN item, which is a superset of the rows
+    // FRONTIER draws: 900 is the shared blocker, so it is neither unblocked nor
+    // blocked-and-listed and has no row here. Picking it must still do something
+    // -- otherwise the input offers a suggestion that silently does nothing.
+    Element.prototype.scrollIntoView = vi.fn()
+    depsFn.mockResolvedValue(bigWaitingFixture(40))
+    renderView()
+    await frontierReady()
+    expect(screen.queryByRole('button', { name: /IS-900\b/ })).not.toBeInTheDocument()
+    const input = screen.getByRole('combobox', { name: /Jump to issue/i })
+    fireEvent.change(input, { target: { value: '900' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    // It answers by opening the focus tree rooted there, rather than no-opping.
+    await waitFor(() => expect(screen.getByRole('img')).toBeInTheDocument())
+  })
+
+  it('a second jump inside the ring window clears the first row ring', async () => {
+    // GPT round 2: the effect cleanup cancelled the pending removal timer without
+    // removing the attribute, so jumping A then B within REVEAL_RING_MS left A
+    // ringed forever -- two highlighted rows, one of them lying about the match.
+    Element.prototype.scrollIntoView = vi.fn()
+    depsFn.mockResolvedValue(bigWaitingFixture(40))
+    renderView()
+    await frontierReady()
+    const input = screen.getByRole('combobox', { name: /Jump to issue/i })
+
+    fireEvent.change(input, { target: { value: '100' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    const rowA = await waitFor(() => {
+      const el = document.querySelector('[data-ir-reveal="1"]')
+      expect(el).not.toBeNull()
+      return el as Element
+    })
+
+    // Second jump well inside the 1.6s window, so the timer never fired.
+    fireEvent.change(input, { target: { value: '101' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+
+    // Exactly one row is ringed, and it is not the first one.
+    await waitFor(() => {
+      const ringed = document.querySelectorAll('[data-ir-reveal="1"]')
+      expect(ringed).toHaveLength(1)
+      expect(ringed[0]).not.toBe(rowA)
+    })
+  })
+})
+
+describe('GraphView narrow branch', () => {
+  it('drops to FRONTIER when the pane goes narrow', async () => {
+    depsFn.mockResolvedValue(fixture())
+    renderView()
+    await frontierReady()
+    // move to FOCUS, then shrink the pane: the tab returns to FRONTIER
+    fireEvent.click(screen.getByRole('tab', { name: /FOCUS TREE/i }))
+    await waitFor(() => expect(screen.getByRole('img')).toBeInTheDocument())
+    act(() => {
+      for (const cb of roCallbacks.current) cb([{ contentRect: { width: 480 } }])
+    })
+    await waitFor(() =>
+      expect(screen.getByRole('tab', { name: /FRONTIER/i })).toHaveAttribute('aria-selected', 'true'),
+    )
+  })
+})

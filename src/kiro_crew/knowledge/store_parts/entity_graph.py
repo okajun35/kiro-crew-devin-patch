@@ -1,0 +1,471 @@
+"""The entity graph: entity, relation and mention rows, and the graph held in memory.
+
+``SimpleDiGraph`` is the small directed graph the store keeps in memory, with its own
+lock so a worker thread can walk it while the loop thread changes it. The methods
+load it on first read, rebuild it from the tables and publish it with one reference
+swap, write entities, relations and mentions, drop entities nothing references, and
+walk a node's neighbourhood. The neighbourhood walk the search uses reads the relation
+table through its indexes, so a search never materialises the graph; only the
+dashboard's graph views do.
+
+A function here whose first parameter is ``self`` is a ``KnowledgeStore`` method:
+the class binds it under the same name in ``knowledge/store.py``, so it reads the
+store's fields and calls its sibling methods through ``self``.
+
+The ``KnowledgeStore`` fields this module uses. Writes: ``_graph``, ``_graph_loaded``.
+Reads: ``_graph_lock``.
+"""
+
+from __future__ import annotations
+
+import json
+import threading
+from collections import defaultdict
+from datetime import datetime
+from typing import TYPE_CHECKING
+from uuid import uuid4
+
+if TYPE_CHECKING:
+    from kiro_crew.knowledge.store import KnowledgeStore
+
+
+class _NodeView:
+    """Minimal node-attribute view supporting get, subscript, iteration, and len."""
+
+    def __init__(self, data: dict[str, dict], lock: "threading.RLock | None" = None):
+        self._data = data
+        self._lock = lock
+
+    def get(self, nid: str, default: dict | None = None) -> dict:
+        return self._data.get(nid, default if default is not None else {})
+
+    def __getitem__(self, nid: str) -> dict:
+        return self._data[nid]
+
+    def __contains__(self, nid: str) -> bool:
+        return nid in self._data
+
+    def __iter__(self):
+        # Snapshot under the lock: a concurrent add_node/clear on the loop
+        # thread must not mutate the dict while an mc-embed reader iterates it
+        # ("dictionary changed size during iteration").
+        if self._lock is not None:
+            with self._lock:
+                return iter(list(self._data))
+        return iter(list(self._data))
+
+    def __len__(self) -> int:
+        return len(self._data)
+
+
+class _EdgeView:
+    """Minimal edge view supporting iteration and subscript access."""
+
+    def __init__(self, fwd: dict[str, dict[str, dict]], lock: "threading.RLock | None" = None):
+        self._fwd = fwd
+        self._lock = lock
+
+    def __getitem__(self, key: tuple[str, str]) -> dict:
+        u, v = key
+        return self._fwd[u][v]
+
+    def __call__(self, *, data: bool = False):  # noqa: ARG002
+        # Materialize a snapshot under the lock before yielding — see _NodeView.
+        if self._lock is not None:
+            with self._lock:
+                snapshot = [
+                    (u, v, attrs)
+                    for u, targets in self._fwd.items()
+                    for v, attrs in targets.items()
+                ]
+        else:
+            snapshot = [
+                (u, v, attrs) for u, targets in self._fwd.items() for v, attrs in targets.items()
+            ]
+        yield from snapshot
+
+
+class SimpleDiGraph:
+    """Minimal directed graph replacing networkx.DiGraph for the subset of API we use."""
+
+    def __init__(self) -> None:
+        # Guards the three dicts: the loop thread mutates the graph while
+        # HybridRetriever.search() walks it on an mc-embed thread, which would
+        # otherwise raise "dictionary changed size during iteration".
+        # Re-entrant because one op (e.g. get_neighbors) takes it repeatedly.
+        self._lock = threading.RLock()
+        self._node_attrs: dict[str, dict] = {}
+        self._fwd: dict[str, dict[str, dict]] = defaultdict(dict)
+        self._rev: dict[str, dict[str, dict]] = defaultdict(dict)
+        self.nodes = _NodeView(self._node_attrs, self._lock)
+        self.edges = _EdgeView(self._fwd, self._lock)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._node_attrs.clear()
+            self._fwd.clear()
+            self._rev.clear()
+
+    def add_node(self, nid: str, **attrs: object) -> None:
+        with self._lock:
+            self._node_attrs[nid] = attrs
+
+    def add_edge(self, u: str, v: str, **attrs: object) -> None:
+        with self._lock:
+            self._fwd[u][v] = attrs
+            self._rev[v][u] = attrs
+
+    def has_edge(self, u: str, v: str) -> bool:
+        with self._lock:
+            return v in self._fwd.get(u, {})
+
+    def has_node(self, nid: str) -> bool:
+        with self._lock:
+            return nid in self._node_attrs
+
+    def degree(self, nid: str) -> int:
+        with self._lock:
+            return len(self._fwd.get(nid, {})) + len(self._rev.get(nid, {}))
+
+    def successors(self, nid: str):
+        # Snapshot the neighbor keys under the lock so the caller can iterate
+        # freely while the loop thread mutates the graph (see __init__).
+        with self._lock:
+            return iter(list(self._fwd.get(nid, {})))
+
+    def predecessors(self, nid: str):
+        with self._lock:
+            return iter(list(self._rev.get(nid, {})))
+
+
+def _prune_orphan_entities(self: KnowledgeStore) -> None:
+    """Delete entities nothing references any more -- no mention, no relation.
+
+    Every path that removes items or a source has to run this, because an
+    entity is only reachable through the rows those paths delete. It takes no
+    transaction of its own -- each call site is already inside an open write
+    transaction -- and it does not reload the in-memory graph, which the sweep
+    can leave holding dropped entities; that stays with whoever owns the
+    transaction.
+    """
+    self.db.execute("""
+            DELETE FROM entities WHERE id NOT IN (SELECT entity_id FROM mentions)
+            AND id NOT IN (SELECT source_id FROM entity_relations)
+            AND id NOT IN (SELECT target_id FROM entity_relations)
+        """)
+
+
+def ensure_graph_loaded(self: KnowledgeStore) -> SimpleDiGraph:
+    """Materialise the entity graph if no reader has done so yet, and return it.
+
+    Graph readers (``get_entity_graph``, ``get_full_graph``) call this from a
+    worker via ``asyncio.to_thread``. It is not run in ``__init__`` because the
+    work scales with ``entities`` + ``entity_relations`` and would stall boot,
+    and it must not run on the loop, where the loop-stall watchdog can
+    hard-exit the gateway. ``allow_on_loop()`` is for constructor setup only.
+
+    The first caller takes the lock and loads; concurrent readers wait.
+
+    A reader must use the returned graph rather than re-read :attr:`graph`:
+    a later :func:`mark_graph_stale` would make that re-read rebuild on the
+    caller's thread. The fast path returns a graph only when it is still the
+    published one, so it never returns an empty placeholder.
+    """
+    graph = self._graph
+    if self._graph_loaded and self._graph is graph:
+        return graph
+    with self._graph_lock:
+        if not self._graph_loaded:
+            self._load_graph()
+        return self._graph
+
+
+def _load_graph(self: KnowledgeStore):
+    """Rebuild the in-memory graph from the tables, atomically.
+
+    Takes ``_graph_lock`` around the WHOLE rebuild: mutation-refresh sites
+    hold no lock, and two concurrent rebuilds could leave wrong rows under a
+    ``_graph_loaded`` flag that never gets rescanned. The SELECTs run after
+    acquisition, so the last rebuild reads the freshest state.
+
+    The graph is built fresh and published with one reference swap, so a
+    reader holding the old object never sees it torn. Multi-step readers
+    (``get_entity_subgraph``, ``get_neighbors``, the graph handlers) pin one
+    reference for their whole read.
+
+    This never takes SQLite's writer lock (refresh sites call it after their
+    COMMIT), so unlike ``_fts_lock`` there is no lock order to invert.
+    """
+    with self._graph_lock:
+        rebuilt = SimpleDiGraph()
+        for row in self.db.execute("SELECT id, name, entity_type FROM entities"):
+            rebuilt.add_node(row["id"], name=row["name"], entity_type=row["entity_type"])
+        for row in self.db.execute(
+            "SELECT id, source_id, target_id, relation_type, weight FROM entity_relations"
+        ):
+            rebuilt.add_edge(
+                row["source_id"],
+                row["target_id"],
+                id=row["id"],
+                relation_type=row["relation_type"],
+                weight=row["weight"],
+            )
+        # Single-reference publish. A reader that captured the previous
+        # ``self._graph`` keeps iterating that complete object; readers after
+        # this point see ``rebuilt``. Neither ever observes a half-built graph.
+        self._graph = rebuilt
+        # Truthful bookkeeping for the refresh call sites too: after any
+        # rebuild the graph IS materialised, so a later first-touch must not
+        # scan again. Set inside the lock, so no reader can observe the flag
+        # True over a half-rebuilt graph.
+        self._graph_loaded = True
+
+
+def mark_graph_stale(self: KnowledgeStore) -> None:
+    """Drop the in-memory graph after a delete; its next reader rebuilds it.
+
+    Rebuilding here would make an artifact sync or the orphan sweep at boot
+    hold every entity and relation in memory (~110 MiB on a 59k-entity
+    library) for a graph nobody asked for. Readers go
+    through :meth:`ensure_graph_loaded`, which rebuilds from the tables on first
+    use. Taken under ``_graph_lock`` so a rebuild in progress finishes before
+    the flag drops; a reader already iterating the old graph keeps that object.
+    The flag drops BEFORE the empty graph is published: the lock-free fast path
+    of :meth:`ensure_graph_loaded` reads the graph first and the flag second, so
+    it can see the old complete graph but never the empty placeholder as loaded.
+    """
+    with self._graph_lock:
+        self._graph_loaded = False
+        self._graph = SimpleDiGraph()
+
+
+def reload_graph(self: KnowledgeStore) -> None:
+    """Invalidate the in-memory entity graph after a delete made in a transaction.
+
+    For a caller that ran :meth:`delete_items_batch_in_txn` and therefore owes
+    what :meth:`delete_items_batch` does for it: :meth:`mark_graph_stale`, so the
+    next reader rebuilds from the tables.
+    """
+    self.mark_graph_stale()
+
+
+def add_entity(self: KnowledgeStore, name, entity_type, description=None, aliases=None) -> str:
+    eid = str(uuid4())
+    now = datetime.now().isoformat()
+    self.db.execute(
+        "INSERT INTO entities (id, name, entity_type, description, aliases, created_at, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (eid, name, entity_type, description, json.dumps(aliases or []), now, now),
+    )
+    # Hold ``_graph_lock`` across BOTH the commit and the in-memory add, as one
+    # critical section. ``_load_graph`` -- which every delete / merge /
+    # import path runs after its own COMMIT -- takes this same lock for its whole
+    # rebuild-and-swap, so serializing commit+add here means a concurrent rebuild
+    # can never land BETWEEN this commit and this add. Without that, a source
+    # deletion that removes this entity's rows could rebuild and swap in the
+    # window, and this late add would re-inject the deleted entity into the
+    # published graph when SQLite has already dropped it. Whichever of the two paths
+    # acquires last leaves the in-memory graph agreeing with the committed rows.
+    with self._graph_lock:
+        self.db.commit()
+        self._graph.add_node(eid, name=name, entity_type=entity_type)
+    return eid
+
+
+def find_entity(self: KnowledgeStore, name):
+    row = self.db.execute("SELECT * FROM entities WHERE name = ?", (name,)).fetchone()
+    if row:
+        return dict(row)
+    row = self.db.execute("SELECT * FROM entities WHERE LOWER(name) = LOWER(?)", (name,)).fetchone()
+    if row:
+        return dict(row)
+    # Only rows that can carry an alias. '' and '[]' (the column default)
+    # parse to no aliases, so filtering them in SQL returns the same row
+    # while sparing a json.loads per entity. The predicate is the partial
+    # index idx_entities_with_aliases word for word, so the read walks only
+    # the alias-bearing rows instead of all 59k entities (~25 ms per missed
+    # query term), and reads (rowid, aliases) from the index alone. The
+    # index returns them in alias order; sorting by rowid restores the table
+    # scan's order, so the first match, and the first malformed row to
+    # raise, are the ones the scan met first.
+    candidates = sorted(
+        self.db.execute(
+            "SELECT rowid, aliases FROM entities "
+            "WHERE aliases IS NOT NULL AND aliases NOT IN ('', '[]')"
+        ).fetchall(),
+        key=lambda row: row[0],
+    )
+    for rowid, raw in candidates:
+        aliases = json.loads(raw) if raw else []
+        if any(a.lower() == name.lower() for a in aliases):
+            # A rowid is not stable: the table has no AUTOINCREMENT, so a row
+            # deleted between the two reads can be reused by an unrelated
+            # entity. Re-reading by rowid AND the aliases just matched returns
+            # only the row that carries them; a replaced row is skipped.
+            row = self.db.execute(
+                "SELECT * FROM entities WHERE rowid = ? AND aliases = ?", (rowid, raw)
+            ).fetchone()
+            if row:
+                return dict(row)
+    return None
+
+
+def merge_entities(self: KnowledgeStore, keep_id, merge_id):
+    self.db.execute(
+        "UPDATE entity_relations SET source_id = ? WHERE source_id = ?", (keep_id, merge_id)
+    )
+    self.db.execute(
+        "UPDATE entity_relations SET target_id = ? WHERE target_id = ?", (keep_id, merge_id)
+    )
+    # Remove self-loops created by the merge
+    self.db.execute(
+        "DELETE FROM entity_relations WHERE source_id = ? AND target_id = ?", (keep_id, keep_id)
+    )
+    # Delete mentions that would conflict, then update the rest
+    self.db.execute(
+        "DELETE FROM mentions WHERE entity_id = ? AND item_id IN (SELECT item_id FROM mentions WHERE entity_id = ?)",
+        (merge_id, keep_id),
+    )
+    self.db.execute("UPDATE mentions SET entity_id = ? WHERE entity_id = ?", (keep_id, merge_id))
+    self.db.execute("DELETE FROM entities WHERE id = ?", (merge_id,))
+    self.db.commit()
+    self._load_graph()
+
+
+def add_entity_relation(
+    self: KnowledgeStore,
+    source_id,
+    target_id,
+    relation_type,
+    description=None,
+    weight=1.0,
+    source_item_id=None,
+) -> str:
+    rid = str(uuid4())
+    now = datetime.now().isoformat()
+    self.db.execute(
+        "INSERT INTO entity_relations (id, source_id, target_id, relation_type, description, weight, source_item_id, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (rid, source_id, target_id, relation_type, description, weight, source_item_id, now),
+    )
+    # Hold ``_graph_lock`` across commit + add, one critical section -- see
+    # add_entity. This closes the delete-then-restore race: a source deletion
+    # whose rebuild+swap would otherwise land between this commit and this add
+    # cannot interleave, so this edge is never re-injected after its row is gone.
+    with self._graph_lock:
+        self.db.commit()
+        self._graph.add_edge(
+            source_id, target_id, id=rid, relation_type=relation_type, weight=weight
+        )
+    return rid
+
+
+def add_mention(self: KnowledgeStore, item_id, entity_id, context=None):
+    now = datetime.now().isoformat()
+    self.db.execute(
+        "INSERT OR IGNORE INTO mentions (item_id, entity_id, context, created_at) VALUES (?, ?, ?, ?)",
+        (item_id, entity_id, context, now),
+    )
+    self.db.commit()
+
+
+#: Ids per ``IN (...)`` in a neighbourhood read. Each statement binds a chunk
+#: twice, which stays under SQLite's default limit of 999 variables.
+_NEIGHBOR_CHUNK = 400
+
+
+def _adjacent_entities(db, ids) -> set[str]:
+    """Every entity one relation away from any of ``ids``, in either direction."""
+    ids = list(ids)
+    out: set[str] = set()
+    for start in range(0, len(ids), _NEIGHBOR_CHUNK):
+        chunk = ids[start : start + _NEIGHBOR_CHUNK]
+        marks = ",".join("?" * len(chunk))
+        for row in db.execute(
+            f"SELECT target_id FROM entity_relations WHERE source_id IN ({marks}) "  # noqa: S608
+            f"UNION SELECT source_id FROM entity_relations WHERE target_id IN ({marks})",
+            (*chunk, *chunk),
+        ):
+            out.add(row[0])
+    return out
+
+
+def get_neighbors(self: KnowledgeStore, entity_id, depth=1) -> list:
+    """Entities within ``depth`` relations of ``entity_id``, in either direction.
+
+    Read from ``entity_relations`` through its ``source_id`` and ``target_id``
+    indexes, one statement per hop and chunk, not from the in-memory graph:
+    the search's graph leg calls this, and materialising the whole graph for
+    it held every entity and relation for the life of the gateway and made the
+    first search after start wait for a full scan of both tables. The walk is
+    the same breadth-first walk over the committed rows the graph is built
+    from, so it returns the same entities.
+    """
+    visited: set[str] = set()
+    frontier = {entity_id}
+    for _ in range(depth):
+        next_frontier = {
+            n for n in _adjacent_entities(self.db, frontier) if n not in visited and n != entity_id
+        }
+        visited |= frontier
+        frontier = next_frontier
+    visited |= frontier
+    visited.discard(entity_id)
+    attrs: dict[str, tuple] = {}
+    ids = list(visited)
+    for start in range(0, len(ids), _NEIGHBOR_CHUNK):
+        chunk = ids[start : start + _NEIGHBOR_CHUNK]
+        marks = ",".join("?" * len(chunk))
+        for row in self.db.execute(
+            f"SELECT id, name, entity_type FROM entities WHERE id IN ({marks})",  # noqa: S608
+            chunk,
+        ):
+            attrs[row[0]] = (row[1], row[2])
+    result = []
+    for nid in visited:
+        name, entity_type = attrs.get(nid, (None, None))
+        result.append({"id": nid, "name": name, "entity_type": entity_type})
+    return result
+
+
+def get_entity_subgraph(self: KnowledgeStore, entity_id, depth=2) -> dict | None:
+    """The D3-shaped subgraph around ``entity_id``, or ``None`` if absent.
+
+    Pins ONE graph reference for the whole read and does the existence check
+    against it, so the check and the traversal see the same snapshot -- a
+    rebuild swapping in a fresh graph between them cannot let an entity pass
+    the check on the old graph and be walked on the new one, returning a
+    degenerate ``name: None`` subgraph instead of ``None``. The
+    ``get_entity_graph`` handler relies on this ``None`` to answer 404.
+    """
+    graph = self.graph
+    if not graph.has_node(entity_id):
+        return None
+    visited = set()
+    frontier = {entity_id}
+    for _ in range(depth):
+        next_frontier = set()
+        for nid in frontier:
+            for neighbor in graph.successors(nid):
+                next_frontier.add(neighbor)
+            for neighbor in graph.predecessors(nid):
+                next_frontier.add(neighbor)
+        visited |= frontier
+        frontier = next_frontier - visited
+    visited |= frontier
+    nodes = []
+    for nid in visited:
+        data = graph.nodes.get(nid, {})
+        nodes.append({"id": nid, "name": data.get("name"), "type": data.get("entity_type")})
+    edges = []
+    for u, v, data in graph.edges(data=True):
+        if u in visited and v in visited:
+            edges.append(
+                {
+                    "source": u,
+                    "target": v,
+                    "type": data.get("relation_type"),
+                    "weight": data.get("weight"),
+                }
+            )
+    return {"nodes": nodes, "edges": edges}

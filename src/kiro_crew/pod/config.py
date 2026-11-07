@@ -1,0 +1,304 @@
+"""Pod runtime configuration — the single source of truth for every path and
+knob the pod runtime uses, all derived from ``$HOME`` and overridable by env.
+
+Every value is ``KIROCREW_POD_*``-overridable so a test harness can stand up a
+fully hermetic pod plane (its own unit prefix, base port, and roots) that cannot
+collide with a developer's live pods.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+from dataclasses import dataclass
+from pathlib import Path
+
+from kiro_crew.config.paths import _default_home
+
+logger = logging.getLogger(__name__)
+
+#: Highest TCP port.
+_MAX_PORT = 65535
+
+# The canonical live gateway port a pod must never bind. Overridable for hosts
+# that run their live plane elsewhere.
+DEFAULT_LIVE_PORT = 5476
+
+# Pod ports are derived as BASE + (cksum(name) % 199) + 1, i.e. BASE+1 .. BASE+199.
+DEFAULT_BASE_PORT = 7810
+
+#: Highest base whose whole BASE+1 .. BASE+199 band is still bindable.
+_MAX_BASE_PORT = _MAX_PORT - 199
+
+# systemd --user template unit. ``<prefix>@<wt>.service`` is one pod.
+DEFAULT_UNIT_PREFIX = "kirocrew-pod"
+
+#: Boot exit codes a RESTART CANNOT HEAL, so the unit must not retry them.
+#:
+#: The pod unit is ``Restart=on-failure`` + ``RestartSec=5``. Every refusal in
+#: :func:`kiro_crew.pod.runtime.boot` is a standing condition -- no pinned
+#: checkout, no venv, no built dist, the derived port IS the live plane, or a pod
+#: OS-home component that could not be verified -- so retrying re-runs the same
+#: refusal every 5 seconds, forever, and buries the FATAL line under repeats.
+#: ``pod/unit.py`` feeds these into ``RestartPreventExitStatus`` so the unit goes
+#: ``failed`` and STAYS there with the reason visible.
+#:
+#: Lives here rather than in ``runtime`` because ``runtime`` imports ``unit`` (so
+#: ``unit`` cannot import ``runtime`` back) while both already import this module
+#: -- one definition, no drift between the code that returns a value and the unit
+#: that exempts it.
+EXIT_PROVISIONING = 3
+EXIT_LIVE_PORT_COLLISION = 70
+#: A security invariant the pod could not establish (currently: the OS home whose
+#: components must all be link-checked before it becomes the child's ``HOME``).
+EXIT_REFUSED_UNRECOVERABLE = 78
+TERMINAL_BOOT_EXIT_CODES: tuple[int, ...] = (
+    EXIT_PROVISIONING,
+    EXIT_LIVE_PORT_COLLISION,
+    EXIT_REFUSED_UNRECOVERABLE,
+)
+
+
+def _canonical_override(raw: str) -> Path:
+    """An operator-supplied path override, anchored so every reader agrees.
+
+    ``expanduser`` then ``abspath``. A RELATIVE override resolves against the
+    reader's working directory, and the CLI and the service-booted gateway (the
+    unit sets no ``WorkingDirectory``, so systemd hands it ``/``) do not share one:
+    ``KIROCREW_POD_ROOT=tmp/pods`` would name two directories. That is a credential
+    leak, because ``pod down`` reclaims the CLI's tree while the pod mints MCP OAuth
+    grants under the gateway's (``KIROCREW_OS_HOME``), so grants would outlive it.
+
+    Anchored at the producer: :meth:`PodConfig.load` reads it and
+    :func:`environment_vars` serialises what ``load`` resolved, so the unit carries
+    an absolute path. ``abspath`` rather than ``Path.resolve()`` so the operator's
+    symlink spelling is kept (on macOS ``/tmp`` would become ``/private/tmp``).
+    Only an OVERRIDE is anchored, which keeps :func:`environment_vars` emitting
+    ``{}`` for an all-defaults plane on a host whose ``$HOME`` is a link.
+    """
+    return Path(os.path.abspath(os.path.expanduser(raw)))
+
+
+def _env_path(key: str, default: Path) -> Path:
+    val = os.environ.get(key)
+    return _canonical_override(val) if val else default
+
+
+def _env_path_opt(key: str) -> Path | None:
+    val = os.environ.get(key)
+    return _canonical_override(val) if val else None
+
+
+def _env_int(key: str, default: int, high: int = _MAX_PORT) -> int:
+    """Port *key* from the environment, or *default* when unset or unusable.
+
+    ``isdigit`` admits characters ``int()`` refuses (U+00B2 SUPERSCRIPT TWO,
+    and any run past ``int()``'s 4300-digit limit), so the conversion is
+    guarded: unguarded, one such value took every pod command down with a
+    traceback. A value outside 1..*high* (``-1``, ``0``, ``70000``) names no
+    usable port, so it falls back to *default* with a warning rather than
+    deriving ports no socket can bind. *high* is 65535 for a port and
+    :data:`_MAX_BASE_PORT` for the derivation base. Blank reads as unset.
+
+    ``pod-e2e.sh`` evaluates this same predicate, conversion and range to find
+    the live plane, and ``test_pod_e2e_harness_paths`` pins the shared
+    expressions, so a change here is carried there in the same commit.
+    """
+    val = os.environ.get(key)
+    if not val:
+        return default
+    port = None
+    if val.strip().lstrip("-").isdigit():
+        try:
+            port = int(val.strip())
+        except ValueError:
+            port = None
+    if port is None or not 1 <= port <= high:
+        logger.warning("ignoring %s=%r: not a port in 1-%d; using %d", key, val, high, default)
+        return default
+    return port
+
+
+def default_gateway_path(home: Path, standard: list[str]) -> str:
+    """The ``PATH`` a booted pod's gateway gets when ``KIROCREW_POD_PATH`` is unset.
+
+    *standard* is the pod's base list: ``~/.local/bin`` followed by the system
+    dirs. The host's user tool-manager bins go in front of it, duplicates dropped.
+
+    A pod starts from the service manager's clean environment, so this list is
+    ALL the gateway can find tools on: Issue Radar's ``glab``/``gh``/``az``, the
+    source-provider panels, and every shell its agent runs. Without the
+    tool-manager bins, a CLI the operator installed through a user-level tool
+    manager would be missing in every pod while the host gateway, whose
+    ``augmented_path`` covers those managers, finds it.
+
+    The added entries are exactly the host's own tool-manager list
+    (``env.user_tool_bin_dirs``, i.e. ``env._EXTRA_PATH_DIRS``), so a directory
+    added there for the host reaches pods too and the two cannot drift. They are
+    fixed, home-rooted install locations, never the operator's live ``PATH``:
+    copying that would carry whatever happened to lead it at ``pod install``
+    time (a worktree venv, a project ``node_modules/.bin``) into every pod. That
+    list already starts with ``~/.local/bin``, and *standard*'s system dirs close
+    the result. A tool resolved from here still goes through its own provenance
+    check (``_validate_provider_executable`` for provider CLIs), so being on
+    ``PATH`` does not make a binary trusted.
+    """
+    # Deferred: kiro_crew.env pulls in heavier optional imports than this module.
+    from kiro_crew.env import user_tool_bin_dirs
+
+    return os.pathsep.join(dict.fromkeys([*user_tool_bin_dirs(str(home)), *standard]))
+
+
+def environment_vars(cfg: PodConfig) -> dict[str, str]:
+    """The pod-plane env a service-manager-booted gateway must be given.
+
+    A booted pod starts with a clean environment, so the plane the CLI resolved
+    has to be pinned into the service definition or the gateway would resolve a
+    DIFFERENT ``PodConfig`` than the CLI that started it. Only values that differ
+    from the built-in default are emitted (plus ``KIROCREW_POD_PATH``, always
+    pinned), so an all-defaults plane yields ``{}``.
+
+    This is the *selection*, deliberately separated from the *serialisation*: the
+    systemd backend renders these as ``Environment=K=V`` lines, the launchd
+    backend hands the same dict to the plist's ``EnvironmentVariables`` key.
+    Keeping one source of truth is what stops the two backends drifting into
+    booting pods with different planes.
+    """
+    home = Path.home()
+    candidates: list[tuple[str, str, str | None]] = [
+        ("KIROCREW_POD_ROOT", str(cfg.pod_root), str(home / ".kirocrew-pods")),
+        ("KIROCREW_POD_ENV_DIR", str(cfg.pods_dir), str(_default_home() / "pods")),
+        (
+            "KIROCREW_POD_ARTIFACTS_DIR",
+            str(cfg.artifacts_dir),
+            str(cfg.pod_root / ".e2e-artifacts"),
+        ),
+        ("KIROCREW_POD_BASE_PORT", str(cfg.base_port), str(DEFAULT_BASE_PORT)),
+        ("KIROCREW_POD_LIVE_PORT", str(cfg.live_port), str(DEFAULT_LIVE_PORT)),
+        ("KIROCREW_POD_UNIT_PREFIX", cfg.unit_prefix, DEFAULT_UNIT_PREFIX),
+        ("KIROCREW_POD_PATH", cfg.gateway_path, None),  # always pin PATH
+    ]
+    out = {key: val for key, val, default in candidates if default is None or val != default}
+    # Optional resolvers — pinned only when set. boot() normally reads the pinned
+    # CHECKOUT= from the per-pod env file directly, so these are belt-and-braces
+    # so a booted service can still resolve the same repo/root the CLI used.
+    if cfg.repo_hint is not None:
+        out["KIROCREW_POD_REPO"] = str(cfg.repo_hint)
+    if cfg.worktrees_root is not None:
+        out["KIROCREW_POD_WORKTREES_ROOT"] = str(cfg.worktrees_root)
+    # Named for what the GATEWAY reads, not for the knob that set it: the pod's
+    # gateway resolves its agent backend from KIROCREW_KIRO_BIN, so pinning any
+    # other key would land in the service definition and change nothing. Emitted
+    # only when the plane asked for it, so a default plane is byte-identical.
+    if cfg.kiro_bin is not None:
+        out["KIROCREW_KIRO_BIN"] = str(cfg.kiro_bin)
+    return out
+
+
+@dataclass(frozen=True)
+class PodConfig:
+    """Resolved, immutable view of where pods live and how they are named.
+
+    Build with :meth:`load` (reads the environment). All fields are plain paths /
+    ints / strings so the rest of the runtime never re-reads ``os.environ``.
+    Worktree *paths* are NOT stored here — a friendly name is resolved to a
+    checkout by :func:`kiro_crew.pod.runtime.resolve_checkout` (git-native).
+    """
+
+    # Isolated pod HOMEs (one dir per running pod; nuked on stop).
+    pod_root: Path
+    # Per-pod env files (pinned CHECKOUT= / PORT= / SEED= for a named pod).
+    pods_dir: Path
+    # Artifacts (logs / screenshots) from pod runs.
+    artifacts_dir: Path
+    # Deterministic port base and the live port to refuse.
+    base_port: int
+    live_port: int
+    # systemd unit naming.
+    unit_prefix: str
+    # PATH handed to a booted pod gateway.
+    gateway_path: str
+    # Optional: the repo git is queried from to resolve worktree names. When
+    # unset, resolution falls back to the invoking working directory.
+    repo_hint: Path | None
+    # Optional: last-resort name->path root used only when git resolution can't
+    # be used (hermetic test/CI planes). Unset by default — git is primary.
+    worktrees_root: Path | None
+    # Optional: the agent backend a booted pod's gateway spawns, pinned into the
+    # service definition as KIROCREW_KIRO_BIN. Unset by default, so an ordinary
+    # pod resolves the host's real kiro-cli exactly as before.
+    #
+    # Exists because a booted pod starts from the service manager's clean
+    # environment, so nothing a caller exports reaches it: `pod up` could not
+    # hand a pod the packaged fake ACP backend, and an offline CI runner had no
+    # way to drive a real agent turn inside a pod at all. Pinned through
+    # `environment_vars` rather than either backend directly, so the systemd unit
+    # and the launchd plist cannot drift on it.
+    #
+    # Defaulted, unlike its optional siblings above, so an existing
+    # ``PodConfig(...)`` call site keeps compiling: this knob adds a capability
+    # and every plane that does not ask for it must stay byte-identical.
+    kiro_bin: Path | None = None
+
+    @classmethod
+    def load(cls) -> "PodConfig":
+        home = Path.home()
+        pod_root = _env_path("KIROCREW_POD_ROOT", home / ".kirocrew-pods")
+        # Pod env files are HOST-side state, so they follow the data-home move to
+        # ~/.kiro/crew. Use the DEFAULT home (not config_dir()) so a pod process
+        # that has its own isolated KIROCREW_HOME set can't redirect the host's
+        # pod registry into the pod's throwaway home.
+        pods_dir = _env_path("KIROCREW_POD_ENV_DIR", _default_home() / "pods")
+        artifacts_dir = _env_path("KIROCREW_POD_ARTIFACTS_DIR", pod_root / ".e2e-artifacts")
+        default_path = default_gateway_path(
+            home,
+            [
+                str(home / ".local" / "bin"),
+                "/usr/local/bin",
+                "/usr/bin",
+                "/bin",
+            ],
+        )
+        return cls(
+            pod_root=pod_root,
+            pods_dir=pods_dir,
+            artifacts_dir=artifacts_dir,
+            base_port=_env_int("KIROCREW_POD_BASE_PORT", DEFAULT_BASE_PORT, _MAX_BASE_PORT),
+            live_port=_env_int("KIROCREW_POD_LIVE_PORT", DEFAULT_LIVE_PORT),
+            unit_prefix=os.environ.get("KIROCREW_POD_UNIT_PREFIX", DEFAULT_UNIT_PREFIX),
+            gateway_path=os.environ.get("KIROCREW_POD_PATH", default_path),
+            repo_hint=_env_path_opt("KIROCREW_POD_REPO"),
+            worktrees_root=_env_path_opt("KIROCREW_POD_WORKTREES_ROOT"),
+            kiro_bin=_env_path_opt("KIROCREW_POD_KIRO_BIN"),
+        )
+
+    # derived locations
+    def home_dir(self, name: str) -> Path:
+        """Isolated ``KIROCREW_HOME`` for pod *name* (nuked on stop)."""
+        return self.pod_root / name
+
+    def env_file(self, name: str) -> Path:
+        """Per-pod env file holding pinned ``CHECKOUT=`` / ``PORT=`` / ``SEED=``."""
+        return self.pods_dir / f"{name}.env"
+
+    def refusal_file(self, name: str) -> Path:
+        """Where a TERMINAL boot refusal is recorded for pod *name*.
+
+        Host-side (beside the env file), deliberately NOT under
+        :meth:`home_dir`: the refusal this records is precisely "a component of
+        that tree could not be verified", so the tree is the wrong place to keep
+        the evidence -- and ``down`` nukes the home, which would erase it.
+
+        Exists because the two service managers make a refusal visible in
+        different amounts. systemd leaves the unit ``failed`` with the ``FATAL``
+        line in ``journalctl``. launchd has no journal and, under the exit-0
+        mechanism that stops its restart loop (see
+        :func:`kiro_crew.pod.launchd.launchd_exit_code`), a terminal refusal
+        looks like an ORDINARY CLEAN EXIT to ``launchctl``. This file is what
+        keeps it legible on both: ``kirocrew pod ls`` reads it through
+        :func:`kiro_crew.pod.cli._print_refusals` and reports the refusal as its
+        own section, so a refused pod does not silently drop out of the listing
+        for merely not running. The ``--json`` form of ``ls`` reports live pods
+        only and does not carry these records.
+        """
+        return self.pods_dir / f"{name}.refused"

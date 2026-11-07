@@ -1,0 +1,763 @@
+"""Failure-branch coverage for :mod:`kiro_crew.slack.handler`.
+
+``test_slack_handler.py`` and ``test_slack_handler_coverage.py`` drive the happy
+paths of the Slack command surface. This module deliberately targets what they
+leave behind: the ``except`` arms that only run when the Slack API, the config
+store, or the SEL audit sink misbehave, plus the early keyword dispatch inside
+``handle_message`` (``status`` / ``sessions`` / ``!compact`` / the
+not-authorized replies).
+
+Everything runs in-process against doubles: no network, no subprocess, and no
+write outside ``tmp_path`` (``config_path`` is redirected per test).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+from slack_wire_helpers import SlackWire, slack_wire
+
+from conftest import MockSlackClient
+from kiro_crew import agent_discovery
+from kiro_crew.config.loader import ConfigReadError
+from kiro_crew.messaging import auto_title
+from kiro_crew.messaging import commands as mc
+from kiro_crew.providers.base import LLMEvent
+from kiro_crew.slack import handler as h
+
+#: These tests start background helper turns, which are skipped while the host's
+#: memory posture is critical (see ``ample_host_free_memory``).
+pytestmark = pytest.mark.usefixtures("ample_host_free_memory")
+
+# ──────────────────────────────────────────────────────────────────────
+# doubles
+# ──────────────────────────────────────────────────────────────────────
+
+
+#: These tests exercise the SLACK side (thread renaming), not the record
+#: pin, so they pass the value production supplies when there is nothing to
+#: pin. ``maybe_auto_title`` requires it, which is what stops a call site
+#: from reading the record inside the task and reopening the window.
+_PRESENT_PIN = auto_title.RecordPin(auto_title.RECORD_PRESENT, "")
+
+
+def _wire_trace(wire: SlackWire) -> list[tuple[str, str, str]]:
+    """``(method, channel, text-or-reaction)`` of every request the real client sent."""
+    return [(c.method, c.get("channel"), c.get("text") or c.get("name")) for c in wire.calls]
+
+
+def _remove_reaction_raises(monkeypatch: pytest.MonkeyPatch, wire: SlackWire) -> None:
+    """The real remove reaches the wire, then raises as a client that does not swallow would."""
+    real_remove = wire.client.remove_reaction
+
+    async def _remove_then_raise(*args, **kwargs):
+        await real_remove(*args, **kwargs)
+        raise RuntimeError("slack remove_reaction unavailable")
+
+    monkeypatch.setattr(wire.client, "remove_reaction", _remove_then_raise)
+
+
+class FlakySlack(MockSlackClient):
+    """MockSlackClient whose named methods raise instead of recording.
+
+    The handler wraps almost every Slack call in ``try/except`` so a transient
+    API error degrades cosmetics rather than aborting a turn. Those arms are
+    only reachable with a client that actually fails.
+    """
+
+    def __init__(self, *fail: str) -> None:
+        super().__init__()
+        self.fail: set[str] = set(fail)
+
+    async def add_reaction(self, channel, ts, emoji, raise_on_error=False):
+        if "add_reaction" in self.fail:
+            raise RuntimeError("slack add_reaction unavailable")
+        await super().add_reaction(channel, ts, emoji, raise_on_error)
+
+    async def remove_reaction(self, channel, ts, emoji, raise_on_error=False):
+        if "remove_reaction" in self.fail:
+            raise RuntimeError("slack remove_reaction unavailable")
+        await super().remove_reaction(channel, ts, emoji, raise_on_error)
+
+    async def post_message(self, channel, text, thread_ts=None):
+        if "post_message" in self.fail:
+            raise RuntimeError("slack post_message unavailable")
+        return await super().post_message(channel, text, thread_ts)
+
+    async def post_blocks(self, channel, blocks, text, thread_ts=None):
+        if "post_blocks" in self.fail:
+            raise RuntimeError("slack post_blocks unavailable")
+        return await super().post_blocks(channel, blocks, text, thread_ts)
+
+
+def _raising_sel(*, method: str) -> MagicMock:
+    """A ``sel()`` factory whose *method* raises, for audit-sink failure arms."""
+    audit = MagicMock()
+    getattr(audit, method).side_effect = RuntimeError("audit sink down")
+    return MagicMock(return_value=audit)
+
+
+async def _drain() -> None:
+    """Let ``asyncio.ensure_future`` callbacks queued by the code under test run."""
+    for _ in range(4):
+        await asyncio.sleep(0)
+
+
+def _texts(slack: MockSlackClient) -> str:
+    return "\n".join(
+        str(a[1].get("text") or "")
+        for a in slack.actions
+        if a[0] in ("post", "update", "blocks", "ephemeral")
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────
+# state hygiene
+# ──────────────────────────────────────────────────────────────────────
+@pytest.fixture(autouse=True)
+def _clean_state():
+    """Reset the module globals these tests touch, before and after."""
+
+    def _reset() -> None:
+        # Through the shared module's own hook: the auto-title claim LRU and its
+        # lock live in `messaging.auto_title` now, and `reset()` does both halves.
+        # A test that crashed mid-title leaves the claim marked AND the permit held,
+        # and `LoopBoundLock` rebinding per loop covers a new loop but not a leaked
+        # permit on the same one.
+        auto_title.reset()
+        h._thread_agents.clear()
+        h._thread_projects.clear()
+        h._hydrated_sessions.clear()
+        h._thread_temporary.clear()
+        h._thread_incognito.clear()
+        h._pending_approvals.clear()
+        h._linked_approvals.clear()
+        h._trusted_sessions.clear()
+        h._cached_default_agent = None
+        h._dashboard_state = None
+        h._orch_cfg = None
+        h._tracking_channels = set()
+
+    _reset()
+    yield
+    _reset()
+
+
+@pytest.fixture()
+def owner(monkeypatch):
+    monkeypatch.setattr(h, "_owner_id", "U1")
+    return "U1"
+
+
+@pytest.fixture()
+def sessions():
+    """SessionManager double. ``_session_map=None`` keeps flag hydration inert."""
+    sm = MagicMock()
+    sm._session_map = None
+    sm.try_acquire = AsyncMock(return_value=True)
+    sm.has_session = MagicMock(return_value=False)
+    sm.release = MagicMock()
+    sm.destroy = AsyncMock()
+    sm.discard_conversation = AsyncMock()
+    sm.get_session_for_thread = MagicMock(return_value=None)
+    return sm
+
+
+# ──────────────────────────────────────────────────────────────────────
+# StatusReactionController — Slack API failures
+# ──────────────────────────────────────────────────────────────────────
+class TestStatusReactionControllerFailures:
+    """Every reaction call is best-effort; none may propagate."""
+
+    @pytest.mark.asyncio
+    async def test_swap_emoji_swallows_add_and_remove_failures(self):
+        slack = FlakySlack("add_reaction", "remove_reaction")
+        ctrl = h.StatusReactionController(slack, "C1", "1.0")
+        # The ack: add_reaction raises inside _swap_emoji.
+        ctrl.start(native_status=False)
+        await _drain()
+        assert ctrl._current_emoji == h._PHASE_EMOJIS["queued"]
+        # The error swap: now there IS an old emoji, so the remove_reaction
+        # failure arm runs too.
+        ctrl.finalize(error=True)
+        await _drain()
+        assert ctrl._current_emoji == h._PHASE_EMOJIS["error"]
+
+
+# ──────────────────────────────────────────────────────────────────────
+# config writers — read/write failures must surface as ValueError
+# ──────────────────────────────────────────────────────────────────────
+class TestConfigWriteFailures:
+    """Both writers fail CLOSED: a bad read must never write a {} baseline."""
+
+    @pytest.fixture(autouse=True)
+    def _local_config(self, monkeypatch, tmp_path):
+        cfg = tmp_path / "config.json"
+        cfg.write_text("{}", encoding="utf-8", newline="\n")
+        monkeypatch.setattr(h, "config_path", lambda: cfg)
+        return cfg
+
+    def test_set_default_agent_read_error(self, monkeypatch):
+        def _boom(_path, *, mutate):
+            raise ConfigReadError("config.json is not valid JSON")
+
+        monkeypatch.setattr(h, "update_config_locked", _boom)
+        with pytest.raises(ValueError, match="Failed to read config"):
+            h._set_default_agent("kirocrew")
+        assert h._cached_default_agent is None
+
+    def test_set_default_agent_write_error(self, monkeypatch):
+        def _boom(_path, *, mutate):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(h, "update_config_locked", _boom)
+        with pytest.raises(ValueError, match="Failed to write config"):
+            h._set_default_agent("kirocrew")
+        # Cache must NOT advance past a failed write.
+        assert h._cached_default_agent is None
+
+    def test_persist_channel_config_read_error(self, monkeypatch):
+        def _boom(_path, *, mutate):
+            raise ConfigReadError("truncated file")
+
+        monkeypatch.setattr(h, "update_config_locked", _boom)
+        with pytest.raises(ValueError, match="Failed to read config"):
+            h._persist_channel_config("C1", activation="mention")
+
+    def test_persist_channel_config_write_error(self, monkeypatch):
+        def _boom(_path, *, mutate):
+            raise OSError("read-only filesystem")
+
+        monkeypatch.setattr(h, "update_config_locked", _boom)
+        with pytest.raises(ValueError, match="Failed to write config"):
+            h._persist_channel_config("C1", agent="kirocrew")
+
+    def test_persist_channel_config_merges_both_fields(self, monkeypatch, tmp_path):
+        # Real file through the real locked primitive: the write must merge
+        # into existing settings, not overwrite them.
+        cfg = tmp_path / "config.json"
+        cfg.write_text(json.dumps({"slack": {"bot": "x"}}), encoding="utf-8", newline="\n")
+        monkeypatch.setattr(h, "config_path", lambda: cfg)
+        h._persist_channel_config("C9", activation="always", agent="kirocrew")
+        written = json.loads(cfg.read_text(encoding="utf-8"))
+        ch = written["slack"]["channels"]["C9"]
+        assert ch == {"activation": "always", "agent": "kirocrew"}
+        # Sibling keys survive the merge.
+        assert written["slack"]["bot"] == "x"
+
+
+class TestSensitivePathRefusal:
+    def test_both_writers_refuse_a_sensitive_config_path(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(h, "config_path", lambda: tmp_path / "config.json")
+        monkeypatch.setattr(h, "is_sensitive_path", lambda _p: True)
+        with pytest.raises(ValueError, match="sensitive path"):
+            h._set_default_agent("kirocrew")
+        with pytest.raises(ValueError, match="sensitive path"):
+            h._persist_channel_config("C1", activation="mention")
+
+
+# ──────────────────────────────────────────────────────────────────────
+# set_yolo_mode — the headless --slack-only startup path
+# ──────────────────────────────────────────────────────────────────────
+class TestSetYoloMode:
+    def test_enabled_grants_a_standing_yolo(self, monkeypatch):
+        calls: list[str] = []
+        monkeypatch.setattr(h, "apply_config_duration", lambda: calls.append("duration"))
+        monkeypatch.setattr(h, "grant_declared_yolo", lambda: calls.append("grant"))
+        h.set_yolo_mode(True)
+        assert calls == ["duration", "grant"]
+
+    def test_disabled_only_applies_the_configured_duration(self, monkeypatch):
+        calls: list[str] = []
+        monkeypatch.setattr(h, "apply_config_duration", lambda: calls.append("duration"))
+        monkeypatch.setattr(h, "grant_declared_yolo", lambda: calls.append("grant"))
+        h.set_yolo_mode(False)
+        assert calls == ["duration"]
+
+
+# ──────────────────────────────────────────────────────────────────────
+# agent-name resolution — project specs, path validation, bad JSON
+# ──────────────────────────────────────────────────────────────────────
+class TestResolveAgentName:
+    def test_project_spec_wins_over_user_level_agents(self, monkeypatch, tmp_path):
+        spec = tmp_path / "reviewer.agent-spec.json"
+        spec.write_text("{}", encoding="utf-8", newline="\n")
+        monkeypatch.setattr(h, "_discover_project_agents", lambda _d, **kw: [spec])
+        monkeypatch.setattr(h, "project_agent_name", lambda p: "project-reviewer")
+        assert h._resolve_agent_name("reviewer", str(tmp_path)) == "project-reviewer"
+
+    def test_unsafe_agent_path_resolves_to_none(self, monkeypatch, tmp_path):
+        agents = tmp_path / "agents"
+        agents.mkdir()
+        (agents / "helper.json").write_text('{"name": "helper"}', encoding="utf-8", newline="\n")
+        monkeypatch.setattr(h, "_discover_project_agents", lambda _d, **kw: [])
+        monkeypatch.setattr(h, "kiro_agents_dir", lambda: agents)
+        # The hardened reader vets the RESOLVED target in the same step as the
+        # read, so the refusal is injected at its gate, not at a path check
+        # here. That gate is is_sensitive_canonical_path; is_sensitive_path in
+        # agent_discovery gates only the project dir and the cache key.
+        monkeypatch.setattr(agent_discovery, "is_sensitive_canonical_path", lambda _p: True)
+        assert h._resolve_agent_name("helper") is None
+
+    def test_unparseable_spec_falls_back_to_the_file_stem(self, monkeypatch, tmp_path):
+        agents = tmp_path / "agents"
+        agents.mkdir()
+        (agents / "helper.json").write_text("{not json", encoding="utf-8", newline="\n")
+        monkeypatch.setattr(h, "_discover_project_agents", lambda _d, **kw: [])
+        monkeypatch.setattr(h, "kiro_agents_dir", lambda: agents)
+        assert h._resolve_agent_name("helper") == "helper"
+
+
+class TestIterCcAgentNames:
+    def _cc_dir(self, tmp_path: Path) -> Path:
+        agents = tmp_path / "plugin" / "agents"
+        agents.mkdir(parents=True)
+        (agents / "one.md").write_text(
+            "---\nname: reviewer\n---\nbody\n", encoding="utf-8", newline="\n"
+        )
+        return tmp_path
+
+    def test_unreadable_spec_is_skipped(self, monkeypatch, tmp_path):
+        cc = self._cc_dir(tmp_path)
+        monkeypatch.setattr(h, "safe_read_file_bytes", lambda _p: None)
+        assert list(h._iter_cc_agent_names(cc)) == []
+
+    def test_reader_exception_is_swallowed(self, monkeypatch, tmp_path):
+        cc = self._cc_dir(tmp_path)
+
+        def _boom(_p):
+            raise OSError("permission denied")
+
+        monkeypatch.setattr(h, "safe_read_file_bytes", _boom)
+        assert list(h._iter_cc_agent_names(cc)) == []
+
+    def test_missing_directory_yields_nothing(self, tmp_path):
+        assert list(h._iter_cc_agent_names(tmp_path / "absent")) == []
+
+    def test_declared_name_is_yielded(self, tmp_path):
+        assert list(h._iter_cc_agent_names(self._cc_dir(tmp_path))) == ["reviewer"]
+
+
+# ──────────────────────────────────────────────────────────────────────
+# !compact — every cosmetic/teardown failure arm
+# ──────────────────────────────────────────────────────────────────────
+def _provider(*, compact_raises: bool = False, result: str = "completed") -> MagicMock:
+    provider = MagicMock()
+    if compact_raises:
+        provider.compact = AsyncMock(side_effect=RuntimeError("transport closed"))
+    else:
+        provider.compact = AsyncMock(return_value=None)
+    summary = "boom" if result == "failed" else ""
+    provider.wait_for_compaction = AsyncMock(return_value={"type": result, "summary": summary})
+    return provider
+
+
+class TestCompactCommandFailureArms:
+    @pytest.mark.asyncio
+    async def test_pre_ui_failure_does_not_abort_compaction(self, sessions):
+        slack = FlakySlack("add_reaction")
+        sessions.get_provider = MagicMock(return_value=_provider())
+        await h._handle_compact_command(slack, sessions, "C1", "t1", "m1", "slack:t1")
+        assert "✅ Context compacted." in _texts(slack)
+        sessions.release.assert_called_once_with("slack:t1")
+
+    @pytest.mark.asyncio
+    async def test_compact_failure_tears_down_even_when_every_cleanup_fails(
+        self, sessions, monkeypatch
+    ):
+        sessions.get_provider = MagicMock(return_value=_provider(compact_raises=True))
+        sessions.discard_conversation = AsyncMock(side_effect=RuntimeError("registry locked"))
+        async with slack_wire(monkeypatch) as wire:
+            wire.fail("chat.postMessage", "channel_not_found")
+            _remove_reaction_raises(monkeypatch, wire)
+            await h._handle_compact_command(wire.client, sessions, "C1", "t1", "m1", "slack:t1")
+        sessions.discard_conversation.assert_awaited_once_with("slack:t1")
+        sessions.release.assert_called_once_with("slack:t1")
+        # Every report and cleanup is still attempted after each one before it failed.
+        assert _wire_trace(wire) == [
+            ("reactions.add", "C1", "recycle"),
+            ("chat.postMessage", "C1", "🔄 Compacting context…"),
+            ("chat.postMessage", "C1", "❌ Compaction failed unexpectedly."),
+            ("reactions.remove", "C1", "recycle"),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_reporting_and_audit_failures_are_swallowed(self, sessions, monkeypatch):
+        sessions.get_provider = MagicMock(return_value=_provider())
+        monkeypatch.setattr(h, "sel", _raising_sel(method="log_tool_invocation"))
+        async with slack_wire(monkeypatch) as wire:
+            wire.fail("chat.postMessage", "channel_not_found")
+            _remove_reaction_raises(monkeypatch, wire)
+            await h._handle_compact_command(wire.client, sessions, "C1", "t1", "m1", "slack:t1")
+        sessions.release.assert_called_once_with("slack:t1")
+        assert _wire_trace(wire) == [
+            ("reactions.add", "C1", "recycle"),
+            ("chat.postMessage", "C1", "🔄 Compacting context…"),
+            ("chat.postMessage", "C1", "✅ Context compacted."),
+            ("reactions.remove", "C1", "recycle"),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_failed_verdict_reports_the_backend_error(self, sessions):
+        slack = FlakySlack()
+        sessions.get_provider = MagicMock(return_value=_provider(result="failed"))
+        await h._handle_compact_command(slack, sessions, "C1", "t1", "m1", "slack:t1")
+        assert "Compaction failed: boom" in _texts(slack)
+
+    @pytest.mark.asyncio
+    async def test_unknown_verdict_reports_a_timeout(self, sessions):
+        slack = FlakySlack()
+        sessions.get_provider = MagicMock(return_value=_provider(result="pending"))
+        await h._handle_compact_command(slack, sessions, "C1", "t1", "m1", "slack:t1")
+        assert "Compaction timed out." in _texts(slack)
+
+    @pytest.mark.asyncio
+    async def test_busy_session_refuses_instead_of_destroying_it(self, sessions):
+        slack = FlakySlack()
+        sessions.try_acquire = AsyncMock(return_value=False)
+        sessions.has_session = MagicMock(return_value=True)
+        await h._handle_compact_command(slack, sessions, "C1", "t1", "m1", "slack:t1")
+        assert "Still working on your last message" in _texts(slack)
+        sessions.release.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_no_session_after_acquire(self, sessions):
+        slack = FlakySlack()
+        sessions.get_provider = MagicMock(return_value=None)
+        await h._handle_compact_command(slack, sessions, "C1", "t1", "m1", "slack:t1")
+        assert "No active session to compact." in _texts(slack)
+        sessions.release.assert_called_once_with("slack:t1")
+
+
+# ──────────────────────────────────────────────────────────────────────
+# !unknown — the catch-all that must not fall through to the LLM
+# ──────────────────────────────────────────────────────────────────────
+class TestUnknownBangCommand:
+    @pytest.mark.asyncio
+    async def test_unknown_command_is_answered_not_forwarded(self, sessions, owner):
+        slack = FlakySlack()
+        reply = await h._handle_slash_command(
+            "!definitelynotacommand", slack, sessions, "C1", "t1", "m1", "slack:t1", owner
+        )
+        # "" (not None) is what stops handle_message forwarding to the agent.
+        assert reply == ""
+        assert "Unknown command" in _texts(slack)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# small command helpers — empty-argument early returns
+# ──────────────────────────────────────────────────────────────────────
+class TestCommandHelperEarlyReturns:
+    @pytest.mark.asyncio
+    async def test_spawn_with_no_task_declines(self):
+        manager = MagicMock()
+        assert await mc.spawn_task_reply("", manager) is None
+        manager.spawn.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_spawn_keyword_without_prefix_declines(self):
+        assert await h._handle_spawn_command("summarize this", MagicMock()) is None
+
+    @pytest.mark.asyncio
+    async def test_task_run_with_no_argument_declines(self):
+        runner = MagicMock()
+        out = await h._handle_run_command("task run", runner, FlakySlack(), "C1", "t1")
+        assert out is None
+        out = await h._handle_run_command("task run   ", runner, FlakySlack(), "C1", "t1")
+        assert out is None
+
+    @pytest.mark.asyncio
+    async def test_task_run_missing_spec_file(self, tmp_path):
+        runner = MagicMock()
+        runner.running = False
+        missing = tmp_path / "no-such-spec.yaml"
+        out = await h._handle_run_command(f"task run {missing}", runner, FlakySlack(), "C1", "t1")
+        assert out is not None and "Spec file not found" in out
+
+    @pytest.mark.asyncio
+    async def test_cron_command_needs_an_action(self):
+        cron = MagicMock()
+        assert await h._handle_cron_command("cron", cron, "C1", "t1") is None
+        assert await h._handle_cron_command("notcron list", cron, "C1", "t1") is None
+        assert await h._handle_cron_command("cron remove", cron, "C1", "t1") is None
+        assert await h._handle_cron_command("cron bogus job1", cron, "C1", "t1") is None
+
+
+# ──────────────────────────────────────────────────────────────────────
+# auto-title — manual-title race and conversation-log failure
+# ──────────────────────────────────────────────────────────────────────
+class _TitleClient:
+    """Minimal ACP client double that streams a one-chunk title."""
+
+    def __init__(self, title: str = "Deploy the gateway") -> None:
+        self._title = title
+
+    async def stream(self, _prompt):
+        yield LLMEvent(kind=h.EVENT_TEXT_CHUNK, text=self._title)
+        yield LLMEvent(kind=h.EVENT_COMPLETE)
+
+    async def reject_tool(self, _request_id):  # pragma: no cover - not reached here
+        return None
+
+
+@pytest.fixture()
+def title_sessions():
+    sm = MagicMock()
+    sm.get_or_create = AsyncMock(return_value=(_TitleClient(), None, None))
+    sm.release = MagicMock()
+    return sm
+
+
+class TestAutoTitle:
+    @pytest.mark.asyncio
+    async def test_manual_title_set_mid_stream_wins(self, title_sessions):
+        slack = FlakySlack()
+        h._titled_threads["slack:t1"] = "manual"
+        await h._maybe_auto_title_slack(
+            slack,
+            title_sessions,
+            "C1",
+            "slack:t1",
+            None,
+            "hello",
+            "hi there",
+            pin=_PRESENT_PIN,
+        )
+        assert not [a for a in slack.actions if a[0] == "set_thread_title"]
+
+    @pytest.mark.asyncio
+    async def test_conversation_log_failure_still_titles_the_thread(self, title_sessions):
+        slack = FlakySlack()
+        log = MagicMock()
+        log.set_title = MagicMock(side_effect=RuntimeError("log locked"))
+        await h._maybe_auto_title_slack(
+            slack,
+            title_sessions,
+            "C1",
+            "slack:t1",
+            log,
+            "hello",
+            "hi there",
+            pin=_PRESENT_PIN,
+        )
+        titled = [a for a in slack.actions if a[0] == "set_thread_title"]
+        assert titled and titled[0][1]["title"] == "Deploy the gateway"
+        # A log failure must not mark the thread untitled (no retry storm).
+        assert "slack:t1" not in h._titled_threads
+
+    @pytest.mark.asyncio
+    async def test_skip_verdict_allows_a_later_retry(self, title_sessions):
+        slack = FlakySlack()
+        title_sessions.get_or_create = AsyncMock(return_value=(_TitleClient("SKIP"), None, None))
+        h._titled_threads["slack:t1"] = "auto"
+        await h._maybe_auto_title_slack(
+            slack,
+            title_sessions,
+            "C1",
+            "slack:t1",
+            None,
+            "hello",
+            "hi",
+            pin=_PRESENT_PIN,
+        )
+        assert "slack:t1" not in h._titled_threads
+        assert not [a for a in slack.actions if a[0] == "set_thread_title"]
+
+
+# ──────────────────────────────────────────────────────────────────────
+# handle_message — early keyword dispatch and permission replies
+# ──────────────────────────────────────────────────────────────────────
+async def _msg(slack, sessions, text, *, user="U1", **kw):
+    await h.handle_message(slack, sessions, "C1", text, None, "m1", user, **kw)
+
+
+class TestHandleMessageKeywordDispatch:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("gate", "verdict", "text"),
+        [
+            pytest.param(
+                "maybe_route_linked_thread",
+                True,
+                "anything at all",
+                id="test_linked_thread_intercept_short_circuits",
+            ),
+            pytest.param(
+                "channel_inbound_permitted",
+                False,
+                "status",
+                id="test_governance_denial_drops_the_message",
+            ),
+        ],
+    )
+    async def test_gate_drops_the_message(self, sessions, owner, monkeypatch, gate, verdict, text):
+        slack = FlakySlack()
+        gate_mock = AsyncMock(return_value=verdict)
+        monkeypatch.setattr(h, gate, gate_mock)
+        await _msg(slack, sessions, text)
+        gate_mock.assert_awaited_once()
+        assert slack.actions == []
+        sessions.get_or_create.assert_not_called()
+
+    # NOTE: the bare ``status`` keyword (handler.py:2642) is NOT covered here.
+    # ``handle_message`` re-imports ``current_context`` locally further down its
+    # own body (handler.py:3705), which makes the name local to the whole
+    # function, so the ``status`` branch raises ``UnboundLocalError`` before it
+    # can reply. Covering it would mean asserting the broken behaviour; the
+    # defect is reported instead.
+
+    @pytest.mark.asyncio
+    async def test_sessions_keyword_is_audited_and_rendered(self, sessions, owner, monkeypatch):
+        slack = FlakySlack()
+        called: dict = {}
+
+        async def _fake(
+            cmd_text, _slack, channel, reply_ts, msg_ts, session_key, log, *, sessions=None
+        ):
+            called["session_key"] = session_key
+
+        monkeypatch.setattr(h, "_handle_sessions_command", _fake)
+        await _msg(slack, sessions, "sessions")
+        assert called["session_key"] == h.canonical_key("m1")
+
+    @pytest.mark.asyncio
+    async def test_sessions_keyword_denies_a_non_owner(self, sessions, owner, monkeypatch):
+        slack = FlakySlack()
+        monkeypatch.setattr(h, "_handle_sessions_command", AsyncMock())
+        await _msg(slack, sessions, "sessions", user="U999")
+        assert "Permission denied" in _texts(slack)
+        h._handle_sessions_command.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "text",
+        [
+            pytest.param("!compact", id="test_compact_keyword_dispatches_for_the_owner"),
+            pytest.param(
+                "<@UBOT|kirocrew> !compact",
+                id="test_mention_prefix_is_stripped_before_command_matching",
+            ),
+        ],
+    )
+    async def test_compact_keyword_dispatch(self, sessions, owner, monkeypatch, text):
+        slack = FlakySlack()
+        monkeypatch.setattr(h, "_handle_compact_command", AsyncMock())
+        await _msg(slack, sessions, text)
+        h._handle_compact_command.assert_awaited_once()
+        args = h._handle_compact_command.await_args.args
+        assert args[0] is slack and args[1] is sessions
+        assert args[2] == "C1"
+        assert args[4] == "m1"
+        assert args[5] == h.canonical_key("m1")
+
+    @pytest.mark.asyncio
+    async def test_compact_keyword_denied_for_a_stranger(self, sessions, owner, monkeypatch):
+        slack = FlakySlack()
+        monkeypatch.setattr(h, "_handle_compact_command", AsyncMock())
+        await _msg(slack, sessions, "!compact", user="U999")
+        assert "Not authorized to compact." in _texts(slack)
+        h._handle_compact_command.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("text", "expected"),
+        [
+            pytest.param(
+                "!dashboard",
+                "Not authorized.",
+                id="test_allowed_user_command_denied_for_a_stranger",
+            ),
+            pytest.param(
+                "!agent kirocrew",
+                "Owner-only command.",
+                id="test_owner_only_command_denied_for_a_stranger",
+            ),
+        ],
+    )
+    async def test_command_denied_for_a_stranger(
+        self, sessions, owner, monkeypatch, text, expected
+    ):
+        slack = FlakySlack()
+        monkeypatch.setattr(h, "_handle_slash_command", AsyncMock(return_value=""))
+        await _msg(slack, sessions, text, user="U999")
+        assert expected in _texts(slack)
+        h._handle_slash_command.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_hook_auto_reply_answers_without_touching_acp(self, sessions, owner):
+        slack = FlakySlack()
+        builder = MagicMock()
+        builder.hooks.on_message = MagicMock(
+            return_value=MagicMock(action=h.HOOK_REPLY, text="canned answer")
+        )
+        await _msg(slack, sessions, "ping", context_builder=builder)
+        assert "canned answer" in _texts(slack)
+        sessions.get_or_create.assert_not_called()
+
+
+# ──────────────────────────────────────────────────────────────────────
+# _safe_update / _safe_final_update — Slack edit failures
+# ──────────────────────────────────────────────────────────────────────
+class TestSafeUpdates:
+    @pytest.mark.asyncio
+    async def test_safe_update_truncates_and_swallows_failure(self):
+        sent: list[str] = []
+
+        class _Boom(MockSlackClient):
+            async def update_message(self, channel, ts, text):
+                sent.append(text)
+                raise RuntimeError("message_not_found")
+
+        await h._safe_update(_Boom(), "C1", "1.0", "x" * (h.SLACK_MSG_LIMIT + 50))
+        assert len(sent) == 1
+        assert sent[0].startswith("x" * h.SLACK_MSG_LIMIT)
+        assert not sent[0][h.SLACK_MSG_LIMIT :].startswith("x")
+
+    @pytest.mark.asyncio
+    async def test_safe_final_update_swallows_both_edit_and_followup_failures(self):
+        calls: list[str] = []
+
+        class _BoomUpdate(FlakySlack):
+            async def update_message(self, channel, ts, text):
+                calls.append("update")
+                raise RuntimeError("message_not_found")
+
+            async def post_message(self, channel, text, thread_ts=None):
+                calls.append("post")
+                return await super().post_message(channel, text, thread_ts)
+
+        boom = _BoomUpdate("post_message")
+        await h._safe_final_update(boom, "C1", "1.0", "y" * (h.SLACK_MSG_LIMIT * 2), "t1")
+        # The failed edit does not stop the overflow parts from being attempted.
+        assert calls[0] == "update"
+        assert "post" in calls[1:]
+        assert boom.actions == []
+
+
+# ──────────────────────────────────────────────────────────────────────
+# agent listing — union across both sources, dedup, hidden variant
+# ──────────────────────────────────────────────────────────────────────
+class TestListAllAgentNames:
+    def test_union_dedups_and_hides_the_internal_variant(self, monkeypatch, tmp_path):
+        agents = tmp_path / "agents"
+        agents.mkdir()
+        for stem in ("alpha", "shared", "kirocrew-lite"):
+            (agents / f"{stem}.json").write_text(
+                json.dumps({"name": stem}), encoding="utf-8", newline="\n"
+            )
+        monkeypatch.setattr(h, "kiro_agents_dir", lambda: agents)
+        monkeypatch.setattr(
+            h, "_iter_cc_agent_names", lambda _d=None: iter(["shared", "beta", "kirocrew-lite"])
+        )
+        out = h._list_all_agent_names()
+        names = [n.strip() for n in out.split(",")]
+        assert names == ["alpha", "shared", "beta"]
+
+    def test_empty_sources_report_none_found(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(h, "kiro_agents_dir", lambda: tmp_path / "absent")
+        monkeypatch.setattr(h, "_iter_cc_agent_names", lambda _d=None: iter([]))
+        assert h._list_all_agent_names() == "(none found)"

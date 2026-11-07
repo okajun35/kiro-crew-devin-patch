@@ -1,0 +1,303 @@
+"""Tests for `{{WIDGET_BLOCK}}` placeholder resolution in context.py.
+
+Before the widgets skill was introduced, `_resolve_prompt_templates` injected
+~200 words of theme-variable rules + a `[WIDGETS]` per-message append that
+duplicated the same content. Both have been replaced with a short pointer at
+the system-prompt level and a bundled `widgets` skill the agent cats on
+demand. These tests lock the new shape so we don't accidentally reintroduce
+the bloat.
+"""
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import pytest
+
+from kiro_crew.crew_mode import CONDUCTOR_TEMPLATES
+
+
+def _resolve(prompt: str, session_key: str, density: str = "more") -> str:
+    """Call the private template resolver with a canned config."""
+    from kiro_crew.context import ContextBuilder
+
+    fake_cfg = SimpleNamespace(dashboard=SimpleNamespace(widget_density=density))
+    with patch("kiro_crew.context.KiroCrewConfig.load", return_value=fake_cfg):
+        return ContextBuilder._resolve_prompt_templates(prompt, session_key)
+
+
+class TestWidgetBlockPlaceholder:
+    """`{{WIDGET_BLOCK}}` expands to a short skill pointer on dashboard; empty elsewhere."""
+
+    def test_non_dashboard_strips_placeholder(self):
+        # Slack / CLI / channel sessions cannot render widgets; the placeholder
+        # MUST expand to empty so the prompt stays lean.
+        prompt = "prefix {{WIDGET_BLOCK}} suffix"
+        for key in ("slack:C123:123.456", "cli:local", "channel:Cabc", ""):
+            result = _resolve(prompt, key)
+            assert "{{WIDGET_BLOCK}}" not in result
+            assert "mcwidget" not in result.lower()
+            assert result == "prefix  suffix"
+
+    def test_dashboard_more_density_emits_pointer(self):
+        # The `more` branch should encourage widgets and point at the skill: it
+        # says WHEN to draw one unasked, not only how.
+        result = _resolve("{{WIDGET_BLOCK}}", "dashboard:abc", density="more")
+        assert "## Inline Widgets" in result
+        assert "<mcwidget" in result
+        assert "`widgets` skill" in result
+        assert "draw it as one widget without being asked" in result
+
+    def test_dashboard_less_density_emits_pointer(self):
+        # The `less` branch should discourage widgets but still point at the skill.
+        result = _resolve("{{WIDGET_BLOCK}}", "dashboard:abc", density="less")
+        assert "## Inline Widgets" in result
+        assert "<mcwidget" in result
+        assert "`widgets` skill" in result
+        assert "prefer" in result.lower()
+        assert "without being asked" not in result
+
+    def test_pointer_does_not_restate_skill_content(self):
+        # The main-prompt pointer must NOT inline the theme-variable table,
+        # the full rules, or per-Tailwind-class guidance. That lives in the
+        # bundled skill. Regression guard against reintroducing the bloat.
+        for density in ("more", "less"):
+            result = _resolve("{{WIDGET_BLOCK}}", "dashboard:abc", density=density)
+            assert "var(--bg)" not in result, f"theme var leaked into {density} pointer"
+            assert "var(--card)" not in result
+            assert "Chart.js" not in result
+            assert "bg-[var(" not in result
+
+    def test_pointer_is_short(self):
+        # Hard budget per density. The pre-pointer block was ~800 chars of
+        # inlined instructions; the pointer deliberately grew to two short
+        # sections (Inline Widgets + Artifacts, ~640 chars for "more") when the
+        # Artifacts pointer was added, and again by one theme-contract sentence
+        # (~1000 / ~560) once answer-only widgets shipped unreadable in dark
+        # mode because the model never loaded the skill, and once more by the
+        # animation baseline (~1320 / ~630), which must reach agents whose
+        # skill:// mapping hides the skill, and for "more" by the when-to-draw
+        # sentence (~1530), which no skill load can supply. Budgets sit just
+        # above today's sizes to keep catching accidental regrowth toward
+        # inlining full skill docs.
+        budgets = {"more": 1550, "less": 660}
+        for density, budget in budgets.items():
+            result = _resolve("{{WIDGET_BLOCK}}", "dashboard:abc", density=density)
+            assert len(result) < budget, f"{density} pointer too long: {len(result)} chars"
+
+    def test_pointer_carries_the_theme_contract_without_the_var_table(self):
+        # The one rule that cannot wait for a skill load: the frame's body is
+        # already themed, so a fixed light palette with the theme's text color
+        # inherited (the answer-only failure) renders white-on-white in dark
+        # mode. Both densities state the rule in prose -- no var names, so the
+        # no-restating guard above still holds.
+        for density in ("more", "less"):
+            result = _resolve("{{WIDGET_BLOCK}}", "dashboard:abc", density=density)
+            assert "The frame is themed" in result, density
+            assert "never a fixed palette" in result, density
+            assert "background together with its text color" in result, density
+
+    def test_pointer_carries_the_animation_baseline(self):
+        # The widgets skill holds the full animation rules, but an agent whose
+        # skill:// mapping omits it never sees the skill. The floor -- move only
+        # when motion carries information, a pause control, the reduced-motion
+        # setting -- rides in the pointer so it holds without the skill.
+        for density in ("more", "less"):
+            result = _resolve("{{WIDGET_BLOCK}}", "dashboard:abc", density=density)
+            assert "Animate only when the" in result, density
+            assert "pause control" in result, density
+            assert "reduced-motion setting" in result, density
+
+    def test_dashboard_underscore_key_also_matches(self):
+        # Some dashboard sessions use `dashboard_<slot>` instead of `dashboard:<slot>`.
+        result = _resolve("{{WIDGET_BLOCK}}", "dashboard_slot1", density="more")
+        assert "<mcwidget" in result
+
+    def test_density_default_when_config_missing(self):
+        # If the dashboard config omits widget_density entirely, fall back to "more".
+        from kiro_crew.context import ContextBuilder
+
+        fake_cfg = SimpleNamespace(dashboard=SimpleNamespace())
+        with patch("kiro_crew.context.KiroCrewConfig.load", return_value=fake_cfg):
+            result = ContextBuilder._resolve_prompt_templates("{{WIDGET_BLOCK}}", "dashboard:x")
+        # The `more` branch fires (skill pointer + encouraging wording) and the
+        # `less` branch does not. Assert structurally, not on specific prose
+        # tokens — the wording may evolve.
+        assert "`widgets` skill" in result, "skill pointer missing"
+        assert "prefer" not in result.lower(), "less-branch wording leaked"
+
+
+def _spec_body(agent: str) -> str:
+    """*agent*'s charter, the text its installer's spec prompt is built from."""
+    from kiro_crew.agent_parts import spec_prompts
+
+    return {
+        "kirocrew-worker": spec_prompts._WORKER_SYSTEM_PROMPT,
+        "kirocrew-team-lead": spec_prompts._TEAM_LEAD_SYSTEM_PROMPT,
+        "kirocrew-pipeline-conductor": spec_prompts._PIPELINE_CONDUCTOR_SYSTEM_PROMPT,
+        "kirocrew-security-conductor": spec_prompts._SECURITY_CONDUCTOR_SYSTEM_PROMPT,
+    }.get(agent, spec_prompts._CONDUCTOR_SYSTEM_PROMPT)
+
+
+class TestConductorCarriesTheWidgetBlock:
+    """Every shipped conductor talks to a person in the dashboard chat, so its
+    contract block carries the per-surface widget pointer. Its spec prompt does
+    not: kiro-cli loads that text natively and a crewmate's essentials deliver it
+    verbatim, so a placeholder there would never be resolved. A worker reports
+    to its conductor, not a person, and gets no pointer."""
+
+    @staticmethod
+    def _contract(tmp_path, monkeypatch, agent, session_key, *, private_owner):
+        import json
+
+        from kiro_crew.context import ContextBuilder
+        from kiro_crew.memory import MemoryStore
+        from kiro_crew.skills import SkillsLoader
+
+        agents_dir = tmp_path / ".kiro" / "agents"
+        agents_dir.mkdir(parents=True, exist_ok=True)
+        (agents_dir / f"{agent}.json").write_text(
+            json.dumps({"name": agent, "prompt": _spec_body(agent)}), encoding="utf-8"
+        )
+        monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+        monkeypatch.setattr("kiro_crew.agent.KIRO_AGENTS_DIR", agents_dir)
+        monkeypatch.setattr("kiro_crew.agent_discovery._KIRO_AGENTS_DIR", agents_dir)
+        builder = ContextBuilder(
+            memory=MemoryStore(workspace=tmp_path / "ws"),
+            skills=SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False),
+        )
+        fake_cfg = SimpleNamespace(dashboard=SimpleNamespace(widget_density="more"))
+        with patch("kiro_crew.context.KiroCrewConfig.load", return_value=fake_cfg):
+            return builder._resolve_agent_prompt(
+                agent,
+                project=None,
+                mode="",
+                session_key=session_key,
+                is_cc=False,
+                private_owner=private_owner,
+                session_start=True,
+            )
+
+    @pytest.mark.parametrize("agent", [*sorted(CONDUCTOR_TEMPLATES), "kirocrew-worker"])
+    def test_the_spec_prompts_carry_no_unresolved_placeholder(self, agent):
+        assert "{{" not in _spec_body(agent)
+
+    @pytest.mark.parametrize("agent", sorted(CONDUCTOR_TEMPLATES))
+    @pytest.mark.parametrize("private_owner", [True, False])
+    def test_every_conductor_gets_the_pointer_on_the_dashboard(
+        self, tmp_path, monkeypatch, agent, private_owner
+    ):
+        # private_owner=True is the crewmate path: its own prompt arrives through
+        # the essentials, so the contract block holds the pointer alone.
+        contract = self._contract(
+            tmp_path, monkeypatch, agent, f"dashboard_member-{agent}", private_owner=private_owner
+        )
+        assert "## Inline Widgets" in contract
+        assert "The frame is themed" in contract
+        assert "{{WIDGET_BLOCK}}" not in contract
+        assert (_spec_body(agent).splitlines()[0] in contract) is not private_owner
+
+    @pytest.mark.parametrize("private_owner", [True, False])
+    def test_a_conductor_gets_no_pointer_off_the_dashboard(
+        self, tmp_path, monkeypatch, private_owner
+    ):
+        contract = self._contract(
+            tmp_path,
+            monkeypatch,
+            "kirocrew-conductor",
+            "slack:C123:123.456",
+            private_owner=private_owner,
+        )
+        assert "Inline Widgets" not in contract
+        assert "{{WIDGET_BLOCK}}" not in contract
+        # A crewmate whose block held only the pointer gets no block at all.
+        assert (contract == "") is private_owner
+
+    def test_the_team_lead_gets_no_pointer_off_the_dashboard(self, tmp_path, monkeypatch):
+        contract = self._contract(
+            tmp_path, monkeypatch, "kirocrew-team-lead", "slack:C123:123.456", private_owner=False
+        )
+        assert "# Kiro Crew Team Lead" in contract
+        assert "Inline Widgets" not in contract
+        assert "{{WIDGET_BLOCK}}" not in contract
+
+    @pytest.mark.parametrize(
+        ("agent", "heading"),
+        [("kirocrew-worker", "# Kiro Crew Worker"), ("kirocrew-mate-worker", "## Output Format")],
+    )
+    def test_a_worker_gets_no_pointer(self, tmp_path, monkeypatch, agent, heading):
+        # The crewmate's worker is default-named, so its contract is the default
+        # prompt, whose own token would otherwise resolve to the pointer.
+        contract = self._contract(
+            tmp_path, monkeypatch, agent, "dashboard:abc", private_owner=False
+        )
+        assert heading in contract
+        assert "Inline Widgets" not in contract
+        assert "{{WIDGET_BLOCK}}" not in contract
+
+
+class TestMaxSubagentsPlaceholder:
+    """`{{MAX_SUBAGENTS}}` expands to the concurrent cap IN FORCE on every transport."""
+
+    @staticmethod
+    def _resolve_cap(prompt, session_key, *, cap=None, raises=False, live=0):
+        from kiro_crew.context import ContextBuilder
+
+        fake_cfg = SimpleNamespace(dashboard=SimpleNamespace(widget_density="more"))
+        if raises:
+            sub = patch(
+                "kiro_crew.subagent.resolve_max_subagents",
+                side_effect=RuntimeError("boom"),
+            )
+        else:
+            sub = patch("kiro_crew.subagent.resolve_max_subagents", return_value=cap)
+        with (
+            patch("kiro_crew.context.KiroCrewConfig.load", return_value=fake_cfg),
+            patch("kiro_crew.resource_status.adaptive_exec_cap", return_value=live),
+            sub,
+        ):
+            return ContextBuilder._resolve_prompt_templates(prompt, session_key)
+
+    def test_the_cap_in_force_wins_over_the_configured_ceiling(self):
+        # ``max_subagents`` is a ceiling; the adaptive controller can be
+        # dispatching far fewer under it, and a model sized to the ceiling
+        # queues work it believes is running. The live figure is what is used,
+        # with no ceiling label, and the configured number does not appear.
+        result = self._resolve_cap("up to {{MAX_SUBAGENTS}} run", "dashboard:abc", cap=64, live=8)
+        assert "up to 8 run" in result
+        assert "64" not in result and "ceiling" not in result
+
+    def test_token_replaced_with_labelled_ceiling_on_every_transport(self):
+        # No controller in this process: the configured number is still given,
+        # but LABELLED as a ceiling so the model does not read it as the cap in
+        # force. It must reach dashboard, Slack, CLI, and empty-key sessions
+        # alike — delegation guidance is transport-agnostic.
+        for key in ("dashboard:abc", "slack:C1:1.2", "cli:local", ""):
+            result = self._resolve_cap("up to {{MAX_SUBAGENTS}} agents", key, cap=12)
+            assert "{{MAX_SUBAGENTS}}" not in result
+            assert "up to 12 (configured ceiling) agents" in result
+
+    def test_zero_cap_falls_back_to_several(self):
+        # cap==0 (auto-size failed / unreadable host) keeps the sentence grammatical.
+        result = self._resolve_cap("up to {{MAX_SUBAGENTS}} agents", "slack:C1:1.2", cap=0)
+        assert "up to several agents" in result
+
+    def test_resolver_error_falls_back_to_several(self):
+        # A raising resolver must never break prompt assembly.
+        result = self._resolve_cap("up to {{MAX_SUBAGENTS}} agents", "dashboard:abc", raises=True)
+        assert "up to several agents" in result
+
+    def test_absent_token_skips_resolver(self):
+        # No token → the (heavier) sub-agent resolver is never invoked.
+        from kiro_crew.context import ContextBuilder
+
+        fake_cfg = SimpleNamespace(dashboard=SimpleNamespace(widget_density="more"))
+        with (
+            patch("kiro_crew.context.KiroCrewConfig.load", return_value=fake_cfg),
+            patch("kiro_crew.subagent.resolve_max_subagents") as resolver,
+        ):
+            ContextBuilder._resolve_prompt_templates(
+                "no token here {{WIDGET_BLOCK}}", "dashboard:abc"
+            )
+        resolver.assert_not_called()

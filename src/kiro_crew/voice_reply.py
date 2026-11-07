@@ -1,0 +1,1752 @@
+"""Kiro Crew voice reply — generate TTS audio and deliver it to the requesting surface.
+
+Post-response hook: strips markdown, generates audio via the configured
+TTS provider (the host's engine or Amazon Polly), then delivers it back to the
+requesting surface (Slack thread upload, dashboard playback).
+Fire-and-forget — never blocks the text response.
+
+Supported providers:
+- ``system`` (default): the host's own speech engine, which needs nothing
+  installed and no account — ``say`` on macOS, System.Speech through
+  Windows PowerShell 5.1 on Windows, ``espeak-ng`` on Linux when present.
+  Produces WAV. Linux is the one platform where it can be absent.
+- ``polly``: OPTIONAL Amazon Polly via the ``aws polly synthesize-speech`` CLI.
+  Produces MP3. Requires the ``aws`` CLI on PATH plus valid AWS credentials +
+  network. This module never imports ``boto3``/``botocore`` — Polly is driven
+  entirely through the CLI subprocess, so the module imports cleanly on a
+  vanilla machine without any AWS SDK installed. When the CLI or credentials
+  are absent, the Polly path degrades gracefully (returns ``None``).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import logging
+import os
+import re
+import shutil
+import tempfile
+from functools import cache
+from typing import TYPE_CHECKING, Any
+
+from kiro_crew import aws_consent, speech_providers
+from kiro_crew.constants import md_link_destination, strip_control_comments
+from kiro_crew.deploy.engine import resolve_aws_bin
+from kiro_crew.emoji_list import STANDARD_EMOJIS
+from kiro_crew.platform.context import redact_log_via_context
+from kiro_crew.platform_compat import IS_MACOS, IS_WINDOWS, trusted_system_bin
+from kiro_crew.sandbox import (
+    SandboxUnavailableError,
+    cgroup_scope_argv,
+    create_subprocess_limited,
+    sandboxed_spawn_argv_async,
+    scrub_env,
+    without_python_env,
+    wrap_argv,
+    wrap_argv_async,
+)
+from kiro_crew.security import (
+    redact_credentials,
+    redact_exfiltration_urls,
+    redact_with_findings,
+)
+from kiro_crew.voice_reply_registered import (  # noqa: F401 - re-exported
+    _synthesize_registered,
+    iter_registered_chunks,
+    join_audio,
+    registered_voice_config,
+)
+
+if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
+
+    from markdown_it import MarkdownIt
+    from markdown_it.rules_inline import StateInline
+    from markdown_it.token import Token
+
+    from kiro_crew.slack.client import SlackClientOps
+
+logger = logging.getLogger(__name__)
+
+#: Emoji shortcode names dropped from read-aloud text, e.g. ``wave`` for ``:wave:``.
+_EMOJI_SHORTCODES = frozenset(STANDARD_EMOJIS)
+
+
+def resolve_polly_cli() -> str | None:
+    """Resolve the ``aws`` CLI for Polly spawn sites; ``None`` when not invocable.
+
+    Routes through the deploy engine's shared well-known-dirs resolver so a
+    GUI-launched gateway's minimal PATH still finds the CLI instead of silently
+    skipping TTS / degrading to an empty voice list. The trailing
+    ``shutil.which`` turns the resolver's bare-name fallback into the ``None``
+    these probe sites already treat as "unavailable", and confirms an absolute
+    hit is still actually executable.
+    """
+    aws_bin = resolve_aws_bin()
+    return aws_bin if shutil.which(aws_bin) else None
+
+
+# ── Provider constants ──
+PROVIDER_POLLY = "polly"
+PROVIDER_SYSTEM = "system"
+VALID_PROVIDERS = frozenset({PROVIDER_POLLY, PROVIDER_SYSTEM})
+# Removed providers a saved config may still name. Each resolves to the
+# default with one warning per process; see docs/request-for-change/
+# rfc-remove-piper-tts.md. The ``piper_*`` keys beside it are left in
+# config.json, unread, so a downgrade still finds them.
+REMOVED_PROVIDERS = frozenset({"piper"})
+# The host's built-in speech engine is the default because it is the only
+# provider that needs nothing installed and no account: macOS and Windows both
+# ship one, so auto-speak works on a fresh machine. Polly is the paid cloud
+# option, used only when explicitly selected.
+DEFAULT_PROVIDER = PROVIDER_SYSTEM
+
+
+def valid_providers() -> frozenset[str]:
+    """Every ``voice_reply.provider`` a config may select: built-ins plus the edition's.
+
+    :data:`VALID_PROVIDERS` stays the built-in set. An edition's registered TTS
+    names (``PlatformContext.speech``) join it; boot refuses one that collides
+    with a built-in. With the default registry this IS :data:`VALID_PROVIDERS`.
+    """
+    registered = speech_providers.registered_tts_names()
+    if not registered:
+        return VALID_PROVIDERS
+    return VALID_PROVIDERS | frozenset(registered)
+
+
+def default_provider() -> str:
+    """What an absent ``voice_reply.provider`` resolves to.
+
+    The edition's ``default_tts()`` when it names a selectable provider, else
+    :data:`DEFAULT_PROVIDER`. Used only for the ABSENT key: an invalid stored value
+    still falls back to :data:`DEFAULT_PROVIDER` (see
+    :func:`resolve_configured_provider`).
+    """
+    edition = speech_providers.edition_default_tts()
+    if edition is not None and edition in valid_providers():
+        return edition
+    return DEFAULT_PROVIDER
+
+
+# Built-in engine per platform. The value is what ``_synthesize_system``
+# switches on, so it names the engine rather than the OS: a host can lack the
+# engine its OS normally ships (a container without ``say``), and then there is
+# no built-in provider at all rather than a differently-named one.
+SYSTEM_ENGINE_SAY = "say"  # macOS /usr/bin/say
+SYSTEM_ENGINE_SAPI = "sapi"  # Windows System.Speech via powershell.exe
+SYSTEM_ENGINE_ESPEAK = "espeak-ng"  # Linux/BSD, when installed
+
+# SAPI's Rate is an integer -10..10 on a roughly logarithmic scale, while
+# ``say`` and ``espeak-ng`` take words per minute. Both are derived from the
+# same ``rate`` percentage the Polly provider already validates, so selecting a
+# speed never depends on which platform the user is on.
+_SYSTEM_BASE_WPM = 175  # `say` and `espeak-ng` default speaking rate
+_SAPI_RATE_MIN = -10
+_SAPI_RATE_MAX = 10
+_SYSTEM_WPM_MIN = 80
+_SYSTEM_WPM_MAX = 500
+
+
+def is_available(provider: str = DEFAULT_PROVIDER) -> bool:
+    """Return True if TTS for the given provider can be produced.
+
+    - ``system``: checks the host's built-in engine is invocable. macOS and
+      Windows always satisfy this; a Linux host without ``espeak-ng`` does not,
+      and there is no fallback to fabricate — the caller reports it as
+      unavailable so the user can install it or pick another provider.
+    - ``polly``: checks the ``aws`` CLI is on PATH. Credential validity is
+      NOT verified here — a missing/expired profile still fails gracefully
+      inside ``synthesize_speech`` (caught, logged, returns None).
+
+    Callers use this to decide whether to post a fallback ephemeral message
+    when voice output was requested but cannot be produced.
+    """
+    if provider == PROVIDER_SYSTEM:
+        return resolve_system_tts() is not None
+    if provider == PROVIDER_POLLY:
+        return resolve_polly_cli() is not None
+    registered = speech_providers.tts_provider(provider)
+    if registered is not None:
+        # An edition provider answers through its own check(). BLOCKING, like
+        # this whole function (its callers run it off the loop).
+        return speech_providers.check_status_sync(registered, {"provider": provider}).available
+    logger.warning("is_available: unknown provider %r", provider)
+    return False
+
+
+class SystemVoiceProbeError(RuntimeError):
+    """The host's built-in engine exists but its voice list could not be read.
+
+    Distinct from "no engine at all", which is an ordinary state the panel
+    reports neutrally. This one is a failure with a retry, so it must not be
+    flattened into an empty voice list.
+    """
+
+
+def resolve_system_tts() -> tuple[str, str] | None:
+    """Return ``(engine, binary)`` for the host's built-in TTS, else ``None``.
+
+    Resolution goes through ``trusted_system_bin`` rather than ``PATH``: the
+    gateway's ``PATH`` can lead with directories the agent itself can write, and
+    a planted ``say``/``espeak-ng`` shim would then be handed LLM text with the
+    gateway's environment.
+
+    Linux is the one platform with no guaranteed engine — a stock Ubuntu Desktop
+    carries the espeak-ng *library* and data but not the CLI, and Server carries
+    neither — so ``None`` there is the normal answer, not a broken host.
+    """
+    if IS_MACOS:
+        found = trusted_system_bin("say")
+        return (SYSTEM_ENGINE_SAY, found) if found else None
+    if IS_WINDOWS:
+        # Windows PowerShell 5.1 specifically, which is what ships in
+        # System32\WindowsPowerShell\v1.0. System.Speech is .NET-Framework-only
+        # and Speak() throws in PowerShell 7, so resolving a `pwsh` on PATH
+        # instead would produce a provider that reports available and then
+        # fails on every call.
+        found = trusted_system_bin("powershell")
+        return (SYSTEM_ENGINE_SAPI, found) if found else None
+    for name in ("espeak-ng", "espeak"):
+        found = trusted_system_bin(name)
+        if found:
+            return (SYSTEM_ENGINE_ESPEAK, found)
+    return None
+
+
+async def resolve_system_tts_async() -> tuple[str, str] | None:
+    """``resolve_system_tts`` off the event loop.
+
+    Resolution stats a handful of fixed directories. Each stat is cheap on a
+    healthy host but is not bounded: a fixed directory can sit on a stalled
+    network or fuse mount, and the gateway runs every session and its heartbeats
+    on one loop, so one blocked stat freezes all of them. Every async caller
+    goes through this rather than the sync form.
+    """
+    return await asyncio.to_thread(resolve_system_tts)
+
+
+def _system_wpm(rate: object) -> int:
+    """Map a validated ``rate`` percentage onto words per minute."""
+    pct = int(_validate_rate(rate).rstrip("%"))
+    wpm = round(_SYSTEM_BASE_WPM * pct / 100)
+    return max(_SYSTEM_WPM_MIN, min(_SYSTEM_WPM_MAX, wpm))
+
+
+def _sapi_rate(rate: object) -> int:
+    """Map a validated ``rate`` percentage onto SAPI's -10..10 integer scale.
+
+    SAPI's scale is roughly logarithmic with each step near 1.4x, so a linear
+    percentage cannot land exactly; 10% per step keeps 100% at 0 (the engine
+    default) and reaches the endpoints at the extremes the UI offers.
+    """
+    pct = int(_validate_rate(rate).rstrip("%"))
+    step = round((pct - 100) / 10)
+    return max(_SAPI_RATE_MIN, min(_SAPI_RATE_MAX, step))
+
+
+# ── Config defaults ──
+DEFAULT_VOICE = "Ruth"
+DEFAULT_ENGINE = "generative"
+DEFAULT_RATE = "100%"
+DEFAULT_PITCH = "+0%"
+OUTPUT_FORMAT = "mp3"
+#: Polly's Ogg/Opus output format, written on request (``ogg_opus=True``).
+OGG_OPUS_FORMAT = "ogg_opus"
+MAX_CHARS = 2900  # Polly SSML limit ~3000 chars, leave margin
+
+VALID_ENGINES = frozenset({"neural", "generative", "long-form", "standard"})
+_RATE_RE = re.compile(r"^\d{1,3}%$")
+_PITCH_RE = re.compile(r"^[+-]\d{1,2}%$")
+
+
+def _validate_rate(rate: object) -> str:
+    """Return *rate* if it looks like ``'95%'``, else the default.
+
+    The parameter is ``object`` because the value reaches here straight from
+    ``config.json``: a hand-edited ``"rate": 100`` arrives as an int, and
+    handing that to ``_RATE_RE.match`` raises TypeError inside synthesis. A bare
+    number is a mundane typo rather than an extreme condition, so it degrades to
+    the default rate instead of dropping the audio. Coercing here rather than at
+    each caller is what makes every reader of ``rate`` safe at once.
+    """
+    return rate if isinstance(rate, str) and _RATE_RE.match(rate) else DEFAULT_RATE
+
+
+def _validate_pitch(pitch: object) -> str:
+    """Return *pitch* if it looks like ``'+10%'``, else the default.
+
+    Non-string input degrades to the default for the same reason as
+    :func:`_validate_rate`.
+    """
+    return pitch if isinstance(pitch, str) and _PITCH_RE.match(pitch) else DEFAULT_PITCH
+
+
+def validated_config_string(value: object) -> str | None:
+    """Return *value* stripped when it is a string, else ``None``.
+
+    ``None`` means "reject", not "empty": for these fields an empty string is
+    itself a meaningful value (``system_voice=""`` selects the OS default voice),
+    so silently coercing a wrong TYPE to ``""`` would rewrite the caller's intent
+    from "set this voice" into "use the default" without telling them.
+
+    Shared by the config loader and the dashboard PUT handler. Splitting them
+    is what let the write path keep
+    persisting ``str({})`` -> ``"{}"`` as a voice name or a binary path while the
+    loader was already defending against exactly that value on read.
+    """
+    if not isinstance(value, str):
+        return None
+    return value.strip()
+
+
+def validated_config_bool(value: object) -> bool | None:
+    """Return *value* when it is a real bool, else ``None`` meaning "reject".
+
+    ``bool()`` is the trap this exists to avoid. It never raises, which makes it
+    look like a safe total function, but it is not TRUTH-PRESERVING for the values
+    a JSON client actually sends: ``bool("false")`` is ``True``, so a caller
+    passing the string ``"false"`` persists the exact opposite of what it asked
+    for, silently. Total is not the same property as correct.
+
+    JSON has real booleans, so a client that means false can send ``false``; a
+    quoted ``"false"`` is a bug worth reporting rather than guessing at.
+    """
+    if not isinstance(value, bool):
+        return None
+    return value
+
+
+#: A BCP-47 language tag such as ``en-US`` or ``zh-CN``, the shape the language
+#: pickers offer. Shape-checked because the value is handed to a provider.
+_LANGUAGE_CODE_RE = re.compile(r"[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8}){0,3}")
+
+
+def validated_language_code(value: object) -> str | None:
+    """Return *value* as a TTS language tag, ``""`` for none, or ``None`` to reject.
+
+    ``""`` (and a blank string) means "no preference": each provider speaks in
+    its own default language, which is how every config without the key behaves.
+    Shared by the config loaders, which read ``None`` as ``""``, and the dashboard
+    PUT handler, which answers ``None`` with a 400.
+    """
+    text = validated_config_string(value)
+    if text is None or (text and not _LANGUAGE_CODE_RE.fullmatch(text)):
+        return None
+    return text
+
+
+#: A Markdown link whose destination keeps a balanced ``(...)`` pair; see
+#: :func:`kiro_crew.constants.md_link_destination`. The label stops at the next
+#: ``[``, so a run of ``[`` cannot make every opener rescan the text.
+_MARKDOWN_LINK_RE = re.compile(rf"\[([^\[\]]+)\]\({md_link_destination('[^()]')}+\)")
+
+
+def strip_markdown(text: str) -> str:
+    """Strip Slack mrkdwn / markdown to plain speakable text."""
+    t = text
+    # Replace fenced code blocks with spoken placeholder
+
+    def _code_block(m):
+        content = m.group(0)
+        if content.startswith("```diff"):
+            return " (diff block) "
+        return " (code block) "
+
+    t = re.sub(r"```[\s\S]*?```", _code_block, t)
+    # Remove HTML/XML tags and their content for block-level elements
+    t = re.sub(r"<mcwidget[^>]*>[\s\S]*?</mcwidget>", " (widget) ", t)
+    # Strip RECOGNIZED control-tag comments (keep-visible, deliver
+    # routing, plan_task_id anchors) — never all comments, and never inside
+    # inline code, which renders literally and must survive to speech. The
+    # generic tag regex below deliberately excludes "<!". Shared
+    # implementation + grammar spec: constants.strip_control_comments.
+    t = strip_control_comments(t)
+    # Replace markdown tables with spoken placeholder
+
+    def _table(m):
+        rows = (
+            len([ln for ln in m.group(0).splitlines() if ln.strip().startswith("|")]) - 1
+        )  # exclude header separator
+        return f" (table with {rows} rows) "
+
+    t = re.sub(r"(?:^\|.+\|$\n?){2,}", _table, t, flags=re.MULTILINE)
+    # Remove inline code: keep short non-path text, strip long or path-like
+
+    def _inline_code(m):
+        inner = m.group(1)
+        if len(inner) > 30 or "/" in inner:
+            return " (file path) "
+        return inner
+
+    t = re.sub(r"`([^`]+)`", _inline_code, t)
+    # Slack links: <url|label> → label, bare <url> → ""
+    t = re.sub(r"<([^|>]+)\|([^>]+)>", r"\2", t)
+    t = re.sub(r"<https?://[^>]+>", " (link) ", t)
+    # Remove remaining HTML/XML tags (after Slack links are processed)
+    t = re.sub(r"</?[a-zA-Z][^>]*>", "", t)
+    # Markdown links: [label](url) → label
+    t = _MARKDOWN_LINK_RE.sub(r"\1", t)
+    # OPTIONS buttons line, before the bare-URL pass, whose \S+ would take
+    # the closing "]" of a URL inside the line.
+    t = re.sub(r"\[OPTIONS:.*?\]", "", t)
+    # Emphasis and strikethrough markers and known emoji shortcodes, by
+    # markdown token: see _drop_markers.
+    t = _drop_markers(t)
+    # Bare URLs, after the parse, so a marker that closes right after a URL
+    # (~~see https://example.com~~) is paired and dropped first.
+    t = re.sub(r"https?://\S+", " (link) ", t)
+    # Unicode emoji
+    t = re.sub(
+        r"[\U0001f300-\U0001faff\U00002702-\U000027b0\U0000fe00-\U0000fe0f\U0000200d]+",
+        "",
+        t,
+    )
+    # Diff blocks: lines starting with +/- only inside fenced blocks are
+    # already removed above; catch stray unified-diff hunks.
+    t = re.sub(r"^@@[^@]+@@.*$", "", t, flags=re.MULTILINE)
+    # Collapse blank-line runs
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    # Re-run redaction on the STRIPPED text. Every strip above can make two
+    # halves of a secret contiguous (a control comment, `**` emphasis, or an
+    # HTML tag interposed inside a key id), so a credential scan that ran on
+    # the raw text has not necessarily seen the string TTS will speak.
+    # Idempotent on clean text; placeholders survive re-scanning.
+    t, _ = redact_exfiltration_urls(t)
+    t, _ = redact_credentials(t)
+    # Identifier underscores become word breaks only after the re-scan, so
+    # a token whose pattern includes "_" is matched whole.
+    t = _space_identifier_underscores(t)
+    # Collapse space runs
+    t = re.sub(r"  +", " ", t)
+    return t.strip()
+
+
+@cache
+def _speech_markdown() -> MarkdownIt:
+    """The inline parser that finds emphasis, strikethrough and code spans.
+
+    Every other markdown rule is off, so links, paths and plain text come back
+    as text exactly as written. Strikethrough takes one or two tildes, the way
+    GitHub and Slack render it: the built-in rule reads ``~~`` and
+    ``_single_tilde`` reads ``~``, on every ``markdown-it-py`` that
+    ``setup.cfg`` allows. Built on first use: importing ``markdown_it`` costs
+    about 35 ms, and only a voice reply needs it.
+    """
+    from markdown_it import MarkdownIt
+
+    md = MarkdownIt("zero").enable(["emphasis", "strikethrough", "backticks"])
+    md.inline.ruler.after("strikethrough", "single_tilde", _single_tilde)
+    return md
+
+
+def _single_tilde(state: StateInline, silent: bool) -> bool:
+    """Read a lone ``~`` as a strikethrough marker.
+
+    It joins the delimiter list the built-in strikethrough rule uses, so a
+    pair of them becomes ``s_open`` and ``s_close`` tokens and a lone one
+    with no partner stays text.
+    """
+    from markdown_it.rules_inline.state_inline import Delimiter
+
+    if silent or state.src[state.pos] != "~":
+        return False
+    scanned = state.scanDelims(state.pos, True)
+    if scanned.length != 1:
+        return False
+    token = state.push("text", "", 0)
+    token.content = "~"
+    state.delimiters.append(
+        Delimiter(
+            marker=ord("~"),
+            length=0,
+            token=len(state.tokens) - 1,
+            end=-1,
+            open=scanned.can_open,
+            close=scanned.can_close,
+        )
+    )
+    state.pos += 1
+    return True
+
+
+@cache
+def _code_span_markdown() -> MarkdownIt:
+    """The inline parser that finds code spans and nothing else."""
+    from markdown_it import MarkdownIt
+
+    return MarkdownIt("zero").enable("backticks")
+
+
+def _inline_tokens(md: MarkdownIt, text: str) -> list[Token]:
+    """The inline tokens of ``text``, which is parsed as one paragraph."""
+    return md.parseInline(text)[0].children or []
+
+
+def _drop_markers(text: str) -> str:
+    """Drop emphasis and strikethrough markers and known emoji shortcodes.
+
+    The parser turns each matched marker pair into open and close tokens,
+    which carry no text and are skipped. A ``*`` inside a text token is a
+    marker with no partner: only the emphasis rule reads ``*``, so it is
+    dropped too, which keeps a key id split by a lone ``**`` whole for the
+    credential re-scan. An unpaired ``_`` or ``~`` is text and stays.
+    """
+    out: list[str] = []
+    for tok in _inline_tokens(_speech_markdown(), text):
+        if tok.type == "text":
+            out.append(_drop_shortcodes(tok.content.replace("*", "")))
+        elif tok.type == "code_inline":
+            out.append(tok.markup + tok.content + tok.markup)
+    return "".join(out)
+
+
+def _drop_shortcodes(text: str) -> str:
+    """Drop each ``:name:`` whose name is a known emoji shortcode.
+
+    Only names in ``STANDARD_EMOJIS`` count, so the digits between the
+    colons of a clock time or a ratio (10:30:45, 16:9:1) are kept. A name
+    made of digits, such as ``100``, counts only when no digit touches its
+    colons, so 16:100:1 is a ratio and stays.
+    """
+    parts = text.split(":")
+    out = [parts[0]]
+    i = 1
+    while i < len(parts):
+        if i + 1 < len(parts) and _is_shortcode(out[-1], parts[i], parts[i + 1]):
+            out[-1] += parts[i + 1]
+            i += 2
+        else:
+            out.append(parts[i])
+            i += 1
+    return ":".join(out)
+
+
+def _is_shortcode(before: str, name: str, after: str) -> bool:
+    """Whether ``:name:``, between ``before`` and ``after``, is a known emoji shortcode."""
+    if name not in _EMOJI_SHORTCODES:
+        return False
+    if not name.isdigit():
+        return True
+    return not (before[-1:].isdigit() or after[:1].isdigit())
+
+
+def _space_identifier_underscores(text: str) -> str:
+    """Speak each ``_`` left in text as a word break: max_retry_count.
+
+    Code spans keep their underscores.
+    """
+    out: list[str] = []
+    for tok in _inline_tokens(_code_span_markdown(), text):
+        if tok.type == "code_inline":
+            out.append(tok.markup + tok.content + tok.markup)
+        else:
+            out.append(" ".join(tok.content.split("_")))
+    return "".join(out)
+
+
+def text_to_ssml(
+    text: str,
+    rate: str = DEFAULT_RATE,
+    pitch: str = DEFAULT_PITCH,
+    engine: str = DEFAULT_ENGINE,
+) -> str:
+    """Wrap plain text in SSML with natural pauses and prosody controls."""
+    from kiro_crew.security import redact_credentials, redact_exfiltration_urls
+
+    text, _ = redact_exfiltration_urls(text)
+    text, _ = redact_credentials(text)
+    clean = strip_markdown(text)
+    if not clean:
+        return ""
+    if len(clean) > MAX_CHARS:
+        # Truncate at last sentence boundary before limit
+        trunc = clean[:MAX_CHARS].rsplit(".", 1)[0]
+        clean = (trunc or clean[:MAX_CHARS]) + "."
+    # Escape XML entities
+    clean = clean.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    # Natural pauses
+    clean = re.sub(r"\n\n+", '<break time="600ms"/>\n', clean)
+    clean = re.sub(r"\n", '<break time="300ms"/>\n', clean)
+    # Neural engines don't support <prosody> tags (InvalidSsmlException);
+    # keep <break> for natural pauses but skip the prosody wrapper.
+    if engine == "neural":
+        return f"<speak>{clean}</speak>"
+    rate = _validate_rate(rate)
+    pitch = _validate_pitch(pitch)
+    # generative / long-form engines don't support pitch
+    if engine in ("generative", "long-form"):
+        prosody = f'<prosody rate="{rate}">{clean}</prosody>'
+    else:
+        prosody = f'<prosody rate="{rate}" pitch="{pitch}">{clean}</prosody>'
+    return f"<speak>{prosody}</speak>"
+
+
+async def _kill_and_reap(
+    proc: "asyncio.subprocess.Process", label: str, *, timed_out: bool
+) -> None:
+    """Terminate and drain a child ``asyncio.wait_for`` already gave up on.
+
+    ``wait_for`` cancels ``communicate()`` but never terminates the child, and a
+    caller cancellation (client disconnect) or an interpreter-exit signal arrives
+    the same way, so without this a zombie keeps consuming CPU after we return.
+
+    The reap goes through ``communicate()`` rather than ``wait()``: the pipe
+    readers are already cancelled, so a killed child blocked on a full PIPE would
+    never be drained and ``wait()`` would hang. On the non-timeout path a repeat
+    cancellation landing on the reap is swallowed so the ORIGINAL exception is
+    the one that propagates; on the timeout path it is a genuinely new
+    cancellation and is let out.
+    """
+    try:
+        proc.kill()
+    except OSError:
+        pass
+    try:
+        await proc.communicate()
+    except Exception:
+        logger.debug("%s wait after kill failed", label, exc_info=True)
+    except BaseException:
+        if timed_out:
+            raise
+
+
+MIN_AUDIO_BYTES = 100
+
+
+def _produced_audio(out_path: str) -> bool:
+    """Return whether *out_path* holds a plausible audio file.
+
+    Both stats are done here, in one call, so a caller can offload the pair with
+    a single thread hop. An engine that exits 0 having written nothing (or a
+    truncated header) is a real outcome, so size is checked, not just existence.
+    """
+    return os.path.isfile(out_path) and os.path.getsize(out_path) >= MIN_AUDIO_BYTES
+
+
+async def _run_tts_subprocess(
+    cmd: list[str],
+    out_path: str,
+    *,
+    label: str,
+    display: str,
+    stdin_text: str = "",
+    first_party_fixed_argv: bool = False,
+    timeout: int = 60,
+) -> bool:
+    """Run one TTS command that writes *out_path*; return whether it produced audio.
+
+    Shared by every local engine so the subtle parts — killing and reaping a
+    child that timed out or was cancelled, and never leaving a zombie holding a
+    full pipe — have one implementation rather than one per provider.
+    The caller owns *out_path* and discards it when this returns False.
+
+    EVERY engine goes through the sandbox: each one parses text it did not
+    author, so confinement is the default and there is no per-provider skip.
+    :func:`sandboxed_spawn_argv_async` supplies BOTH layers — the OS-level
+    wrap and a credential-scrubbed environment — because on a backend-less
+    host the env scrub is the only one of the two that still applies, and a
+    TTS child has no business reading the gateway's credentials either way.
+    ``first_party_fixed_argv`` is the sanctioned carve-out for the one spawn
+    whose argv this package derives entirely — it changes nothing where a
+    backend exists, and on a backend-less host (Windows) it runs env-scrubbed,
+    loudly warned and SEL-audited under any governance floor, instead of
+    fail-closing and leaving that platform with no built-in voice.
+    """
+    sandbox_cleanup: str | None = None
+    try:
+        # Both preparation steps stat the filesystem — the sandbox probe walks
+        # PATH, and the cgroup wrap ensures the parent slice's limits — so
+        # neither may run inline on the event loop.
+        cmd, child_env, sandbox_cleanup = await sandboxed_spawn_argv_async(
+            cmd,
+            mode="standard",
+            first_party_fixed_argv=first_party_fixed_argv,
+        )
+        cmd = await asyncio.to_thread(cgroup_scope_argv, cmd)  # cgroup DoS ceiling
+        proc = await create_subprocess_limited(
+            *cmd,
+            env=child_env,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            _stdout, stderr = await asyncio.wait_for(
+                proc.communicate(stdin_text.encode("utf-8")),
+                timeout=timeout,
+            )
+        except BaseException as exc:
+            timed_out = isinstance(exc, asyncio.TimeoutError)
+            if timed_out:
+                logger.error("%s timed out after %ds; killing subprocess", label, timeout)
+            await _kill_and_reap(proc, label, timed_out=timed_out)
+            if not timed_out:
+                raise  # cancellation/interrupt must propagate to the caller
+            return False
+        if proc.returncode != 0:
+            logger.error(
+                "%s failed (rc=%d): %s",
+                label,
+                proc.returncode,
+                # Redact the whole stream, then keep the tail: the TTS backend
+                # prints its failure reason last.
+                redact_log_via_context(stderr.decode(errors="replace"))[-500:],
+            )
+            return False
+        # Both stats go off-loop in ONE hop: the output lives under TMPDIR, which
+        # an operator can point at a network or FUSE mount, and a stalled stat
+        # there would freeze every session and heartbeat this loop serves.
+        if not await asyncio.to_thread(_produced_audio, out_path):
+            logger.error("%s output too small", label)
+            return False
+        return True
+    except SandboxUnavailableError as exc:
+        # Same fail-closed sandbox refusal as the Polly path — relay the sandbox
+        # layer's own kind-specific remedy prose (see that handler for why it is
+        # never hardcoded) instead of logging a stack trace that reads as an
+        # engine fault.
+        logger.error(
+            "voice_reply: %s refused by the sandbox (%s): %s",
+            display,
+            exc.kind,
+            exc,
+        )
+        # Re-raised rather than collapsed to False: this exception carries the ONLY
+        # actionable diagnosis, and a bool cannot be told apart from a broken
+        # binary, a rejected voice or a muted device. Each caller decides what its
+        # own surface can show; the dashboard endpoint relays the prose.
+        raise
+    except Exception:
+        logger.exception("%s synthesis error", label)
+        return False
+    finally:
+        # Clean up the sandbox launcher script / seatbelt profile spawned by
+        # wrap_argv (None on platforms without a sandbox backend).
+        if sandbox_cleanup:
+            try:
+                os.unlink(sandbox_cleanup)
+            except OSError:
+                pass
+
+
+def _new_wav_path() -> str:
+    """Allocate an empty temp ``.wav`` and return its path."""
+    fd, path = tempfile.mkstemp(suffix=".wav")
+    os.close(fd)
+    return path
+
+
+def _spill_text(text: str) -> str:
+    """Write *text* to a temp UTF-8 file and return its path."""
+    fd, path = tempfile.mkstemp(suffix=".txt")
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(text)
+    return path
+
+
+async def _synthesize_system(
+    text: str,
+    voice: object = "",
+    rate: object = DEFAULT_RATE,
+) -> str | None:
+    """Speak *text* with the host's built-in engine. Returns a WAV path or None.
+
+    Every engine here is handed the text out of band — on stdin, or in a temp
+    file for SAPI — never in argv, so nothing in a model's output is parsed as a
+    command-line option or a shell word.
+
+    Both temp-file allocations run on a worker thread: a reply's whole text is
+    spilled to disk on the SAPI path, and the gateway runs every session on one
+    loop, so a synchronous write here stalls every other chat turn.
+    """
+    resolved = await resolve_system_tts_async()
+    if not resolved:
+        logger.error("no built-in system TTS engine on this host")
+        return None
+    engine, bin_path = resolved
+
+    # Coerced at the one consumer rather than at each config reader: the value
+    # arrives raw from config.json, where a hand-edited `"system_voice": []` is
+    # possible, and every engine here would break on it differently — SAPI's
+    # `_ps_quote` raises AttributeError, and the two argv engines raise TypeError
+    # inside the spawn. An unusable name degrades to the engine's own default.
+    voice = voice if isinstance(voice, str) else ""
+
+    path = await asyncio.to_thread(_new_wav_path)
+    text_file = ""
+    voice_file = ""
+    succeeded = False
+    try:
+        cmd: list[str]
+        stdin_text = text
+        if engine == SYSTEM_ENGINE_SAY:
+            cmd = [
+                bin_path,
+                "-o",
+                path,
+                "--file-format=WAVE",
+                # `say -o` defaults to AIFF-C; the dashboard plays PCM WAV.
+                "--data-format=LEI16@22050",
+                "-r",
+                str(_system_wpm(rate)),
+            ]
+            if voice:
+                cmd += ["-v", voice]
+        elif engine == SYSTEM_ENGINE_ESPEAK:
+            cmd = [bin_path, "-w", path, "-s", str(_system_wpm(rate))]
+            if voice:
+                cmd += ["-v", voice]
+        else:
+            text_file = await asyncio.to_thread(_spill_text, text)
+            # The voice name goes to a file for the same reason the text does:
+            # it comes from config.json, and keeping it off argv is what makes
+            # this spawn's argv derived entirely inside this package.
+            if voice:
+                voice_file = await asyncio.to_thread(_spill_text, voice)
+            cmd = [
+                bin_path,
+                "-NoProfile",
+                "-NonInteractive",
+                "-NoLogo",
+                "-EncodedCommand",
+                _sapi_encoded_command(path, text_file, voice_file, _sapi_rate(rate)),
+            ]
+            stdin_text = ""
+        succeeded = await _run_tts_subprocess(
+            cmd,
+            path,
+            label=engine,
+            display="System TTS",
+            stdin_text=stdin_text,
+            # SAPI only: after the two spills above, that argv is a System32
+            # binary plus module constants and internally-derived temp paths, so
+            # it satisfies the first-party carve-out. `say`/`espeak-ng` carry the
+            # configured voice on argv and cannot claim it — which costs nothing,
+            # because the carve-out is inert wherever a backend exists.
+            first_party_fixed_argv=engine == SYSTEM_ENGINE_SAPI,
+        )
+        return path if succeeded else None
+    finally:
+        # Invariant, not per-exit cleanup: EVERY unsuccessful exit — including
+        # CancelledError, which ``except Exception`` does not catch — must
+        # discard the owned temp file, or a new exit path re-opens the leak.
+        if not succeeded:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        for scratch in (text_file, voice_file):
+            if scratch:
+                try:
+                    os.unlink(scratch)
+                except OSError:
+                    pass
+
+
+def _sapi_encoded_command(out_path: str, text_path: str, voice_path: str, rate: int) -> str:
+    """Build the base64 ``-EncodedCommand`` payload for the SAPI synthesizer.
+
+    Encoding sidesteps command-line quoting entirely, which matters because the
+    script embeds filesystem paths. ONLY internally-derived temp paths and a
+    validated integer are interpolated: both the spoken text and the voice name
+    are read from files at runtime, so nothing a user or a model supplied ever
+    reaches argv. That is what lets the Windows spawn claim
+    ``first_party_fixed_argv`` at the sandbox chokepoint. Each path is escaped
+    for a PowerShell single-quoted literal so a quote in a temp path cannot
+    terminate the string.
+    """
+    select_voice = (
+        f"$v=[IO.File]::ReadAllText({_ps_quote(voice_path)},[Text.Encoding]::UTF8);"
+        "$s.SelectVoice($v);"
+        if voice_path
+        else ""
+    )
+    script = (
+        "$ErrorActionPreference='Stop';"
+        "Add-Type -AssemblyName System.Speech;"
+        f"$t=[IO.File]::ReadAllText({_ps_quote(text_path)},[Text.Encoding]::UTF8);"
+        "$s=New-Object System.Speech.Synthesis.SpeechSynthesizer;"
+        "try{"
+        f"{select_voice}"
+        f"$s.Rate={rate};"
+        # Pin the container format: SetOutputToWaveFile(path) alone leaves it to
+        # the selected voice, and the dashboard decodes one shape.
+        "$f=New-Object System.Speech.AudioFormat.SpeechAudioFormatInfo("
+        "22050,"
+        "[System.Speech.AudioFormat.AudioBitsPerSample]::Sixteen,"
+        "[System.Speech.AudioFormat.AudioChannel]::Mono);"
+        f"$s.SetOutputToWaveFile({_ps_quote(out_path)},$f);"
+        "$s.Speak($t);"
+        "}finally{$s.Dispose()}"
+    )
+    return base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+
+
+def _ps_quote(value: str) -> str:
+    """Return *value* as a PowerShell single-quoted literal."""
+    return "'" + value.replace("'", "''") + "'"
+
+
+# macOS `say -v '?'` pads the voice name with at least two spaces before the
+# locale, and names themselves contain spaces and parentheses ("Grandma
+# (Deutsch)"), so the run of spaces is the only reliable field separator.
+# The locale tail excludes the separators it is delimited by (`[A-Za-z0-9]`, not
+# `\w`, which contains `_`): with `\w` there are many ways to partition a run
+# like `0_0_0_`, and the resulting backtracking is exponential in its length.
+_SAY_VOICE_RE = re.compile(r"^(?P<name>\S.*?)\s{2,}(?P<locale>[A-Za-z]{2}(?:[-_][A-Za-z0-9]+)*)\s")
+
+_SAPI_LIST_VOICES = (
+    "$ErrorActionPreference='Stop';"
+    "Add-Type -AssemblyName System.Speech;"
+    "$s=New-Object System.Speech.Synthesis.SpeechSynthesizer;"
+    "try{$s.GetInstalledVoices()|"
+    "Where-Object{$_.Enabled}|"
+    "ForEach-Object{$_.VoiceInfo.Name+'|'+$_.VoiceInfo.Culture.Name}}"
+    "finally{$s.Dispose()}"
+)
+
+
+async def list_system_voices() -> list[dict[str, str]]:
+    """Enumerate the built-in engine's voices as ``{id, name, language}`` dicts.
+
+    Empty when the host has no built-in engine. A probe that FAILS raises
+    :class:`SystemVoiceProbeError` instead of returning empty: the caller cannot
+    tell those apart from the value alone, and an empty list is rendered as a
+    picker offering only the OS default, which reads as "this host has one
+    voice" rather than as a failure the user can retry.
+
+    The engine's default voice is deliberately not synthesized into an entry: it
+    speaks whatever language the OS is set to, which is the right answer often
+    enough that naming a specific voice must stay optional.
+
+    A voice's ``id`` is what the synthesis path passes back to the engine, so it
+    is the engine's own selector — a name for ``say`` and SAPI, a language code
+    for ``espeak-ng``, which has one voice per language.
+    """
+    resolved = await resolve_system_tts_async()
+    if not resolved:
+        return []
+    engine, bin_path = resolved
+    if engine == SYSTEM_ENGINE_SAY:
+        cmd = [bin_path, "-v", "?"]
+    elif engine == SYSTEM_ENGINE_ESPEAK:
+        cmd = [bin_path, "--voices"]
+    else:
+        cmd = [
+            bin_path,
+            "-NoProfile",
+            "-NonInteractive",
+            "-NoLogo",
+            "-EncodedCommand",
+            base64.b64encode(_SAPI_LIST_VOICES.encode("utf-16-le")).decode("ascii"),
+        ]
+    try:
+        # The cgroup wrap ensures the parent slice's limits, which touches the
+        # cgroup filesystem, so it cannot run inline on the event loop. The
+        # probe's argv is fixed, but its environment is still the gateway's, and
+        # a voice listing has no use for the gateway's credentials.
+        scoped, probe_env = await asyncio.to_thread(
+            lambda: (cgroup_scope_argv(cmd), scrub_env()),
+        )
+        proc = await create_subprocess_limited(
+            *scoped,
+            env=probe_env,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except Exception as exc:
+        logger.exception("system voice enumeration failed to spawn")
+        raise SystemVoiceProbeError("voice enumeration failed to spawn") from exc
+    try:
+        stdout, _stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
+    except BaseException as exc:
+        timed_out = isinstance(exc, asyncio.TimeoutError)
+        await _kill_and_reap(proc, "system voice probe", timed_out=timed_out)
+        if not timed_out:
+            raise
+        logger.error("system voice enumeration timed out")
+        raise SystemVoiceProbeError("voice enumeration timed out") from exc
+    if proc.returncode != 0:
+        logger.warning("system voice enumeration failed (rc=%s)", proc.returncode)
+        raise SystemVoiceProbeError(f"voice enumeration exited {proc.returncode}")
+    return _parse_system_voices(engine, stdout.decode(errors="replace"))
+
+
+def _parse_system_voices(engine: str, out: str) -> list[dict[str, str]]:
+    """Turn one engine's voice listing into sorted ``{id, name, language}`` rows."""
+    voices: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for line in out.splitlines():
+        line = line.rstrip()
+        if not line.strip():
+            continue
+        if engine == SYSTEM_ENGINE_SAY:
+            match = _SAY_VOICE_RE.match(line)
+            if not match:
+                continue
+            name = match.group("name").strip()
+            entry = {"id": name, "name": name, "language": match.group("locale").replace("_", "-")}
+        elif engine == SYSTEM_ENGINE_ESPEAK:
+            fields = line.split()
+            # The listing starts with a header row whose first column is the
+            # literal "Pty"; every voice row starts with a numeric priority.
+            if len(fields) < 4 or not fields[0].isdigit():
+                continue
+            entry = {"id": fields[1], "name": fields[3], "language": fields[1]}
+        else:
+            name, _, culture = line.partition("|")
+            name = name.strip()
+            if not name:
+                continue
+            entry = {"id": name, "name": name, "language": culture.strip()}
+        if entry["id"] in seen:
+            continue
+        seen.add(entry["id"])
+        voices.append(entry)
+    voices.sort(key=lambda v: (v["language"], v["name"]))
+    return voices
+
+
+async def synthesize_speech(
+    text: str,
+    provider: str = DEFAULT_PROVIDER,
+    # Polly-specific:
+    voice_id: str = DEFAULT_VOICE,
+    engine: str = DEFAULT_ENGINE,
+    rate: str = DEFAULT_RATE,
+    pitch: str = DEFAULT_PITCH,
+    aws_profile: str = "",
+    region: str = "",
+    # System-specific:
+    system_voice: str = "",
+    # Edition providers only; see the registered branch below.
+    language_code: str = "",
+    # Polly only: Ogg/Opus instead of MP3.
+    ogg_opus: bool = False,
+) -> str | None:
+    """Generate audio from *text* using the configured *provider*.
+
+    Returns the path to a temp audio file (``.mp3`` for Polly, ``.ogg`` for
+    Polly with *ogg_opus*, ``.wav`` for the built-in system engine), or None on
+    failure. Caller is responsible for deleting the file.
+
+    LLM output is redacted for credentials and exfiltration URLs before
+    synthesis — audio files uploaded to Slack bypass the usual text-path
+    redaction, so we apply both filters here to prevent secrets or
+    suspicious URLs from being spoken and persisted in Slack.
+    """
+    # ── Redact LLM output before it crosses an external surface (audio) ──
+    text, cred_warns, url_warns = redact_with_findings(text)
+    if cred_warns:
+        logger.warning("voice_reply: redacted %d credential pattern(s) before TTS", len(cred_warns))
+    if url_warns:
+        logger.warning("voice_reply: redacted %d suspicious URL(s) before TTS", len(url_warns))
+
+    # ``language_code`` is unused by both built-ins: Polly and the built-in engine
+    # each speak the language of the voice the user picked.
+    if provider == PROVIDER_POLLY:
+        ssml = text_to_ssml(text, rate=rate, pitch=pitch, engine=engine)
+        if not ssml:
+            return None
+        return await _synthesize_polly(
+            ssml,
+            voice_id=voice_id,
+            engine=engine,
+            aws_profile=aws_profile,
+            region=region,
+            ogg_opus=ogg_opus,
+        )
+    if provider == PROVIDER_SYSTEM:
+        plain = strip_markdown(text).strip()
+        if not plain:
+            return None
+        return await _synthesize_system(plain, voice=system_voice, rate=rate)
+    registered = speech_providers.tts_provider(provider)
+    if registered is not None:
+        plain = strip_markdown(text).strip()
+        if not plain:
+            return None
+        return await _synthesize_registered(
+            registered,
+            plain,
+            registered_voice_config(
+                provider,
+                voice_id=voice_id,
+                rate=rate,
+                pitch=pitch,
+                system_voice=system_voice,
+                language_code=language_code,
+            ),
+        )
+    logger.error("synthesize_speech: unknown provider %r", provider)
+    return None
+
+
+# The one Polly failure whose fix is "change the voice, engine or region": the
+# chosen engine (or language voice) is not offered in the request's region, so
+# AWS rejects every sentence identically. The reported AWS CLI stderr for it is
+#   An error occurred (ValidationException) when calling the SynthesizeSpeech
+#   operation: The selected engine is not supported in this region
+# so ``not supported in this region`` matches it; the two exception names cover
+# the forms AWS returns when the voice's language, rather than the engine, is
+# the unsupported one. It is the only AWS error that raises
+# ``voice_polly_rejected`` and stops the stream, because it is the only one that
+# repeats for every sentence and the only one that fix resolves. These markers
+# match against the CLI stderr; an error narrower to one sentence
+# (``InvalidSsmlException``, ``InvalidParameterValue``) or about the account
+# rather than the request (``AccessDenied``, ``ExpiredToken``) is absent on
+# purpose, so it falls through to the ``None``/skip-per-sentence path and the
+# dashboard shows its generic notice — the honest answer when the remedy is not
+# "change the voice, engine or region". A general AWS-error taxonomy belongs to
+# a separate change.
+_POLLY_ENGINE_REGION_ERRORS = (
+    "EngineNotSupportedException",
+    "LanguageNotSupportedException",
+    "not supported in this region",
+)
+
+
+def _classify_polly_failure(stderr: str) -> "VoiceSynthesisError | None":
+    """Return the coded error for a Polly stderr, or ``None`` to skip-per-sentence.
+
+    Only the engine/region-unsupported rejection becomes a raise, because it is
+    the only AWS failure whose fix is the one action the notice names — pick a
+    different voice, engine, or region — and the only one that repeats for every
+    sentence. Every other nonzero exit (a sentence-scoped SSML/parameter error,
+    a credential or access error, a transport blip) returns ``None``, so the
+    caller skips that sentence and the dashboard shows its generic notice.
+    Naming a remedy that does not fit is worse than the generic notice, so an
+    unrecognised failure says nothing specific. The AWS message can echo the
+    SSML, so it stays in the log; the raised text is fixed.
+    """
+    for marker in _POLLY_ENGINE_REGION_ERRORS:
+        if marker in stderr:
+            return VoiceSynthesisError(
+                "voice_polly_rejected",
+                "Amazon Polly does not offer the selected voice or engine in the "
+                "selected AWS region. In the Text-to-speech settings, pick a "
+                "different Voice, Engine, or Region.",
+            )
+    return None
+
+
+async def _synthesize_polly(
+    ssml: str,
+    voice_id: str = DEFAULT_VOICE,
+    engine: str = DEFAULT_ENGINE,
+    aws_profile: str = "",
+    region: str = "",
+    *,
+    raise_refusal: bool = False,
+    ogg_opus: bool = False,
+) -> str | None:
+    """Call Amazon Polly to generate MP3 (or Ogg/Opus).  Returns temp file path or ``None``.
+
+    ``ssml`` may be SSML (starting with ``<speak``) or plain text;
+    text-type is auto-detected from the leading ``<speak`` tag.
+
+    ``ogg_opus`` asks for Ogg/Opus in a ``.ogg`` file instead of MP3.
+
+    ``raise_refusal`` is for a caller with a person waiting: when no consent is
+    recorded for this profile and region it raises
+    ``VoiceSynthesisError("voice_consent_required")`` instead of returning ``None``,
+    and the engine/region-unsupported rejection raises
+    ``VoiceSynthesisError("voice_polly_rejected")`` rather than being retried once
+    per sentence. Every other nonzero exit returns ``None`` (skip-per-sentence),
+    so an unrecognised or sentence-scoped failure falls back to text rather than
+    naming a remedy that may not fit.
+    """
+    # Polly is a PAID AWS service and this is the request that spends money, so
+    # it does not happen without a recorded operator consent for this exact
+    # profile+region. The check is local (no AWS call of its own) because this
+    # path runs unattended — a Slack thread reply, an auto-reply to a voice
+    # memo, a scheduled job — so there is nobody here to prompt. Refusing
+    # returns None, which is this function's established "no audio" contract:
+    # callers already fall back to a text-only reply.
+    if not await aws_consent.refuse_and_log(
+        aws_consent.SERVICE_POLLY, profile=aws_profile, region=region
+    ):
+        if raise_refusal:
+            # Only a missing grant is the person's to fix. The gate's log and
+            # audit keep the account, profile and region this text leaves out.
+            granted, _ = aws_consent.is_granted(
+                aws_consent.SERVICE_POLLY, profile=aws_profile, region=region
+            )
+            if not granted:
+                raise VoiceSynthesisError(
+                    "voice_consent_required",
+                    "Amazon Polly use is not confirmed for this profile and region. "
+                    "Nothing was sent to AWS. Confirm it in Settings -> Voice.",
+                )
+        return None
+    # Polly is OPTIONAL and driven via the ``aws`` CLI (no boto3 dependency).
+    # On a vanilla machine without the CLI installed, degrade gracefully here
+    # instead of raising FileNotFoundError from create_subprocess_exec. Resolved
+    # absolutely (shared deploy-engine resolver) so a GUI-launched gateway's
+    # minimal PATH does not silently skip TTS; resolution probes the
+    # filesystem, so it runs in a thread rather than on the event loop.
+    aws_bin = await asyncio.to_thread(resolve_polly_cli)
+    if aws_bin is None:
+        logger.info("voice_reply: Polly unavailable (aws CLI not resolvable); skipping TTS")
+        return None
+    if not aws_profile:
+        # The reporter's core case: with no profile the argv below carries no
+        # ``--profile``, so the CLI's own chain decides which account is
+        # billed. The consent record above pinned that choice, but say so in
+        # the log too, because "no profile" reads as "no account" and is not.
+        logger.info(
+            "voice_reply: Polly is using the %s",
+            aws_consent.credential_source(aws_profile),
+        )
+    if engine not in VALID_ENGINES:
+        logger.error("Invalid Polly engine %r, falling back to neural", engine)
+        engine = DEFAULT_ENGINE
+    fd, path = tempfile.mkstemp(suffix=".ogg" if ogg_opus else ".mp3")
+    os.close(fd)
+    sandbox_cleanup: str | None = None
+    succeeded = False
+    try:
+        try:
+            cmd: list[str] = [aws_bin, "polly", "synthesize-speech"]
+            if aws_profile:
+                cmd += ["--profile", aws_profile]
+            if region:
+                cmd += ["--region", region]
+            cmd += [
+                "--engine",
+                engine,
+                "--voice-id",
+                voice_id,
+                "--output-format",
+                OGG_OPUS_FORMAT if ogg_opus else OUTPUT_FORMAT,
+                "--text-type",
+                "ssml" if ssml.startswith("<speak") else "text",
+                "--text",
+                ssml,
+                path,
+            ]
+            # LLM-derived SSML is passed on the command line to the AWS CLI.
+            # Apply an OS-level sandbox (namespace on Linux / seatbelt on
+            # macOS) so a compromised CLI or model can't reach private
+            # filesystem areas. ``wrap_argv`` is a no-op on platforms without
+            # a backend and returns a cleanup path that we must unlink after
+            # the child exits.
+            cmd, sandbox_cleanup = await wrap_argv_async(cmd, mode="standard", _prepare=wrap_argv)
+            cmd = cgroup_scope_argv(cmd)  # cgroup DoS ceiling
+            proc = await create_subprocess_limited(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                # A Python AWS CLI must not load the gateway's packages.
+                env=without_python_env(),
+            )
+            try:
+                _, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+            except BaseException as exc:
+                # ``asyncio.wait_for`` cancels ``proc.communicate()`` on
+                # timeout — and a caller cancellation (client disconnect)
+                # arrives here as CancelledError, as do interpreter-exit
+                # signals such as KeyboardInterrupt — but none of them
+                # terminate the child: kill it explicitly to avoid a hung
+                # ``aws polly`` process consuming resources after we exit.
+                # Temp-file discard is owned by the ``finally`` invariant
+                # below.
+                timed_out = isinstance(exc, asyncio.TimeoutError)
+                if timed_out:
+                    logger.error("Polly timed out after 30s; killing subprocess")
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+                # Reap via communicate(), not wait(): wait_for already
+                # cancelled the pipe readers, so a killed child blocked on a
+                # full PIPE would never be drained and wait() would hang.
+                try:
+                    await proc.communicate()
+                except Exception:
+                    logger.debug("polly wait after kill failed", exc_info=True)
+                except BaseException:
+                    # A repeat cancellation can land on the reap await. When we
+                    # are already propagating (non-timeout path) swallow it so
+                    # the ORIGINAL exception is the one that propagates; on the
+                    # timeout path it is a genuinely new cancellation, so let
+                    # it out.
+                    if timed_out:
+                        raise
+                if not timed_out:
+                    raise  # cancellation/interrupt must propagate to the caller
+                return None
+            if proc.returncode != 0:
+                decoded = stderr.decode(errors="replace")
+                logger.error("Polly failed: %s", decoded)
+                if raise_refusal:
+                    # A classified AWS error is a property of this profile,
+                    # region, engine and voice, so it repeats identically for
+                    # every sentence. The unattended path returns None and lets
+                    # the caller fall back to text, but the dashboard stream has
+                    # a person waiting: returning None there retries the same
+                    # doomed call once per sentence and ends in the generic "no
+                    # audio" notice. Stop at the first one with the code whose
+                    # remedy actually fixes it — an unsupported engine/region is
+                    # not the same fix as an expired credential. An unclassified
+                    # failure stays None, so the generic notice shows, which is
+                    # the honest answer when the cause is unknown.
+                    classified = _classify_polly_failure(decoded)
+                    if classified is not None:
+                        raise classified
+                return None
+            if os.path.getsize(path) < 100:
+                logger.error("Polly output too small")
+                return None
+            succeeded = True
+            return path
+        except SandboxUnavailableError as exc:
+            # A host with no OS sandbox backend (every Windows host, and Linux
+            # without user namespaces) fail-closes here rather than spawning the
+            # AWS CLI unconfined. Report it as its own diagnosis: the generic
+            # handler below logs a stack trace under "Polly synthesis error",
+            # which reads as a Polly/credentials fault and sends the operator
+            # looking in the wrong place.
+            #
+            # The remedy prose comes from ``str(exc)``, never hardcoded here.
+            # The sandbox layer picks it per ``kind``, and only "no_backend"
+            # names the allow_unsandboxed_exec opt-in: "transient" means
+            # momentary resource pressure where callers must NOT advise
+            # disabling the sandbox, and "foreign_sandbox" means this host's
+            # sandbox is fine and the fix is a kiro-cli setting.
+            logger.error(
+                "voice_reply: Polly TTS refused by the sandbox (%s): %s",
+                exc.kind,
+                exc,
+            )
+            # Re-raised for the same reason as the shared subprocess helper: the
+            # sentinel loses the one fact that resolves this. The ``finally`` below
+            # still discards the owned temp file, which matters MORE once the
+            # exception travels instead of a return value.
+            raise
+        except VoiceSynthesisError:
+            # The coded AWS-rejection error raised above on the ``raise_refusal``
+            # path is a deliberate signal to the waiting caller, not a synthesis
+            # fault to collapse into None — let it travel. The ``finally`` still
+            # discards the owned temp file.
+            raise
+        except Exception:
+            logger.exception("Polly synthesis error")
+            return None
+    finally:
+        # Invariant, not per-exit cleanup: EVERY unsuccessful exit — including
+        # CancelledError, which ``except Exception`` does not catch — must
+        # discard the owned temp file, or a new exit path re-opens the leak.
+        if not succeeded:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        # Clean up the sandbox launcher script / seatbelt profile spawned
+        # by wrap_argv (None on platforms without a sandbox backend).
+        if sandbox_cleanup:
+            try:
+                os.unlink(sandbox_cleanup)
+            except OSError:
+                pass
+
+
+async def upload_voice_to_slack(
+    slack_client: SlackClientOps,
+    channel: str,
+    thread_ts: str,
+    audio_path: str,
+) -> bool:
+    """Upload an audio file to a Slack thread as a voice clip.
+
+    The file extension (.mp3 / .wav / .ogg etc.) is preserved so Slack's
+    player renders it correctly.
+    """
+    ext = os.path.splitext(audio_path)[1].lstrip(".") or "mp3"
+    try:
+        await slack_client.upload_file(
+            channel=channel,
+            thread_ts=thread_ts,
+            file=audio_path,
+            filename=f"voice-reply.{ext}",
+            title="\U0001f50a Voice Reply",
+        )
+        return True
+    except Exception:
+        logger.exception("Slack file upload failed")
+        return False
+
+
+def split_sentences(text: str) -> list[str]:
+    """Split speakable text at Latin/CJK sentence and paragraph boundaries."""
+    clean = strip_markdown(text)
+    if not clean:
+        return []
+    parts = re.split(r"(?<=[.!?])\s+|(?<=[。！？；])\s*|\n+", clean)
+    return [s.strip() for s in parts if s.strip()]
+
+
+class VoiceSynthesisError(RuntimeError):
+    """A provider failure with a stable code for dashboard localization."""
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+
+
+async def stitch_mp3s(paths: list[str], output: str | None = None) -> str | None:
+    """Concatenate MP3 files into a single file using ffmpeg.
+
+    Returns ``None`` on failure (spawn error, timeout, non-zero exit, or an
+    empty output file). An output this call allocated itself (no ``output``
+    argument) is removed on any unsuccessful exit; a caller-supplied
+    ``output`` path is left untouched.
+
+    Windows: ffmpeg is not guaranteed on PATH, so the dashboard-streaming stitch
+    path fails there; making it optional with a warning is a known gap. The
+    Slack thread-upload path is unaffected.
+    """
+    if not paths:
+        return None
+    if len(paths) == 1:
+        if output:
+            shutil.copy2(paths[0], output)
+            return output
+        return paths[0]
+    owned = output is None
+    if output is None:
+        fd, output = tempfile.mkstemp(suffix=".mp3")
+        os.close(fd)
+
+    def _discard_owned_output() -> None:
+        # On failure this function returns None, so no caller ever receives an
+        # internally allocated (mkstemp) path — remove it or it leaks with no
+        # surviving owner. A caller-supplied ``output`` is never ours to delete.
+        if owned:
+            try:
+                os.unlink(output)
+            except OSError:
+                pass
+
+    concat = "|".join(paths)
+    succeeded = False
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg",
+            "-y",
+            "-i",
+            f"concat:{concat}",
+            "-c",
+            "copy",
+            output,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            await asyncio.wait_for(proc.communicate(), timeout=30)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            # asyncio.wait_for cancels communicate() but does NOT terminate
+            # the child — kill it explicitly (mirroring the polly
+            # path) so it stops consuming CPU and, on Windows, releases the
+            # output handle that would otherwise make the unlink in the
+            # ``finally`` below fail and re-leak the file.
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            try:
+                await proc.communicate()
+            except Exception:
+                logger.debug("ffmpeg wait after kill failed", exc_info=True)
+            raise
+        if (
+            proc.returncode != 0
+            or not os.path.exists(output)
+            # The mkstemp allocation always exists, so "ffmpeg produced no
+            # output" manifests as an empty file, not an absent one.
+            or os.path.getsize(output) == 0
+        ):
+            return None
+        succeeded = True
+        return output
+    except Exception:
+        logger.exception("ffmpeg stitch failed")
+        return None
+    finally:
+        # Invariant, not per-exit cleanup: EVERY unsuccessful exit — including
+        # CancelledError, which ``except Exception`` does not catch — must
+        # discard the owned output, or a new exit path re-opens the leak.
+        if not succeeded:
+            _discard_owned_output()
+
+
+async def streaming_voice_reply(
+    response_text: str,
+    voice_id: str = DEFAULT_VOICE,
+    engine: str = DEFAULT_ENGINE,
+    rate: str = DEFAULT_RATE,
+    pitch: str = DEFAULT_PITCH,
+    aws_profile: str = "",
+    region: str = "",
+):
+    """Async generator: yields (sentence_index, sentence_text, mp3_bytes) per sentence.
+
+    Use this for dashboard streaming — play each chunk as it arrives,
+    then call ``stitch_mp3s`` on the collected paths for a single replay file.
+
+    LLM output is redacted for credentials and exfiltration URLs before
+    synthesis (same rationale as ``synthesize_speech``) — streaming audio
+    to the dashboard bypasses the usual text-path redaction.
+    """
+    # ── Redact LLM output before it crosses an external surface (audio) ──
+    response_text, cred_warns, url_warns = redact_with_findings(response_text)
+    if cred_warns:
+        logger.warning(
+            "stream_voice_chunks: redacted %d credential pattern(s) before TTS", len(cred_warns)
+        )
+    if url_warns:
+        logger.warning(
+            "stream_voice_chunks: redacted %d suspicious URL(s) before TTS", len(url_warns)
+        )
+
+    sentences = split_sentences(response_text)
+    for i, sentence in enumerate(sentences):
+        ssml = text_to_ssml(sentence, rate=rate, pitch=pitch, engine=engine)
+        if not ssml:
+            continue
+        # Dashboard streaming is Polly-only today (sentence-by-sentence MP3
+        # chunks). Calls the Polly-specific internal to avoid double-wrapping
+        # text→SSML through the public dispatcher. Raises when no consent is
+        # recorded for this profile and region, or on the engine/region-
+        # unsupported rejection that repeats for every sentence; any other
+        # refusal skips this sentence and the next one is checked again.
+        mp3_path = await _synthesize_polly(
+            ssml,
+            voice_id=voice_id,
+            engine=engine,
+            aws_profile=aws_profile,
+            region=region,
+            raise_refusal=True,
+        )
+        if not mp3_path:
+            continue
+        try:
+            with open(mp3_path, "rb") as f:
+                mp3_bytes = f.read()
+            yield i, sentence, mp3_bytes
+        finally:
+            try:
+                os.unlink(mp3_path)
+            except OSError:
+                pass
+
+
+#: Keys read out of the ``voice_reply`` config section, with their defaults. One
+#: table so a channel cannot end up honouring a different set from another
+#: channel; :func:`synthesis_settings` maps it onto the kwargs
+#: :func:`synthesize_and_deliver` takes.
+_SYNTHESIS_KEYS: "tuple[tuple[str, str, Any], ...]" = (
+    ("voice_id", "voice_id", DEFAULT_VOICE),
+    ("engine", "engine", DEFAULT_ENGINE),
+    ("rate", "rate", DEFAULT_RATE),
+    ("pitch", "pitch", DEFAULT_PITCH),
+    ("aws_profile", "aws_profile", ""),
+    ("region", "region", ""),
+    ("system_voice", "system_voice", ""),
+)
+
+
+_warned_removed_providers: set[str] = set()
+
+
+def _warn_removed_provider(name: str) -> None:
+    """Log, once per process, that a saved config names a removed provider."""
+    if name in _warned_removed_providers:
+        return
+    _warned_removed_providers.add(name)
+    logger.warning(
+        "voice_reply.provider %r was removed (unpinned downloads and license, see "
+        "https://github.com/kirodotdev/KiroCrew/issues/23154); speaking with %r. "
+        'Set voice_reply.provider to "system" or "polly" in config.json to silence '
+        "this notice.",
+        name,
+        DEFAULT_PROVIDER,
+    )
+
+
+def resolve_configured_provider(section: dict | None) -> str:
+    """Resolve the provider from a raw ``voice_reply`` config section.
+
+    One implementation for every reader, so the rules below cannot drift between
+    the Slack loader, the Telegram settings path, and the dashboard.
+
+    Validated here rather than at synthesis time: a typo (``"ploly"``) would
+    otherwise pass through and only fail after the user has already spoken and is
+    waiting for a spoken answer. Both the absent-key default and the
+    invalid-value fallback stay LOCAL — reaching a paid AWS service because a key
+    was missing is not a decision an operator made, and a wrong local provider
+    costs nothing and degrades to a "TTS isn't configured" notice.
+
+    An absent provider takes the edition's ``default_tts()`` when the composed
+    platform context sets one (:func:`default_provider`); a stored value always
+    wins over it.
+
+    A removed provider (:data:`REMOVED_PROVIDERS`) resolves to the built-in
+    default, and an unnamed provider on a config that still carries
+    ``piper_model`` from before ``system`` became the default resolves like any
+    absent one, each with one warning per process so the operator can see why
+    their voice changed.
+    """
+    section = section or {}
+    provider = section.get("provider")
+    if not provider:
+        if validated_config_string(section.get("piper_model")):
+            _warn_removed_provider("piper")
+        # Only an absent, null or empty provider takes the edition default. A
+        # malformed falsy value (``false``, ``0``, ``[]``) keeps the built-in one.
+        if provider is None or provider == "":
+            return default_provider()
+        return DEFAULT_PROVIDER
+    if isinstance(provider, str) and provider in REMOVED_PROVIDERS:
+        _warn_removed_provider(provider)
+        return DEFAULT_PROVIDER
+    # ``in VALID_PROVIDERS`` raises TypeError on an unhashable JSON value
+    # (config.json can hold a list or dict where a string belongs), so the type
+    # is checked before the membership test.
+    selectable = valid_providers()
+    if not isinstance(provider, str) or provider not in selectable:
+        # Deliberately the built-in DEFAULT_PROVIDER, not the edition default: a
+        # mistyped value must not land on a provider (possibly a hosted, billed
+        # one) that nobody chose.
+        logger.warning(
+            "voice_reply.provider %r not in %s, defaulting to %r",
+            provider,
+            sorted(selectable),
+            DEFAULT_PROVIDER,
+        )
+        return DEFAULT_PROVIDER
+    return provider
+
+
+def synthesis_settings(raw: dict | None) -> dict:
+    """The ``voice_reply`` section as :func:`synthesize_and_deliver` kwargs.
+
+    *raw* is the section itself (``cfg.raw.get("voice_reply")``), so a caller with
+    a validated config and a caller reading ``config.json`` directly resolve the
+    same way.
+    """
+    section = raw or {}
+    out: dict = {"provider": resolve_configured_provider(section)}
+    for key, kwarg, default in _SYNTHESIS_KEYS:
+        out[kwarg] = section.get(key, default)
+    out["language_code"] = validated_language_code(section.get("language_code")) or ""
+    return out
+
+
+async def synthesize_and_deliver(
+    deliver: "Callable[[str], Awaitable[bool]]",
+    response_text: str,
+    provider: str = DEFAULT_PROVIDER,
+    # Polly:
+    voice_id: str = DEFAULT_VOICE,
+    engine: str = DEFAULT_ENGINE,
+    rate: str = DEFAULT_RATE,
+    pitch: str = DEFAULT_PITCH,
+    aws_profile: str = "",
+    region: str = "",
+    # System:
+    system_voice: str = "",
+    language_code: str = "",
+    # Polly only: Ogg/Opus instead of MP3.
+    ogg_opus: bool = False,
+) -> bool:
+    """Synthesize *response_text* and hand the audio file to *deliver*.
+
+    The channel-neutral half of the pipeline. ``synthesize_speech`` was already
+    surface-agnostic; the only Slack-shaped step was the upload, so it becomes a
+    callback taking the temp file's path and returning whether it landed.
+
+    The temp file is unlinked in a ``finally`` regardless of what *deliver* does,
+    including raising — a synthesizer that keeps its output on a delivery failure
+    leaks a decoded copy of the answer into the temp dir, which is the one place a
+    restricted session's text must not persist.
+
+    Returns False when synthesis produced nothing, so a caller can post its
+    unavailable notice rather than silently sending only text.
+    """
+    try:
+        audio_path = await synthesize_speech(
+            response_text,
+            provider=provider,
+            voice_id=voice_id,
+            engine=engine,
+            rate=rate,
+            pitch=pitch,
+            aws_profile=aws_profile,
+            region=region,
+            system_voice=system_voice,
+            language_code=language_code,
+            ogg_opus=ogg_opus,
+        )
+    except SandboxUnavailableError:
+        # This path delivers audio to a chat surface and has no channel for remedy
+        # prose, so a refusal is still just "no audio" here. Both current callers
+        # drop that signal — Slack's wrapper discards the bool entirely and
+        # Telegram only logs it — so on those surfaces a refusal stays silent,
+        # unchanged by this function. Caught explicitly all the same, so it cannot
+        # escape as an unhandled error on a voice reply; the dashboard synthesis
+        # endpoint is the surface that relays the remedy.
+        return False
+    if not audio_path:
+        return False
+    try:
+        return await deliver(audio_path)
+    finally:
+        try:
+            os.unlink(audio_path)
+        except OSError:
+            pass
+
+
+async def voice_reply(
+    slack_client: SlackClientOps,
+    channel: str,
+    thread_ts: str,
+    response_text: str,
+    provider: str = DEFAULT_PROVIDER,
+    # Polly:
+    voice_id: str = DEFAULT_VOICE,
+    engine: str = DEFAULT_ENGINE,
+    rate: str = DEFAULT_RATE,
+    pitch: str = DEFAULT_PITCH,
+    aws_profile: str = "",
+    region: str = "",
+    # System:
+    system_voice: str = "",
+    language_code: str = "",
+) -> bool:
+    """Full pipeline: text → provider synthesis → Slack upload.
+
+    Provider selection is controlled by the ``provider`` argument; arguments
+    belonging to the other providers are ignored.
+
+    Kept as its own entry point rather than folded into
+    :func:`synthesize_and_deliver`: Slack's callers pass a channel and a thread
+    rather than a delivery callback, and preserving the signature keeps every one
+    of them — and their tests — unchanged.
+    """
+    return await synthesize_and_deliver(
+        lambda path: upload_voice_to_slack(slack_client, channel, thread_ts, path),
+        response_text,
+        provider=provider,
+        voice_id=voice_id,
+        engine=engine,
+        rate=rate,
+        pitch=pitch,
+        aws_profile=aws_profile,
+        region=region,
+        system_voice=system_voice,
+        language_code=language_code,
+    )

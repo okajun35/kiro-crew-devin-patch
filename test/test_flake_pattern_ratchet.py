@@ -1,0 +1,1958 @@
+"""Ratchet: a change may not add a shape that makes a test flaky to any file.
+
+The Determinism contract in ``docs/system-specs/common/testing-conventions.md`` names
+the shapes a test must not use. ``semgrep/test-determinism.yaml`` refuses the
+commonest of them on a new line (a sleep as a barrier, a ``time`` patch, a bare
+``monkeypatch.undo()``, a reload, a naive local-time read, an unseeded draw, an autouse
+fixture on the shared ``monkeypatch``, a promise-sleep, ``waitForTimeout``). This module
+counts per file only the shapes those patterns miss; see below.  So no site needs
+both ``# nosemgrep`` and ``# flake-ok``. In a file the pinned semgrep reads no line of
+(one over its size limit, or one it cannot parse; see ``semgrep_cannot_read``), the
+``time`` patches its rule would refuse are counted too. The tree already holds
+thousands; each file a change touches is held to its count at its merge-base.
+
+* A file's count may not rise; a new file starts at 0, a deleted file passes.
+
+"""
+
+from __future__ import annotations
+
+import ast
+import importlib.util
+import io
+import os
+import re
+import subprocess
+import tokenize
+import warnings
+from collections import Counter
+from collections.abc import Callable, Iterable
+from pathlib import Path
+
+import pytest
+import yaml
+from flake_pattern_js_detectors import JS_DETECTORS
+from source_corpus import repo_files, repo_root
+from test_ratchet_scope import (
+    _GIT_COMMAND_LINE_CONFIG,
+    _fixture_git_env,
+    assert_fixture_ignores_ambient_git,
+)
+
+from kiro_crew.platform.update_governance import _GIT_LOCATION_VARS
+
+_RATCHET_SCOPE_SCRIPT = repo_root() / "scripts" / "ratchet_scope.py"
+_SPEC = importlib.util.spec_from_file_location("ratchet_scope", _RATCHET_SCOPE_SCRIPT)
+assert _SPEC and _SPEC.loader
+ratchet_scope = importlib.util.module_from_spec(_SPEC)
+_SPEC.loader.exec_module(ratchet_scope)
+
+pytestmark = pytest.mark.xdist_group(name="tree_scan_flake_ratchet")
+
+#: A ``flake-ok`` reason shorter than this is not a reason.
+MIN_REASON_CHARS = 10
+_FLAKE_OK = re.compile(r"(?:#|//)\s*flake-ok:\s*(?P<reason>\S.*?)\s*(?:\*/)?$")
+
+# ── which files are scanned ───────────────────────────────────────────
+
+
+def _is_python_test_file(rel: str) -> bool:
+    if not rel.endswith(".py"):
+        return False
+    name = rel.rsplit("/", 1)[-1]
+    if name == "conftest.py":
+        return True
+    if rel.startswith("test/"):
+        return True
+    if rel.startswith("src/kiro_crew/apps/builtins/"):
+        parts = rel.split("/")
+        return any(part == "tests" or part.endswith("_tests") for part in parts[:-1])
+    return False
+
+
+_JS_SUFFIXES = (".ts", ".tsx", ".js", ".mjs", ".cjs")
+
+
+def _is_js_test_file(rel: str) -> bool:
+    if not rel.startswith("website/") or not rel.endswith(_JS_SUFFIXES):
+        return False
+    if "/node_modules/" in rel:
+        return False
+    name = rel.rsplit("/", 1)[-1]
+    if rel.startswith(("website/integration/", "website/playwright/")):
+        return True
+    if rel.startswith("website/src/"):
+        return ".test." in name or "/test/" in rel
+    if rel.startswith("website/electron/"):
+        return "/test/" in rel
+    return False
+
+
+# ── the flake-ok escape ───────────────────────────────────────────────
+
+
+def _flake_ok(line: str) -> bool:
+    match = _FLAKE_OK.search(line)
+    if not match:
+        return False
+    reason = match.group("reason")
+    return len(reason) >= MIN_REASON_CHARS and any(c.isalpha() for c in reason)
+
+
+# ── Python detectors (AST) ────────────────────────────────────────────
+
+#: Stdlib names whose rebinding changes the clock or the sleep of the whole worker.
+_CLOCK_ATTRS = {
+    "time": frozenset(
+        {
+            "time",
+            "time_ns",
+            "monotonic",
+            "monotonic_ns",
+            "perf_counter",
+            "perf_counter_ns",
+            "sleep",
+            "localtime",
+            "gmtime",
+        }
+    ),
+    "asyncio": frozenset({"sleep"}),
+    "datetime": frozenset({"datetime", "date"}),
+}
+_CLOCK_CALLS = frozenset({"monotonic", "perf_counter", "time", "monotonic_ns", "perf_counter_ns"})
+_DELTA_NAMES = re.compile(r"(elapsed|duration|took|delta|wall)", re.IGNORECASE)
+_STAMP_NAMES = re.compile(
+    r"^(start|started|end|ended|before|after|began|finished|now|then|t\d|t_\w+|\w+_at)$"
+)
+_TIMEOUT_ERRORS = frozenset({"TimeoutError", "asyncio.TimeoutError", "futures.TimeoutError"})
+#: Calls that open a listener: a literal port handed to one is the D9 shape.
+_LISTENERS = frozenset(
+    {
+        "TCPSite",
+        "run_app",
+        "start_server",
+        "create_server",
+        "HTTPServer",
+        "ThreadingHTTPServer",
+        "TCPServer",
+        "ThreadingTCPServer",
+        "UDPServer",
+        "serve",
+        "make_server",
+    }
+)
+#: Where a listener call takes its port positionally (0-based).
+_LISTENER_PORT_ARG = {"TCPSite": 2, "start_server": 2, "create_server": 2}
+
+
+def _dotted(node: ast.AST) -> str:
+    """``a.b.c`` for a Name/Attribute chain, else ''."""
+    parts: list[str] = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if isinstance(node, ast.Name):
+        parts.append(node.id)
+        return ".".join(reversed(parts))
+    return ""
+
+
+def _number(node: ast.AST | None) -> float | None:
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+        if isinstance(node.value, bool):
+            return None
+        return float(node.value)
+    return None
+
+
+class _Module:
+    """One parsed file, with what the detectors share."""
+
+    def __init__(self, tree: ast.Module) -> None:
+        self.tree = tree
+        #: local name -> stdlib module, for ``import time as _time`` and the like.
+        self.modules: dict[str, str] = {name: name for name in ("time", "asyncio", "datetime")}
+        self.parents: dict[ast.AST, ast.AST] = {}
+        self.calls: list[ast.Call] = []
+        self.asserts: list[ast.Assert] = []
+        self.writes: list[ast.AST] = []  # Assign, AugAssign, Delete
+        #: local name -> asyncio name, for ``from asyncio import to_thread as tt``.
+        self.asyncio_names: dict[str, str] = {}
+        # One walk; every detector reads these lists instead of walking again.
+        stack: list[ast.AST] = [tree]
+        while stack:
+            node = stack.pop()
+            for child in ast.iter_child_nodes(node):
+                self.parents[child] = node
+                stack.append(child)
+            if isinstance(node, ast.Call):
+                self.calls.append(node)
+            elif isinstance(node, ast.Assert):
+                self.asserts.append(node)
+            elif isinstance(node, (ast.Assign, ast.AugAssign, ast.Delete)):
+                self.writes.append(node)
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name in _CLOCK_ATTRS:
+                        self.modules[alias.asname or alias.name] = alias.name
+            elif isinstance(node, ast.ImportFrom) and node.module == "asyncio":
+                for alias in node.names:
+                    self.asyncio_names[alias.asname or alias.name] = alias.name
+
+    def stdlib_of(self, node: ast.AST) -> str | None:
+        """The stdlib module a Name or Attribute names, through this file's aliases."""
+        if isinstance(node, ast.Name):
+            return self.modules.get(node.id)
+        dotted = _dotted(node)
+        if dotted.endswith((".time", ".asyncio", ".datetime")):
+            # ``<subject>.time``: the module under test's own binding of the stdlib
+            # module, which a test patches to change the clock for the whole worker.
+            return dotted.rsplit(".", 1)[1]
+        return None
+
+    def enclosing_function(self, node: ast.AST):
+        current = self.parents.get(node)
+        while current is not None and not isinstance(
+            current, (ast.FunctionDef, ast.AsyncFunctionDef)
+        ):
+            current = self.parents.get(current)
+        return current
+
+    def inside_raises_timeout(self, node: ast.AST) -> bool:
+        current = self.parents.get(node)
+        while current is not None:
+            if isinstance(current, (ast.With, ast.AsyncWith)):
+                for item in current.items:
+                    call = item.context_expr
+                    if (
+                        isinstance(call, ast.Call)
+                        and _dotted(call.func).endswith("raises")
+                        and call.args
+                        and _dotted(call.args[0]) in _TIMEOUT_ERRORS
+                    ):
+                        return True
+            current = self.parents.get(current)
+        return False
+
+    def inside_paused(self, node: ast.AST) -> bool:
+        current = self.parents.get(node)
+        while current is not None:
+            if isinstance(current, (ast.With, ast.AsyncWith)):
+                for item in current.items:
+                    call = item.context_expr
+                    if isinstance(call, ast.Call) and _dotted(call.func).endswith("paused"):
+                        return True
+            current = self.parents.get(current)
+        return False
+
+
+def _patched_target(node: ast.Call) -> tuple[ast.AST | None, str | None]:
+    """``(object, attribute)`` a ``setattr`` / ``patch.object`` call patches."""
+    if len(node.args) >= 2 and isinstance(node.args[1], ast.Constant):
+        return node.args[0], str(node.args[1].value)
+    return (node.args[0] if node.args else None), None
+
+
+#: What ``kirocrew.test-stdlib-clock-rebound`` (semgrep/test-determinism.yaml) refuses:
+#: ``<x>.setattr(time, ...)`` and ``<x>.patch.object(time, ...)`` on the stdlib ``time``
+#: module, named directly (an ``import time as`` alias included) or reached through
+#: another module's binding (``<mod>.time``), and a ``"time.<attr>"`` or
+#: ``"pkg.mod.time.<attr>"`` target string handed to ``<x>.setattr`` or ``<x>.patch``.
+#: K3 counts the clock and sleep patches that rule's patterns miss, so no site needs
+#: both markers, and, in a file semgrep reads nothing of, these as well.
+_TIME_RULE_STRING_TARGET = re.compile(r"(^|\.)time\.\w+$")
+
+
+def _time_rule_refuses(module: _Module, node: ast.Call, target: ast.AST | None) -> bool:
+    name = _dotted(node.func)
+    via_setattr = isinstance(node.func, ast.Attribute) and node.func.attr == "setattr"
+    if isinstance(target, ast.Constant) and isinstance(target.value, str):
+        via_patch = name == "patch" or name.endswith(".patch")
+        return bool(_TIME_RULE_STRING_TARGET.search(target.value)) and (via_setattr or via_patch)
+    via_patch_object = name == "patch.object" or name.endswith(".patch.object")
+    return (
+        target is not None
+        and module.stdlib_of(target) == "time"
+        and (via_setattr or via_patch_object)
+    )
+
+
+def _k3_stdlib_clock_patch(module: _Module, source: str) -> Iterable[ast.AST]:
+    """A patch on a stdlib clock or sleep the time rule does not refuse: ``asyncio.sleep``
+    and ``datetime.datetime`` / ``date``, named directly or through another module's
+    binding (``<mod>.asyncio``, ``"pkg.mod.datetime.<attr>"``). In a file semgrep cannot
+    read (:func:`semgrep_cannot_read`) the rule refuses nothing, so there the ``time``
+    patches it would refuse are counted too.
+    """
+    unread = semgrep_cannot_read(module, source)
+    for node in module.calls:
+        name = _dotted(node.func)
+        target: ast.AST | None
+        if name.endswith(("setattr", "patch.object")) and node.args:
+            target, attr = _patched_target(node)
+            if isinstance(target, ast.Constant) and isinstance(target.value, str):
+                stdlib, _, attr = target.value.rpartition(".")
+                stdlib = stdlib.rsplit(".", 1)[-1]
+            else:
+                stdlib = module.stdlib_of(target) if target is not None else None
+        elif (
+            (name == "patch" or name.endswith(".patch"))
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+        ):
+            target = node.args[0]
+            stdlib, _, attr = str(target.value).rpartition(".")
+            stdlib = stdlib.rsplit(".", 1)[-1]
+        else:
+            continue
+        if attr in _CLOCK_ATTRS.get(stdlib or "", ()) and (
+            unread or not _time_rule_refuses(module, node, target)
+        ):
+            yield node
+
+
+def _restores_sys_modules(fn: ast.AST) -> bool:
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Subscript) and _dotted(target.value) == "sys.modules":
+                    return True
+        if isinstance(node, ast.Call):
+            name = _dotted(node.func)
+            if name.endswith(("setitem", "patch.dict", "delitem")) and node.args:
+                if _dotted(node.args[0]) == "sys.modules":
+                    return True
+    return False
+
+
+def _k5_sys_modules_eviction(module: _Module) -> Iterable[ast.AST]:
+    """``del sys.modules[...]`` / ``sys.modules.pop(...)`` with no restore in the same
+    function. ``importlib.reload`` is ``kirocrew.test-in-process-reload``'s, not this."""
+    for node in [*module.calls, *module.writes]:
+        evicted = False
+        if isinstance(node, ast.Delete):
+            evicted = any(
+                isinstance(t, ast.Subscript) and _dotted(t.value) == "sys.modules"
+                for t in node.targets
+            )
+        elif isinstance(node, ast.Call) and _dotted(node.func) == "sys.modules.pop":
+            evicted = True
+        if evicted:
+            fn = module.enclosing_function(node)
+            if fn is None or not _restores_sys_modules(fn):
+                yield node
+
+
+def _k6_raw_environ_write(module: _Module) -> Iterable[ast.AST]:
+    for node in module.writes:
+        targets: list[ast.AST] = []
+        if isinstance(node, (ast.Assign, ast.Delete)):
+            targets = list(node.targets)
+        elif isinstance(node, ast.AugAssign):
+            targets = [node.target]
+        for target in targets:
+            if isinstance(target, ast.Subscript) and _dotted(target.value) == "os.environ":
+                yield node
+                break
+
+
+def _is_clock_delta(node: ast.AST) -> bool:
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Sub):
+        for side in (node.left, node.right):
+            if isinstance(side, ast.Call) and _dotted(side.func).rsplit(".", 1)[-1] in _CLOCK_CALLS:
+                return True
+        names = [_dotted(side).rsplit(".", 1)[-1] for side in (node.left, node.right)]
+        if all(names) and all(_STAMP_NAMES.match(name) for name in names):
+            return True
+    if isinstance(node, (ast.Name, ast.Attribute)):
+        return bool(_DELTA_NAMES.search(_dotted(node)))
+    return False
+
+
+def _k8_duration_bound(module: _Module) -> Iterable[ast.AST]:
+    for node in module.asserts:
+        if not isinstance(node.test, ast.Compare):
+            continue
+        compare = node.test
+        left = compare.left
+        for op, right in zip(compare.ops, compare.comparators):
+            if (
+                isinstance(op, (ast.Lt, ast.LtE))
+                and _is_clock_delta(left)
+                and _number(right) is not None
+            ):
+                yield node
+                break
+            left = right
+
+
+def _literal_timeout(call: ast.Call, position: int) -> float | None:
+    for keyword in call.keywords:
+        if keyword.arg == "timeout":
+            return _number(keyword.value)
+    if len(call.args) > position:
+        return _number(call.args[position])
+    return None
+
+
+def _k9_short_literal_wait(module: _Module) -> Iterable[ast.AST]:
+    for node in module.calls:
+        name = _dotted(node.func)
+        if name.endswith("wait_for"):
+            seconds = _literal_timeout(node, 1)
+        elif isinstance(node.func, ast.Attribute) and node.func.attr in ("wait", "result", "join"):
+            seconds = _literal_timeout(node, 0)
+        else:
+            continue
+        if seconds is None or not 0 < seconds < 2 or module.inside_raises_timeout(node):
+            continue
+        outer = module.parents.get(node)
+        if isinstance(outer, ast.UnaryOp) and isinstance(outer.op, ast.Not):
+            continue  # ``assert not event.wait(0.1)``: a short bound weakens a negative, never reds it
+        yield node
+
+
+def _k11_literal_listener_port(module: _Module) -> Iterable[ast.AST]:
+    for node in module.calls:
+        callee = _dotted(node.func).rsplit(".", 1)[-1]
+        if callee == "bind" and node.args and isinstance(node.args[0], ast.Tuple):
+            elts = node.args[0].elts
+            if len(elts) >= 2 and _number(elts[1]):
+                yield node
+            continue
+        if callee not in _LISTENERS:
+            continue
+        port = next((kw.value for kw in node.keywords if kw.arg == "port"), None)
+        position = _LISTENER_PORT_ARG.get(callee)
+        if port is None and position is not None and len(node.args) > position:
+            port = node.args[position]
+        if port is None and node.args and isinstance(node.args[0], ast.Tuple):
+            elts = node.args[0].elts  # HTTPServer(("127.0.0.1", 8080), ...)
+            port = elts[1] if len(elts) >= 2 else None
+        if _number(port):
+            yield node
+
+
+def _k13_fixed_flush_ceiling(module: _Module) -> Iterable[ast.AST]:
+    for node in module.calls:
+        if _dotted(node.func).endswith("emit.flush") and _literal_timeout(node, 0) is not None:
+            yield node
+
+
+def _k14_unpaused_crew_log_rmtree(module: _Module, source: str) -> Iterable[ast.AST]:
+    for node in module.calls:
+        if _dotted(node.func) != "shutil.rmtree":
+            continue
+        text = ast.get_source_segment(source, node) or ""
+        if ("crew_log" in text or "crew-log" in text) and not module.inside_paused(node):
+            yield node
+
+
+def _is_wait(node: ast.AST) -> bool:
+    return isinstance(node, ast.Attribute) and node.attr == "wait"
+
+
+def _k15_parked_pool_wait(module: _Module) -> Iterable[ast.AST]:
+    """A test parking ``<obj>.wait`` on an executor: ``to_thread(<obj>.wait, ...)`` or
+    ``run_in_executor(<any>, <obj>.wait, ...)``, whatever the bound, none included.
+
+    The parked wait holds a pool thread the code it waits for may need to make the
+    event fire, so a bound only changes how the starvation fails. The callee is matched
+    by its last name, so an aliased module counts too, and a name bound by
+    ``from asyncio import to_thread as tt`` resolves to ``to_thread``. Any ``.wait``
+    counts, which may over-count a little. Known misses: ``functools.partial``, a
+    ``lambda``, a rebound ``w = ev.wait``, a rebound callee (``f = asyncio.to_thread``),
+    ``executor.submit`` and ``getattr``."""
+    for node in module.calls:
+        func = node.func
+        if isinstance(func, ast.Name):
+            callee = module.asyncio_names.get(func.id, func.id)
+        else:
+            callee = func.attr if isinstance(func, ast.Attribute) else ""
+        if callee == "to_thread" and node.args and _is_wait(node.args[0]):
+            yield node
+        elif callee == "run_in_executor" and len(node.args) >= 2 and _is_wait(node.args[1]):
+            yield node
+
+
+def _k18_xfail_strict_false(module: _Module) -> Iterable[ast.AST]:
+    """``pytest.mark.xfail(strict=False)`` overrides the global ``xfail_strict = true``
+    in ``setup.cfg``, making an unexpected pass invisible until it silently pollutes main.
+
+    Matches ``pytest.mark.xfail(strict=False, ...)`` and ``pytest.xfail(strict=False)``;
+    does not flag calls that omit ``strict=`` (the global covers those) or that pass
+    ``strict=True`` explicitly."""
+    for node in module.calls:
+        func_name = _dotted(node.func)
+        if func_name not in ("pytest.mark.xfail", "pytest.xfail"):
+            continue
+        for keyword in node.keywords:
+            if keyword.arg == "strict":
+                val = keyword.value
+                if isinstance(val, ast.Constant) and val.value is False:
+                    yield node
+                    break
+
+
+#: Duration keyword names.  Only ``timeout`` exactly, or names with a time-unit suffix.
+_DURATION_KW_SECS = re.compile(
+    r"^(timeout|.+(_s|_sec|_secs|_second|_seconds))$",
+    re.IGNORECASE,
+)
+_DURATION_KW_MS = re.compile(
+    r"(_ms|_msec|_msecs|_millisecond|_milliseconds)$",
+    re.IGNORECASE,
+)
+
+
+_K9_CALLEE_ENDS = frozenset({"wait_for", "wait", "result", "join"})
+FUNC_TYPES = (ast.FunctionDef, ast.AsyncFunctionDef)
+
+
+#: Kwarg names whose component is a wait-bound word (setattr keeps _is_duration_kw).
+_KWARG_WAIT_BOUND = re.compile(
+    r"(?:^|_)(?:timeout|deadline|ttl|grace)(?:_|$)"
+    r"|(?:^|_)budget_(?:s|secs?|seconds?|ms|msecs?|milliseconds?)$",
+    re.IGNORECASE,
+)
+
+
+def _is_duration_kw(name: str) -> bool:
+    return bool(_DURATION_KW_MS.search(name) or _DURATION_KW_SECS.match(name))
+
+
+def _kc_testing_names(module: _Module) -> frozenset[str]:
+    names: set[str] = set()
+    for node in ast.walk(module.tree):
+        if isinstance(node, ast.ImportFrom) and node.module:
+            if node.module == "kiro_crew.testing" or node.module.startswith("kiro_crew.testing."):
+                for alias in node.names:
+                    names.add(alias.asname or alias.name)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.asname and alias.name.startswith("kiro_crew.testing"):
+                    names.add(alias.asname)
+    return frozenset(names)
+
+
+def _enclosing_param_names(module: _Module, node: ast.AST) -> frozenset[str]:
+    fn = module.enclosing_function(node)
+    if fn is None:
+        return frozenset()
+    a = fn.args
+    pool = a.args + a.posonlyargs + a.kwonlyargs
+    if a.vararg:
+        pool.append(a.vararg)
+    if a.kwarg:
+        pool.append(a.kwarg)
+    return frozenset(x.arg for x in pool)
+
+
+def _kc_testing_val(node: ast.AST, kc_names: frozenset[str], param_names: frozenset[str]) -> bool:
+    if isinstance(node, ast.Constant):
+        v = node.value
+        return v is None or (not isinstance(v, bool) and isinstance(v, (int, float)) and v == 0)
+    if isinstance(node, ast.Name):
+        return node.id in kc_names or node.id in param_names
+    if isinstance(node, ast.Attribute):
+        dotted = _dotted(node)
+        if dotted.startswith("kiro_crew.testing."):
+            return True
+        root = dotted.split(".")[0]
+        return bool(root) and root in kc_names
+    if isinstance(node, ast.Call):
+        return _kc_testing_val(node.func, kc_names, frozenset())
+    return False
+
+
+def _k19_short_literal_duration_arg(module: _Module) -> Iterable[ast.AST]:
+    """Non-kc-testing value on a duration-named kwarg or ``setattr`` attr."""
+    kc_names = _kc_testing_names(module)
+
+    for node in module.calls:
+        callee_end = node.func.attr if isinstance(node.func, ast.Attribute) else _dotted(node.func)
+
+        # ── setattr(mod, "attr_name", value) shape ───────────────────
+        if callee_end == "setattr" and len(node.args) >= 3:
+            attr_arg = node.args[1]
+            if isinstance(attr_arg, ast.Constant) and isinstance(attr_arg.value, str):
+                if _is_duration_kw(attr_arg.value):
+                    val_node = node.args[2]
+                    params = _enclosing_param_names(module, node)
+                    if not _kc_testing_val(val_node, kc_names, params):
+                        yield node
+            continue  # never also check setattr's own keyword args
+
+        # ── skip K9 bounded-wait primitives ───────────────────────────
+        if callee_end in _K9_CALLEE_ENDS:
+            continue
+
+        # ── duration-named keyword arg ────────────────────────────────
+        params = _enclosing_param_names(module, node)
+        fn_names = {n.name for n in module.tree.body if isinstance(n, FUNC_TYPES)}
+        for kw in node.keywords:
+            if kw.arg is None:
+                continue
+            if not _KWARG_WAIT_BOUND.search(kw.arg):
+                continue
+            if isinstance(kw.value, ast.Lambda):
+                continue
+            if isinstance(kw.value, ast.Name) and kw.value.id in fn_names:
+                continue
+            if _kc_testing_val(kw.value, kc_names, params):
+                continue
+            yield node
+            break
+
+
+#: Session-metadata writers whose last step is ``replace_with_retry``'s rename.
+_SESSION_WRITES = frozenset({"update_metadata", "update_metadata_if"})
+
+
+def _k20_on_loop_session_write(module: _Module) -> Iterable[ast.AST]:
+    """``<log>.update_metadata(...)`` or ``update_metadata_if`` in a coroutine's own frame.
+    On the loop thread ``replace_with_retry`` makes one rename attempt, so a Windows
+    sharing violation on the transcript fails the test;
+    ``await asyncio.to_thread(log.update_metadata, ...)`` gets the retry. A call in a
+    nested ``def`` or ``lambda`` runs wherever that is sent, so it is not counted. Known
+    miss: a sync helper that writes, called from a coroutine."""
+    frames = (*FUNC_TYPES, ast.Lambda)
+    for node in module.calls:
+        if not (isinstance(node.func, ast.Attribute) and node.func.attr in _SESSION_WRITES):
+            continue
+        frame = module.parents.get(node)
+        while frame is not None and not isinstance(frame, frames):
+            frame = module.parents.get(frame)
+        if isinstance(frame, ast.AsyncFunctionDef):
+            yield node
+
+
+def _kiro_crew_module_names(module: _Module) -> frozenset[str]:
+    """Lowercase names imported from ``kiro_crew.*`` at module scope.
+
+    Covers both ``from kiro_crew.X import mod`` (ImportFrom) and
+    ``import kiro_crew.X.mod as mod`` (Import with alias).  A kiro_crew module
+    import binds a persistent object: assigning a live asyncio Task or TimerHandle
+    to one of its attributes creates state that survives the test's event loop.
+    """
+    names: set[str] = set()
+    for node in module.tree.body:
+        if isinstance(node, ast.ImportFrom) and node.module:
+            if node.module == "kiro_crew" or node.module.startswith("kiro_crew."):
+                for alias in node.names:
+                    name = alias.asname or alias.name
+                    if name and name[0].islower():
+                        names.add(name)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.asname and (
+                    alias.name == "kiro_crew" or alias.name.startswith("kiro_crew.")
+                ):
+                    if alias.asname[0].islower():
+                        names.add(alias.asname)
+    return frozenset(names)
+
+
+def _is_task_creating_value(node: ast.AST) -> bool:
+    """True when *node* is a call that produces an asyncio Task or TimerHandle."""
+    if not isinstance(node, ast.Call):
+        return False
+    func = node.func
+    if isinstance(func, ast.Attribute):
+        attr = func.attr
+    elif isinstance(func, ast.Name):
+        attr = func.id
+    else:
+        return False
+    return attr in ("create_task", "ensure_future", "call_later", "call_at")
+
+
+def _k16_module_async_state(module: _Module) -> Iterable[ast.AST]:
+    """Writes a Task or TimerHandle into a kiro_crew module attribute from a test
+    function, when no autouse fixture or self-cleanup guards the state.
+
+    The module object outlives the test's event loop; a stale Task in module state
+    causes the next test on the same xdist worker to hang (asyncio.gather on a Task
+    from a closed loop never resolves) or read half-initialised state.
+
+    Detects four write shapes: plain assignment, annotated assignment, container
+    ``add``/``append`` calls, and indirect assignment (local var holds the task).
+    ``monkeypatch.setattr`` is not detected because monkeypatch always restores the
+    original attribute at teardown.  Exempts a write when:
+    - the enclosing function is an autouse fixture,
+    - an autouse fixture in the same file resets that ``<mod>.<attr>`` to ``None``
+      or calls ``.clear()`` on it (autouse fixtures protect all tests in the file),
+    - a non-autouse yield fixture resets the attribute AND the enclosing test
+      function requests that fixture (by parameter name or ``@pytest.mark.usefixtures``),
+    - the enclosing test function itself resets the same attribute to ``None``
+      (explicit inline cleanup).
+    """
+    kc_mods = _kiro_crew_module_names(module)
+    if not kc_mods:
+        return
+
+    # ── build autouse fixture set ──────────────────────────────────────────
+    autouse_fns: set[str] = set()
+    for node in ast.walk(module.tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for dec in node.decorator_list:
+            dec_text = ast.unparse(dec)
+            if "autouse" in dec_text and "True" in dec_text:
+                autouse_fns.add(node.name)
+
+    # ── collect reset pairs in two buckets ────────────────────────────────
+    # Autouse fixtures credit all tests in the file.
+    # Non-autouse yield fixtures only credit tests that request them.
+    autouse_reset_pairs: set[tuple[str, str]] = set()
+    fixture_reset_map: dict[str, set[tuple[str, str]]] = {}
+
+    for node in ast.walk(module.tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        is_autouse = node.name in autouse_fns
+        has_yield = any(isinstance(n, (ast.Yield, ast.YieldFrom)) for n in ast.walk(node))
+        if not (is_autouse or has_yield):
+            continue
+        pairs_for_fn: set[tuple[str, str]] = set()
+        for child in ast.walk(node):
+            # mod._attr = None
+            if isinstance(child, ast.Assign) and len(child.targets) == 1:
+                t = child.targets[0]
+                if (
+                    isinstance(t, ast.Attribute)
+                    and isinstance(t.value, ast.Name)
+                    and t.value.id in kc_mods
+                    and isinstance(child.value, ast.Constant)
+                    and child.value.value is None
+                ):
+                    pairs_for_fn.add((t.value.id, t.attr))
+            # mod._attr.clear() / .discard()
+            elif isinstance(child, ast.Expr) and isinstance(child.value, ast.Call):
+                call = child.value
+                if (
+                    isinstance(call.func, ast.Attribute)
+                    and call.func.attr in ("clear", "discard")
+                    and isinstance(call.func.value, ast.Attribute)
+                    and isinstance(call.func.value.value, ast.Name)
+                    and call.func.value.value.id in kc_mods
+                ):
+                    pairs_for_fn.add((call.func.value.value.id, call.func.value.attr))
+        if is_autouse:
+            autouse_reset_pairs |= pairs_for_fn
+        elif pairs_for_fn:
+            fixture_reset_map[node.name] = pairs_for_fn
+
+    def _requested_fixtures(fn: ast.AST) -> frozenset[str]:
+        """Parameter names + @pytest.mark.usefixtures names for *fn*."""
+        names: set[str] = set()
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            return frozenset()
+        for arg in fn.args.args + fn.args.kwonlyargs + (fn.args.posonlyargs or []):
+            names.add(arg.arg)
+        for dec in fn.decorator_list:
+            if isinstance(dec, ast.Call):
+                func = dec.func
+                is_usefixtures = (
+                    isinstance(func, ast.Attribute) and func.attr == "usefixtures"
+                ) or (isinstance(func, ast.Name) and func.id == "usefixtures")
+                if is_usefixtures:
+                    for arg in dec.args:
+                        if isinstance(arg, ast.Constant):
+                            names.add(str(arg.value))
+        return frozenset(names)
+
+    def _fn_resets(fn: ast.AST, mod: str, attr: str) -> bool:
+        """Does *fn* itself set ``<mod>.<attr> = None`` anywhere in its body?"""
+        for child in ast.walk(fn):
+            if isinstance(child, ast.Assign) and len(child.targets) == 1:
+                t = child.targets[0]
+                if (
+                    isinstance(t, ast.Attribute)
+                    and isinstance(t.value, ast.Name)
+                    and t.value.id == mod
+                    and t.attr == attr
+                    and isinstance(child.value, ast.Constant)
+                    and child.value.value is None
+                ):
+                    return True
+        return False
+
+    def _task_locals(fn: ast.AST) -> frozenset[str]:
+        """Names bound to a task-creating call inside *fn*."""
+        names: set[str] = set()
+        for child in ast.walk(fn):
+            if isinstance(child, ast.Assign) and _is_task_creating_value(child.value):
+                for tgt in child.targets:
+                    if isinstance(tgt, ast.Name):
+                        names.add(tgt.id)
+        return frozenset(names)
+
+    def _should_yield(node: ast.AST, mod: str, attr: str, value: ast.AST) -> bool:
+        fn = module.enclosing_function(node)
+        if fn is None or getattr(fn, "name", None) in autouse_fns:
+            return False
+        task_vars = _task_locals(fn)
+        is_task = _is_task_creating_value(value) or (
+            isinstance(value, ast.Name) and value.id in task_vars
+        )
+        if not is_task:
+            return False
+        # Autouse protection: module-wide
+        if (mod, attr) in autouse_reset_pairs:
+            return False
+        # Non-autouse fixture protection: only if this test requests the fixture
+        requested = _requested_fixtures(fn)
+        for fixture_name, pairs in fixture_reset_map.items():
+            if fixture_name in requested and (mod, attr) in pairs:
+                return False
+        # Self-cleanup: the test function itself resets the attribute
+        if _fn_resets(fn, mod, attr):
+            return False
+        return True
+
+    # ── 1. plain assignment: mod._attr = task / local_task_var ────────────
+    for write in module.writes:
+        if not isinstance(write, ast.Assign):
+            continue
+        for target in write.targets:
+            if (
+                isinstance(target, ast.Attribute)
+                and isinstance(target.value, ast.Name)
+                and target.value.id in kc_mods
+            ):
+                if _should_yield(write, target.value.id, target.attr, write.value):
+                    yield write
+                    break
+
+    # ── 2. annotated assignment: mod._attr: T = task ──────────────────────
+    for node in ast.walk(module.tree):
+        if not isinstance(node, ast.AnnAssign) or node.value is None:
+            continue
+        target = node.target
+        if (
+            isinstance(target, ast.Attribute)
+            and isinstance(target.value, ast.Name)
+            and target.value.id in kc_mods
+        ):
+            if _should_yield(node, target.value.id, target.attr, node.value):
+                yield node
+
+    # ── 3. container add/append: mod._attr.add(task) / .append(...) ───────
+    for call in module.calls:
+        func = call.func
+        if not (
+            isinstance(func, ast.Attribute)
+            and func.attr in ("add", "append", "extend")
+            and isinstance(func.value, ast.Attribute)
+            and isinstance(func.value.value, ast.Name)
+            and func.value.value.id in kc_mods
+        ):
+            continue
+        if not call.args or not _is_task_creating_value(call.args[0]):
+            continue
+        if _should_yield(call, func.value.value.id, func.value.attr, call.args[0]):
+            yield call
+
+    # ── 4. monkeypatch.setattr(mod, "_attr", task): NOT detected.
+    # monkeypatch restores the original value at teardown, so no task
+    # reference persists in module state after the test ends.
+
+
+def _parenthesized_with_as(source: bytes, starts: list[int], node: ast.AST) -> bool:
+    """Whether *node* is ``with (a as b, ...):``: one pair of parentheses holds every
+    item and at least one binds a name. ``with (a) as b:`` and ``with (a, b):`` are not."""
+    if not isinstance(node, (ast.With, ast.AsyncWith)) or not node.body:
+        return False
+    if all(item.optional_vars is None for item in node.items):
+        return False
+    # AST columns are UTF-8 byte offsets.
+    start = starts[node.lineno - 1] + node.col_offset
+    body = starts[node.body[0].lineno - 1] + node.body[0].col_offset
+    text = source[start:body].decode("utf-8")
+    tokens = (
+        token
+        for token in tokenize.generate_tokens(io.StringIO(text).readline)
+        if token.type not in (tokenize.NL, tokenize.NEWLINE, tokenize.COMMENT)
+    )
+    depth = 0
+    try:
+        for token in tokens:
+            if depth == 0 and token.string in ("async", "with"):
+                continue
+            if depth == 0 and token.string != "(":
+                return False
+            if token.type == tokenize.OP and token.string in ("(", "[", "{"):
+                depth += 1
+            elif token.type == tokenize.OP and token.string in (")", "]", "}"):
+                depth -= 1
+                if depth == 0:
+                    return next(tokens).string == ":"
+    except (tokenize.TokenError, StopIteration):
+        return False
+    return False
+
+
+#: semgrep's default ``--max-target-bytes``: it skips a larger file unread.
+SEMGREP_MAX_TARGET_BYTES = 1_000_000
+
+
+def semgrep_cannot_read(module: _Module, source: str) -> bool:
+    """Whether the pinned semgrep (1.78, ``.github/workflows/code-review.yml``) reads
+    no line of this file, so none of its rules refuses anything in it.
+
+    Two cases. A file over :data:`SEMGREP_MAX_TARGET_BYTES` is skipped. And a file
+    holding both a lambda with a bare ``*`` (``lambda a, *, b: ...``) and a
+    parenthesized ``with (a as b, ...):`` is a whole-file syntax error: semgrep's first
+    Python parser rejects the lambda, the one it falls back to rejects the ``with``.
+    Either shape alone parses, and so does ``lambda a, *rest, b``.
+    """
+    encoded = source.encode("utf-8")
+    if len(encoded) > SEMGREP_MAX_TARGET_BYTES:
+        return True
+    nodes = list(module.parents)
+    if not any(
+        isinstance(node, ast.Lambda) and node.args.kwonlyargs and node.args.vararg is None
+        for node in nodes
+    ):
+        return False
+    starts = [0]
+    for line in encoded.splitlines(keepends=True):
+        starts.append(starts[-1] + len(line))
+    return any(_parenthesized_with_as(encoded, starts, node) for node in nodes)
+
+
+#: class -> words one of which every shape of that class contains. A file holding none
+#: is not parsed: each set is deliberately broader than its detector, never narrower.
+PY_TRIGGERS: dict[str, tuple[str, ...]] = {
+    "K3-stdlib-clock-patch": ("setattr", "patch"),
+    "K5-sys-modules-eviction": ("modules",),
+    "K6-raw-environ-write": ("environ",),
+    "K8-duration-upper-bound": ("assert",),
+    "K9-short-literal-wait": ("(",),
+    "K11-literal-listener-port": ("(",),
+    "K13-fixed-flush-ceiling": ("flush",),
+    "K14-unpaused-crew-log-rmtree": ("rmtree",),
+    "K15-parked-pool-wait": ("to_thread", "run_in_executor"),
+    "K16-module-async-state": ("create_task", "call_later", "ensure_future", "call_at"),
+    "K18-xfail-strict-false": ("xfail",),
+    "K19-short-literal-duration-arg": ("(",),
+    "K20-on-loop-session-write": ("update_metadata",),
+}
+
+#: The classes whose detector also reads the source text.
+_READS_SOURCE = frozenset({"K3-stdlib-clock-patch", "K14-unpaused-crew-log-rmtree"})
+
+#: class -> detector.
+PY_DETECTORS: dict[str, Callable[..., Iterable[ast.AST]]] = {
+    "K3-stdlib-clock-patch": _k3_stdlib_clock_patch,
+    "K5-sys-modules-eviction": _k5_sys_modules_eviction,
+    "K6-raw-environ-write": _k6_raw_environ_write,
+    "K8-duration-upper-bound": _k8_duration_bound,
+    "K9-short-literal-wait": _k9_short_literal_wait,
+    "K11-literal-listener-port": _k11_literal_listener_port,
+    "K13-fixed-flush-ceiling": _k13_fixed_flush_ceiling,
+    "K14-unpaused-crew-log-rmtree": _k14_unpaused_crew_log_rmtree,
+    "K15-parked-pool-wait": _k15_parked_pool_wait,
+    "K16-module-async-state": _k16_module_async_state,
+    "K18-xfail-strict-false": _k18_xfail_strict_false,
+    "K19-short-literal-duration-arg": _k19_short_literal_duration_arg,
+    "K20-on-loop-session-write": _k20_on_loop_session_write,
+}
+
+
+# ── counting ──────────────────────────────────────────────────────────
+
+
+def _excuse_lines(node: ast.AST) -> range:
+    """The lines a ``flake-ok`` marker may sit on to excuse *node*: its own."""
+    start = getattr(node, "lineno", 1)
+    end = getattr(node, "end_lineno", start) or start
+    return range(start, end + 1)
+
+
+def _python_findings(source: str) -> Iterable[tuple[str, str, bool]]:
+    """``(class, site identity, excused by flake-ok)`` for each finding in a source.
+
+    The identity is the class plus the unparsed text of the enclosing function (the
+    finding itself at module level), so a site that MOVES with its function keeps it.
+    """
+    active = [klass for klass, words in PY_TRIGGERS.items() if any(w in source for w in words)]
+    if not active:
+        return
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return
+    module = _Module(tree)
+    lines = source.splitlines()
+    for klass in active:
+        detector = PY_DETECTORS[klass]
+        found = detector(module, source) if klass in _READS_SOURCE else detector(module)
+        for node in found:
+            span = [n for n in _excuse_lines(node) if 0 < n <= len(lines)]
+            excused = any(_flake_ok(lines[n - 1]) for n in span)
+            yield klass, ast.unparse(module.enclosing_function(node) or node), excused
+
+
+def _js_findings(rel: str, source: str) -> Iterable[tuple[str, str, bool]]:
+    """``(class, the stripped line, excused by flake-ok)`` for each finding in a source."""
+    lines = source.splitlines()
+    for klass, detector in JS_DETECTORS.items():
+        for number in detector(rel, source):
+            line = lines[number - 1]
+            yield klass, line.strip(), _flake_ok(line)
+
+
+def _tally(findings: Iterable[tuple[str, str, bool]]) -> tuple[Counter[str], int]:
+    counts: Counter[str] = Counter()
+    excused = 0
+    for klass, _site, ok in findings:
+        if ok:
+            excused += 1
+        else:
+            counts[klass] += 1
+    return counts, excused
+
+
+def count_python(source: str) -> tuple[Counter[str], int]:
+    """``(class -> count, flake-ok lines)`` for one Python source."""
+    return _tally(_python_findings(source))
+
+
+def count_js(rel: str, source: str) -> tuple[Counter[str], int]:
+    return _tally(_js_findings(rel, source))
+
+
+_Sites = Counter[tuple[str, str]]
+
+
+def sites(rel: str, source: str) -> tuple[_Sites, _Sites]:
+    """``(counted, present)``: ``(class, site identity) -> count`` for one test source,
+    without and with the lines a ``flake-ok`` excuses."""
+    found = _python_findings(source) if _is_python_test_file(rel) else _js_findings(rel, source)
+    counted: _Sites = Counter()
+    present: _Sites = Counter()
+    for klass, site, ok in found:
+        present[(klass, site)] += 1
+        if not ok:
+            counted[(klass, site)] += 1
+    return counted, present
+
+
+# ── the change in front of the ratchet ────────────────────────────────
+
+#: Env var that forces an explicit base, matching the shared helper.
+BASE_ENV = "FLAKE_RATCHET_BASE"
+
+
+def merge_base(root: Path, *, env: dict[str, str] | None = None) -> tuple[str | None, str]:
+    """``(base commit, how it was found)`` for this change against *root*; shared helper.
+
+    Delegates to :func:`ratchet_scope.change_merge_base` so the base precedence
+    stays the one every change-shaped gate reads.
+    """
+    return ratchet_scope.change_merge_base(BASE_ENV, cwd=root, env=env)
+
+
+def changed_files(root: Path, base: str) -> list[tuple[str | None, str | None]]:
+    """``(path at base, path now)`` for each file this change touches against *base*."""
+    return ratchet_scope.change_files(base, cwd=root)
+
+
+def _counted(rel: str) -> bool:
+    return _is_python_test_file(rel) or _is_js_test_file(rel)
+
+
+def _sites_at(root: Path, base: str | None, rel: str | None) -> tuple[_Sites, _Sites]:
+    if rel is None or not _counted(rel):
+        return Counter(), Counter()
+    if base is not None:
+        text = ratchet_scope.show_at(base, rel, cwd=root)
+    else:
+        try:
+            text = (root / rel).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            text = None
+    return sites(rel, text) if text is not None else (Counter(), Counter())
+
+
+def _class_total(sites_of_file: _Sites, klass: str) -> int:
+    return sum(count for (k, _site), count in sites_of_file.items() if k == klass)
+
+
+def _moved_into(
+    drops: list[int], gone: list[_Sites], arrived: list[_Sites], rises: list[int]
+) -> list[int]:
+    """How much of each file's rise in one class sites MOVED from other files cover.
+
+    A maximum flow: from each file whose count dropped (up to that drop), along each
+    identity that left it, to each file that identity arrived in, and out up to that
+    file's rise. A file passes on what it receives, so a chain of moves (A's site to B
+    while B's own moves to C) is followed; an identity that left no file, or a file
+    whose count did not drop and received nothing (a function edited in place), lends
+    nothing. Edmonds-Karp over a graph of a few nodes per changed file.
+    """
+    files = range(len(drops))
+    graph: dict[object, dict[object, int]] = {"source": {}, "sink": {}}
+
+    def edge(head: object, tail: object, capacity: int) -> None:
+        graph.setdefault(head, {})
+        graph.setdefault(tail, {})
+        graph[head][tail] = graph[head].get(tail, 0) + capacity
+        graph[tail].setdefault(head, 0)
+
+    for index in files:
+        if drops[index] > 0:
+            edge("source", ("file", index), drops[index])
+        for site, count in sorted(gone[index].items()):
+            edge(("file", index), ("site", site), count)
+        for site, count in sorted(arrived[index].items()):
+            edge(("site", site), ("file", index), count)
+        if rises[index] > 0:
+            edge(("file", index), "sink", rises[index])
+    while True:
+        parent: dict[object, object] = {"source": "source"}
+        queue = ["source"]
+        while queue and "sink" not in parent:
+            head = queue.pop(0)
+            for tail, room in graph[head].items():
+                if room > 0 and tail not in parent:
+                    parent[tail] = head
+                    queue.append(tail)
+        if "sink" not in parent:
+            break
+        path = ["sink"]
+        while path[-1] != "source":
+            path.append(parent[path[-1]])
+        hops = list(zip(path[1:], path[:-1]))
+        pushed = min(graph[head][tail] for head, tail in hops)
+        for head, tail in hops:
+            graph[head][tail] -= pushed
+            graph[tail][head] += pushed
+    # What the sink edge still has room for is the part of the rise no move covered.
+    return [graph.get(("file", index), {}).get("sink", 0) for index in files]
+
+
+def change_risen(root: Path, base: str) -> dict[tuple[str, str], tuple[int, int]]:
+    """``(class, path) -> (count now, count allowed)`` for every rise in this change.
+
+    Each file is held to its own count per class at *base*; a new file starts at 0.
+    A rise is forgiven only for a site that MOVED: the same (class, identity), where
+    the identity is the enclosing function's unparsed Python text or the stripped
+    JavaScript line, that left another file in the same change (see :func:`_moved_into`).
+    A site a ``flake-ok`` still excuses has not left.
+    """
+    paths: list[str | None] = []
+    befores: list[_Sites] = []
+    nows: list[_Sites] = []
+    gones: list[_Sites] = []
+    for old, new in sorted(changed_files(root, base), key=lambda pair: str(pair[1] or pair[0])):
+        before, _before_present = _sites_at(root, base, old)
+        now, now_present = _sites_at(root, None, new)
+        paths.append(new)
+        befores.append(before)
+        nows.append(now)
+        gones.append(before - now_present)
+    risen: dict[tuple[str, str], tuple[int, int]] = {}
+    for klass in sorted({klass for now in nows for klass, _site in now}):
+        was = [_class_total(before, klass) for before in befores]
+        count = [_class_total(now, klass) for now in nows]
+
+        def of_class(sites_of_file: _Sites) -> _Sites:
+            return Counter({key: n for key, n in sites_of_file.items() if key[0] == klass})
+
+        unforgiven = _moved_into(
+            [max(0, w - c) for w, c in zip(was, count)],
+            [of_class(gone) for gone in gones],
+            [of_class(now - before) for before, now in zip(befores, nows)],
+            [max(0, c - w) if path is not None else 0 for path, w, c in zip(paths, was, count)],
+        )
+        for path, c, excess in zip(paths, count, unforgiven):
+            if path is not None and excess > 0:
+                risen[(klass, path)] = (c, c - excess)
+    return risen
+
+
+# ── the ratchet ───────────────────────────────────────────────────────
+
+
+def test_no_changed_file_gains_a_flaky_shape() -> None:
+    root = repo_root()
+    base, how = merge_base(root)
+    if base is None:
+        message = f"flake-pattern ratchet compared nothing: {how}"
+        if os.environ.get("GITHUB_ACTIONS") == "true":
+            _write_job_summary(f"**Warning:** {message}.")
+        warnings.warn(message, UserWarning, stacklevel=1)
+        return
+    risen = change_risen(root, base)
+    print(f"compared with {base[:12]}, {how}")
+    detail = "\n".join(
+        f"  {path}: {klass} {now} > {allowed}"
+        for (klass, path), (now, allowed) in sorted(risen.items())
+    )
+    assert not risen, (
+        "this change adds a shape the Determinism contract rules out "
+        "(docs/system-specs/common/testing-conventions.md#determinism-contract-read-this-first); "
+        f"each count is this file's against {base[:12]}:\n{detail}\nFix the new site, or carry "
+        "`# flake-ok: <reason>` on its line when the shape is deliberate."
+    )
+
+
+def _write_job_summary(line: str) -> None:
+    path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not path:
+        return
+    try:
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(line + "\n")
+    except OSError:
+        pass
+
+
+# ── the detectors find what they say, and only that ───────────────────
+
+#: class -> (snippets the detector must count once each, a near miss it must not count).
+PY_CASES: dict[str, tuple[tuple[str, ...], str]] = {
+    "K3-stdlib-clock-patch": (
+        (
+            "import asyncio\ndef test_x(monkeypatch):\n    monkeypatch.setattr(asyncio, 'sleep', f)\n",
+            "def test_x():\n    with patch('kiro_crew.providers.acp.asyncio.sleep', new=f):\n"
+            "        pass\n",
+            "import datetime\ndef test_x(monkeypatch):\n"
+            "    monkeypatch.setattr(datetime, 'datetime', Frozen)\n",
+            "def test_x(monkeypatch):\n    monkeypatch.setattr(subject.asyncio, 'sleep', f)\n",
+            "def test_x(monkeypatch):\n"
+            "    monkeypatch.setattr('kiro_crew.acp.client.datetime.datetime', Frozen)\n",
+            "import asyncio\nfrom unittest import mock\ndef test_x():\n"
+            "    with mock.patch.object(asyncio, 'sleep', f):\n        pass\n",
+        ),
+        # The right seam, a non-clock attribute, and the shapes the time rule refuses.
+        "import os\nimport time\nimport time as _t\nimport unittest.mock\n"
+        "from unittest import mock\ndef test_x(monkeypatch):\n"
+        "    monkeypatch.setattr(subject, 'time', fake)\n    monkeypatch.setattr(os, 'getcwd', f)\n"
+        "    monkeypatch.setattr('time.tzname', t)\n    monkeypatch.setattr(time, 'monotonic', f)\n"
+        "    monkeypatch.setattr(_t, 'sleep', f)\n    monkeypatch.setattr('time.time', f)\n"
+        "    monkeypatch.setattr(subject.time, 'monotonic', f)\n"
+        "    monkeypatch.setattr('kiro_crew.acp.client.time.monotonic', f)\n"
+        "    monkeypatch.setattr('kiro_crew.acp.client.time', fake)\n"
+        "    with patch('time.sleep'), patch.object(time, 'monotonic', f):\n        pass\n"
+        "    with mock.patch.object(_t, 'time', f), unittest.mock.patch('time.sleep'):\n"
+        "        pass\n"
+        "    with mock.patch('kiro_crew.cron.time.time'), patch.object(subject.time, 'sleep'):\n"
+        "        pass\n",
+    ),
+    "K5-sys-modules-eviction": (
+        (
+            "import sys\ndef test_x():\n    del sys.modules['m']\n",
+            "import sys\ndef test_x():\n    sys.modules.pop('m', None)\n",
+        ),
+        # A restore in the same function, and the reload the reload rule refuses.
+        "import importlib\nimport sys\ndef test_x(monkeypatch):\n    del sys.modules['m']\n"
+        "    sys.modules['m'] = saved\ndef test_y():\n    importlib.reload(mod)\n",
+    ),
+    "K6-raw-environ-write": (
+        ("import os\ndef test_x():\n    os.environ['A'] = '1'\n",),
+        "import os\ndef test_x(monkeypatch):\n    monkeypatch.setenv('A', '1')\n    x = os.environ['A']\n",
+    ),
+    "K8-duration-upper-bound": (
+        (
+            "import time\ndef test_x():\n    t = time.monotonic()\n    run()\n"
+            "    assert time.monotonic() - t < 1.0\n",
+            "def test_x():\n    assert (\n        elapsed < 5.0\n    ), 'took too long'\n",
+            "def test_x():\n    assert 0.15 < elapsed < 1.0\n",
+            "def test_x():\n    assert after - before < 0.05\n",
+        ),
+        "import time\ndef test_x():\n    t = time.monotonic()\n    run()\n"
+        "    assert time.monotonic() - t < LOST_RUN_SECS\n    assert elapsed > 0.1\n",
+    ),
+    "K9-short-literal-wait": (
+        (
+            "def test_x():\n    thread.join(0.5)\n",
+            "async def test_x():\n    await asyncio.wait_for(f, 1)\n",
+        ),
+        "import pytest\ndef test_x():\n    thread.join(30)\n    with pytest.raises(TimeoutError):\n"
+        "        fut.result(timeout=0.01)\n    assert not stopped.wait(0.1)\n",
+    ),
+    "K11-literal-listener-port": (
+        (
+            "def test_x():\n    web.TCPSite(runner, '127.0.0.1', 8765)\n",
+            "def test_x():\n    s.bind(('127.0.0.1', 9000))\n",
+            "def test_x():\n    HTTPServer(('127.0.0.1', 8080), Handler)\n",
+        ),
+        "def test_x():\n    web.TCPSite(runner, '127.0.0.1', 0)\n    s.bind(('127.0.0.1', 0))\n"
+        "    record = AppProcess(port=9137)\n",
+    ),
+    "K13-fixed-flush-ceiling": (
+        ("def test_x():\n    assert emit.flush(timeout=5.0)\n",),
+        "def test_x():\n    assert emit.flush()\n",
+    ),
+    "K14-unpaused-crew-log-rmtree": (
+        (
+            "import shutil\ndef test_x():\n    shutil.rmtree(crew_log_path('session', sid).parent)\n",
+        ),
+        "import shutil\ndef test_x():\n    with eager.paused():\n"
+        "        shutil.rmtree(crew_log_path('session', sid).parent)\n",
+    ),
+    "K15-parked-pool-wait": (
+        (
+            "import asyncio\nasync def test_x():\n    assert await asyncio.to_thread(ev.wait, 5)\n",
+            "import asyncio\nasync def test_x():\n    await asyncio.to_thread(ev.wait, timeout=2.0)\n",
+            "import asyncio\nasync def test_x():\n    await asyncio.to_thread(self.ev.wait)\n",
+            "import asyncio\nasync def test_x():\n"
+            "    await asyncio.to_thread(ev.wait, default_timeout())\n",
+            "from asyncio import to_thread\nasync def test_x():\n    await to_thread(ev.wait, 5)\n",
+            "from asyncio import to_thread as tt\nasync def test_x():\n    await tt(ev.wait, 5)\n",
+            "import asyncio\nasync def test_x():\n    real = asyncio\n"
+            "    await real.to_thread(ev.wait, 5)\n",
+            "import asyncio\nasync def test_x():\n"
+            "    await asyncio.get_running_loop().run_in_executor(None, started.wait, 5)\n",
+            "async def test_x(loop):\n    await loop.run_in_executor(pool, release.wait)\n",
+        ),
+        # Another callable, a non-blocking read, polling from the loop, a held-side
+        # wait on the code's own thread, and the shape named only in a docstring.
+        "import asyncio\nasync def test_x(loop):\n    'asyncio.to_thread(ev.wait, 5)'\n"
+        "    await asyncio.to_thread(work, 5)\n    await asyncio.to_thread(ev.is_set)\n"
+        "    await loop.run_in_executor(None, work, 5)\n"
+        "    await async_wait_until(ev.is_set)\ndef held():\n    assert ev.wait(5)\n",
+    ),
+    "K16-module-async-state": (
+        (
+            # 1. Plain assignment: create_task on imported kiro_crew module attr
+            "import asyncio\nfrom kiro_crew.apps.builtins.aws_control import hooks\n"
+            "async def test_x():\n    hooks._task = asyncio.create_task(f())\n",
+            # 2. call_later via get_running_loop()
+            "import asyncio\nfrom kiro_crew.dashboard import crewmate_feed\n"
+            "async def test_y():\n"
+            "    crewmate_feed._timer = asyncio.get_running_loop().call_later(0.4, lambda: None)\n",
+            # 3. Container add: mod._attr.add(create_task(...))
+            "import asyncio\nfrom kiro_crew.apps.builtins.aws_control import hooks\n"
+            "async def test_add():\n    hooks._pending.add(asyncio.create_task(f()))\n",
+            # 4. Plain Import alias: import kiro_crew.x.hooks as hooks
+            "import asyncio\nimport kiro_crew.apps.builtins.aws_control.hooks as hooks\n"
+            "async def test_import():\n    hooks._task = asyncio.create_task(f())\n",
+            # 5. Indirect assignment: t = create_task(); mod._attr = t
+            "import asyncio\nfrom kiro_crew.apps.builtins.aws_control import hooks\n"
+            "async def test_indirect():\n"
+            "    t = asyncio.create_task(f())\n    hooks._task = t\n",
+            # 6. Annotated assignment
+            "import asyncio\nfrom kiro_crew.apps.builtins.aws_control import hooks\n"
+            "async def test_ann():\n"
+            "    hooks._task: asyncio.Task = asyncio.create_task(f())\n",
+            # 7. Non-autouse yield fixture resets _keep; test NOT requesting it writes -> K16
+            "import asyncio\nimport pytest\nfrom kiro_crew.dashboard import crewmate_feed\n"
+            "@pytest.fixture\n"
+            "def _clean_feed():\n    crewmate_feed._keep.clear()\n    yield\n"
+            "    crewmate_feed._keep.clear()\n"
+            "async def test_no_fixture():\n"
+            "    crewmate_feed._keep.add(asyncio.create_task(f()))\n",
+        ),
+        # Near misses — all count 0:
+        # autouse resets (hooks, _task) -> test_x write exempt;
+        # non-autouse yield fixture requested -> exempt;
+        # non-kiro_crew base -> not counted; None value -> not a task;
+        # self-cleanup (same-fn None reset) -> exempt;
+        # monkeypatch.setattr -> not detected.
+        "import asyncio\nimport pytest\n"
+        "from kiro_crew.apps.builtins.aws_control import hooks\n"
+        "@pytest.fixture(autouse=True)\n"
+        "def _isolated():\n    hooks._task = None\n    yield\n    hooks._task = None\n"
+        "@pytest.fixture\n"
+        "def _opt():\n    hooks._task = None\n    yield\n    hooks._task = None\n"
+        "async def test_x():\n"
+        "    hooks._task = asyncio.create_task(g())  # autouse resets -> exempt\n"
+        "    client._task = asyncio.create_task(g())  # not a kc module -> exempt\n"
+        "    hooks._timer = None\n"  # None is not a task
+        "async def test_cleanup():\n"
+        "    hooks._task = asyncio.create_task(g())\n"
+        "    hooks._task = None\n"  # explicit self-cleanup -> exempt
+        "async def test_uses_opt(_opt):\n"
+        "    hooks._task = asyncio.create_task(g())  # requests _opt -> exempt\n"
+        "async def test_setattr(monkeypatch):\n"
+        "    monkeypatch.setattr(hooks, '_task', asyncio.create_task(g()))\n",  # not detected
+    ),
+    "K18-xfail-strict-false": (
+        (
+            "import pytest\n@pytest.mark.xfail(strict=False, reason='issue pending')\n"
+            "def test_x():\n    pass\n",
+            "import pytest\n@pytest.mark.xfail(\n    strict=False,\n    reason='known'\n)\n"
+            "def test_x():\n    pass\n",
+        ),
+        # No strict= omission is fine (global xfail_strict=true covers it);
+        # explicit strict=True is fine; strict=False on a non-xfail call is not counted.
+        "import pytest\n@pytest.mark.xfail(reason='known')\ndef test_x():\n    pass\n"
+        "@pytest.mark.xfail(strict=True, reason='known')\ndef test_y():\n    pass\n"
+        "def test_z(strict=False):\n    pass\n"
+        "def test_w():\n    obj.configure(strict=False)\n",
+    ),
+    "K19-short-literal-duration-arg": (
+        (
+            "def test_x():\n    run(timeout=1.5)\n",
+            "_T = 30\ndef test_x():\n    run(timeout=_T)\n",
+            "def test_x(mp):\n    mp.setattr(m, '_UPDATE_DRAIN_TIMEOUT_SECS', 1)\n",
+            "def test_x():\n    run(_UPDATE_DRAIN_TIMEOUT_SECS=1)\n",
+            "def test_x():\n    run(timeout=some_other_call())\n",
+            "def test_x():\n    t = 30\n    run(timeout=t)\n",
+            "def test_x():\n    run(read_timeout=5)\n",
+            "def test_x():\n    Cfg(log_budget_secs=20)\n",
+            "def test_x():\n    x(ttl_secs=30)\n",
+            "def test_x():\n    call(deadline=5)\n",
+            "def test_x():\n    run(on_timeout=5)\n",
+        ),
+        "import kiro_crew.testing.wait as kc_wait\n"
+        "from kiro_crew.testing.wait import FALLBACK_TIMEOUT_SECS, default_timeout\n"
+        "from kiro_crew.testing import wait\n"
+        "def cb(): pass\n"
+        "def test_x(monkeypatch, tmo):\n"
+        "    run(timeout=0)\n    run(timeout=None)\n"
+        "    run(timeout=FALLBACK_TIMEOUT_SECS)\n"
+        "    run(timeout=wait.FALLBACK_TIMEOUT_SECS)\n    run(timeout=kc_wait.FALLBACK_TIMEOUT_SECS)\n"
+        "    run(timeout=default_timeout())\n    run(timeout=wait.default_timeout())\n"
+        "    run(timeout=tmo)\n    pool.submit(task).result(timeout=60)\n"
+        "    monkeypatch.setattr(m, 'timeout_secs', 0)\n    monkeypatch.setattr(m, 'timeout_secs', FALLBACK_TIMEOUT_SECS)\n"
+        "    asyncio.wait_for(coro, timeout=30)\n    t.join(timeout=5)\n"
+        "    every_secs=60\n    idle_secs=60\n    elapsed_ms=1.0\n    age_secs=5\n    duration_ms=10\n"
+        "    run(on_timeout=cb)\n    run(on_timeout=lambda: None)\n",
+    ),
+    "K20-on-loop-session-write": (
+        (
+            "async def test_x(log):\n    log.update_metadata(k, {})\n",
+            "class T:\n    async def seed(self):\n        with lock:\n"
+            "            self.log.update_metadata_if(k, {}, ok)\n",
+        ),
+        # Off the loop: a sync test, the method handed to a worker, a nested def or lambda.
+        "def test_x(log):\n    log.update_metadata(k, {})\n"
+        "async def test_y(log):\n    await asyncio.to_thread(log.update_metadata, k, {})\n"
+        "    await asyncio.to_thread(lambda: log.update_metadata(k, {}))\n"
+        "    def seed():\n        log.update_metadata(k, {})\n",
+    ),
+}
+
+#: Sources the pinned semgrep reads no line of, each holding one ``time`` patch.
+_UNREAD = (
+    "def test_x(monkeypatch):\n    g(lambda a, *, b: 1)\n    with (\n        open(p) as f,\n"
+    "        open(q) as h,\n    ):\n        monkeypatch.setattr(time, 'time', f)\n",
+    "def test_x(monkeypatch):\n    with (open(p) as f):\n        g(lambda *, k=1: k)\n"
+    "    monkeypatch.setattr(subject.time, 'monotonic', f)\n",
+    # A non-ASCII last item: the columns the check slices by are bytes.
+    "async def test_x():\n    async with (a() as b, c('é')):\n        g(lambda a, *, b: 1)\n"
+    "    with patch('kiro_crew.cron.time.time'):\n        pass\n",
+    "def test_x(monkeypatch):\n    monkeypatch.setattr(time, 'sleep', f)\n"
+    + "#" * SEMGREP_MAX_TARGET_BYTES
+    + "\n",
+)
+
+#: The same ``time`` patch in sources semgrep does read: a lambda with ``*rest``, or a
+#: bare ``*`` beside a ``with`` that binds outside its parentheses, binds nothing, or
+#: has no parentheses; each shape of the pair alone; a file at the size limit.
+_READ = (
+    "def test_x(monkeypatch):\n    g(lambda a, *rest, b: 1)\n    with (open(p) as f):\n"
+    "        monkeypatch.setattr(time, 'time', f)\n",
+    "def test_x(monkeypatch):\n    g(lambda a, *, b: 1)\n    with (open(p)) as f, (open(q)):\n"
+    "        pass\n    with (open(p), open(q)):\n        pass\n"
+    "    with open(p) as f, open(q) as h:\n        monkeypatch.setattr(time, 'time', f)\n",
+    "def test_x(monkeypatch):\n    g(lambda a, *, b: 1)\n    monkeypatch.setattr(time, 'time', f)\n",
+    "def test_x(monkeypatch):\n    with (open(p) as f):\n        monkeypatch.setattr(time, 'time', f)\n",
+)
+
+
+def _at_the_size_limit() -> str:
+    head = "def test_x(monkeypatch):\n    monkeypatch.setattr(time, 'sleep', f)\n"
+    return head + "#" * (SEMGREP_MAX_TARGET_BYTES - len(head) - 1) + "\n"
+
+
+def test_semgrep_cannot_read_models_the_pinned_engine() -> None:
+    """``semgrep_cannot_read`` models 1.78's parsers and size limit. A bump of the SAST
+    job's pin fails here, so whoever bumps it re-measures what the new engine skips."""
+    workflow = (repo_root() / ".github" / "workflows" / "code-review.yml").read_text(
+        encoding="utf-8"
+    )
+    pins = set(re.findall(r"semgrep==([\w.]+)", workflow))
+    assert pins == {"1.78.0"}, (
+        f"the SAST job pins semgrep {sorted(pins)}: re-measure which files it reads no "
+        "line of and update semgrep_cannot_read and SEMGREP_MAX_TARGET_BYTES to match"
+    )
+
+
+def test_k3_counts_the_time_rule_shapes_only_where_semgrep_reads_nothing() -> None:
+    """The time rule refuses these patches only in a file semgrep reads; where it
+    reads nothing, K3 counts them, so the ratchet covers what the scan cannot."""
+    for source in _UNREAD:
+        assert semgrep_cannot_read(_Module(ast.parse(source)), source), source[:120]
+        assert count_python(source)[0]["K3-stdlib-clock-patch"] == 1, source[:120]
+    limit = _at_the_size_limit()
+    assert len(limit.encode("utf-8")) == SEMGREP_MAX_TARGET_BYTES
+    for source in (*_READ, limit):
+        assert not semgrep_cannot_read(_Module(ast.parse(source)), source), source[:120]
+        assert count_python(source)[0]["K3-stdlib-clock-patch"] == 0, source[:120]
+
+
+JS_CASES: dict[str, tuple[str, tuple[str, ...], str]] = {
+    "J1-electron-promise-sleep": (
+        "website/electron/test/a.test.js",
+        (
+            "await new Promise((r) => setTimeout(r, 50));\n",
+            "await new Promise((r) => { setTimeout(r, 150); });\n",
+        ),
+        "await new Promise((r) => setTimeout(r, 0));\n",
+    ),
+    "J3-unpinned-date": (
+        "website/src/a.test.tsx",
+        ("const now = Date.now();\n",),
+        "vi.setSystemTime(new Date('2026-01-01'));\nconst now = Date.now();\n",
+    ),
+    "J4-playwright-visible-branch": (
+        "website/playwright/a.spec.ts",
+        ("if (await page.getByRole('dialog').isVisible()) {\n",),
+        "await expect(page.getByRole('dialog')).toBeVisible();\n",
+    ),
+    "J5-duration-upper-bound": (
+        "website/src/a.test.ts",
+        ("expect(performance.now() - start).toBeLessThan(50);\n",),
+        "expect(performance.now() - start).toBeLessThan(BUDGET_MS);\n",
+    ),
+    "J6-unrestored-fake-timers": (
+        "website/src/a.test.ts",
+        ("it('x', () => {\n  vi.useFakeTimers();\n});\n",),
+        "it('x', () => {\n  vi.useFakeTimers();\n  try {\n    vi.advanceTimersByTime(5);\n"
+        "  } finally {\n    vi.useRealTimers();\n  }\n});\n",
+    ),
+}
+
+
+@pytest.mark.parametrize("klass", sorted(PY_CASES))
+def test_each_python_detector_counts_its_shape_and_not_the_near_miss(klass: str) -> None:
+    positives, negative = PY_CASES[klass]
+    for positive in positives:
+        assert count_python(positive)[0][klass] == 1, f"{klass} missed its own shape"
+        assert any(w in positive for w in PY_TRIGGERS[klass]), f"{klass}'s trigger skips it"
+    assert any(w in negative for w in PY_TRIGGERS[klass]), f"{klass}'s near miss is never read"
+    assert count_python(negative)[0][klass] == 0, f"{klass} counted a near miss"
+
+
+@pytest.mark.parametrize("klass", sorted(JS_CASES))
+def test_each_js_detector_counts_its_shape_and_not_the_near_miss(klass: str) -> None:
+    rel, positives, negative = JS_CASES[klass]
+    for positive in positives:
+        assert count_js(rel, positive)[0][klass] == 1, f"{klass} missed its own shape"
+    assert count_js(rel, negative)[0][klass] == 0, f"{klass} counted a near miss"
+
+
+def test_every_detector_has_cases() -> None:
+    assert set(PY_CASES) == set(PY_DETECTORS) == set(PY_TRIGGERS)
+    assert set(JS_CASES) == set(JS_DETECTORS)
+
+
+@pytest.mark.parametrize("klass", sorted(PY_CASES))
+def test_a_detector_that_finds_nothing_fails_its_positive_case(klass, monkeypatch) -> None:
+    """Mutation proof: the positive case is what catches a detector gone blind."""
+    monkeypatch.setitem(PY_DETECTORS, klass, lambda *_args: ())
+    with pytest.raises(AssertionError, match="missed its own shape"):
+        test_each_python_detector_counts_its_shape_and_not_the_near_miss(klass)
+
+
+@pytest.mark.parametrize("klass", sorted(JS_CASES))
+def test_a_js_detector_that_finds_nothing_fails_its_positive_case(klass, monkeypatch) -> None:
+    monkeypatch.setitem(JS_DETECTORS, klass, lambda *_args: [])
+    with pytest.raises(AssertionError, match="missed its own shape"):
+        test_each_js_detector_counts_its_shape_and_not_the_near_miss(klass)
+
+
+def test_a_flake_ok_line_is_excused_only_with_a_reason() -> None:
+    shape = "import os\ndef test_x():\n    os.environ['A'] = '1'{}\n"
+    counts, excused = count_python(shape.format("  # flake-ok: the variable is the subject"))
+    assert counts["K6-raw-environ-write"] == 0 and excused == 1
+    for unreasoned in (
+        "  # flake-ok: short",
+        "  # flake-ok: ..........",
+        "  # flake-ok: 1234567890",
+    ):
+        counts, excused = count_python(shape.format(unreasoned))
+        assert counts["K6-raw-environ-write"] == 1 and excused == 0, unreasoned
+    js = "const stamp = Date.now(); // flake-ok: only logged, never compared\n"
+    assert count_js("website/src/a.test.ts", js) == (Counter(), 1)
+
+
+#: class -> the semgrep rule (semgrep/test-determinism.yaml) whose shape family it shares.
+_RULE_OF = {
+    "K3-stdlib-clock-patch": "kirocrew.test-stdlib-clock-rebound",
+    "K5-sys-modules-eviction": "kirocrew.test-in-process-reload",
+}
+_SEMGREP_MARK = re.compile(r"^\s*# (ruleid|ok): (\S+)\s*$")
+
+
+def test_a_class_counts_only_what_its_semgrep_rule_misses() -> None:
+    """The rule's own fixture, which the SAST job's ``semgrep --test`` checks both ways,
+    shows the split: no ``ruleid:`` line is counted (so no site needs both markers), and
+    every line the class counts there is an ``ok:`` line the rule is proven to miss."""
+    text = (repo_root() / "semgrep-tests" / "test-determinism.py").read_text(encoding="utf-8")
+    lines = text.splitlines()
+    marks: dict[str, dict[int, str]] = {}
+    for index, line in enumerate(lines[:-1]):
+        match = _SEMGREP_MARK.match(line)
+        if match:
+            marks.setdefault(match.group(2), {})[index + 2] = match.group(1)
+    module = _Module(ast.parse(text))
+    for klass, rule in _RULE_OF.items():
+        detector = PY_DETECTORS[klass]
+        found = detector(module, text) if klass in _READS_SOURCE else detector(module)
+        counted = {node.lineno for node in found}
+        refused = {n for n, kind in marks.get(rule, {}).items() if kind == "ruleid"}
+        missed = {n for n, kind in marks.get(rule, {}).items() if kind == "ok"}
+        assert refused, f"{rule} has no refused case in its fixture"
+        assert counted and counted <= missed, (klass, sorted(counted), sorted(missed))
+
+
+def test_the_electron_promise_sleep_is_the_only_one_counted() -> None:
+    sleep = "await new Promise((r) => setTimeout(r, 50));\n"
+    assert count_js("website/electron/test/a.test.js", sleep)[0]["J1-electron-promise-sleep"] == 1
+    for rel in (
+        "website/src/a.test.tsx",
+        "website/integration/a.test.ts",
+        "website/playwright/a.spec.ts",
+    ):
+        assert count_js(rel, sleep)[0]["J1-electron-promise-sleep"] == 0, rel
+
+
+def test_the_scan_covers_the_test_trees_and_nothing_else() -> None:
+    assert _is_python_test_file("test/test_a.py")
+    assert _is_python_test_file("src/kiro_crew/apps/builtins/x/tests/test_a.py")
+    assert _is_python_test_file(
+        "src/kiro_crew/apps/builtins/x/crew/runtime/container_tests/test_a.py"
+    )
+    assert _is_python_test_file("conftest.py")
+    assert not _is_python_test_file("src/kiro_crew/session.py")
+    assert _is_js_test_file("website/src/pages/a.test.tsx")
+    assert _is_js_test_file("website/playwright/a.spec.ts")
+    assert _is_js_test_file("website/electron/test/a.test.js")
+    assert not _is_js_test_file("website/src/pages/a.tsx")
+    assert not _is_js_test_file("website/node_modules/x/test/a.test.js")
+
+
+def _run_git(root: Path, *args: str) -> str:
+    # The scrubbed fixture env: no inherited location, template hooks or identity.
+    return subprocess.run(
+        ["git", *args],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=60,
+        env=_fixture_git_env(),
+    ).stdout.strip()
+
+
+def _drop_ambient_git(monkeypatch) -> None:
+    """``merge_base`` and ``change_risen`` run git with the ambient env: drop the
+    location family an exported ``GIT_DIR`` / ``GIT_INDEX_FILE`` would redirect, and
+    the ``git -c`` options a hook that ran the suite exports."""
+    for name in (*_GIT_LOCATION_VARS, *_GIT_COMMAND_LINE_CONFIG):
+        monkeypatch.delenv(name, raising=False)
+
+
+_SITE = "def test_{name}():\n    os.environ['A'] = '1'\n    assert done()\n"
+
+
+def _sites(*names: str) -> str:
+    return "import os\n" + "".join(_SITE.format(name=name) for name in names)
+
+
+@pytest.fixture
+def git_repo(tmp_path, monkeypatch):
+    """A repo whose ``main`` holds a file with one K6 site, checked out on a branch."""
+    _drop_ambient_git(monkeypatch)
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    for name in ("GITHUB_BASE_REF", "GITHUB_EVENT_NAME", BASE_ENV):
+        monkeypatch.delenv(name, raising=False)
+    root = tmp_path / "repo"
+    (root / "test").mkdir(parents=True)
+    (root / "test" / "test_a.py").write_text(_sites("a"), encoding="utf-8")
+    (root / "test" / "test_b.py").write_text("def test_b():\n    assert True\n", encoding="utf-8")
+    _run_git(root, "init", "-q")
+    _run_git(root, "checkout", "-q", "-b", "main")
+    _run_git(root, "add", "-A")
+    _run_git(root, "commit", "-q", "-m", "base")
+    _run_git(root, "checkout", "-q", "-b", "change")
+    return root
+
+
+def test_the_git_fixture_ignores_ambient_git_state(request, monkeypatch, tmp_path) -> None:
+    assert_fixture_ignores_ambient_git(request, monkeypatch, tmp_path, "git_repo")
+
+
+def test_the_merge_base_is_found_against_the_local_base_branch(git_repo) -> None:
+    base, how = merge_base(git_repo)
+    assert base == _run_git(git_repo, "rev-parse", "main") and "main" in how
+
+
+def test_a_pull_request_merge_commit_is_measured_against_its_first_parent(
+    git_repo, monkeypatch
+) -> None:
+    (git_repo / "test" / "test_b.py").write_text(_sites("b"), encoding="utf-8")
+    _run_git(git_repo, "commit", "-q", "-am", "change")
+    before = _run_git(git_repo, "rev-parse", "main")
+    _run_git(git_repo, "checkout", "-q", "main")
+    _run_git(git_repo, "merge", "-q", "--no-ff", "-m", "merge", "change")
+    monkeypatch.setenv("GITHUB_BASE_REF", "main")
+    base, how = merge_base(git_repo)
+    assert base == before and "first parent" in how
+    assert change_risen(git_repo, base) == {("K6-raw-environ-write", "test/test_b.py"): (1, 0)}
+
+
+def _ci_shaped_checkout(source: Path, dest: Path, depth: int) -> Path:
+    """Fetch ``source``'s ``main`` at ``depth`` into a fresh repo, detached, the way
+    ``actions/checkout`` fetches the merge ref: no ``origin/main`` and no ``main``."""
+    _run_git(dest.parent, "init", "-q", dest.name)
+    _run_git(dest, "fetch", "-q", f"--depth={depth}", source.as_uri(), "main")
+    _run_git(dest, "checkout", "-q", "--detach", "FETCH_HEAD")
+    return dest
+
+
+@pytest.mark.parametrize("depth", [1, 2])
+def test_a_ci_checkout_needs_depth_two_to_compare(git_repo, monkeypatch, depth) -> None:
+    # The base gains a commit after the branch point, so depth 2 is not the whole history.
+    (git_repo / "test" / "test_b.py").write_text(_sites("b"), encoding="utf-8")
+    _run_git(git_repo, "commit", "-q", "-am", "change")
+    _run_git(git_repo, "checkout", "-q", "main")
+    (git_repo / "test" / "test_c.py").write_text("def test_c():\n    assert 1\n", encoding="utf-8")
+    _run_git(git_repo, "add", "-A")
+    _run_git(git_repo, "commit", "-q", "-m", "main moved")
+    before = _run_git(git_repo, "rev-parse", "main")
+    _run_git(git_repo, "merge", "-q", "--no-ff", "-m", "merge", "change")
+    checkout = _ci_shaped_checkout(git_repo, git_repo.parent / f"ci-{depth}", depth)
+    monkeypatch.setenv("GITHUB_BASE_REF", "main")
+    base, how = merge_base(checkout)
+    if depth == 1:
+        assert base is None, how
+        return
+    assert base == before and "first parent" in how
+    assert change_risen(checkout, base) == {("K6-raw-environ-write", "test/test_b.py"): (1, 0)}
+
+
+def test_the_backend_tests_checkout_keeps_the_merge_parent() -> None:
+    # Without the merge parent the ratchet compares nothing on CI and gates nothing.
+    workflow = yaml.safe_load((repo_root() / ".github/workflows/ci.yml").read_text("utf-8"))
+    steps = workflow["jobs"]["backend-test"]["steps"]
+    checkout = next(step for step in steps if "actions/checkout" in str(step.get("uses", "")))
+    assert (checkout.get("with") or {}).get("fetch-depth") == 2
+
+
+def test_a_site_already_on_the_base_does_not_red_a_change_to_another_file(git_repo) -> None:
+    (git_repo / "test" / "test_b.py").write_text("def test_b():\n    assert 1\n", encoding="utf-8")
+    assert change_risen(git_repo, merge_base(git_repo)[0]) == {}
+
+
+def test_a_new_site_in_a_changed_file_is_named(git_repo, monkeypatch) -> None:
+    import test_flake_pattern_ratchet as module
+
+    (git_repo / "test" / "test_b.py").write_text(_sites("b"), encoding="utf-8")
+    assert change_risen(git_repo, merge_base(git_repo)[0]) == {
+        ("K6-raw-environ-write", "test/test_b.py"): (1, 0)
+    }
+    monkeypatch.setattr(module, "repo_root", lambda: git_repo)
+    with pytest.raises(AssertionError, match=r"test/test_b\.py: K6-raw-environ-write 1 > 0"):
+        module.test_no_changed_file_gains_a_flaky_shape()
+
+
+def test_a_renamed_or_deleted_file_keeps_the_change_green(git_repo) -> None:
+    _run_git(git_repo, "mv", "test/test_a.py", "test/test_c.py")
+    assert change_risen(git_repo, merge_base(git_repo)[0]) == {}
+    _run_git(git_repo, "rm", "-q", "-f", "test/test_c.py")
+    assert change_risen(git_repo, merge_base(git_repo)[0]) == {}
+
+
+def test_sites_moved_into_a_new_file_stay_green_up_to_what_left(git_repo) -> None:
+    (git_repo / "test" / "test_a.py").write_text("def test_a():\n    assert 1\n", encoding="utf-8")
+    (git_repo / "test" / "test_part.py").write_text(_sites("a"), encoding="utf-8")
+    assert change_risen(git_repo, merge_base(git_repo)[0]) == {}
+    (git_repo / "test" / "test_part.py").write_text(_sites("a", "extra"), encoding="utf-8")
+    assert change_risen(git_repo, merge_base(git_repo)[0]) == {
+        ("K6-raw-environ-write", "test/test_part.py"): (2, 1)
+    }
+
+
+def test_an_unreadable_merge_base_warns_and_compares_nothing(tmp_path, monkeypatch) -> None:
+    import test_flake_pattern_ratchet as module
+
+    _drop_ambient_git(monkeypatch)
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path.parent))
+    for name in (BASE_ENV, "GITHUB_ACTIONS", "GITHUB_STEP_SUMMARY"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(module, "repo_root", lambda: tmp_path)
+    assert merge_base(tmp_path)[0] is None
+    with pytest.warns(UserWarning, match="compared nothing"):
+        module.test_no_changed_file_gains_a_flaky_shape()
+
+
+def test_the_ci_warning_goes_to_an_isolated_job_summary(tmp_path, monkeypatch) -> None:
+    import test_flake_pattern_ratchet as module
+
+    _drop_ambient_git(monkeypatch)
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path.parent))
+    monkeypatch.delenv(BASE_ENV, raising=False)
+    monkeypatch.setattr(module, "repo_root", lambda: tmp_path)
+    summary = tmp_path / "summary.md"
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
+    with pytest.warns(UserWarning, match="compared nothing"):
+        module.test_no_changed_file_gains_a_flaky_shape()
+    assert "compared nothing" in summary.read_text(encoding="utf-8")
+
+
+def test_a_forks_stale_origin_loses_to_a_newer_upstream(git_repo) -> None:
+    old_main = _run_git(git_repo, "rev-parse", "main")
+    _run_git(git_repo, "checkout", "-q", "main")
+    (git_repo / "test" / "test_merged.py").write_text(_sites("merged"), encoding="utf-8")
+    _run_git(git_repo, "add", "-A")
+    _run_git(git_repo, "commit", "-q", "-m", "merged upstream")
+    new_main = _run_git(git_repo, "rev-parse", "main")
+    _run_git(git_repo, "update-ref", "refs/remotes/origin/main", old_main)
+    _run_git(git_repo, "update-ref", "refs/remotes/upstream/main", new_main)
+    _run_git(git_repo, "checkout", "-q", "-b", "fork-change")
+    base, how = merge_base(git_repo)
+    assert base == new_main and "upstream/main" in how
+    assert change_risen(git_repo, base) == {}  # the merged site is on the base, not the change
+
+
+def test_an_explicit_base_wins_over_everything(git_repo, monkeypatch) -> None:
+    base = _run_git(git_repo, "rev-parse", "main")
+    (git_repo / "test" / "test_b.py").write_text(_sites("b"), encoding="utf-8")
+    _run_git(git_repo, "commit", "-q", "-am", "change")
+    monkeypatch.setenv(BASE_ENV, "change")
+    assert merge_base(git_repo) == (
+        _run_git(git_repo, "rev-parse", "change"),
+        f"the merge-base with change ({BASE_ENV})",
+    )
+    monkeypatch.setenv(BASE_ENV, base)
+    assert merge_base(git_repo)[0] == base
+    monkeypatch.setenv(BASE_ENV, "no-such-ref")
+    assert merge_base(git_repo)[0] is None
+
+
+def test_a_push_is_measured_against_its_first_parent(git_repo, monkeypatch) -> None:
+    before = _run_git(git_repo, "rev-parse", "HEAD")
+    (git_repo / "test" / "test_b.py").write_text(_sites("b"), encoding="utf-8")
+    _run_git(git_repo, "commit", "-q", "-am", "pushed")
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "push")
+    base, how = merge_base(git_repo)
+    assert base == before and "push" in how
+
+
+def test_a_fixed_site_does_not_forgive_a_different_new_one(git_repo) -> None:
+    (git_repo / "test" / "test_a.py").write_text("def test_a():\n    assert 1\n", encoding="utf-8")
+    (git_repo / "test" / "test_new.py").write_text(_sites("new"), encoding="utf-8")
+    assert change_risen(git_repo, merge_base(git_repo)[0]) == {
+        ("K6-raw-environ-write", "test/test_new.py"): (1, 0)
+    }
+
+
+def test_an_edited_function_lends_its_old_text_to_no_new_file(git_repo) -> None:
+    # test_a keeps its one site but its text changes; a new file carries the OLD text.
+    edited = _sites("a").replace("assert done()", "assert done(1)")
+    (git_repo / "test" / "test_a.py").write_text(edited, encoding="utf-8")
+    (git_repo / "test" / "test_copy.py").write_text(_sites("a"), encoding="utf-8")
+    assert change_risen(git_repo, merge_base(git_repo)[0]) == {
+        ("K6-raw-environ-write", "test/test_copy.py"): (1, 0)
+    }
+
+
+def test_a_move_beside_an_edit_in_the_same_file_stays_green(git_repo) -> None:
+    # test_a.py: test_a is edited in place, test_b moves verbatim to test_y.py.
+    (git_repo / "test" / "test_a.py").write_text(_sites("a", "b"), encoding="utf-8")
+    _run_git(git_repo, "commit", "-q", "-am", "two sites")
+    _run_git(git_repo, "branch", "-f", "main", "HEAD")
+    edited = _sites("a").replace("assert done()", "assert done(1)")
+    (git_repo / "test" / "test_a.py").write_text(edited, encoding="utf-8")
+    (git_repo / "test" / "test_y.py").write_text(_sites("b"), encoding="utf-8")
+    assert change_risen(git_repo, merge_base(git_repo)[0]) == {}
+
+
+def test_a_file_whose_count_dropped_lends_nothing_to_a_copy_of_its_new_text(git_repo) -> None:
+    (git_repo / "test" / "test_a.py").write_text(_sites("a", "b"), encoding="utf-8")
+    _run_git(git_repo, "commit", "-q", "-am", "two sites")
+    _run_git(git_repo, "branch", "-f", "main", "HEAD")
+    edited = _sites("a").replace("assert done()", "assert done(1)")
+    (git_repo / "test" / "test_a.py").write_text(edited, encoding="utf-8")
+    for name in ("test_w.py", "test_y.py", "test_z.py"):
+        (git_repo / "test" / name).write_text(edited, encoding="utf-8")
+    assert change_risen(git_repo, merge_base(git_repo)[0]) == {
+        ("K6-raw-environ-write", f"test/{name}"): (1, 0)
+        for name in ("test_w.py", "test_y.py", "test_z.py")
+    }
+
+
+def test_a_chain_of_moves_stays_green(git_repo) -> None:
+    # test_a's site moves into test_b while test_b's own site moves on to test_c.
+    (git_repo / "test" / "test_b.py").write_text(_sites("b"), encoding="utf-8")
+    _run_git(git_repo, "commit", "-q", "-am", "a site in each")
+    _run_git(git_repo, "branch", "-f", "main", "HEAD")
+    (git_repo / "test" / "test_a.py").write_text("def test_a():\n    assert 1\n", encoding="utf-8")
+    (git_repo / "test" / "test_b.py").write_text(_sites("a"), encoding="utf-8")
+    (git_repo / "test" / "test_c.py").write_text(_sites("b"), encoding="utf-8")
+    assert change_risen(git_repo, merge_base(git_repo)[0]) == {}
+
+
+@pytest.mark.parametrize("donor", ["test_0.py", "test_d.py"])
+def test_the_verdict_does_not_depend_on_which_file_sorts_first(git_repo, donor) -> None:
+    # test_a holds a and b; the donor holds another a. a is edited inside test_a, the
+    # donor's a moves to test_b and test_a's b moves to test_c: every rise is a move.
+    (git_repo / "test" / "test_a.py").write_text(_sites("a", "b"), encoding="utf-8")
+    (git_repo / "test" / donor).write_text(_sites("a"), encoding="utf-8")
+    _run_git(git_repo, "add", "-A")
+    _run_git(git_repo, "commit", "-q", "-m", "two files")
+    _run_git(git_repo, "branch", "-f", "main", "HEAD")
+    edited = _sites("a").replace("assert done()", "assert done(1)")
+    (git_repo / "test" / "test_a.py").write_text(edited, encoding="utf-8")
+    (git_repo / "test" / donor).write_text("def test_x():\n    assert 1\n", encoding="utf-8")
+    (git_repo / "test" / "test_b.py").write_text(_sites("a"), encoding="utf-8")
+    (git_repo / "test" / "test_c.py").write_text(_sites("b"), encoding="utf-8")
+    assert change_risen(git_repo, merge_base(git_repo)[0]) == {}
+
+
+def test_a_site_a_flake_ok_now_excuses_has_not_left(git_repo) -> None:
+    marked = _sites("a").replace("= '1'\n", "= '1'  # flake-ok: deliberate raw write here\n")
+    (git_repo / "test" / "test_a.py").write_text(marked, encoding="utf-8")
+    (git_repo / "test" / "test_copy.py").write_text(_sites("a"), encoding="utf-8")
+    assert change_risen(git_repo, merge_base(git_repo)[0]) == {
+        ("K6-raw-environ-write", "test/test_copy.py"): (1, 0)
+    }
+
+
+def test_a_site_moved_between_existing_files_stays_green(git_repo) -> None:
+    (git_repo / "test" / "test_a.py").write_text(
+        "def test_other():\n    assert 1\n", encoding="utf-8"
+    )
+    moved = "def test_b():\n    assert True\n" + _sites("a").replace("import os\n", "")
+    (git_repo / "test" / "test_b.py").write_text("import os\n" + moved, encoding="utf-8")
+    assert change_risen(git_repo, merge_base(git_repo)[0]) == {}
+
+
+def main() -> int:
+    """Print current counts per file for burn-down review; no gating."""
+    import json
+
+    rows: dict[str, dict[str, int]] = {}
+    for path in repo_files():
+        rel = path.relative_to(repo_root()).as_posix()
+        if not _counted(rel):
+            continue
+        try:
+            source = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        counts, _ok = count_python(source) if _is_python_test_file(rel) else count_js(rel, source)
+        for klass, count in counts.items():
+            if count:
+                rows.setdefault(rel, {})[klass] = count
+    print(json.dumps(rows, indent=2, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

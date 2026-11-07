@@ -1,0 +1,230 @@
+"""Fail-closed companion discovery via ``importlib.metadata`` entry points.
+
+A non-standalone edition is supplied by a companion package that registers a
+``kirocrew.plugins`` entry point pointing at its composition root
+(``build_enterprise_context``).  Discovery is **fail-closed**: when the profile is
+non-standalone but no compatible companion is found, boot aborts rather than silently
+running with the open-source defaults (which could drop a security overlay).
+"""
+
+from __future__ import annotations
+
+import importlib.metadata
+import logging
+from typing import TYPE_CHECKING, List, Sequence
+
+from kiro_crew import edition
+from kiro_crew.platform.admission import (
+    AdmissionPolicy,
+    PluginManifest,
+    evaluate_admission,
+    load_admission_policy,
+    missing_policy_remedy,
+    read_policy_trust_root,
+    seed_default_policy,
+)
+from kiro_crew.platform.context import (
+    PROFILE_STANDALONE,
+    PlatformCompositionError,
+)
+
+if TYPE_CHECKING:
+    from kiro_crew.config.loader import KiroCrewConfig
+    from kiro_crew.platform.context import PlatformContext
+
+logger = logging.getLogger(__name__)
+
+# The entry-point group a companion registers its composition root under.
+PLUGIN_GROUP = "kirocrew.plugins"
+
+
+class PluginAdmissionError(PlatformCompositionError):
+    """Raised when a plugin is rejected by the fleet admission policy.
+
+    A subclass of :class:`PlatformCompositionError` so a rejected plugin aborts
+    boot fail-closed, the same as any other composition failure.
+    """
+
+
+def plugin_entry_points() -> List[importlib.metadata.EntryPoint]:
+    """Return the registered ``kirocrew.plugins`` entry points (may be empty).
+
+    Handles the ``importlib.metadata.entry_points`` API split across versions:
+    the ``group=`` keyword only exists on Python 3.10+.  On 3.9 (the declared
+    minimum) ``entry_points()`` returns a dict keyed by group, so we select the
+    group from it.  Without this branch a 3.9 host silently sees zero plugins,
+    and an Amazon host then fails closed at boot even with the companion
+    installed.
+
+    In an enterprise build a failed scan raises :class:`PlatformCompositionError`
+    instead of answering ``[]``: an empty answer there means "no companion, boot
+    on the core defaults", so a scan that could not read an installed
+    companion's metadata must not be mistaken for one that found none.
+    """
+    try:
+        eps = importlib.metadata.entry_points()
+        if hasattr(eps, "select"):
+            # Python 3.10+: SelectableGroups / EntryPoints.select(group=...)
+            return list(eps.select(group=PLUGIN_GROUP))
+        # Python 3.9: entry_points() returns a dict {group: [EntryPoint, ...]}.
+        return list(eps.get(PLUGIN_GROUP, []))  # type: ignore[attr-defined]
+    except Exception as exc:
+        if edition.is_enterprise():
+            raise PlatformCompositionError(
+                f"could not read the installed {PLUGIN_GROUP!r} entry points "
+                f"({type(exc).__name__}: {exc}); refusing to boot (fail-closed)."
+            ) from exc
+        logger.debug("entry-point discovery failed", exc_info=True)
+        return []
+
+
+def refresh_plugin_config_keys(manifests: Sequence[PluginManifest]) -> frozenset[str]:
+    """Publish config keys from manifests already returned by admission."""
+    from kiro_crew.config.validation import replace_extension_config_keys
+
+    return replace_extension_config_keys(
+        "plugins", (key for manifest in manifests for key in manifest.config_keys)
+    )
+
+
+def refresh_installed_plugin_config_keys() -> frozenset[str]:
+    """Discover and publish declarations from the admissible companion only.
+
+    Process launch calls this synchronously before its first config load and
+    before CLI logging exists, so it reads the policy through the side-effect-free
+    :func:`read_policy_trust_root`: no first-run seed, posture publish, or SEL
+    record. Boot-time admission in :func:`discover_companion_context` remains the
+    audited decision and republishes from its own manifest. Unexpected failures
+    retain the prior snapshot; an absent, ambiguous, or rejected companion
+    publishes no declarations.
+    """
+    from kiro_crew.config.validation import extension_config_keys
+
+    try:
+        eps = plugin_entry_points()
+        if len(eps) != 1:
+            return refresh_plugin_config_keys([])
+        decision = evaluate_admission(eps[0], read_policy_trust_root())
+        manifests = (
+            [decision.manifest] if decision.allowed and decision.manifest is not None else []
+        )
+        return refresh_plugin_config_keys(manifests)
+    except Exception:
+        logger.debug("installed plugin config-key discovery failed", exc_info=True)
+        return extension_config_keys("plugins")
+
+
+def discover_companion_context(
+    profile: str,
+    cfg: "KiroCrewConfig",
+    *,
+    policy: "AdmissionPolicy | None" = None,
+    entry_points: Sequence[importlib.metadata.EntryPoint] | None = None,
+) -> "PlatformContext | None":
+    """Load the companion-composed context for a non-standalone profile.
+
+    Returns ``None`` only for the standalone profile.  For any non-standalone
+    profile it either returns the companion's :class:`PlatformContext` or raises
+    :class:`PlatformCompositionError` (fail-closed).
+
+    Before importing any plugin code, every candidate entry point is run through
+    the fleet :class:`AdmissionPolicy` (``policy``, default-loaded from the
+    fleet-controlled source).  A plugin the policy rejects raises
+    :class:`PluginAdmissionError` — the supply-chain / kill-switch gate.
+    """
+    if profile == PROFILE_STANDALONE:
+        return None
+
+    eps = list(entry_points) if entry_points is not None else plugin_entry_points()
+    if not eps:
+        if edition.is_enterprise():
+            # resolve_profile ignores KIROCREW_PROFILE on this build, so the
+            # standalone advice below would send the operator round in a loop.
+            raise PlatformCompositionError(
+                f"this is an enterprise-edition build but no {PLUGIN_GROUP!r} entry "
+                "point is installed; refusing to boot with open-source defaults "
+                "(fail-closed). Install the companion package, or run an oss build "
+                "to use the open-source edition."
+            )
+        raise PlatformCompositionError(
+            f"profile={profile!r} but no {PLUGIN_GROUP!r} entry point is installed; "
+            "refusing to boot with open-source defaults (fail-closed). Install the "
+            "companion package, or set KIROCREW_PROFILE=standalone to run the "
+            "open-source edition (e.g. on a host with a stale SSO marker)."
+        )
+    if len(eps) > 1:
+        names = [e.name for e in eps]
+        raise PlatformCompositionError(
+            f"ambiguous {PLUGIN_GROUP!r} entry points: {names}; expected exactly one."
+        )
+
+    ep = eps[0]
+
+    # ── Admission gate (verify-before-run) ──
+    # Decide allow/reject BEFORE ep.load() so a rejected plugin's code never
+    # runs.  The policy is the fleet trust root, never sourced from the plugin.
+    if policy is None:
+        # Seed the permissive first-run default BEFORE consulting the policy.  A
+        # fleet's FIRST boot runs bootstrap → discovery (here) BEFORE the
+        # gateway's ``run_first_run_setup`` seed, so without this a companion
+        # would be rejected by the fail-closed default and boot would abort.
+        # Marker-guarded + idempotent: a later DELETION is NOT re-seeded, so
+        # tampering still fails closed.
+        seed_default_policy()
+        policy = load_admission_policy()
+        # Read once, right after the load it explains: an absent policy is the one
+        # rejection whose cause is not the policy's own verdict.
+        remedy = missing_policy_remedy()
+    else:
+        remedy = None
+    decision = evaluate_admission(ep, policy)
+    if not decision.allowed:
+        reason = f"{decision.reason} ({remedy})" if remedy else decision.reason
+        logger.error("plugin %r rejected by admission policy: %s", ep.name, reason)
+        # Land the DENY on the immutable audit trail, not just the app log —
+        # plugin admission is an authorization-decision chokepoint (ban /
+        # allowlist / invalid-signature / capability-ceiling). Mirrors the
+        # fail-closed SEL emit in platform/admission.py (CWE-778). Best-effort:
+        # this runs on the bootstrap path where SEL may not be fully wired.
+        try:
+            from kiro_crew.sel import sel
+
+            sel().log_api_access(
+                caller="_host",
+                operation="plugin.admission",
+                outcome="denied",
+                source="apps.admission",
+                resources=f"plugin={ep.name}",
+                error=decision.reason,
+            )
+        except Exception:
+            logger.debug("plugin-admission DENY SEL emit unavailable", exc_info=True)
+        raise PluginAdmissionError(f"plugin {ep.name!r} rejected by admission policy: {reason}")
+    logger.info("plugin %r admitted: %s", ep.name, decision.reason)
+    refresh_plugin_config_keys([decision.manifest] if decision.manifest is not None else [])
+
+    try:
+        build_context = ep.load()
+    except Exception as exc:  # pragma: no cover - import-time companion failure
+        raise PlatformCompositionError(
+            f"failed to load companion entry point {ep.name!r}: {exc}"
+        ) from exc
+
+    # Normalize ANY composition-root failure to PlatformCompositionError so the
+    # fail-closed boot guard recognizes it. A companion that raises a plain
+    # ValueError/ImportError/KeyError here would otherwise propagate un-wrapped
+    # and be swallowed by the cli.main boot handler (which only re-raises
+    # PlatformCompositionError), silently downgrading the edition.
+    try:
+        ctx = build_context(cfg)
+    except PlatformCompositionError:
+        raise
+    except Exception as exc:
+        raise PlatformCompositionError(
+            f"companion entry point {ep.name!r} failed to compose a context: {exc}"
+        ) from exc
+    if ctx is None:
+        raise PlatformCompositionError(
+            f"companion entry point {ep.name!r} returned no PlatformContext."
+        )
+    return ctx

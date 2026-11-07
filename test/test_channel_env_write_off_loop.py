@@ -1,0 +1,356 @@
+"""Every channel token save writes ``.env`` off the loop AND drains before unlocking.
+
+``_write_env_updates`` is sync file I/O and the six save handlers are ``async`` on
+the gateway loop. Pinned: the write runs on a worker (checked on the thread it ran
+on, by wrapping ``_write_env_updates``), and a cancelled save drains that worker
+before releasing ``_get_config_lock()``, which a bare ``asyncio.to_thread`` does not.
+
+``.env`` and ``config.json`` live in ``tmp_path`` and validators are stubbed.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import os
+import threading
+from pathlib import Path
+
+import pytest
+from aiohttp import web
+from aiohttp.test_utils import TestClient, TestServer
+
+import kiro_crew.config.loader as loader
+import kiro_crew.dashboard.handlers.messaging as mod
+from kiro_crew.testing.wait import await_until
+
+# Shapes each validator accepts. Real-looking because the handlers reject on
+# format before they ever reach the write, and a rejected body would make this
+# pass for the wrong reason.
+TELEGRAM_TOKEN = "110201543:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw"
+DISCORD_TOKEN = ".".join(
+    ["MTA5OTk5OTk5OTk5OTk5OTk5OQ", "GhIjKl", "MnOpQrStUvWxYz0123456789_-AbCdEfGhIj"]
+)
+
+# route, handler attribute, validator attribute, body — one row per channel.
+CHANNELS = [
+    ("slack", "api_slack_config_save", "_validate_slack_token", {"bot_token": "xoxb-NEW"}),
+    ("discord", "api_discord_config_save", "_validate_discord_token", {"bot_token": DISCORD_TOKEN}),
+    ("webex", "api_webex_config_save", "_validate_webex_token", {"bot_token": "webex-tok-1234"}),
+    (
+        "telegram",
+        "api_telegram_config_save",
+        "_validate_telegram_token",
+        {"bot_token": TELEGRAM_TOKEN},
+    ),
+]
+
+#: The channels whose saves are driven end to end here. Named so a
+#: parametrisation that silently loses one is a failure, not a smaller run.
+PINNED = {"slack", "discord", "webex", "telegram"}
+
+
+def _drive(channel: str, monkeypatch, tmp_path: Path) -> list[int]:
+    """Save one channel's token; return the threads the .env write ran on."""
+    name, handler_attr, validator_attr, body = next(c for c in CHANNELS if c[0] == channel)
+
+    env = tmp_path / ".env"
+    env.write_text("", encoding="utf-8")
+    monkeypatch.setattr(loader, "env_path", lambda: env)
+    monkeypatch.setattr(loader, "config_path", lambda: tmp_path / "config.json")
+    monkeypatch.setattr(mod, "is_direct_local_request", lambda req: True)
+
+    async def _accept(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(mod, validator_attr, _accept, raising=False)
+
+    threads: list[int] = []
+    real_write = mod._write_env_updates
+
+    def _record(updates):
+        threads.append(threading.get_ident())
+        return real_write(updates)
+
+    monkeypatch.setattr(mod, "_write_env_updates", _record)
+
+    async def _run() -> int:
+        app = web.Application()
+        app.router.add_put(f"/api/{name}/config", getattr(mod, handler_attr))
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.put(f"/api/{name}/config", json=body)
+            return resp.status
+
+    # A landed save copies its credentials into os.environ. Put every key it
+    # touched back as it was, so a token saved here never reaches a later test.
+    environ_before = dict(os.environ)
+    try:
+        status = asyncio.run(_run())
+    finally:
+        for key in set(os.environ) | set(environ_before):
+            if key not in environ_before:
+                os.environ.pop(key, None)
+            elif os.environ.get(key) != environ_before[key]:
+                os.environ[key] = environ_before[key]
+    assert status == 200, f"{name} save did not succeed ({status}); the write was never reached"
+    return threads
+
+
+@pytest.mark.parametrize("channel", sorted(c[0] for c in CHANNELS))
+def test_channel_token_save_writes_env_off_the_loop(channel, monkeypatch, tmp_path: Path) -> None:
+    loop_thread = threading.get_ident()
+    threads = _drive(channel, monkeypatch, tmp_path)
+
+    assert threads, f"the {channel} save never wrote .env"
+    assert threads[0] != loop_thread, (
+        f"the {channel} token save wrote .env on the gateway loop: a stat, a full "
+        "read and re-parse, then a temp-file create + chmod + rename, with every "
+        "other session blocked for the duration"
+    )
+
+
+def test_the_family_is_covered_here(monkeypatch, tmp_path: Path) -> None:
+    """Every channel this module claims to pin is still parametrised.
+
+    A parametrisation that quietly lost a channel would keep passing while
+    that channel regressed to a bare offload, which is the exact way a
+    per-site convention drifts back apart.
+    """
+    covered = {c[0] for c in CHANNELS}
+    assert PINNED <= covered, f"channels dropped from the table: {PINNED - covered}"
+
+
+def test_cancelling_a_save_drains_the_env_write_before_releasing_the_lock(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """A cancelled save must not hand the config lock on mid-write.
+
+    A thread cannot be cancelled, so without the drain the next save enters while
+    the file is mid-rewrite and drops the first save's credential.
+
+    Ordering uses events, not sleeps: the worker parks, the caller is cancelled, and
+    a second writer must wait for the first worker.
+    """
+    from kiro_crew.dashboard.handlers.agents import _get_config_lock
+
+    in_write = threading.Event()
+    finish = threading.Event()
+    order: list[str] = []
+
+    def _slow_write(_updates):
+        order.append("worker-start")
+        in_write.set()
+        finish.wait(timeout=10)
+        order.append("worker-end")
+
+    monkeypatch.setattr(mod, "_write_env_updates", _slow_write)
+
+    async def _first():
+        async with _get_config_lock():
+            await mod._write_env_off_loop({"A": "1"})
+
+    async def _second():
+        async with _get_config_lock():
+            order.append("second-ran")
+
+    async def _run() -> tuple[bool, list[str]]:
+        first = asyncio.create_task(_first())
+        assert await asyncio.to_thread(in_write.wait, 10), "the worker never entered"
+
+        first.cancel()
+        second = asyncio.create_task(_second())
+        # Yield generously rather than sleeping: if the lock had been released the
+        # second writer would have run by now.
+        for _ in range(200):
+            await asyncio.sleep(0)
+        early = "second-ran" in order
+
+        finish.set()
+        try:
+            await first
+        except asyncio.CancelledError:
+            pass
+        await await_until(second, what="the second writer finishing")
+        return early, order
+
+    early, seen = asyncio.run(_run())
+
+    assert not early, (
+        "the config lock was handed to the next channel save while the cancelled "
+        "one's worker was still rewriting .env: %r" % (seen,)
+    )
+    assert seen.index("worker-end") < seen.index(
+        "second-ran"
+    ), "the second save entered before the first write finished: %r" % (seen,)
+
+
+# ── the shared rollback step ─────────────────────────────────────────────────
+
+#: Every settings owner that commits config.json and then .env.
+_SAVER_OWNERS = ("slack", "teams", "webex", "wecom", "feishu", "discord", "telegram")
+
+
+@pytest.mark.parametrize("owner", _SAVER_OWNERS)
+def test_every_saver_writes_env_through_the_shared_rollback_step(owner: str) -> None:
+    """A saver reaches ``.env`` only through ``_write_env_or_roll_back``.
+
+    The write-then-roll-back-then-sync sequence exists once. A saver that called
+    ``_write_env_off_loop`` itself would be a second copy, and a copy is how one
+    saver ends up with the rollback but not the cancellation guard.
+    """
+    source = (
+        Path(mod.__file__).resolve().parent.parent / "messaging_api" / f"{owner}_settings.py"
+    ).read_text(encoding="utf-8")
+    assert source.count("await _write_env_or_roll_back(") == 1
+    assert "_write_env_off_loop(" not in source
+    assert "asyncio.shield(" not in source
+
+
+def _rollback_probe() -> tuple[list[str], object]:
+    calls: list[str] = []
+
+    async def _rollback() -> None:
+        calls.append("rollback")
+
+    return calls, _rollback
+
+
+def test_a_failed_write_rolls_back_and_raises(monkeypatch) -> None:
+    async def _boom(_updates):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(mod, "_write_env_off_loop", _boom)
+    calls, rollback = _rollback_probe()
+    with pytest.raises(OSError):
+        asyncio.run(mod._write_env_or_roll_back({"KC_PROBE_TOKEN": "x"}, rollback))
+    assert calls == ["rollback"]
+
+
+def test_a_failed_write_with_no_config_commit_just_raises(monkeypatch) -> None:
+    async def _boom(_updates):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(mod, "_write_env_off_loop", _boom)
+    with pytest.raises(OSError):
+        asyncio.run(mod._write_env_or_roll_back({"KC_PROBE_TOKEN": "x"}, None))
+
+
+@pytest.mark.parametrize("write_fails", [False, True])
+def test_a_cancelled_save_rolls_back_only_when_the_write_failed(
+    write_fails: bool, monkeypatch
+) -> None:
+    """Cancel the caller while the write is parked; the write then lands or fails.
+
+    A write that landed pairs with the committed config, so rolling the config
+    back would split the pair. A write that failed leaves the config ahead of
+    ``.env``, so it is undone. The cancellation propagates in both cases.
+    """
+    release = asyncio.Event()
+
+    async def _parked(_updates):
+        await await_until(release, what="the test releasing the parked write")
+        if write_fails:
+            raise OSError(5, "I/O error")
+
+    monkeypatch.setattr(mod, "_write_env_off_loop", _parked)
+    calls, rollback = _rollback_probe()
+
+    async def _run() -> bool:
+        save = asyncio.create_task(mod._write_env_or_roll_back({"KC_PROBE_TOKEN": "x"}, rollback))
+        for _ in range(5):
+            await asyncio.sleep(0)
+        save.cancel()
+        for _ in range(5):
+            await asyncio.sleep(0)
+        release.set()
+        try:
+            await await_until(save, what="the cancelled save settling")
+        except asyncio.CancelledError:
+            return True
+        return False
+
+    assert asyncio.run(_run()) is True
+    assert calls == (["rollback"] if write_fails else [])
+
+
+def test_a_landed_write_honours_the_docker_creds_scrub(monkeypatch) -> None:
+    """The env sync routes through the shared ``apply_env_credential_changes``, so
+    under ``_KIROCREW_CREDS_SCRUBBED`` a credential key is NOT re-injected into
+    os.environ (the duplicate-loop bug that ignored the scrub). A non-credential
+    operator key still applies."""
+
+    async def _ok(_updates):
+        return None
+
+    monkeypatch.setattr(mod, "_write_env_off_loop", _ok)
+    _calls, rollback = _rollback_probe()
+    with monkeypatch.context() as env:
+        env.setenv("_KIROCREW_CREDS_SCRUBBED", "1")
+        env.delenv("SLACK_BOT_TOKEN", raising=False)
+        env.setenv("KC_PROBE_PROXY", "unset-before")
+        env.delenv("KC_PROBE_PROXY")
+        asyncio.run(
+            mod._write_env_or_roll_back(
+                {"SLACK_BOT_TOKEN": "xoxb-rotated", "KC_PROBE_PROXY": "http://p"}, rollback
+            )
+        )
+        # The credential key is NOT re-injected under the scrub...
+        assert "SLACK_BOT_TOKEN" not in os.environ
+        # ...but a non-credential operator setting still applies.
+        assert os.environ.get("KC_PROBE_PROXY") == "http://p"
+    assert "KC_PROBE_PROXY" not in os.environ
+
+
+def test_a_landed_write_syncs_the_process_environment(monkeypatch) -> None:
+    async def _ok(_updates):
+        return None
+
+    monkeypatch.setattr(mod, "_write_env_off_loop", _ok)
+    calls, rollback = _rollback_probe()
+    with monkeypatch.context() as env:
+        env.setenv("KC_PROBE_CLEARED", "old")
+        # setenv first records the variable's original state (absent here), so
+        # the undo removes whatever the helper writes; delenv then clears it.
+        env.setenv("KC_PROBE_SET", "unset-before-the-save")
+        env.delenv("KC_PROBE_SET")
+        asyncio.run(
+            mod._write_env_or_roll_back({"KC_PROBE_SET": "new", "KC_PROBE_CLEARED": None}, rollback)
+        )
+        assert os.environ.get("KC_PROBE_SET") == "new"
+        assert "KC_PROBE_CLEARED" not in os.environ
+    # Once the scoped undo has run, neither probe is left behind for a later test.
+    assert "KC_PROBE_SET" not in os.environ
+    assert "KC_PROBE_CLEARED" not in os.environ
+    assert calls == []
+
+
+@pytest.mark.parametrize("channel", ["discord", "telegram"])
+def test_the_config_and_env_writes_run_under_the_live_config_hold(
+    channel: str, monkeypatch, tmp_path: Path
+) -> None:
+    """The Discord and Telegram saves roll their config write back on a failed
+    ``.env`` write, so, like the other savers, both writes run under
+    ``live.hold()``: the watcher must not apply a config the failing write may
+    yet undo."""
+    from kiro_crew.config import live
+
+    held_at: list[str] = []
+    watcher = live.watch()
+    real_json_write = loader.write_config_atomically
+    real_env_write = mod._write_env_off_loop
+
+    def _json_write(path, data, **kw):
+        held_at.append(f"config:{watcher._hold_depth}")
+        real_json_write(path, data, **kw)
+
+    async def _env_write(updates):
+        held_at.append(f"env:{watcher._hold_depth}")
+        await real_env_write(updates)
+
+    monkeypatch.setattr(loader, "write_config_atomically", _json_write)
+    monkeypatch.setattr(mod, "_write_env_off_loop", _env_write)
+    (tmp_path / "config.json").write_text(
+        '{"%s": {"enabled": false, "bot_token": "legacy"}}' % channel, encoding="utf-8"
+    )
+    _drive(channel, monkeypatch, tmp_path)
+    assert held_at == ["config:1", "env:1"], held_at
+    assert watcher._hold_depth == 0

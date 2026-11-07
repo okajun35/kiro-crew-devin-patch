@@ -1,0 +1,974 @@
+import { safeSetItem } from '../../utils/safeStorage'
+import { useState, useMemo, useCallback, useEffect, useRef, type ReactNode } from 'react'
+import { Bell, BellOff, Check, CheckCheck, Layers, X } from 'lucide-react'
+import { motion, useReducedMotion } from 'framer-motion'
+import { useNavigate } from 'react-router-dom'
+import { shallowEqual } from 'react-redux'
+import { useGuardedLeave } from '../NavigationLeaveGuard'
+import { useAppSelector, useAppDispatch } from '../../store'
+import { clearNotifications, ackAllNotifications, deleteNotification, decideApprovalRow, dismissLocalApprovalRow, approvalMarks, rowPhase } from '../../store/notificationsSlice'
+import { api } from '../../api/client'
+import { EmptyState, SearchInput } from '../ui'
+import Clickable from '../Clickable'
+import Glass from '../Glass'
+import ErrorNotice from '../ErrorNotice'
+import MarkdownRenderer from '../MarkdownRenderer'
+import MessageErrorBoundary from '../MessageErrorBoundary'
+import StatusNotice from '../StatusNotice'
+import { disintegrate } from '../../lib/disintegrate'
+import type { Notification } from '../../types'
+import {
+  parseTs, dateGroup, KIND_META, DEFAULT_META, fmtTime, stripMd, notePriority, noteText, safeInternalUrl,
+  MAC_ACTION_BTN_CLASS, decisionFailedCopy, decidedClearFailedCopy,
+} from './notifMeta'
+import NotificationPermissionHint from './NotificationPermissionHint'
+import NotificationCard, { CARD_RADIUS, type NotificationCardAction } from './NotificationCard'
+import { CrewmateNoteFace, CrewmateNoteName, CrewmateRosterError, noteMember } from './CrewmateNoteFace'
+import NotificationClearButton, { NOTIF_CONTROL_HEIGHT } from './NotificationClearButton'
+import { keepsOutOfDayClear, stackKeyOf, stackLabelOf } from './notificationStacks'
+
+import { i18nT } from '../../i18n/t'
+import { useLanguageGeneration } from '../../i18n/useLanguageGeneration'
+import { uiLocation } from '../../uiLocations/uiLocation'
+/** localStorage key for app channels the user has already decided on (keep or
+ *  mute) via the first-notification prompt. System channels never prompt. */
+export const SEEN_CHANNELS_STORAGE_KEY = 'mc:notif:seenChannels'
+
+const withChannel = (set: ReadonlySet<string>, channel: string): ReadonlySet<string> =>
+  set.has(channel) ? set : new Set(set).add(channel)
+
+function withoutChannel(set: ReadonlySet<string>, channel: string): ReadonlySet<string> {
+  if (!set.has(channel)) return set
+  const next = new Set(set)
+  next.delete(channel)
+  return next
+}
+
+function loadSeenChannels(): Set<string> {
+  try {
+    const arr = JSON.parse(localStorage.getItem(SEEN_CHANNELS_STORAGE_KEY) || '[]')
+    if (Array.isArray(arr)) return new Set(arr.filter((c): c is string => typeof c === 'string'))
+  } catch { /* fall through */ }
+  return new Set()
+}
+
+/**
+ * Notification activity feed. Shared by the full page and the topbar bell
+ * popover as one implementation: multi-select
+ * kind filter (persisted to localStorage), search, ack-all/clear, and a
+ * date-grouped list whose rows disintegrate on delete. Selection state is owned
+ * by the host (passed via selectedTs/onSelect) so the host renders the matching
+ * detail panel; deleting the selected row clears it naturally because the host
+ * derives `selected` from the items list by ts.
+ */
+export default function NotificationFeed({ selectedTs, onSelect, variant = 'panel', header, footer, revealTs = null }: {
+  selectedTs: string | null
+  onSelect: (n: Notification) => void
+  /** 'mac' renders rows as floating Notification Center-style cards. */
+  variant?: 'panel' | 'mac'
+  /** Optional header row rendered inside the mac controls card (title + actions). */
+  header?: ReactNode
+  /** Optional footer row rendered at the bottom of the mac controls card. */
+  footer?: ReactNode
+  /** A ts whose row should be brought into view (deep link): expands the
+   *  collapsed group_key stack hiding it, then scrolls it into view. Each
+   *  distinct value is revealed once; selection/ack stay the host's job. */
+  revealTs?: string | null
+}) {
+  const dispatch = useAppDispatch()
+  const reduceMotion = useReducedMotion()
+  const items = useAppSelector(s => s.notifications.items)
+  const [filter, setFilter] = useState('')
+  // Silenced (muted-channel) rows are ghosts behind an explicit disclosure --
+  // mute keeps history but should not clutter the default view. This is NOT a
+  // kind filter: it reveals rows that are otherwise unreachable, so it survived
+  // the removal of the per-kind chips.
+  const [showMuted, setShowMuted] = useState(false)
+  // App channels the user has already kept/muted via the first-notification
+  // prompt (persisted so the prompt shows exactly once per channel).
+  const [seenChannels, setSeenChannels] = useState<Set<string>>(loadSeenChannels)
+
+  // Writes the decision to storage outside the state updater, so a mute that
+  // lands after this feed unmounted (the bell popover closed) is still kept.
+  const markChannelSeen = useCallback((channel: string) => {
+    const stored = loadSeenChannels()
+    stored.add(channel)
+    try { safeSetItem(SEEN_CHANNELS_STORAGE_KEY, JSON.stringify(Array.from(stored))) } catch { /* ignore quota errors */ }
+    setSeenChannels(prev => {
+      if (prev.has(channel)) return prev
+      const next = new Set(prev)
+      next.add(channel)
+      return next
+    })
+  }, [])
+
+  // Mute records the channel as decided only once the server took the mute.
+  // A failed write keeps the prompt up with an error, so the user can retry
+  // instead of being left with a loud channel and no prompt.
+  // Both are per channel: one channel's save or failure never unlocks or
+  // clears another's.
+  const [mutingChannels, setMutingChannels] = useState<ReadonlySet<string>>(() => new Set())
+  const [muteFailedChannels, setMuteFailedChannels] = useState<ReadonlySet<string>>(() => new Set())
+  const muteChannel = useCallback((channel: string) => {
+    setMuteFailedChannels(prev => withoutChannel(prev, channel))
+    setMutingChannels(prev => withChannel(prev, channel))
+    api.updateNotificationChannelSettings(channel, { muted: true })
+      .then(() => { markChannelSeen(channel) })
+      .catch(() => { setMuteFailedChannels(prev => withChannel(prev, channel)) })
+      .finally(() => { setMutingChannels(prev => withoutChannel(prev, channel)) })
+  }, [markChannelSeen])
+  const keepChannel = useCallback((channel: string) => {
+    setMuteFailedChannels(prev => withoutChannel(prev, channel))
+    markChannelSeen(channel)
+  }, [markChannelSeen])
+
+  const silencedCount = useMemo(() => items.filter(n => n.silenced).length, [items])
+
+  const languageGeneration = useLanguageGeneration()
+  const filtered = useMemo(() => {
+    void languageGeneration // a gateway-written note is searched by its localized copy
+    let list = [...items].reverse()
+    // Muted-channel rows stay in history but hide behind the "Show muted"
+    // disclosure (mute-doesn't-destroy semantics).
+    if (!showMuted) list = list.filter(n => !n.silenced)
+    if (filter) {
+      const q = filter.toLowerCase()
+      list = list.filter(n => {
+        const { title, body } = noteText(n)
+        return ((title || '') + (body || '')).toLowerCase().includes(q)
+      })
+    }
+    return list
+  }, [items, filter, showMuted, languageGeneration])
+
+  // Only a feed showing a crewmate's note reads the roster, so only that feed
+  // can report the roster read failing. While a crewmate note is selected its
+  // detail panel reports the failure, so the feed leaves it to that one copy.
+  const showsCrewmate = useMemo(() => filtered.some(n => noteMember(n)), [filtered])
+  const detailReportsRoster = useMemo(
+    () => !!selectedTs && items.some(n => n.ts === selectedTs && noteMember(n)),
+    [items, selectedTs],
+  )
+
+  // First notification from a new app channel gets an inline keep/mute prompt
+  // (attached to the newest such row). System channels never prompt; a channel
+  // already decided on (or already muted server-side) doesn't either. A
+  // channel whose mute is saving or failed keeps its prompt on its own newest
+  // row, so a note from another new channel cannot hide that save or its error.
+  const promptTsSet = useMemo(() => {
+    const out = new Set<string>()
+    const prompted = new Set<string>()
+    let freshShown = false
+    for (const n of filtered) {
+      if (!n.source || n.source === 'system' || !n.channel ||
+          seenChannels.has(n.channel) || n.silenced || prompted.has(n.channel)) continue
+      const held = mutingChannels.has(n.channel) || muteFailedChannels.has(n.channel)
+      if (!held && freshShown) continue
+      if (!held) freshShown = true
+      out.add(n.ts)
+      prompted.add(n.channel)
+    }
+    return out
+  }, [filtered, seenChannels, mutingChannels, muteFailedChannels])
+
+  const groups = useMemo(() => {
+    const map = new Map<string, Notification[]>()
+    for (const n of filtered) {
+      const g = dateGroup(parseTs(n.ts))
+      const arr = map.get(g)
+      if (arr) arr.push(n); else map.set(g, [n])
+    }
+    return map
+  }, [filtered])
+
+  const navigate = useNavigate()
+  // Same gate as the detail panel: a note's action button navigates away from
+  // whatever page the feed is floating over, and the ask belongs in front of the
+  // handler rather than around its navigate call.
+  const leave = useGuardedLeave()
+  // Stacking -- notes sharing a stack key (`stackKeyOf`: the producer's
+  // group_key, else the sender) within a date group collapse into one stack
+  // (newest is the visible head), macOS Notification Center style. Expansion
+  // is per stack key, session-local.
+  const [expandedStacks, setExpandedStacks] = useState<Set<string>>(new Set())
+  const toggleStack = useCallback((key: string) => {
+    setExpandedStacks(prev => {
+      const next = new Set(prev)
+      if (next.has(key)) next.delete(key); else next.add(key)
+      return next
+    })
+  }, [])
+
+  // `stackTs` lists every note in the head's stack; only the expanded stack
+  // header's two-press Clear uses it. A collapsed deck's ⓧ dismisses just its
+  // visible (newest) head, so the deck shrinks by one.
+  type Row = { n: Notification; stackKey?: string; stackCount?: number; stackExpanded?: boolean; isStackChild?: boolean; stackTs?: string[] }
+  const stackedGroups = useMemo(() => {
+    const out = new Map<string, Row[]>()
+    for (const [g, notes] of groups.entries()) {
+      const rows: Row[] = []
+      const stacks = new Map<string, Notification[]>()
+      for (const n of notes) {
+        const key = stackKeyOf(n)
+        if (!key) continue
+        const arr = stacks.get(key)
+        if (arr) arr.push(n); else stacks.set(key, [n])
+      }
+      const seen = new Set<string>()
+      for (const n of notes) {
+        const key = stackKeyOf(n)
+        if (!key || (stacks.get(key)?.length ?? 0) < 2) {
+          rows.push({ n })
+          continue
+        }
+        if (seen.has(key)) continue
+        seen.add(key)
+        const stack = stacks.get(key)!  // notes is newest-first, so [0] is the head
+        const stackKey = `${g}:${key}`
+        const expanded = expandedStacks.has(stackKey)
+        rows.push({ n: stack[0], stackKey, stackCount: stack.length, stackExpanded: expanded, stackTs: stack.map(s => s.ts) })
+        if (expanded) for (const child of stack.slice(1)) rows.push({ n: child, isStackChild: true })
+      }
+      out.set(g, rows)
+    }
+    return out
+  }, [groups, expandedStacks])
+
+  const [clearFailed, setClearFailed] = useState(false)
+  // Counts failures. A clear that succeeds removes the notice only when no
+  // other clear failed while it was in flight, so two clears running at once
+  // cannot let the later success hide the earlier failure.
+  const failSeq = useRef(0)
+  const settleClear = useCallback((failed: boolean, seqAtStart: number) => {
+    if (failed) {
+      failSeq.current += 1
+      setClearFailed(true)
+    } else if (failSeq.current === seqAtStart) {
+      setClearFailed(false)
+    }
+  }, [])
+
+  // The row that takes focus once a clear removes the focused control (a day
+  // header, a stack header, a row's ⓧ): the first row rendered after the
+  // cleared ones, else the last one before them. `gone` lists the notes being
+  // cleared and `origin` the control that had focus when the clear began; the
+  // target holds until every one of them has left `items` or the clear has
+  // settled. See the effect below listRef.
+  const refocus = useRef<{ ts: string | null, gone: Set<string>, origin: Element | null, settled: boolean } | null>(null)
+  // Bumped when a clear settles, so the refocus effect re-runs even when the
+  // last deletion committed before the clear's own bookkeeping did.
+  const [refocusTick, setRefocusTick] = useState(0)
+  const neighbourOf = useCallback((tsList: string[]): string | null => {
+    const gone = new Set(tsList)
+    const rows = Array.from(stackedGroups.values()).flat().map(r => r.n.ts)
+    let last = -1
+    rows.forEach((ts, i) => { if (gone.has(ts)) last = i })
+    return rows.slice(last + 1).find(ts => !gone.has(ts))
+      ?? rows.slice(0, Math.max(last, 0)).reverse().find(ts => !gone.has(ts))
+      ?? null
+  }, [stackedGroups])
+
+  // Wait for the whole group: one successful deletion must not hide a failure.
+  const clearNotes = useCallback(async (tsList: string[]) => {
+    const seqAtStart = failSeq.current
+    const target = { ts: neighbourOf(tsList), gone: new Set(tsList), origin: document.activeElement, settled: false }
+    refocus.current = target
+    const results = await Promise.allSettled(tsList.map(ts => dispatch(deleteNotification(ts)).unwrap()))
+    const failed = results.some(result => result.status === 'rejected')
+    if (refocus.current === target) {
+      // Nothing left the list, so nothing lost focus.
+      if (results.every(result => result.status === 'rejected')) refocus.current = null
+      else { target.settled = true; setRefocusTick(t => t + 1) }
+    }
+    settleClear(failed, seqAtStart)
+    return !failed
+  }, [dispatch, neighbourOf, settleClear])
+
+  const clearAll = useCallback(async () => {
+    const seqAtStart = failSeq.current
+    try {
+      await dispatch(clearNotifications()).unwrap()
+      settleClear(false, seqAtStart)
+    } catch {
+      settleClear(true, seqAtStart)
+    }
+  }, [dispatch, settleClear])
+
+  // Deep-link reveal. The feed owns this (rather than the host querying the
+  // document) because only the feed knows about group_key stacking, and a
+  // document-scoped query could hit the same data-ts row rendered by the
+  // topbar bell popover. Runs until the row is committed: first pass expands
+  // a collapsed stack hiding the target (state change re-runs the effect),
+  // the pass that finds the element scrolls it and marks the ts revealed.
+  // A row that never renders (silenced behind the muted disclosure, or an
+  // unknown ts) is deliberately left alone — reveal is best-effort and the
+  // host's detail panel does not depend on it.
+  const listRef = useRef<HTMLDivElement>(null)
+  const revealedRef = useRef<string | null>(null)
+  useEffect(() => {
+    if (!revealTs || revealedRef.current === revealTs) return
+    const target = items.find(n => n.ts === revealTs)
+    if (!target) return
+    const targetStack = stackKeyOf(target)
+    if (targetStack) {
+      const g = dateGroup(parseTs(target.ts))
+      const key = `${g}:${targetStack}`
+      const stackSize = items.filter(n => stackKeyOf(n) === targetStack &&
+        dateGroup(parseTs(n.ts)) === g).length
+      if (stackSize > 1 && !expandedStacks.has(key)) {
+        setExpandedStacks(prev => new Set(prev).add(key))
+        return
+      }
+    }
+    const el = listRef.current?.querySelector(`[data-ts="${CSS.escape(revealTs)}"]`)
+    if (el) {
+      revealedRef.current = revealTs
+      // Harmless when the host is about to hide the feed (mobile swaps to the
+      // full-width detail): the row is still mounted at this point and the
+      // scroll is a no-op on a hidden container afterwards.
+      el.scrollIntoView?.({ block: 'center' })
+    }
+  }, [revealTs, items, expandedStacks])
+
+  // After a clear commits, a focused control that unmounted with its rows left
+  // focus on <body>. Hand it to the neighbouring row's open control instead.
+  // Each deletion commits on its own, so a multi-note clear changes `items`
+  // several times while the clicked control is still mounted and focused; the
+  // target waits until every cleared note has gone, the clear settled (which
+  // covers a partial failure), or the clicked control unmounted (an expanded
+  // stack's header goes when one note is left), so focus never waits on
+  // <body>. Focus the user moved to another live element is left alone.
+  useEffect(() => {
+    const r = refocus.current
+    if (!r) return
+    const active = document.activeElement
+    if (active && active !== document.body && active.isConnected && active !== r.origin) {
+      refocus.current = null
+      return
+    }
+    if (!r.settled && r.origin?.isConnected && items.some(n => r.gone.has(n.ts))) return
+    // The clearing control survived (a partial failure kept its rows), so
+    // focus never fell to <body>.
+    if (active && active === r.origin && active.isConnected) {
+      refocus.current = null
+      return
+    }
+    const el = r.ts ? listRef.current?.querySelector<HTMLElement>(`[data-ts="${CSS.escape(r.ts)}"] [role="button"]`) : null
+    if (el) {
+      refocus.current = null
+      el.focus()
+    } else if (r.settled) {
+      // A partial clear whose every note was a target has no stored neighbour
+      // (or the neighbour has gone too), yet the clearing control unmounted
+      // when its rows shrank, so focus sits on <body>. Hand it to the first
+      // surviving row rather than dropping it.
+      refocus.current = null
+      listRef.current?.querySelector<HTMLElement>('[data-notif-row] [role="button"]')?.focus()
+    }
+  }, [items, refocusTick])
+
+  // Up/Down on a row's open control press the neighbouring row's open control,
+  // in rendered order (a collapsed stack is one stop), and move focus to it, so
+  // repeated presses walk the feed. Pressing the control rather than selecting
+  // the note makes a step do exactly what a click on that row does: in the bell
+  // sheet a collapsed stack expands instead of opening its newest note. Keys
+  // from an inner control (dismiss, Approve, a code block), modified arrows and
+  // the ends are left to the browser.
+  const stepSelectionWithArrowKeys = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    const step = e.key === 'ArrowDown' ? 1 : e.key === 'ArrowUp' ? -1 : 0
+    const row = (e.target as Element).closest('[data-notif-row]')
+    const fromTs = row?.getAttribute('data-ts')
+    if (!step || !fromTs || e.target !== row?.querySelector('[role="button"]')) return
+    if (e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return
+    const rows = Array.from(stackedGroups.values()).flat()
+    const next = rows[rows.findIndex(r => r.n.ts === fromTs) + step]
+    const nextOpenControl = next && e.currentTarget.querySelector<HTMLElement>(`[data-ts="${CSS.escape(next.n.ts)}"] [role="button"]`)
+    if (!nextOpenControl) return
+    e.preventDefault()
+    nextOpenControl.click()
+    nextOpenControl.focus()
+  }
+
+  // One-click approval resolution from the feed. A decision that lands
+  // removes the row. A terminal refusal (the approval expired or was decided
+  // elsewhere) only RETIRES it in the notifications slice: a retired row
+  // stays listed without Approve/Reject and says why, and leaves when its
+  // close X succeeds.
+  // The marks live in the slice, not here, because this feed mounts twice (the
+  // page and the bell popover, which remounts on every open) and both must
+  // agree. A second decision on the same approval, from this view or another,
+  // needs no lock: the server accepts one decision per approval and refuses
+  // the rest, which retires the row like any refusal. A retryable failure keeps the
+  // buttons and says so on that row, unless a frame ended the request
+  // meanwhile: the slice then retires the row with the failure
+  // (`ended_failed`), since nothing is left to retry. The value is
+  // the server's own refusal text ('' for a response-less transport failure,
+  // which gets the hedged copy), as in `ApprovalCard`. A retired row keeps
+  // its ordinary close X, which is how it leaves the feed.
+  const [decideFailed, setDecideFailed] = useState<Readonly<Record<string, { reason: string }>>>({})
+  // Each row's approval phase (retired, or decided with a failed DELETE, whose
+  // close X tries again) is held in the slice so the detail panel shows it
+  // too, and read only through `rowPhase`.
+  const marks = useAppSelector(s => approvalMarks(s.notifications), shallowEqual)
+  // Retiring a row takes the pressed Approve/Reject away, which drops keyboard
+  // focus to <body>. This holds the ts of that approval until its buttons are
+  // gone, and the effect below then moves focus to the row's close X, the one
+  // thing left to do with it, or to the list once the row has left. Only if focus was actually lost: a
+  // reader who has moved on keeps their place.
+  const focusRescueRef = useRef<string | null>(null)
+  // The ts of a row whose decide just failed retryably: the effect below
+  // brings that row's notice into view, past the list's scroll fade, as it
+  // does for a retired row's.
+  const failedNoticeRef = useRef<string | null>(null)
+  const resolveApprovalNote = useCallback((n: Notification, action: 'approve' | 'reject') => {
+    setDecideFailed(m => {
+      if (!Object.hasOwn(m, n.ts)) return m
+      const { [n.ts]: _drop, ...rest } = m
+      return rest
+    })
+    // Armed before the press: the slice settles the row (retired, decided
+    // with a failed DELETE, or gone) before the thunk resolves, and the
+    // effect below rescues focus from whichever the press came to.
+    focusRescueRef.current = n.ts
+    // `decideApprovalRow` holds the row through the response, so a frame that
+    // ends the request meanwhile cannot take away the row its refusal shows on.
+    void dispatch(decideApprovalRow({ n, action })).then(result => {
+      if (!decideApprovalRow.fulfilled.match(result)) return
+      const outcome = result.payload
+      if (outcome.kind !== 'failed') return
+      // The buttons stay, so nothing needs rescuing.
+      if (focusRescueRef.current === n.ts) focusRescueRef.current = null
+      failedNoticeRef.current = n.ts
+      setDecideFailed(m => ({ ...m, [n.ts]: { reason: outcome.reason } }))
+    })
+  }, [dispatch])
+  useEffect(() => {
+    const ts = focusRescueRef.current
+    if (ts === null) return
+    if (items.some(i => i.ts === ts) && rowPhase(marks, ts).phase === 'live') return
+    const active = document.activeElement
+    const lost = !active || active === document.body
+    const row = listRef.current?.querySelector<HTMLElement>(`[data-ts="${CSS.escape(ts)}"]`)
+    if (!row) {
+      focusRescueRef.current = null
+      if (lost) listRef.current?.focus()
+      return
+    }
+    focusRescueRef.current = null
+    if (lost) row.querySelector<HTMLElement>('[data-notif-dismiss]')?.focus()
+    // The notice that replaced the buttons is the point of the retirement:
+    // bring its last line into view, past the list's scroll fade.
+    row.querySelector<HTMLElement>('[data-testid="notif-approval-retired"], [data-testid="notif-dismiss-failed"]')?.scrollIntoView?.({ block: 'nearest' })
+  }, [items, marks])
+  useEffect(() => {
+    const ts = failedNoticeRef.current
+    if (ts === null || !Object.hasOwn(decideFailed, ts)) return
+    failedNoticeRef.current = null
+    const row = listRef.current?.querySelector<HTMLElement>(`[data-ts="${CSS.escape(ts)}"]`)
+    row?.querySelector<HTMLElement>('[data-testid="notif-approval-notice"]')?.scrollIntoView?.({ block: 'nearest' })
+  }, [decideFailed])
+
+  const unread = items.filter(n => !n.acked).length
+  const mac = variant === 'mac'
+
+  // Extracted so the two variants can order them differently: panel puts the
+  // muted disclosure above the search box, mac puts it below, inside one grouped
+  // card (with the host-provided header on top).
+  //
+  // The muted row renders solely when something is actually silenced, so it
+  // disappears entirely on a normal feed.
+  const mutedRow = silencedCount > 0 ? (
+    <div className={`flex gap-1 ${mac ? 'mb-1.5' : 'mb-2'} flex-wrap shrink-0`}>
+      <button
+        type="button"
+        aria-pressed={showMuted}
+        className={`px-2 py-1 rounded-md text-[12px] font-medium cursor-pointer border border-dashed transition-all font-body ${showMuted ? 'bg-bg-hover text-text border-border-strong' : 'bg-transparent text-muted border-border hover:text-text hover:border-border-strong'}`}
+        onClick={() => setShowMuted(v => !v)}
+      >
+        {/* The label names the ACTION the press performs, not the state the rows
+            are in: "Muted (3)" left it ambiguous whether pressing reveals muted
+            rows or mutes something. Both halves keep the count in parentheses so
+            neither needs a plural form. */}
+        <BellOff className="lucide-inline" /> {showMuted
+          ? i18nT('components.notifications.notificationFeed.hide_muted_count', { count: silencedCount })
+          : i18nT('components.notifications.notificationFeed.show_muted_count', { count: silencedCount })}
+      </button>
+    </div>
+  ) : null
+  const searchRow = (
+    <div className="flex gap-2 mb-2 items-center shrink-0">
+      <div className="flex-1"><SearchInput className="[&>input]:!bg-bg-elevated/40 [&>input]:!border-border/60" placeholder={i18nT('components.notifications.notificationFeed.search')} value={filter} onChange={e => setFilter(e.target.value)} /></div>
+      {!mac && unread > 0 && <button {...uiLocation('notifications.page-mark-all-read')} className="px-2 py-1 rounded-md border border-ok/40 bg-ok/10 text-ok-text text-[12px] font-semibold cursor-pointer hover:bg-ok/20 transition-all font-body whitespace-nowrap" onClick={() => dispatch(ackAllNotifications())}><Check className="lucide-inline" /> {i18nT('components.notifications.notificationFeed.all')}</button>}
+      {/* The bell's trash can and "Clear all", not "✕ Clear": beside the
+          search field an ⓧ "Clear" reads as "clear the search". */}
+      {!mac && items.length > 0 && <NotificationClearButton {...uiLocation('notifications.page-clear-all')} icon="trash" confirmText={i18nT('components.notifications.notificationFeed.clear_all')} onClick={clearAll}>{i18nT('components.notifications.notificationFeed.clear_all')}</NotificationClearButton>}
+    </div>
+  )
+
+  /** The first-note-from-a-channel prompt: keep or mute. One body, two
+   *  shells (an accent glass pane in mac mode, an attached strip in panel mode). */
+  const promptBody = (pc: { channel: string; label: string }) => (
+    <>
+      <Bell className="lucide-inline shrink-0 text-accent" />
+      <div className="flex-1 min-w-0 text-[12px] text-text">{i18nT('components.notifications.notificationFeed.first_notification_from')} <span className="font-semibold">{pc.label}</span>{i18nT('components.notifications.notificationFeed.keep_receiving_these')}</div>
+      <button
+        type="button"
+        className="px-2.5 py-1 rounded-md text-[12px] font-semibold cursor-pointer border-none bg-accent text-card hover:opacity-90 transition-opacity font-body whitespace-nowrap disabled:opacity-50 disabled:cursor-default"
+        onClick={() => keepChannel(pc.channel)}
+        // Keep waits for an in-flight mute, so the two answers cannot race.
+        disabled={mutingChannels.has(pc.channel)}
+      >{i18nT('components.notifications.notificationFeed.keep')}</button>
+      <button
+        type="button"
+        className="px-2.5 py-1 rounded-md text-[12px] font-medium cursor-pointer bg-transparent text-muted border border-border-strong hover:text-text transition-colors font-body whitespace-nowrap disabled:opacity-50 disabled:cursor-default"
+        onClick={() => muteChannel(pc.channel)}
+        disabled={mutingChannels.has(pc.channel)}
+        {...uiLocation('notifications.mute-channel')}
+      >{i18nT('components.notifications.notificationFeed.mute_channel')}</button>
+    </>
+  )
+
+  return (
+    <div className="flex flex-col flex-1 min-h-0">
+      {/* Controls: mac mode groups header + search + muted disclosure in ONE
+          floating card (search above the disclosure); panel mode puts the
+          disclosure first, directly on the popover surface. */}
+      {mac ? (
+        <Glass variant="panel" radius={CARD_RADIUS} className="notif-material glass-shadow px-2.5 pt-2 pb-1 mb-2 shrink-0">
+          <div className="flex items-center gap-1.5">
+            <div className="flex-1 min-w-0">{header}</div>
+            {unread > 0 && (
+              <button
+                title={i18nT('components.notifications.notificationFeed.mark_all_as_read')}
+                aria-label={i18nT('components.notifications.notificationFeed.mark_all_as_read')}
+                {...uiLocation('notifications.mark-all-read')}
+                className="w-6 h-6 rounded-md flex items-center justify-center text-ok hover:text-ok-text bg-transparent border-none cursor-pointer hover:bg-ok/10 transition-colors shrink-0"
+                onClick={() => dispatch(ackAllNotifications())}
+              ><CheckCheck className="lucide-inline" /></button>
+            )}
+            {items.length > 0 && (
+              <NotificationClearButton
+                aria-label={i18nT('components.notifications.notificationFeed.clear_all_notifications')}
+                {...uiLocation('notifications.clear-all')}
+                // A trash can, not an ⓧ: an ⓧ in the sheet's top-right corner
+                // reads as "close the sheet".
+                icon="trash"
+                confirmText={i18nT('components.notifications.notificationFeed.clear_all')}
+                alwaysVisible
+                onClick={clearAll}
+              />
+            )}
+          </div>
+          {searchRow}
+          {mutedRow}
+          {/* One-time nudge toward OS notifications, shown only while the
+              browser has not been asked yet and there is something to be
+              alerted about. Lives in the controls card so it reads as part
+              of the inbox's own settings, not as a notification row. */}
+          <NotificationPermissionHint hasNotes={items.length > 0} />
+          {footer}
+        </Glass>
+      ) : (
+        <>
+          {mutedRow}
+          {searchRow}
+        </>
+      )}
+
+      <ErrorNotice
+        message={clearFailed ? i18nT('components.notifications.notificationFeed.clear_failed') : null}
+        askAgent
+        actionPlacement="below"
+        className="mb-2 shrink-0"
+      />
+
+      {/* List. In the mac variant this container is what a press below the
+          last card lands on, which is why it carries a test id. Everything
+          composed into the mac variant is material or background by decision
+          (shell/notifications/notificationSheet.tsx, the sheet's invariant); a new
+          child needs one or the other. */}
+      {/* eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions -- a named group that delegates Up/Down from the rows' own buttons; the list itself is not a control */}
+      <div ref={listRef} role="group" aria-label={i18nT('app.notifications')} tabIndex={-1} onKeyDown={stepSelectionWithArrowKeys} data-testid="notification-feed-list" className={`flex-1 overflow-y-auto focus:outline-none ${mac ? 'px-4 -mx-4 pb-2' : 'scroll-shadow'}`}>
+        {showsCrewmate && !detailReportsRoster && <CrewmateRosterError className="mb-2 px-1" />}
+        {filtered.length === 0 ? (
+          <EmptyState testId="notification-feed-empty" icon={<Bell className="lucide-inline" />} title={i18nT('components.notifications.notificationFeed.no_notifications')} subtitle={filter ? i18nT('components.notifications.notificationFeed.try_a_different_search') : undefined} />
+        ) : (
+          Array.from(stackedGroups.entries()).map(([group, rows]) => {
+            // A day's clear skips every approval: reading one does not resolve
+            // it, so it must stay for its own Approve/Reject decision.
+            const dayClearable = (groups.get(group) ?? []).filter(g => !keepsOutOfDayClear(g)).map(g => g.ts)
+            return (
+            <div key={group} className="mb-3">
+              {/* The group's own clear sits on its header, so "clear" acts on
+                  the rows right under it rather than on a control far away. */}
+              <div className="group/clear flex items-center gap-1.5 mb-1.5 px-1 min-h-[20px]">
+                <div className={`flex-1 min-w-0 ${mac
+                  ? 'text-[11px] font-bold text-text-strong/80 uppercase tracking-[.06em] drop-shadow-xs'
+                  : 'text-[11px] font-semibold text-muted uppercase tracking-[.04em]'}`}>{group}</div>
+                {dayClearable.length > 0 && (
+                  <NotificationClearButton
+                    aria-label={i18nT('components.notifications.notificationFeed.clear_group', { group })}
+                    confirmText={i18nT('components.notifications.notificationFeed.clear_group', { group })}
+                    onClick={() => clearNotes(dayClearable)}
+                  />
+                )}
+              </div>
+              {rows.map(({ n, stackKey, stackCount, stackExpanded, isStackChild, stackTs }) => {
+                const km = KIND_META[n.kind] || DEFAULT_META
+                const member = noteMember(n)
+                const kindIcon = <span className="text-[13px] shrink-0">{km.icon}</span>
+                const active = selectedTs === n.ts
+                const prio = notePriority(n)
+                const silenced = !!n.silenced
+                // Priority tiers: passive dims, silenced thins the glass
+                // pane's tint (`muted`); critical is signalled by its danger
+                // dot alone. Selection is the pane's accent tint step
+                // (`active`). The shared card carries `notif-material`:
+                // index.css solidifies these surfaces to var(--card) where
+                // backdrop-filter is unsupported (#1817).
+                // A retired approval asks for nothing, so it drops the
+                // critical border and the unread dot and recedes like a read
+                // row.
+                const { phase, endedFailure: retiredFailure, dismissFailed } = rowPhase(marks, n.ts)
+                const retired = phase === 'retired'
+                const settled = retired || (n.kind === 'approval' && dismissFailed)
+                const panelBorder = silenced || settled ? 'border-l-muted' : prio === 'critical' ? 'border-l-danger' : km.borderColor
+                const promptChannel = promptTsSet.has(n.ts) && n.channel && n.source
+                  ? { channel: n.channel, label: `${n.source} / ${n.channel.startsWith(`${n.source}.`) ? n.channel.slice(n.source.length + 1) : n.channel}` }
+                  : null
+                // Inline actions: approval approve/reject, plus generic
+                // actions that render only with a safe dashboard-internal url
+                // (never executable content). A crew member's approval is
+                // decided on its conductor's approval card only, so its note
+                // offers no Approve or Reject; opening it leads to that card.
+                // A decided stored note whose DELETE failed is settled too:
+                // its controls are withdrawn and its notice says why it stayed.
+                const isApproval = n.kind === 'approval' && !n.acked && !n.crew_member && phase === 'live'
+                // A persisted row is untrusted: a truthy non-string body must
+                // not reach the renderer, its raw fallback, or the flattener.
+                const { title, body } = noteText(n)
+                const bodyText = typeof body === 'string' ? body : ''
+                // Defense-in-depth for legacy/corrupted persisted rows: the
+                // actions field must be a real array (a truthy non-array like
+                // `{}` would throw on .filter), and only string fields render
+                // (a non-string label would crash React).
+                const urlActions = (Array.isArray(n.actions) ? n.actions : [])
+                  .filter(a => typeof a?.id === 'string' && typeof a?.label === 'string' && typeof a?.url === 'string')
+                  .map(a => ({ ...a, safeUrl: safeInternalUrl(a.url) }))
+                  .filter(a => a.safeUrl)
+                const approveLabel = i18nT('components.notifications.notificationFeed.approve')
+                const rejectLabel = i18nT('components.notifications.notificationFeed.reject')
+                // A settled row (retired, or decided with a failed DELETE) has
+                // no Approve/Reject to retry with, so a retryable failure from
+                // an earlier press is not shown on it, as in the detail panel.
+                const decideReason = Object.hasOwn(decideFailed, n.ts) && !settled ? decideFailed[n.ts] : null
+                // A press that failed after a frame ended its request: the
+                // row is retired, and the failure leads its notice.
+                const endedFailure = active ? null : retiredFailure
+                const hasActions = isApproval || urlActions.length > 0
+                // A row whose controls authorize a command shows the whole
+                // command: a clamped excerpt turns `echo safe` + `rm -rf target`
+                // into one harmless-looking line. Gated on the KIND, not on
+                // unread: reading the row acks it, and a pending command must
+                // not collapse back into that line while the detail panel
+                // still offers Approve/Reject. A settled approval stays listed
+                // only as a retired row, until it is dismissed. Same renderer
+                // and boundary as the detail panel; the producer's fence tag
+                // makes the lines wrap, so nothing is clipped, clamped or
+                // hidden. One definition for both variants: the mac card's
+                // own excerpt is a two-line clamp, so it takes this instead.
+                const approvalBody = n.kind === 'approval' ? (
+                  <div className={`msg-content text-[12px] text-muted break-words ${mac ? 'mt-1 leading-snug' : 'mt-1'}`} data-testid="approval-body">
+                    <MessageErrorBoundary rawContent={bodyText}>
+                      <MarkdownRenderer content={bodyText} readOnlyCode />
+                    </MessageErrorBoundary>
+                  </div>
+                ) : undefined
+                // Outside the row's Clickable in both variants: that control is
+                // role="button", whose descendants are presentational, so a
+                // notice inside it would never reach a screen reader. A refused
+                // decide or a failed decision renders an error, on the row it
+                // failed for. Below the row's
+                // controls, as in the detail panel and the chat card, so a
+                // retry finds Approve/Reject where they were. No hand-off on
+                // any of the row's notices: the feed also renders in the topbar
+                // bell popover, an overlay that stays open over the page
+                // beneath it, such as an unsaved prompt edit in the Overview
+                // Prompts tab's editor. The hand-off navigates to the chat
+                // without the `useGuardedLeave` gate, so it would unmount that
+                // editor and discard the edit.
+                // A failed close X is the feed's clear notice and sets no mark
+                // here; the mark comes from a landed decision's failed
+                // clean-up. The open row's detail panel already says an
+                // approval row's failed DELETE, so the row does not repeat it.
+                const rowDismissFailed = dismissFailed && !(active && n.kind === 'approval')
+                // A retired row says "no longer pending", so its failed
+                // DELETE shows no recorded decision, as in the detail panel.
+                const rowDecided = rowDismissFailed && !retired
+                const rowNotice = (retired && !active) || decideReason !== null || rowDismissFailed ? (
+                  <div className={`animate-rise ${mac ? 'pl-[36px]' : 'pl-6'}`}>
+                    <ErrorNotice
+                      variant="inline"
+                      className="mt-1"
+                      testId="notif-approval-notice"
+                      message={decideReason !== null ? decisionFailedCopy(decideReason.reason, { targeted: !!n.approval_instance })
+                        : endedFailure !== null ? decisionFailedCopy(endedFailure, { ended: true }) : null}
+                    />
+                    {/* A decide this tab sent was refused as no longer pending: that request
+                        failed, so it renders through the shared ErrorNotice.
+                        The open row's detail panel already says it, so the
+                        row does not repeat it. */}
+                    <ErrorNotice
+                      variant="inline"
+                      className="mt-1"
+                      testId="notif-approval-retired"
+                      message={retired && !active ? i18nT('components.approvalCard.approval_no_longer_pending') : null}
+                    />
+                    {/* A decided stored note whose DELETE the server refused
+                        stays in place; its close X tries again. The decision
+                        itself did not fail, so it leads as a neutral status;
+                        the failed clean-up beneath it is an error and renders
+                        through the shared ErrorNotice. */}
+                    <StatusNotice
+                      tone="info"
+                      className="mt-1"
+                      testId="notif-decision-recorded"
+                      message={rowDecided ? i18nT('components.notifications.notificationFeed.decision_recorded') : null}
+                    />
+                    {/* Boxed beside the boxed StatusNotice above it, so the
+                        two read as one pair; under a retired row's inline
+                        notice it stays inline. */}
+                    <ErrorNotice
+                      variant={rowDecided ? 'block' : 'inline'}
+                      className="mt-1"
+                      testId="notif-dismiss-failed"
+                      message={rowDismissFailed ? decidedClearFailedCopy() : null}
+                    />
+                  </div>
+                ) : null
+                // A read, retired or passive row recedes through its title and
+                // controls only. Its notice keeps full contrast (that sentence
+                // is the row's one remaining message), and so does a retired
+                // row's close X, its only way out.
+                const rowDim = (n.acked || settled || prio === 'passive') && !active && !silenced ? 'opacity-50' : ''
+                const collapsedStack = !!(stackKey && stackCount && stackCount > 1 && !stackExpanded)
+                const actionBtn = MAC_ACTION_BTN_CLASS
+                // The mac row IS the shared card (one rendering with the
+                // banner); the feed adds only what it owns — the reveal anchor,
+                // spacing against the deck/prompt below, selection, the stack
+                // controls and the ghost/selected material.
+                const macActions: NotificationCardAction[] = [
+                  ...(isApproval ? [
+                    { id: 'approve', label: approveLabel, tone: 'ok' as const, onClick: () => resolveApprovalNote(n, 'approve') },
+                    { id: 'reject', label: rejectLabel, tone: 'danger' as const, onClick: () => resolveApprovalNote(n, 'reject') },
+                  ] : []),
+                  ...urlActions.map(a => ({ id: a.id, label: a.label, tone: 'text' as const, onClick: () => leave(() => navigate(a.safeUrl!), a.safeUrl!) })),
+                ]
+                // An expanded stack gets a header row above its newest note,
+                // as macOS Notification Center does: who sent it on the left,
+                // Show less and the stack's clear on the right. The head card
+                // stays the same element, so expanding never swaps it out.
+                const expandedHead = !!(stackKey && stackCount && stackCount > 1 && stackExpanded)
+                const stackLabel = expandedHead ? stackLabelOf(n) : ''
+                const stackHeader = expandedHead && stackKey ? (
+                  <motion.div
+                    initial={reduceMotion ? false : { opacity: 0, y: -4 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    transition={{ duration: 0.18 }}
+                    className={`flex items-center gap-1.5 px-1.5 ${mac ? 'mb-2 mt-0.5' : 'mb-1.5'}`}
+                  >
+                    <div className={`flex-1 min-w-0 truncate font-semibold text-text-strong ${mac ? 'text-[13px] drop-shadow-xs' : 'text-[12px]'}`}>{stackLabel}</div>
+                    <button
+                      type="button"
+                      aria-expanded
+                      className={`${MAC_ACTION_BTN_CLASS} text-muted ${NOTIF_CONTROL_HEIGHT} !py-0 inline-flex items-center leading-none`}
+                      onClick={() => toggleStack(stackKey)}
+                    >{i18nT('components.notifications.notificationFeed.show_less')}</button>
+                    {/* Visible "Clear" text, not an ⓧ: beside Show less a bare
+                        ⓧ cannot say whether it hides the stack or deletes it.
+                        Armed, it names its scope so it never reads as the
+                        inbox-wide "Clear all". */}
+                    <NotificationClearButton
+                      aria-label={i18nT('components.notifications.notificationFeed.clear_group', { group: stackLabel })}
+                      icon="none"
+                      confirmText={i18nT('components.notifications.notificationFeed.clear_this_group')}
+                      alwaysVisible
+                      onClick={() => clearNotes(stackTs ?? [n.ts])}
+                    >{i18nT('components.notifications.notificationFeed.clear')}</NotificationClearButton>
+                  </motion.div>
+                ) : null
+                // Every row's ⓧ, a collapsed deck's head included, dismisses only
+                // that one note; clearing a whole stack is the expanded header's
+                // two-press Clear, so one ⓧ press never deletes more than it shows.
+                const dismissTs = [n.ts]
+                const dismissLabel = i18nT('components.notifications.notificationFeed.dismiss_notification')
+                const dismissRow = async (e?: React.MouseEvent | React.KeyboardEvent) => {
+                  const row = (e?.currentTarget as HTMLElement | undefined)?.closest('[data-notif-row]') as HTMLElement | null
+                  const previousStyle = row?.style.cssText ?? ''
+                  await disintegrate(row)
+                  if (!(n.kind === 'approval' && n._local)) {
+                    // A stored note is deleted like any clear: a failure keeps
+                    // the row and shows the feed's clear notice.
+                    const cleared = await clearNotes(dismissTs)
+                    // A rejected delete keeps its row; undo the dust animation.
+                    if (!cleared && row) row.style.cssText = previousStyle
+                    return
+                  }
+                  // An approval row this tab raised leaves this tab only, and
+                  // stays while its decision is in flight (`dismissLocalApprovalRow`).
+                  // Focus moves to the neighbouring row as for any clear.
+                  const target = { ts: neighbourOf(dismissTs), gone: new Set(dismissTs), origin: document.activeElement, settled: false }
+                  refocus.current = target
+                  const result = await dispatch(dismissLocalApprovalRow(n.ts))
+                  const left = dismissLocalApprovalRow.fulfilled.match(result) && result.payload
+                  if (refocus.current === target) {
+                    if (!left) refocus.current = null
+                    else { target.settled = true; setRefocusTick(t => t + 1) }
+                  }
+                  // A row that stays keeps its place; undo the dust animation.
+                  if (!left && row) row.style.cssText = previousStyle
+                }
+                return (
+                  <div key={n.ts} className={isStackChild && !mac ? 'ml-4' : ''}>
+                    {stackHeader}
+                    {/* data-ts is the reveal effect's DOM anchor for
+                        scroll-into-view, scoped under listRef. */}
+                    {mac ? (
+                      <NotificationCard
+                        data-notif-row data-ts={n.ts}
+                        n={n}
+                        className={`${collapsedStack ? 'mb-0' : promptChannel ? 'mb-1' : 'mb-2'} ${collapsedStack ? 'relative z-[2] cursor-pointer' : ''}`}
+                        active={active}
+                        muted={silenced}
+                        settled={settled}
+                        dismissVisible={settled || dismissFailed}
+                        onOpen={() => { if (collapsedStack && stackKey) toggleStack(stackKey); else onSelect(n) }}
+                        openLabel={collapsedStack
+                          ? i18nT('components.notifications.notificationFeed.expand_grouped_notifications', { count: stackCount, title })
+                          : i18nT('components.notifications.notificationFeed.open_notification', { title })}
+                        onDismiss={dismissRow}
+                        dismissLabel={dismissLabel}
+                        actions={macActions}
+                        body={approvalBody}
+                        footer={rowNotice ?? undefined}
+                        trailing={silenced ? (
+                          <span className="text-[10px] text-muted italic flex items-center gap-1"><BellOff className="lucide-inline" /> {i18nT('components.notifications.notificationFeed.muted_2')}</span>
+                        ) : collapsedStack ? (
+                          <span className="text-[10px] font-medium text-muted px-1.5 py-px rounded-full bg-[color-mix(in_srgb,var(--bg-hover)_80%,transparent)]">{stackCount}</span>
+                        ) : undefined}
+                      />
+                    ) : (
+                    <div data-notif-row data-ts={n.ts}
+                      className={`group flex flex-col px-2.5 py-2 rounded-md ${promptChannel ? 'rounded-b-none mb-0' : 'mb-1'} transition-all border-l-[3px] ${panelBorder} ${silenced ? 'border border-dashed border-border bg-transparent' : active ? 'bg-accent-subtle border border-accent' : 'border border-transparent hover:bg-bg-hover hover:border-border'} ${silenced ? 'opacity-60' : ''}`}
+                    >
+                      <div className="flex items-center gap-2.5">
+                      <Clickable
+                        onClick={() => onSelect(n)}
+                        aria-label={i18nT('components.notifications.notificationFeed.open_notification', { title })}
+                        className={`flex items-center gap-2 flex-1 min-w-0 text-left cursor-pointer ${rowDim}`}
+                      >
+                        {member ? <CrewmateNoteFace member={member} size={18} fallback={kindIcon} /> : kindIcon}
+                        <div className="flex-1 min-w-0">
+                          {member && <CrewmateNoteName member={member} className="block text-[11px] text-muted truncate leading-tight" />}
+                          <div className={`text-[13px] font-semibold truncate leading-tight ${silenced ? 'text-muted font-normal' : 'text-text-strong'}`}>{title}</div>
+                          {approvalBody ?? (
+                            <div className="text-[12px] text-muted mt-0.5 truncate">{stripMd(bodyText).slice(0, 80)}</div>
+                          )}
+                        </div>
+                        <div className="flex flex-col items-end gap-0.5 shrink-0">
+                          <span className="text-[11px] text-muted font-mono">{fmtTime(n.ts)}</span>
+                          {silenced ? (
+                            <span className="text-[10px] text-muted italic flex items-center gap-1"><BellOff className="lucide-inline" /> {i18nT('components.notifications.notificationFeed.muted_2')}</span>
+                          ) : !n.acked && !settled ? (
+                            <span className={`w-1.5 h-1.5 rounded-full animate-dot-breathe ${prio === 'critical' ? 'bg-danger' : 'bg-accent'}`} data-priority={prio} />
+                          ) : null}
+                        </div>
+                      </Clickable>
+                      <Clickable
+                        data-notif-dismiss
+                        aria-label={dismissLabel}
+                        className={`${settled || dismissFailed ? 'opacity-80' : 'opacity-0 group-hover:opacity-40 [@media(hover:none)]:opacity-60'} focus-visible:opacity-100 text-[11px] cursor-pointer hover:!opacity-100 hover:text-danger transition-opacity shrink-0`}
+                        onClick={dismissRow}
+                      ><X className="lucide-inline" /></Clickable>
+                      </div>
+                      {(hasActions || collapsedStack) && (
+                        <div className={`flex items-center gap-1.5 mt-1.5 flex-wrap pl-6 ${rowDim}`}>
+                          {isApproval && (
+                            <>
+                              <button
+                                type="button"
+                                className={`${actionBtn} text-ok`}
+                                onClick={e => { e.stopPropagation(); resolveApprovalNote(n, 'approve') }}
+                              >{approveLabel}</button>
+                              <button
+                                type="button"
+                                className={`${actionBtn} text-danger`}
+                                onClick={e => { e.stopPropagation(); resolveApprovalNote(n, 'reject') }}
+                              >{rejectLabel}</button>
+                            </>
+                          )}
+                          {urlActions.map(a => (
+                            <button
+                              key={a.id}
+                              type="button"
+                              className={`${actionBtn} text-text`}
+                              onClick={e => { e.stopPropagation(); leave(() => navigate(a.safeUrl!), a.safeUrl!) }}
+                            >{a.label}</button>
+                          ))}
+                          <span className="flex-1" />
+                          {/* Panel shows an explicit pill to expand; an
+                              expanded stack folds from its header row. */}
+                          {collapsedStack && stackKey && stackCount && (
+                            <button
+                              type="button"
+                              aria-expanded={!!stackExpanded}
+                              className="px-2 py-0.5 rounded-full text-[11px] font-medium cursor-pointer bg-bg-hover text-muted border border-border hover:text-text hover:border-border-strong transition-colors font-body whitespace-nowrap"
+                              onClick={e => { e.stopPropagation(); toggleStack(stackKey) }}
+                            ><Layers className="lucide-inline" /> {stackExpanded ? i18nT('components.notifications.notificationFeed.show_less') : i18nT('app.n_more', { count: stackCount - 1 })}</button>
+                          )}
+                        </div>
+                      )}
+                      {rowNotice}
+                    </div>
+                    )}
+                    {/* macOS NC deck: two card edges peeking below a collapsed
+                        stack -- click anywhere on the head to expand. */}
+                    {mac && collapsedStack && (
+                      <div aria-hidden className="mb-2">
+                        {/* The same glass as the head on the faded tint step,
+                            tucked under it: only each shell's lower edge shows.
+                            Never `opacity` here — it would void the blur. */}
+                        <Glass variant="panel" radius={CARD_RADIUS} className="notif-material glass-faded relative z-[1] h-3 -mt-1.5 mx-2" />
+                        <Glass variant="panel" radius={CARD_RADIUS} className="notif-material glass-faded relative z-0 h-3 -mt-1.5 mx-4" />
+                      </div>
+                    )}
+                    {promptChannel && (mac ? (
+                      // Its own accent-tinted glass under the row (a pane has
+                      // one radius, so the strip is not glued to the card).
+                      <Glass variant="chip" radius={12} className="notif-material glass-accent glass-shadow flex items-center gap-2 px-3 py-2 mb-2">
+                        {promptBody(promptChannel)}
+                      </Glass>
+                    ) : (
+                      <div className="flex items-center gap-2 px-3 py-2 border border-t-0 rounded-b-md mb-1 bg-accent-subtle border-border">
+                        {promptBody(promptChannel)}
+                      </div>
+                    ))}
+                    {promptChannel && (
+                      <ErrorNotice
+                        message={muteFailedChannels.has(promptChannel.channel) ? i18nT('components.notifications.notificationFeed.mute_failed') : null}
+                        askAgent
+                        actionPlacement="below"
+                        className="mb-2"
+                      />
+                    )}
+                  </div>
+                )
+              })}
+            </div>
+            )
+          })
+        )}
+      </div>
+    </div>
+  )
+}

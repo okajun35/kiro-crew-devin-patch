@@ -1,0 +1,242 @@
+/**
+ * Tablist — the pill switcher as a WAI-ARIA tablist and NOTHING ELSE: no
+ * `aria-controls`, because there is no per-tab panel to point at.
+ *
+ * Use `ui/tabs.tsx` (Radix) by default. Reach for this one only when the body
+ * below the rail is ONE shared subtree parameterised by the active tab rather
+ * than a panel per tab — the Webhooks page is the case: its rail, resize handle,
+ * mobile collapse and banners are shared, and `plane` merely parameterises them
+ * at a dozen points. Radix's `TabsTrigger` emits `aria-controls`
+ * UNCONDITIONALLY, so putting that page on Radix without a `TabsContent` would
+ * leave every trigger referencing an element that does not exist — trading one
+ * accessibility defect for another. A tablist with no panel linkage is the
+ * correct shape there, and `aria-controls` is recommended by WAI-ARIA rather
+ * than required.
+ *
+ * Visually identical to `ui/tabs.tsx` by construction, not by promise: both
+ * import the one class recipe in `ui/tabsPill.ts`, so there is no second copy to
+ * drift. A user cannot see which accessibility shape is underneath, so they must
+ * not be able to see a difference either.
+ *
+ * What this carries that a row of plain buttons does not:
+ *
+ *   - **Keyboard.** Arrow keys move between tabs under a roving tabindex, so the
+ *     whole rail is ONE tab stop rather than one stop per tab.
+ *   - **`aria-selected`.** A coloured pill is invisible to a screen reader.
+ *   - **A shared indicator.** One `layoutId` element slides between segments, so
+ *     the movement reads as a position change rather than two colour flips.
+ */
+import { useRef, type KeyboardEvent, type ReactNode } from 'react'
+import { motion, useReducedMotion } from 'framer-motion'
+import { usePressActivation } from '../hooks/usePressActivation'
+import { forwardUiLocation, UI_LOCATION_ATTR } from '../uiLocations/uiLocation'
+
+import {
+  TABS_COUNT_BASE_CLASS,
+  TABS_INDICATOR_CLASS,
+  TABS_INDICATOR_SPRING,
+  TABS_SEGMENT_ACTIVE_CLASS,
+  TABS_SEGMENT_CLASS,
+  TABS_SEGMENT_DISABLED_CLASS,
+  TABS_TRACK_CLASS,
+} from './ui/tabsPill'
+
+export interface TablistTab<T extends string = string> {
+  key: T
+  label: string
+  icon?: ReactNode
+  /**
+   * Render the tab but refuse selection — for a plane the page knows about and
+   * cannot serve yet. `aria-disabled` rather than the `disabled` attribute keeps
+   * it focusable so its tooltip, which carries the reason, stays reachable.
+   */
+  disabled?: boolean
+  tooltip?: string
+  /** Trailing count, for a rail whose tabs each own a collection. Omitted and
+   *  zero both render nothing — a "0" badge is noise, not information. */
+  count?: number
+}
+
+/** A tab that is a registered UI location; its marker lands on that tab. Named
+ *  in `segments` at the call site (`{ key, label, ...uiLocation(id) }`, the
+ *  shape SegmentedControl and CrewEditorNextRail take), so the generator reads
+ *  the marker from one array literal and the tab's `label` as the label. */
+export interface TablistSegment<T extends string> {
+  key: T
+  label: string
+  'data-ui-location'?: string
+}
+
+interface Props<T extends string = string> {
+  tabs: Array<TablistTab<T>>
+  value: T
+  onChange: (value: T) => void
+  /** Names the tablist for assistive tech. Required: an unlabelled tablist on a
+   *  page with more than one is ambiguous to a screen-reader user. */
+  ariaLabel: string
+  /** Distinguishes this rail's sliding indicator from another one on the same
+   *  page — two rails sharing an id animate into each other. */
+  layoutId?: string
+  /** `active`: only the SELECTED tab shows its label; the others are their icon
+   *  alone (the label stays in the tooltip and the accessible name). For a rail
+   *  in a narrow column whose tabs all carry icons — the crewmate profile card.
+   *  Default `always`. */
+  labels?: 'always' | 'active'
+  /** The tabs that are registered UI locations (see `TablistSegment`). */
+  segments?: readonly TablistSegment<T>[]
+}
+
+/** What the keyboard model needs to know about a tab: nothing but whether it
+ *  can be selected. */
+type RovingTab = { disabled?: boolean }
+
+/** Next enabled index in `dir`, wrapping. Disabled tabs are skipped rather than
+ *  focused-and-refused, which would strand the caret on a dead control. */
+export function nextEnabledIndex(
+  tabs: ReadonlyArray<RovingTab>,
+  from: number,
+  dir: 1 | -1,
+): number {
+  const n = tabs.length
+  for (let step = 1; step <= n; step += 1) {
+    const i = (from + dir * step + n * (step + 1)) % n
+    if (!tabs[i]?.disabled) return i
+  }
+  return from
+}
+
+/** First or last enabled index, for Home / End. */
+export function edgeEnabledIndex(
+  tabs: ReadonlyArray<RovingTab>,
+  edge: 'first' | 'last',
+): number {
+  const order = edge === 'first' ? tabs.map((_, i) => i) : tabs.map((_, i) => tabs.length - 1 - i)
+  for (const i of order) {
+    if (!tabs[i]?.disabled) return i
+  }
+  return 0
+}
+
+/**
+ * The keyboard half of a tablist, for a rail that draws its own tabs: a
+ * roving tabindex (the rail is ONE tab stop) plus the arrow keys, Home and End.
+ * `Tablist` runs on it, and so does any hand-drawn rail whose look differs from
+ * the pill, so there is one keyboard model rather than one per rail.
+ *
+ * Selection follows focus, as in `Tablist`. `orientation` picks the arrow
+ * pair: Left/Right for a horizontal rail, Up/Down for a vertical one.
+ *
+ * Spread `tabProps(i)` on the i-th tab.
+ */
+export function useRovingTabs<K>(
+  tabs: ReadonlyArray<RovingTab & { key: K }>,
+  value: K | undefined,
+  onChange: (key: K) => void,
+  orientation: 'horizontal' | 'vertical' = 'horizontal',
+) {
+  const refs = useRef<Array<HTMLElement | null>>([])
+  const vertical = orientation === 'vertical'
+
+  const move = (to: number) => {
+    const tab = tabs[to]
+    if (!tab || tab.disabled) return
+    // An arrow with nowhere to go (every other tab disabled) lands on the
+    // current tab: nothing to select.
+    if (tab.key !== value) onChange(tab.key)
+    // Follow the selection with focus so the arrow keys keep working from the
+    // tab the user just landed on.
+    refs.current[to]?.focus()
+  }
+
+  const tabProps = (i: number) => ({
+    ref: (el: HTMLElement | null) => { refs.current[i] = el },
+    // Roving tabindex: only the active tab is in the tab order, so the rail
+    // costs one Tab press instead of one per tab.
+    tabIndex: tabs[i]?.key === value ? 0 : -1,
+    onKeyDown: (e: KeyboardEvent<HTMLElement>) => {
+      const forward = vertical ? e.key === 'ArrowDown' : e.key === 'ArrowRight'
+      const back = vertical ? e.key === 'ArrowUp' : e.key === 'ArrowLeft'
+      const to = forward ? nextEnabledIndex(tabs, i, 1)
+        : back ? nextEnabledIndex(tabs, i, -1)
+        : e.key === 'Home' ? edgeEnabledIndex(tabs, 'first')
+        : e.key === 'End' ? edgeEnabledIndex(tabs, 'last')
+        : null
+      if (to === null) return
+      e.preventDefault()
+      move(to)
+    },
+  })
+
+  return tabProps
+}
+
+export default function Tablist<T extends string = string>({
+  tabs,
+  value,
+  onChange,
+  ariaLabel,
+  layoutId = 'tablist-indicator',
+  labels = 'always',
+  segments,
+}: Props<T>) {
+  const reduceMotion = useReducedMotion()
+  const roving = useRovingTabs(tabs, value, onChange)
+  const bindPress = usePressActivation()
+  // The tab's find_ui marker (if it is one), merged with the roving-focus ref.
+  const markerOf = (key: T, ref: (el: HTMLElement | null) => void) =>
+    forwardUiLocation<HTMLButtonElement>(segments?.find(seg => seg.key === key)?.[UI_LOCATION_ATTR], ref)
+
+  return (
+    <div className={TABS_TRACK_CLASS} role="tablist" aria-label={ariaLabel}>
+      {tabs.map((tab, i) => {
+        const isActive = tab.key === value
+        const isDisabled = tab.disabled === true
+        const { ref, ...keys } = roving(i)
+        return (
+          <button
+            key={tab.key}
+            {...markerOf(tab.key, ref)}
+            type="button"
+            role="tab"
+            aria-selected={isActive}
+            aria-disabled={isDisabled || undefined}
+            {...keys}
+            title={tab.tooltip || tab.label}
+            // Select on the mouse press, like the Radix tabs in ui/tabs;
+            // keyboard and touch select on click.
+            {...bindPress(() => {
+              if (!isDisabled) onChange(tab.key)
+            })}
+            className={[
+              TABS_SEGMENT_CLASS,
+              isDisabled ? TABS_SEGMENT_DISABLED_CLASS : '',
+              isActive && !isDisabled ? TABS_SEGMENT_ACTIVE_CLASS : '',
+            ].filter(Boolean).join(' ')}
+          >
+            {isActive && !isDisabled && (
+              <motion.span
+                layoutId={layoutId}
+                aria-hidden="true"
+                className={TABS_INDICATOR_CLASS}
+                transition={reduceMotion ? { duration: 0 } : TABS_INDICATOR_SPRING}
+              />
+            )}
+            {tab.icon}
+            {labels === 'always' || isActive ? (
+              <span className="whitespace-nowrap">{tab.label}</span>
+            ) : (
+              <span className="sr-only">{tab.label}</span>
+            )}
+            {(tab.count ?? 0) > 0 && (
+              <span
+                className={`${TABS_COUNT_BASE_CLASS} ${isActive ? 'text-accent/60' : 'text-muted/40'}`}
+              >
+                {tab.count}
+              </span>
+            )}
+          </button>
+        )
+      })}
+    </div>
+  )
+}

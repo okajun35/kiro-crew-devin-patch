@@ -1,0 +1,616 @@
+# Exporting Kiro Crew metrics over OTLP
+
+Kiro Crew records its metrics through the OpenTelemetry SDK. By default they go
+nowhere but this machine: a local JSONL sink under `~/.kiro/crew/metrics`, which
+the dashboard's Telemetry panel reads. This page is about the other option —
+pushing the same metrics to an **OpenTelemetry Collector**, and from there to
+whatever backend you already run (Amazon CloudWatch, Datadog, or any service that
+accepts OTLP).
+
+Nothing here is on by default, and turning it on takes two separate decisions:
+collection, then egress.
+
+## Default posture
+
+| | Default | What it means |
+|---|---|---|
+| `telemetry.enabled` | `false` | Nothing is recorded. Metric call sites are cheap no-ops. |
+| `telemetry.otlp_endpoint` | `""` (empty) | Nothing leaves the machine. Local JSONL sink only. |
+| `telemetry.otlp_endpoints` | `[]` (empty) | Same: no extra collectors. See [Several collectors](#several-collectors-otlp_endpoints). |
+| OTLP exporter package | not installed | The OTLP exporter is not importable until installed separately. |
+
+Collection and egress are deliberately separate switches. Enabling collection
+gives you the local sink and the Telemetry panel; it does **not** send anything
+anywhere. Egress needs the endpoint set *and* the exporter package installed.
+
+The local sink is never replaced by OTLP — it is additive. When you configure an
+endpoint you get both readers, so the dashboard keeps working and you keep a
+local copy.
+
+## Turning it on
+
+### 1. Install the exporter
+
+From a source checkout, install the declared extra without replacing the editable
+Kiro Crew install:
+
+```bash
+pip install -e ".[otlp]"
+```
+
+For an existing install, install the extra's pinned distribution directly:
+
+```bash
+pip install "opentelemetry-exporter-otlp-proto-http==1.44.0"
+```
+
+The project is not published on the default package index, so
+`pip install "kirocrew[otlp]"` is not a supported command. The exporter uses
+**OTLP over HTTP only** — there is no gRPC exporter, so your collector needs its
+OTLP receiver's `http` protocol enabled (port 4318 by convention, not 4317).
+
+If the exporter package is missing but an endpoint is configured, Kiro Crew logs
+a warning and stays local-only rather than failing to start.
+
+### 2. Enable collection
+
+Either edit `~/.kiro/crew/config.json`:
+
+```json
+{
+  "telemetry": {
+    "enabled": true,
+    "otlp_endpoint": "http://localhost:4318/v1/metrics"
+  }
+}
+```
+
+or set the environment variable, which overrides the config flag in both
+directions and is the convenient form for containers and one-off debugging:
+
+```bash
+KIROCREW_TELEMETRY=1 kirocrew gateway
+```
+
+**`otlp_endpoint` is the full signal URL, including `/v1/metrics`.** It is passed
+to the exporter as-is; no path is appended for you. `http://localhost:4318` alone
+will not work.
+
+### 3. Confirm egress started
+
+On startup the gateway logs the local sink and, separately, the fact that metrics
+are leaving the machine:
+
+```
+telemetry enabled; local JSONL sink at /home/you/.kiro/crew/metrics (otlp=on)
+telemetry OTLP export active; metrics leave this machine (telemetry.otlp_endpoint)
+```
+
+The second line is the one to look for. The endpoint value is never logged — only
+the destination name — so a credential embedded in the URL does not end up in the
+journal.
+
+### Several collectors: `otlp_endpoints`
+
+`telemetry.otlp_endpoints` is a list. Each entry is its own destination with its
+own exporter, so two collectors can receive different things. When
+`otlp_endpoint` is also set, it is the first destination and keeps working exactly
+as above; the list adds to it.
+
+```json
+{
+  "telemetry": {
+    "enabled": true,
+    "otlp_endpoints": [
+      {
+        "name": "ops",
+        "endpoint": "https://collector.example.com/v1/metrics",
+        "headers_env": {"Authorization": "OPS_OTLP_AUTH"}
+      },
+      {
+        "name": "product",
+        "endpoint": "https://metrics.example.org/v1/metrics",
+        "temporality": "delta",
+        "allow": "PRODUCT_METRICS",
+        "point_attributes": {"ClientType": "desktop"},
+        "resource_allow": ["service.name", "service.version"]
+      }
+    ]
+  }
+}
+```
+
+| Key | Required | What it does |
+|---|---|---|
+| `endpoint` | yes | Full `http://` or `https://` signal URL, `/v1/metrics` included. |
+| `name` | no | Shown in logs and in Settings -> Privacy instead of the URL. Letters, digits, `.`, `_`, `-`; at most 64 characters. Defaults to `otlp_endpoints.<index>`. |
+| `enabled` | no | `false` turns the entry off. A disabled entry is not checked. |
+| `headers_env` | no | Header name -> environment variable name. The value is read from the gateway's environment when the exporter is built, so a secret is never in `config.json`. If the variable is unset or blank, that entry sends nothing and a warning names the variable. There is no key for a literal header value: an entry with a `headers` key is skipped with a warning that points here. |
+| `temporality` | no | `""` (the default described in [Temporality](#temporality-the-setting-that-decides-whether-your-backend-accepts-the-data)), `"cumulative"` or `"delta"`. A value here pins every instrument kind for this entry only, and `OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE` no longer moves it. `"delta"` is the OpenTelemetry delta preset: counters and histograms delta, up-down counters cumulative. |
+| `allow` | no | A list of full metric names, or the preset name `"PRODUCT_METRICS"` (the reviewed list in `src/kiro_crew/metrics/product_metrics.py`). Without it the entry gets every metric. An unknown preset name refuses the entry rather than sending everything. |
+| `point_attributes` | no | Fixed labels added to every data point of this entry. Keys come from a reviewed set (`ClientType` today); values are short constants (letters, digits, `.`, `_`, `-`). |
+| `resource_allow` | no | Keep only these resource keys on this entry's batches. |
+
+An entry sends only the headers it names in `headers_env`. The process-wide
+`OTEL_EXPORTER_OTLP_METRICS_HEADERS` / `OTEL_EXPORTER_OTLP_HEADERS` variables, and
+the OpenTelemetry credential-provider variable, apply to `otlp_endpoint` only, as
+they did before the list existed. A list entry with no `headers_env` sends no
+authentication at all, so a credential you set for one collector never reaches a
+second host you add later. To send the same credential to a list entry, name its
+variable in that entry's `headers_env`.
+
+A malformed entry is skipped with one warning that names the entry and the field,
+never a value, and the other entries keep working. At most 16 entries are read;
+the bound only stops a pasted list from starting hundreds of export threads.
+
+Every entry goes through the same gates as `otlp_endpoint`: nothing is sent while
+collection is off (`telemetry.enabled`, `KIROCREW_TELEMETRY`), a policy's
+`capabilities.telemetry` `otlp_hosts` list decides which hosts may receive
+metrics, and Settings -> Privacy lists every entry by name as a place metrics go.
+An entry counts there even while it sends nothing for a reason that can clear on
+its own, such as an unset `headers_env` variable. The list, like `otlp_endpoint`,
+can only be set in `config.json`, not from the dashboard.
+
+#### Collectors a build ships
+
+A build of Kiro Crew can ship a collector of its own. It does so in code, through
+its telemetry provider (`TelemetryProvider.otlp_destinations`), not as an entry in
+your `config.json`; the public build ships none. What that means for you:
+
+- Your own entries still work next to it, as long as the build keeps them (the
+  public provider's list is `otlp_endpoints.config_destinations(cfg)`, which a
+  build's provider is expected to return first).
+- Config cannot remove or turn it off, and an entry of yours cannot repoint it.
+  Settings -> Privacy lists it as included by the build.
+- It never bypasses the gates above. Turning collection off stops it, and a
+  policy can refuse its host.
+
+An enterprise build ignores `otlp_endpoint` and `otlp_endpoints` from local
+config, as it ignores `otlp_endpoint` today; collectors the build ships still
+apply, under the policy.
+
+### Other settings worth knowing
+
+| Key | Default | Notes |
+|---|---|---|
+| `telemetry.export_interval_seconds` | `60` | Applies to both readers. |
+| `telemetry.local_dir` | `~/.kiro/crew/metrics` | Local JSONL shard directory. |
+| `telemetry.retention_days` | `0` | `0` never prunes by age. |
+| `telemetry.max_total_mb` | `0` | `0` never prunes by size. |
+
+## Temporality: the setting that decides whether your backend accepts the data
+
+Counters can be exported two ways. **Cumulative** sends the running total every
+interval; **delta** sends only what changed since the last export. Backends
+disagree about which they want, and sending the wrong one is the most common
+reason metrics arrive but look wrong — a cumulative counter graphed as a rate, or
+a delta counter treated as a total that appears to reset constantly.
+
+Kiro Crew exports **delta** by default, for counters, up-down counters and
+histograms alike. That is the same encoding its local JSONL sink uses, so both
+destinations describe the same instrument the same way; it is also the cheaper
+one, because a cumulative histogram re-sends every bucket of every series on
+every interval whether or not anything happened, while an idle delta series sends
+nothing at all.
+
+To match a backend that wants something else, set the standard OpenTelemetry
+variable. When it is set, Kiro Crew passes no preference of its own and the
+setting is in full control:
+
+```bash
+# Cumulative — the OpenTelemetry default. CloudWatch, Prometheus-style backends.
+OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE=CUMULATIVE
+
+# Delta — what Datadog and most product-analytics ingests expect. Equivalent
+# to the unset default for every instrument Kiro Crew currently emits (the
+# unset default also maps up-down counters to delta; this value keeps them
+# cumulative, and Kiro Crew emits none).
+OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE=DELTA
+
+# Delta for counters and histograms, cumulative for up-down counters.
+OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE=LOWMEMORY
+```
+
+Set it in the gateway's environment, not the collector's — it governs how Kiro
+Crew *encodes* what it sends.
+
+Two things are unaffected by this setting, and knowing that saves debugging time:
+
+- **Gauges have no temporality at all.** Every instrument reporting a
+  point-in-time reading (thread counts, memory, CPU and GC totals, install
+  inventory, the probe-failure count) is a gauge, so the preference does not
+  apply to them. Nothing Kiro Crew exports is a cumulative sum, which is what
+  lets a consumer aggregate one datapoint at a time instead of holding
+  whole-hour state per host.
+- **The local JSONL sink always uses delta** for counters and histograms,
+  whatever this variable says. It is a separate reader with its own encoding, and
+  the dashboard aggregator depends on it.
+
+### If you already export these metrics
+
+These five instruments are gauges that hold lifetime totals, under these
+names:
+
+- `kirocrew.process.cpu.seconds`
+- `kirocrew.process.gc.collections`
+- `kirocrew.process.gc.collected`
+- `kirocrew.process.gc.uncollectable`
+- `kirocrew.inventory.probe.failures`
+
+Each reading is the total since the exporting process started, carried as a
+gauge rather than a monotonic sum. Do not apply a counter function (`rate()`,
+`increase()`, delta-from-cumulative) to them: take the difference between
+consecutive samples instead.
+
+Handle a restart the way you would for any gauge you difference: **clamp negative
+increments to zero**. `service.instance.id` identifies the INSTALL, not the
+process, so a restart does not automatically start a new series at your backend —
+and if the new process happens to reuse the old PID (the kernel wraps through
+`pid_max`), the resource labels are identical while the totals begin again near
+zero, so one consecutive-sample difference across that boundary comes out
+negative. That is one datapoint at a restart boundary, not a corrupted series, and
+a clamp is the standard treatment.
+
+Kiro Crew's own dashboard is not exposed to this: the local JSONL exporter stamps
+each record with the writing process's OS start-time token, and the aggregator
+keys each stream by (PID, that token), so a reused PID lands in a brand-new
+stream. The token is deliberately host-local and reboot-unique, so it never leaves
+the machine — which is why an OTLP consumer has to do the clamp instead.
+
+You can also convert temporality inside the collector with the
+`cumulativetodelta` processor, which is the better lever when one collector feeds
+two backends that disagree.
+
+## Collector configuration
+
+The examples below are collector configs. Point Kiro Crew at the collector's OTLP
+HTTP receiver and let the collector fan out.
+
+**Distribution matters.** The `otelcol` core distribution ships the OTLP receiver
+and a small set of exporters. The vendor exporters below (`awsemf`, `datadog`)
+are only in **`otelcol-contrib`**. Using core and wondering why an exporter is
+"unknown type" is the usual first mistake.
+
+**These samples are illustrative, not tracked.** Vendor exporter options change
+with collector and vendor releases that this repository does not follow, so treat
+each vendor's own collector documentation as authoritative and these blocks as a
+starting shape. What is stable — and what this page actually owns — is the Kiro
+Crew side: the two consent switches, the full-signal-URL requirement, and the
+temporality preference.
+
+### Shared receiver
+
+Every example starts here:
+
+```yaml
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 127.0.0.1:4318
+```
+
+Bind to `127.0.0.1` when the collector runs on the same host as the gateway. A
+`0.0.0.0` bind accepts metrics from anywhere on the network and needs its own
+authentication story.
+
+### Amazon CloudWatch
+
+The `awsemf` exporter writes CloudWatch Embedded Metric Format, which turns each
+metric into a CloudWatch metric via a log group.
+
+```yaml
+exporters:
+  awsemf:
+    region: us-west-2
+    namespace: KiroCrew
+    log_group_name: /kirocrew/metrics
+
+service:
+  pipelines:
+    metrics:
+      receivers: [otlp]
+      exporters: [awsemf]
+```
+
+Use `CUMULATIVE` temporality with this path. Credentials come from the
+collector's own environment via the standard AWS chain, so the collector needs
+`logs:PutLogEvents` and `logs:CreateLogStream` on that log group.
+
+### Datadog
+
+```yaml
+exporters:
+  datadog:
+    api:
+      key: ${env:DD_API_KEY}
+      site: datadoghq.com
+
+processors:
+  # Datadog expects delta counters. Convert here if you would rather not set the
+  # temporality preference on every gateway.
+  cumulativetodelta: {}
+
+service:
+  pipelines:
+    metrics:
+      receivers: [otlp]
+      processors: [cumulativetodelta]
+      exporters: [datadog]
+```
+
+Set `DD_API_KEY` in the collector's environment rather than inlining it.
+
+### Any other OTLP-compatible backend
+
+Most analytics and observability services accept OTLP/HTTP directly. Forward with
+`otlphttp` and add whatever authentication header that service documents:
+
+```yaml
+exporters:
+  otlphttp/vendor:
+    endpoint: https://otlp.example-vendor.com
+    headers:
+      authorization: ${env:VENDOR_API_KEY}
+
+service:
+  pipelines:
+    metrics:
+      receivers: [otlp]
+      exporters: [otlphttp/vendor]
+```
+
+Check that vendor's documentation for three things, because they vary: the exact
+endpoint (some want the base URL and append `/v1/metrics` themselves, others want
+the full signal path), the header name, and the temporality they expect.
+
+One pipeline can also carry several exporters, which is the reason to run a
+collector at all rather than pointing the gateway straight at a vendor.
+
+## What gets exported
+
+The OTLP reader shares one meter provider with the local JSONL sink, so every
+`kirocrew.*` instrument the process records is exported — counters, histograms
+and gauges alike. The full roster lives under "Instrumented signals" in
+[`../system-specs/modules/metrics.md`](../system-specs/modules/metrics.md). The
+gauge families are these two:
+
+- **`kirocrew.process.*`** — this process's own resource behavior: Python and OS
+  thread counts, open file descriptors, current and peak RSS, cumulative CPU
+  seconds, and per-generation GC counters. This family also carries histograms
+  (sampled RSS and CPU utilization).
+- **`kirocrew.inventory.*`** — what this install has configured: active cron jobs,
+  armed monitor loops, installed skills, whether memory has been migrated,
+  knowledge-source and lesson counts, MCP server counts by class, and a
+  fixed set of feature switches. Plus `kirocrew.inventory.probe.failures`, which is
+  absent on a healthy host and appears only when a probe cannot read its source —
+  that is how you tell a broken probe from a host that stopped exporting, since
+  both otherwise look like a missing series.
+
+One threshold is worth knowing when you set alerts on the counts, because it is
+the product's own limit rather than a round number: `200` is the point the lesson
+store starts pruning. The gauges publish the raw number and leave the banding to
+your queries, so you can move that line without a Kiro Crew change.
+
+Resource attributes identify the sending process and are attached to every
+series, so they are what you group by. `service.name` is always `kirocrew`.
+
+### A destination can receive less than everything
+
+The paragraph above describes the destination you configure: `otlp_endpoint`
+sends your own collector every instrument the process records, under the full
+resource, with no attribute Kiro Crew added on its way out. That is unchanged and
+is what this guide is about.
+
+A destination is also allowed to receive only PART of that. `OtlpDestination`
+carries three optional fields. An `otlp_endpoints` entry sets them with the keys
+of the same names, and a build that assembles its own destination can set them
+too:
+
+- `allow` -- only metrics whose name is in this set are sent. Unset means
+  everything, which is what your endpoint gets.
+- `point_attributes` -- fixed key/value pairs added to every data point of that
+  destination. The one reviewed key today is `ClientType`.
+- `resource_allow` -- that destination's batches carry a resource reduced to these
+  keys, so a destination that may see only `service.name` and `service.version`
+  does not receive `service.instance.id`.
+
+Three things to take from this if you operate a collector:
+
+- **Your destination is not affected by another one.** Each destination's
+  narrowing is applied to its own exporter, so nothing another destination
+  declares can add an attribute to, or remove a metric from, what reaches yours.
+- **The local JSONL sink is never narrowed.** It records everything the process
+  collected, under the full resource, which is what makes it the place to check
+  what was actually measured on a machine.
+- **A narrowing can only reduce.** None of the three fields can add a metric, relax
+  the consent gate, or bypass the attribute sanitiser; a destination that sets
+  none of them behaves exactly as this guide describes.
+
+### The `PRODUCT_METRICS` preset
+
+`"allow": "PRODUCT_METRICS"` sends only the reviewed names below, from
+`src/kiro_crew/metrics/product_metrics.py`. Each is a counter or a gauge, and
+every attribute value on it comes from a closed set. Histograms,
+`kirocrew.process.*` and `kirocrew.turn.tokens` are not in it.
+
+| Group | Metrics (`kirocrew.` prefix omitted) |
+|---|---|
+| Sessions and turns | `session.started`, `session.idle_expired`, `subagent.spawned`, `subagent.completed`, `context.compactions`, `turn.completed`, `turn.timeout.cause` |
+| Crew sessions | `crew.session.started`, `crew.turn.started`, `crew.session.tree.depth`, `crew.session.tree.child`, `crew.session_control.calls` |
+| Work ledger and Ultra Mode | `work.created`, `work.item_closed`, `work.dispatches`, `work.reports`, `crew_mode.turned_on`, `crew_mode.new_chats`, `crew_mode.runs_finished`, `crew_mode.steers_per_run`, `crew_mode.worker_waits` |
+| Features | `cron.fires`, `artifact.created`, `workflow.runs`, `approval.decisions`, `autonudge.loops.started`, `autonudge.loops.stopped`, `autonudge.ticks`, `monitor.decisions`, `webhook.requests`, `memory.recalled`, `lesson.injected`, `skill.lazy_load.count`, `app.task.completed`, `channel.message.received`, `ui.control.clicked` |
+| Inventory (gauges) | `inventory.crons.active`, `inventory.monitor_loops.active`, `inventory.skills.installed`, `inventory.memory.migrated`, `inventory.knowledge.documents`, `inventory.lessons`, `inventory.mcp.servers`, `inventory.config.toggle`, `inventory.probe.failures`, `inventory.members` |
+| Recommendations | `tips.feedback`, `feature_video.status`, `milestone.panel_opened`, `milestone.starter_clicked`, `milestone.reached`, `milestone.skipped`, `milestone.mark_all_done`, `milestone.notice_shown`, `milestone.features_completed` |
+
+`PRODUCT_METRICS` groups its names by the question they answer. One group covers
+in-product recommendations (feature tips, the Explore panel, feature videos):
+
+| Metric | Attributes |
+|---|---|
+| `kirocrew.tips.feedback` | `Feature` = `tips`, `Activity` (the action: `shown` / `ack` / `dismiss` / `snooze` / `helpful` / `optout` / `optin` / `other`), `Entity` (a shipped feature doc name or `other`), `source` (`curated` / `catalog` / `generated` / `other`) |
+| `kirocrew.feature_video.status` | `Feature` = `feature_video`, `Activity` (the status: `seen` / `dismissed` / `other`), `Entity` (a shipped feature key or `other`) |
+| `kirocrew.milestone.starter_clicked`, `.skipped` | `Feature` = `milestone`, `Activity` = the last name segment, `Entity` (a catalog milestone id, `all` or `other`), `surface`, and `send` on `starter_clicked` |
+| `kirocrew.milestone.reached` | `Feature` = `milestone`, `Activity` = `reached`, `Entity` (a catalog milestone id), `group`, `via`, `recommended_by` (`tip` / `explore` / `video` / `several` / `none`) |
+| `kirocrew.milestone.panel_opened`, `.mark_all_done`, `.notice_shown`, `.features_completed` | `Feature` = `milestone`, `Activity` = the last name segment, plus `group` on `notice_shown` and `via` on `features_completed` |
+
+These nine are the behavioral metrics (`BEHAVIORAL_METRICS` in
+`src/kiro_crew/metrics/behavioral_metrics.py`): each records one thing a person
+did. They are exported under the instrumentation scope `kiro.crew`, so a
+collector can admit user behavior by scope without taking the inventory gauges.
+Every other metric uses the scope `kiro_crew`. `Feature` and `Activity` are
+constants or values the emit site already closed; `Entity` carries the closed
+target id that earlier releases sent as `feature` or `milestone`.
+
+None carries a tip id, a video id, a timestamp or tip text. `recommended_by` is
+computed on the machine from a 14-day local record and only the label is sent;
+the record itself stays in the owner-only milestones state file. The rules are
+in [`../system-specs/modules/metrics.md`](../system-specs/modules/metrics.md),
+"Recommendation attribution".
+
+### Before you build a per-host dashboard
+
+Kiro Crew sets `service.instance.id` explicitly to a random, persisted install
+identifier, so group by that attribute to distinguish machines and follow an
+install across gateway restarts. It is not derived from a hostname or username.
+`process.pid` is a separate resource attribute: it prevents the gateway, agents,
+and app processes on one install from interleaving their per-process gauges.
+
+That process attribute means an individual series normally turns over when a
+restart receives a different PID even though the install identity stays stable.
+For longitudinal host panels, aggregate the relevant process series by
+`service.instance.id`; for lifetime-total gauges, also treat a new PID as a reset.
+If the data home is unwritable and the install-id mint fails, Kiro Crew omits its
+explicit id and the SDK may fall back to a per-process identity, so cross-restart
+continuity is unavailable on that broken host.
+
+### What these can and cannot tell you
+
+They describe **the machines you run and have opted in**, and nothing wider. Both
+switches default off and OTLP additionally needs the optional exporter package,
+so an aggregate over these gauges is a statement about your own fleet — useful
+for spotting a host that stopped scheduling crons or whose skills tree drifted,
+not a measurement of how a feature is used in general. Kiro Crew's own install
+analytics are a separate, deliberately unrelated channel (`beacon.py`), for
+reasons its docstring sets out.
+
+One practical consequence: `kirocrew.inventory.*` comes from the **gateway process
+only**, while `kirocrew.process.*` comes from every telemetry-enabled process
+(gateway, MCP gateway daemon, spawned agents). Install-level facts are identical
+across those processes, so publishing them from each one would count a single host
+once per process. If you see process metrics from a host but no inventory metrics,
+the gateway on that host is not running or not exporting — that is the signal, not
+a gap in collection.
+
+### Traces are not exported
+
+Kiro Crew emits the OpenTelemetry **metrics** signal only. There are no spans
+and no log records, so a trace-oriented backend (Langfuse, Jaeger, Tempo, or a
+vendor's trace view) receives nothing from it, and nothing in this page turns
+traces on. Pointing `otlp_endpoint` at a `/v1/traces` or `/v1/logs` URL does not
+change that: the collector rejects every metric batch. The gateway logs a
+warning naming the destination when the endpoint's path is one of those routes.
+Trace support is tracked in issue #1643.
+
+### What is deliberately not exported
+
+Reading these metrics should not tell you what a user is working on:
+
+- **No MCP server names.** The MCP gauge publishes two counts, `first_party` and
+  `third_party`. Server names are read to classify and then discarded, because a
+  roster is user-chosen text — unbounded as a label and revealing as data.
+- **No knowledge or lesson content.** Those two gauges publish a count and nothing
+  else: no source titles, paths, or text, and no per-document attributes. The count
+  is deliberately raw rather than banded — the destination is your own collector
+  describing your own machines, and a band would hide exactly the growth the gauge
+  is there to show.
+- **No paths, endpoints, prompts, message content, or session identifiers**
+  anywhere in a metric name or attribute value.
+- **A subsystem that cannot answer produces no data point** rather than a zero.
+  A missing series means "could not read"; a `0` means a real zero. If a series
+  you expect is absent, that is the gauge telling you something.
+
+## Verifying it end to end
+
+### Automated
+
+```bash
+pytest test/metrics/test_otlp_wire_e2e.py
+```
+
+Two tiers. The first drives a real build through a real exporter and asserts the
+instrument roster, resource-attribute fidelity, attribute values, and
+temporality. The second stands up an in-process OTLP receiver on loopback,
+exports to it with the real OTLP exporter, and decodes the protobuf — that tier
+skips unless the OTLP exporter package is installed.
+
+### Against a real collector
+
+The automated tiers stop at the process boundary: they prove what Kiro Crew
+serializes and puts on the wire, not what a collector does with it. Closing that
+last gap needs a collector binary and outbound network, so it is a manual step —
+and one worth doing once against whatever collector you actually run, rather than
+against a stand-in.
+
+Point a collector at Kiro Crew using the [Shared receiver](#shared-receiver)
+config above, and give it an exporter you can read directly instead of a vendor
+backend, so the payload is inspectable:
+
+```yaml
+exporters:
+  # `debug` ships in every collector distribution; `file` needs a distribution
+  # that bundles the contrib file exporter (the standard `otelcol` build does).
+  debug:
+    verbosity: detailed
+
+service:
+  pipelines:
+    metrics:
+      receivers: [otlp]
+      exporters: [debug]
+```
+
+Then start the gateway with `otlp_endpoint` set to that collector, wait one export
+interval, and read what arrived. Expect the `kirocrew.process.*` and
+`kirocrew.inventory.*` gauges, any other `kirocrew.*` instruments the process has
+recorded since start, and the resource attributes described above.
+
+Some instruments are legitimately absent and their silence is not a failure: the
+Linux-only thread and file-descriptor gauges on macOS, and the knowledge, MCP, and
+monitor-loop gauges on an install that has never ingested a document, configured a
+server, or armed a loop. `kirocrew.inventory.probe.failures` is the series that
+distinguishes a probe that broke from a source that is simply not there.
+
+If you fetch a collector binary rather than using one you already run, verify it
+against the checksums published with that release; each release also publishes
+cosign `.sig` and `.pem` files, which are the stronger check and worth using if you
+are vendoring the binary into your own infrastructure.
+
+### By hand, with no collector at all
+
+The quickest smoke test is to watch the local sink, which is fed by the same
+recorder:
+
+```bash
+KIROCREW_TELEMETRY=1 kirocrew gateway
+# after one export interval (60s by default)
+ls ~/.kiro/crew/metrics/
+latest="$(ls -t ~/.kiro/crew/metrics/metrics-*.jsonl | head -1)"
+tail -n 1 "$latest" | python3 -m json.tool | head -40
+```
+
+If instruments appear there but not at your backend, the problem is the endpoint,
+the collector, or temporality — not collection.
+
+## Troubleshooting
+
+| Symptom | Likely cause |
+|---|---|
+| No `telemetry OTLP export active` line | `otlp_endpoint` empty, or the OTLP exporter package is not installed — check for the warning naming the missing package. |
+| `OTLP exporter init failed` warning | Malformed endpoint. The message deliberately omits the URL, since it can carry a credential. |
+| Local shards fill, nothing at the backend | Endpoint missing `/v1/metrics`, collector on 4317 (gRPC) instead of 4318 (HTTP), or the collector's `http` protocol not enabled. |
+| `points at an OTLP traces route` warning | The endpoint ends in `/v1/traces` (or `/v1/logs`). Kiro Crew exports metrics only, so a trace backend such as Langfuse receives nothing. See "Traces are not exported". |
+| Metrics arrive but counters look like resets | Temporality mismatch. See the temporality section. |
+| `unknown type: "awsemf"` at collector startup | Running the core `otelcol`; vendor exporters need `otelcol-contrib`. |
+| One expected series is absent | That probe could not read its source. Absence is a gap, never a zero. |
+| Nothing recorded at all | Collection consent: `telemetry.enabled` is `false` and `KIROCREW_TELEMETRY` is unset. |

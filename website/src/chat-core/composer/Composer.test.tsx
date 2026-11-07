@@ -1,0 +1,330 @@
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { useEffect, useState, type ReactNode } from 'react'
+import { act, fireEvent, render, screen } from '@testing-library/react'
+import { MemoryRouter } from 'react-router-dom'
+import { defaultScheduler, notifyManager, QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { Provider } from 'react-redux'
+import { configureStore } from '@reduxjs/toolkit'
+import chatReducer from '../../store/chatSlice'
+import dashboardReducer from '../../store/dashboardSlice'
+import notificationsReducer from '../../store/notificationsSlice'
+import type { RootState } from '../../store'
+
+/* chat-core P3-b: `ChatInput` gets its microphone from the Composer root's Voice
+ * atom, not from props. These tests pin the contract at the root: standalone =
+ * no mic; under a root = mic; the host handle reaches the atom's controls. */
+
+const engine = {
+  recording: false, transcribing: false, sessionOwner: null as string | null, streamEnabled: false,
+  toggle: vi.fn(), start: vi.fn().mockResolvedValue(undefined), stop: vi.fn(), cancel: vi.fn(), prewarm: vi.fn(),
+  error: null as string | null, level: 0, deviceLabel: '', deviceId: '', clearError: vi.fn(), partial: '',
+  download: null, sampleRef: { current: {} }, switchDevice: vi.fn(), deviceSwitchIsLive: false,
+}
+// `fresh` mimics the real `useVoiceInput`, whose return is a NEW object literal each call while every
+// member (`clearError`, `toggle`, ...) is one stable function. Off by default so the older tests below
+// keep the single-object engine they were written against.
+const voiceFx = vi.hoisted(() => ({ fresh: false }))
+vi.mock('../../hooks/useVoiceInput', () => ({
+  useVoiceInput: () => (voiceFx.fresh ? { ...engine } : engine),
+  voiceInputSupported: true,
+}))
+// `useComposerVoiceSlice` is called once per `ChatInput` body and nowhere else in src, so this counts
+// ChatInput BODY renders exactly. (A <Profiler> over-reports across a memo boundary: see
+// test/ChatSidebar.rowMemo.test.tsx.) The wrapper delegates to the real hook.
+const bodyCount = vi.hoisted(() => ({ chatInput: 0 }))
+vi.mock('./Composer', async importOriginal => {
+  const actual = await importOriginal<typeof import('./Composer')>()
+  return {
+    ...actual,
+    useComposerVoiceSlice: () => { bodyCount.chatInput++; return actual.useComposerVoiceSlice() },
+  }
+})
+// One stable object, as the real hook's state is between renders: a fresh literal per call would
+// itself wake ChatInput and hide what the render-stability tests below measure.
+const ptt = vi.hoisted(() => ({ config: { enabled: false, mode: 'hybrid', binding: { code: 'AltRight' }, holdMs: 500 }, phase: 'idle', holding: false }))
+vi.mock('../../hooks/usePushToTalk', () => ({ usePushToTalk: () => ptt }))
+vi.mock('../../api/client', () => ({
+  api: {
+    sttConfig: vi.fn().mockResolvedValue({ enabled: true, available: true, streaming: false, dictation_panel: true, provider: 'local' }),
+    fileSearch: vi.fn().mockResolvedValue({ root: '/repo', results: [] }),
+    agents: vi.fn().mockResolvedValue([]),
+    models: vi.fn().mockResolvedValue([]),
+    dashboardConfig: vi.fn().mockResolvedValue({}),
+  },
+  SEARCH_MIN_CHARS: 2,
+  ApiError: class ApiError extends Error {},
+}))
+vi.mock('../../hooks/useWebSocket', () => ({ useWebSocket: () => ({ subscribeLogs: () => {} }) }))
+
+Object.defineProperty(window, 'matchMedia', {
+  writable: true,
+  value: vi.fn().mockReturnValue({ matches: false, addEventListener: vi.fn(), removeEventListener: vi.fn() }),
+})
+
+import ChatInput from '../../components/ChatInput'
+import { Composer, type ComposerHandle } from './Composer'
+import { ComposerEditor, ComposerSend, composerSendState } from './atoms'
+import { createComposerDraftStore } from './draftStore'
+import { SlotProvider } from '../../providers/SlotContext'
+import { deriveFollowUpOptions } from '../../app-sdk/protocol'
+import type { ChatMessage } from '../../types'
+
+function makeStore() {
+  return configureStore({
+    reducer: { dashboard: dashboardReducer, chat: chatReducer, notifications: notificationsReducer },
+    preloadedState: {
+      dashboard: {
+        status: null, connected: true, slots: [], unreadSlots: [], refreshTrigger: 0, approvalMode: 'normal',
+        subagentRunning: {}, subagentDetails: {}, subagentText: {},
+      } as unknown as RootState['dashboard'],
+    } as Partial<RootState>,
+  })
+}
+
+function Providers({ children }: { children: ReactNode }) {
+  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+  // Fresh forever, so the seed is not refetched on mount: a refetch resolving after mount renders
+  // ChatInput once more, and the render-stability tests below would count it as per-chunk churn.
+  qc.setQueryDefaults(['sttConfig'], { staleTime: Infinity })
+  qc.setQueryData(['sttConfig'], { enabled: true, available: true, streaming: false, dictation_panel: true, provider: 'local' })
+  return (
+    <Provider store={makeStore()}>
+      <QueryClientProvider client={qc}>
+        <MemoryRouter>
+          <SlotProvider slotId="chat-1-x">{children}</SlotProvider>
+        </MemoryRouter>
+      </QueryClientProvider>
+    </Provider>
+  )
+}
+
+const input = { value: '', onChange: () => {}, onSend: () => {} }
+const mic = () => screen.queryByRole('button', { name: /^Voice input/ })
+
+beforeEach(() => { engine.start.mockClear(); voiceFx.fresh = false; bodyCount.chatInput = 0 })
+
+describe('Composer root + Voice atom', () => {
+  it('a standalone ChatInput has no microphone', () => {
+    render(<Providers><ChatInput {...input} /></Providers>)
+    expect(mic()).toBeNull()
+  })
+
+  it('under a Composer root the same ChatInput renders the microphone, with zero voice props', async () => {
+    await act(async () => {
+      render(
+        <Providers>
+          <Composer slotKey="chat-1-x" value="" onChange={() => {}}>
+            <ChatInput {...input} />
+          </Composer>
+        </Providers>,
+      )
+    })
+    expect(mic()).toBeTruthy()
+    await act(async () => { fireEvent.click(mic()!) })
+    expect(engine.start).toHaveBeenCalledTimes(1)
+  })
+
+  it('the host handle reaches the atom controls (disarmForSend for the send path)', async () => {
+    const ref = { current: null as ComposerHandle | null }
+    await act(async () => {
+      render(
+        <Providers>
+          <Composer ref={ref} slotKey="chat-1-x" value="" onChange={() => {}}>
+            <ChatInput {...input} />
+          </Composer>
+        </Providers>,
+      )
+    })
+    expect(typeof ref.current?.voice()?.disarmForSend).toBe('function')
+  })
+})
+
+describe('Composer root with a draft store (P3-f)', () => {
+  it('ChatInput shows and edits the store text while the host does not re-render', async () => {
+    const draft = createComposerDraftStore('hello')
+    let hostRenders = 0
+    const onChange = (v: string) => draft.set(v)
+    function Host() {
+      hostRenders++
+      return (
+        <Composer slotKey="chat-1-x" draft={draft} onChange={onChange}>
+          <ChatInput onChange={onChange} onSend={() => {}} />
+        </Composer>
+      )
+    }
+    await act(async () => { render(<Providers><Host /></Providers>) })
+    const box = screen.getByRole('textbox', { name: 'Message input' }) as HTMLTextAreaElement
+    expect(box.value).toBe('hello')
+    const before = hostRenders
+    await act(async () => { draft.set('hello world') })
+    expect(box.value).toBe('hello world')
+    await act(async () => { fireEvent.change(box, { target: { value: 'typed by the user' } }) })
+    expect(draft.get()).toBe('typed by the user')
+    expect(box.value).toBe('typed by the user')
+    // Every text change above reached the editor; none re-rendered the host.
+    expect(hostRenders).toBe(before)
+  })
+})
+
+describe('Composer capabilities (embedded preset)', () => {
+  it('voice: false keeps the Voice atom unmounted, so ChatInput gets no microphone', async () => {
+    await act(async () => {
+      render(
+        <Providers>
+          <Composer slotKey="chat-1-x" value="" onChange={() => {}} capabilities={{ voice: false }}>
+            <ChatInput {...input} />
+          </Composer>
+        </Providers>,
+      )
+    })
+    expect(mic()).toBeNull()
+  })
+
+  it('voice: false needs no router: the root mounts outside one', async () => {
+    await act(async () => {
+      render(
+        <Composer slotKey="chat-1-x" value="" onChange={() => {}} capabilities={{ voice: false }}>
+          <ComposerEditor aria-label="Editor" />
+        </Composer>,
+      )
+    })
+    expect(screen.getByRole('textbox', { name: 'Editor' })).toBeTruthy()
+  })
+})
+
+describe('Composer Editor + Send atoms (P3-f)', () => {
+  function Host({ running = false, hasAttachments = false, uploading = false }: { running?: boolean; hasAttachments?: boolean; uploading?: boolean }) {
+    const [text, setText] = useState('')
+    const [sent, setSent] = useState<string[]>([])
+    return (
+      <Composer slotKey="s" value={text} onChange={setText} capabilities={{ voice: false }}>
+        <ComposerEditor aria-label="Editor" />
+        <ComposerSend onSend={() => setSent(s => [...s, text])} running={running} hasAttachments={hasAttachments} uploading={uploading} />
+        <output data-testid="sent">{sent.join('|')}</output>
+      </Composer>
+    )
+  }
+  const send = () => document.querySelector<HTMLButtonElement>('[data-composer-send]')!
+
+  it('the editor writes the root text and Send enables only with content', async () => {
+    render(<Host />)
+    expect(send().dataset.composerSend).toBe('idle')
+    expect(send().disabled).toBe(true)
+    fireEvent.change(screen.getByRole('textbox', { name: 'Editor' }), { target: { value: 'hi' } })
+    expect(send().disabled).toBe(false)
+    fireEvent.click(send())
+    expect(screen.getByTestId('sent').textContent).toBe('hi')
+  })
+
+  it('a running turn turns Send into Queue once there is text, with the word shown', () => {
+    render(<Host running />)
+    expect(send().dataset.composerSend).toBe('idle')
+    fireEvent.change(screen.getByRole('textbox', { name: 'Editor' }), { target: { value: 'later' } })
+    expect(send().dataset.composerSend).toBe('queue')
+    expect(screen.getByRole('button', { name: 'Queue message' })).toBe(send())
+    // Visible text, not only colour, glyph and a tooltip.
+    expect(send().textContent).toBe('Queue')
+    expect(send().title).toBe('Run after the current work finishes')
+  })
+
+  it('staged files alone make a sendable turn, and queue while a turn runs', () => {
+    const { rerender } = render(<Host hasAttachments />)
+    expect(send().disabled).toBe(false)
+    expect(send().dataset.composerSend).toBe('idle')
+    rerender(<Host hasAttachments running />)
+    expect(send().dataset.composerSend).toBe('queue')
+    expect(send().disabled).toBe(false)
+  })
+
+  it('an upload still running refuses the press, with or without text', () => {
+    const { rerender } = render(<Host uploading hasAttachments />)
+    expect(send().disabled).toBe(true)
+    fireEvent.change(screen.getByRole('textbox', { name: 'Editor' }), { target: { value: 'see attached' } })
+    expect(send().disabled).toBe(true)
+    rerender(<Host hasAttachments />)
+    expect(send().disabled).toBe(false)
+  })
+
+  it('reads a draft store without the host re-rendering', async () => {
+    const draft = createComposerDraftStore('')
+    render(
+      <Composer slotKey="s" draft={draft} onChange={v => draft.set(v)} capabilities={{ voice: false }}>
+        <ComposerEditor aria-label="Editor" />
+        <ComposerSend onSend={() => {}} />
+      </Composer>,
+    )
+    expect(send().disabled).toBe(true)
+    await act(async () => { draft.set('from the store') })
+    expect((screen.getByRole('textbox', { name: 'Editor' }) as HTMLTextAreaElement).value).toBe('from the store')
+    expect(send().disabled).toBe(false)
+  })
+
+  it('an atom outside a root fails loudly', () => {
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {})
+    try {
+      expect(() => render(<ComposerEditor />)).toThrow(/inside <Composer>/)
+    } finally { err.mockRestore() }
+  })
+})
+
+describe('composerSendState', () => {
+  it.each([
+    [{ running: false, hasContent: false }, 'idle'],
+    [{ running: false, hasContent: true }, 'idle'],
+    [{ running: true, hasContent: true }, 'queue'],
+    [{ running: true, hasContent: false }, 'idle'],
+  ] as const)('%o -> %s', (args, want) => {
+    expect(composerSendState(args)).toBe(want)
+  })
+})
+
+describe('ChatInput render stability under a host render that changes nothing', () => {
+  // React Query hands results to React on a setTimeout(0), so its mount-time notification would land
+  // after the baseline and count as churn. As microtasks, the act() flush below settles them first.
+  beforeEach(() => { notifyManager.setScheduler(queueMicrotask) })
+  afterEach(() => { notifyManager.setScheduler(defaultScheduler) })
+
+  // Module-level so every Host render hands ChatInput IDENTICAL props except `followUpOptions`.
+  const NOOP = () => {}
+  const STREAMING: ChatMessage[] = [
+    { role: 'user', content: 'go', cls: 'msg msg-u' },
+    { role: 'streaming', content: 'partial answer', cls: 'msg msg-a' },
+  ]
+
+  // Re-renders only itself (not `Providers`, which builds a new store/QueryClient per render).
+  // `derive` re-derives follow-up options on every Host render, as ChatPage's useMemo does per chunk.
+  function RenderHost({ derive, bumpRef }: { derive: boolean; bumpRef: { current: (() => void) | null } }) {
+    const [, setTick] = useState(0)
+    useEffect(() => { bumpRef.current = () => setTick(n => n + 1) }, [bumpRef])
+    const followUpOptions = derive ? deriveFollowUpOptions(STREAMING, true).followUpOptions : undefined
+    return (
+      <Composer slotKey="chat-1-x" value="" onChange={NOOP}>
+        <ChatInput value="" onChange={NOOP} onSend={NOOP} followUpOptions={followUpOptions} onFollowUpSelect={NOOP} />
+      </Composer>
+    )
+  }
+
+  async function chatInputRendersAcrossThreeNoopHostRenders(derive: boolean) {
+    const bumpRef: { current: (() => void) | null } = { current: null }
+    await act(async () => { render(<Providers><RenderHost derive={derive} bumpRef={bumpRef} /></Providers>) })
+    await act(async () => { await Promise.resolve() })          // let the seeded sttConfig / effects settle
+    const base = bodyCount.chatInput
+    expect(base).toBeGreaterThan(0)
+    for (let i = 0; i < 3; i++) await act(async () => { bumpRef.current!() })
+    return bodyCount.chatInput - base
+  }
+
+  it('voice slot: a fresh useVoiceInput object per render does not wake ChatInput', async () => {
+    voiceFx.fresh = true
+    expect(await chatInputRendersAcrossThreeNoopHostRenders(false)).toBe(0)
+  })
+
+  it('follow-up options: re-deriving the empty offer does not wake ChatInput', async () => {
+    expect(await chatInputRendersAcrossThreeNoopHostRenders(true)).toBe(0)
+  })
+
+  it('both together, as ChatPage renders it on a streamed chunk', async () => {
+    voiceFx.fresh = true
+    expect(await chatInputRendersAcrossThreeNoopHostRenders(true)).toBe(0)
+  })
+})

@@ -1,0 +1,527 @@
+"""Recovery path for a cron job with no owning chat session.
+
+A cron created outside a chat (``kirocrew cron add``, the Schedule page, an
+onboarding import) has an empty ``session_key``, which is correct: the field is
+the delivery target. Per-session scoping leaves such a job outside every chat, so
+these tests pin the way back: ``cron list`` shows ownership, ``cron adopt`` sets
+it, and ``--session-of`` stays the exact inverse of the delivery transform.
+"""
+
+import argparse
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from kiro_crew.cli_commands import _cron
+from kiro_crew.cron import CronService
+from kiro_crew.history import ConversationLog
+
+
+def _job(job_id="abc12345", *, session_key="", created_by=""):
+    job = MagicMock()
+    job.id = job_id
+    job.name = "nightly"
+    job.message = "run the sweep"
+    job.enabled = True
+    job.schedule.kind = "every"
+    job.schedule.every_secs = 3600
+    job.schedule.cron_expr = None
+    job.schedule.at_ts = None
+    job.session_key = session_key
+    job.created_by = created_by
+    return job
+
+
+def _adopt_args(job_id="abc12345", *, session_of=None, release=False):
+    return argparse.Namespace(
+        cron_action="adopt",
+        job_id=job_id,
+        session_of=session_of,
+        release=release,
+    )
+
+
+class TestCronListOwnership:
+    """``cron list`` is the only surface that shows who owns a job."""
+
+    def test_list_marks_a_job_with_no_owning_session(self, capsys):
+        with (
+            patch("kiro_crew.cli_commands.CronService") as mock_svc_cls,
+            patch("kiro_crew.cli_commands.sel"),
+        ):
+            mock_svc_cls.return_value.list_jobs.return_value = [_job()]
+            _cron(argparse.Namespace(cron_action="list"))
+        out = capsys.readouterr().out
+        # Without this line the CLI was the one place the state existed and
+        # nothing rendered it, so a correct "no chat owns this" read as a job
+        # that had silently vanished from chat.
+        assert "owner: none" in out
+        assert "dashboard Schedule page" in out
+
+    def test_list_shows_the_owning_session_key(self, capsys):
+        with (
+            patch("kiro_crew.cli_commands.CronService") as mock_svc_cls,
+            patch("kiro_crew.cli_commands.sel"),
+        ):
+            mock_svc_cls.return_value.list_jobs.return_value = [
+                _job(session_key="dashboard:chat-3-1712793600")
+            ]
+            _cron(argparse.Namespace(cron_action="list"))
+        out = capsys.readouterr().out
+        assert "owner: dashboard:chat-3-1712793600" in out
+        assert "owner: none" not in out
+
+    def test_list_shows_provenance_when_tagged(self, capsys):
+        """``created_by`` is a separate, namespaced provenance tag (``app:*`` /
+        ``import:*``) and is NOT the owner -- printing both keeps them distinct."""
+        with (
+            patch("kiro_crew.cli_commands.CronService") as mock_svc_cls,
+            patch("kiro_crew.cli_commands.sel"),
+        ):
+            mock_svc_cls.return_value.list_jobs.return_value = [
+                _job(created_by="import:slack-reminders")
+            ]
+            _cron(argparse.Namespace(cron_action="list"))
+        out = capsys.readouterr().out
+        assert "owner: none" in out
+        assert "created by: import:slack-reminders" in out
+
+
+class TestCronAdopt:
+    def test_adopt_reports_the_delivery_consequence(self, capsys):
+        with (
+            patch("kiro_crew.cli_commands.CronService") as mock_svc_cls,
+            patch("kiro_crew.cli_commands.sel"),
+        ):
+            mock_svc = mock_svc_cls.return_value
+            mock_svc.adopt_job.return_value = True
+            _cron(_adopt_args(session_of="chat-3-1712793600"))
+        out = capsys.readouterr().out
+        # The message states the delivery consequence, because for this field
+        # owning the job and receiving its output are the same fact.
+        assert "results are delivered there" in out
+        assert "dashboard:chat-3-1712793600" in out
+
+    @staticmethod
+    def _owner_after_adopt(tmp_path, session_of: str) -> str:
+        """Adopt a job held in a real store and return the owner it now carries."""
+        svc = CronService(base_dir=tmp_path)
+        job = svc.add_job(name="j", message="m", every_secs=60)
+        with (
+            patch("kiro_crew.cli_commands.CronService", return_value=svc),
+            patch("kiro_crew.cli_commands.sel"),
+        ):
+            _cron(_adopt_args(job.id, session_of=session_of))
+        return CronService(base_dir=tmp_path).get_job(job.id).session_key
+
+    def test_session_of_adds_the_prefix_the_consumers_strip(self, tmp_path):
+        owner = self._owner_after_adopt(tmp_path, "chat-3-1712793600")
+        assert owner == "dashboard:chat-3-1712793600"
+
+    def test_session_of_round_trips_through_the_real_delivery_resolver(self):
+        """Drift guard: ``--session-of`` must be the exact inverse of the
+        transform the delivery path applies.
+
+        Both consumers reach a slot with ``removeprefix("dashboard:")``; a prefix
+        drift would point adopted jobs at a missing slot, so assert the round trip.
+        """
+        stored = {}
+
+        with (
+            patch("kiro_crew.cli_commands.CronService") as mock_svc_cls,
+            patch("kiro_crew.cli_commands.sel"),
+        ):
+            mock_svc = mock_svc_cls.return_value
+            mock_svc.adopt_job.side_effect = lambda jid, sk: stored.setdefault(jid, sk) or True
+            _cron(_adopt_args(session_of="chat-7-1712793999"))
+
+        assert stored["abc12345"].removeprefix("dashboard:") == "chat-7-1712793999"
+
+    def test_session_of_accepts_an_already_qualified_key_unchanged(self, tmp_path):
+        """A key that already carries a namespace is passed through, so an
+        operator pasting a full key into ``--session-of`` is not double-prefixed
+        into an undeliverable ``dashboard:dashboard:...``."""
+        owner = self._owner_after_adopt(tmp_path, "dashboard:chat-3-1712793600")
+        assert owner == "dashboard:chat-3-1712793600"
+
+    def test_release_clears_the_owner(self, capsys):
+        with (
+            patch("kiro_crew.cli_commands.CronService") as mock_svc_cls,
+            patch("kiro_crew.cli_commands.sel"),
+        ):
+            mock_svc = mock_svc_cls.return_value
+            mock_svc.adopt_job.return_value = True
+            _cron(_adopt_args(release=True))
+            mock_svc.adopt_job.assert_called_once_with("abc12345", "")
+        assert "released" in capsys.readouterr().out
+
+    def test_missing_job_exits_nonzero(self):
+        with (
+            patch("kiro_crew.cli_commands.CronService") as mock_svc_cls,
+            patch("kiro_crew.cli_commands.sel"),
+        ):
+            mock_svc_cls.return_value.adopt_job.return_value = False
+            with pytest.raises(SystemExit) as exc:
+                _cron(_adopt_args("deadbeef", session_of="dashboard:chat-1"))
+            assert exc.value.code == 1
+
+    @pytest.mark.parametrize("blank", ["", "   "])
+    def test_blank_target_is_refused_rather_than_silently_releasing(self, blank):
+        """A blank target must NOT fall through to the release path: that would
+        turn a typo into a silent hand-back to operator-only management."""
+        with (
+            patch("kiro_crew.cli_commands.CronService") as mock_svc_cls,
+            patch("kiro_crew.cli_commands.sel"),
+        ):
+            mock_svc = mock_svc_cls.return_value
+            with pytest.raises(SystemExit) as exc:
+                _cron(_adopt_args(session_of=blank))
+            assert exc.value.code == 1
+            mock_svc.adopt_job.assert_not_called()
+
+    def test_adopt_is_audited(self):
+        with (
+            patch("kiro_crew.cli_commands.CronService") as mock_svc_cls,
+            patch("kiro_crew.cli_commands.sel") as mock_sel,
+        ):
+            mock_svc_cls.return_value.adopt_job.return_value = True
+            _cron(_adopt_args(session_of="dashboard:chat-3"))
+            mock_sel.return_value.log_api_access.assert_called_once()
+            kwargs = mock_sel.return_value.log_api_access.call_args.kwargs
+            assert kwargs["operation"] == "cron.adopt"
+            assert "dashboard:chat-3" in kwargs["resources"]
+
+
+class TestAdoptTargetVisibility:
+    """A typo must not silently produce a job whose output reaches nobody.
+
+    An unknown key is accepted, since a new tab with no history is a valid live
+    target, but it must warn.
+    """
+
+    def _run_adopt_with_known(self, known):
+        with (
+            patch("kiro_crew.cli_commands.CronService") as mock_svc_cls,
+            patch("kiro_crew.cli_commands.sel"),
+            patch("kiro_crew.cli_commands.ConversationLog") as mock_log_cls,
+        ):
+            mock_svc_cls.return_value.adopt_job.return_value = True
+            mock_log_cls.return_value.has_log.return_value = known
+            _cron(_adopt_args(session_of="chat-9-1712799999"))
+            return mock_log_cls
+
+    def test_unknown_session_warns(self, capsys):
+        self._run_adopt_with_known(False)
+        err = capsys.readouterr().err
+        assert "no recorded session" in err
+        assert "chat-9-1712799999" in err
+        assert "--release" in err
+
+    def test_known_session_does_not_warn(self, capsys):
+        self._run_adopt_with_known(True)
+        assert "no recorded session" not in capsys.readouterr().err
+
+    def test_a_real_existing_session_does_not_warn(self, capsys, tmp_path, monkeypatch):
+        """The lookup must use the spelling the transcript store actually uses.
+
+        A dashboard transcript is keyed ``dashboard_chat-9-....jsonl``, not by the
+        stripped slot, and a channel-origin one has no prefix, so the check resolves
+        through the delivery path's helpers. The other tests mock ``has_log``; this
+        one writes through the real ConversationLog so a spelling mismatch fails.
+        """
+        monkeypatch.setattr("kiro_crew.history._sessions_dir", lambda: tmp_path)
+        ConversationLog(base_dir=tmp_path).append("dashboard:chat-9-1712799999", "user", "hello")
+        with (
+            patch("kiro_crew.cli_commands.CronService") as mock_svc_cls,
+            patch("kiro_crew.cli_commands.sel"),
+        ):
+            mock_svc_cls.return_value.adopt_job.return_value = True
+            _cron(_adopt_args(session_of="chat-9-1712799999"))
+        assert "no recorded session" not in capsys.readouterr().err
+
+    def test_a_real_absent_session_still_warns(self, capsys, tmp_path, monkeypatch):
+        """The warning must survive the fix: a typo is still worth catching."""
+        monkeypatch.setattr("kiro_crew.history._sessions_dir", lambda: tmp_path)
+        with (
+            patch("kiro_crew.cli_commands.CronService") as mock_svc_cls,
+            patch("kiro_crew.cli_commands.sel"),
+        ):
+            mock_svc_cls.return_value.adopt_job.return_value = True
+            _cron(_adopt_args(session_of="chat-9-typo"))
+        assert "no recorded session" in capsys.readouterr().err
+
+    def test_existence_is_checked_on_the_delivery_resolved_key(self, capsys, tmp_path, monkeypatch):
+        """Not on the prefix-stripped slot, which no transcript is keyed by.
+
+        The check must ask for the same file the DELIVERY path would read, so
+        the two cannot drift apart. For the common ``chat-N`` spelling that is
+        the full session key; the two tests below cover the spellings where
+        delivery resolves something else.
+        """
+        # A transcript under the prefix-stripped slot only: a lookup on that
+        # spelling would find it and stay quiet.
+        monkeypatch.setattr("kiro_crew.history._sessions_dir", lambda: tmp_path)
+        ConversationLog(base_dir=tmp_path).append("chat-9-1712799999", "user", "hello")
+        with (
+            patch("kiro_crew.cli_commands.CronService") as mock_svc_cls,
+            patch("kiro_crew.cli_commands.sel"),
+        ):
+            mock_svc_cls.return_value.adopt_job.return_value = True
+            _cron(_adopt_args(session_of="chat-9-1712799999"))
+        assert "no recorded session" in capsys.readouterr().err
+
+    def test_a_channel_origin_slot_does_not_warn(self, capsys, tmp_path, monkeypatch):
+        """``dashboard:slack_<ts>`` has no ``dashboard_`` on its transcript.
+
+        ``_safe_key`` folds it and the live ``slack:<ts>`` onto ``slack_<ts>.jsonl``,
+        so a raw lookup of ``dashboard_slack_<ts>.jsonl`` would warn falsely.
+        """
+        monkeypatch.setattr("kiro_crew.history._sessions_dir", lambda: tmp_path)
+        ConversationLog(base_dir=tmp_path).append("slack_1785370133.085469", "user", "hello")
+        with (
+            patch("kiro_crew.cli_commands.CronService") as mock_svc_cls,
+            patch("kiro_crew.cli_commands.sel"),
+        ):
+            mock_svc_cls.return_value.adopt_job.return_value = True
+            _cron(_adopt_args(session_of="dashboard:slack_1785370133.085469"))
+        assert "no recorded session" not in capsys.readouterr().err
+
+    def test_a_stacked_dashboard_prefix_does_not_warn(self, capsys, tmp_path, monkeypatch):
+        """``--session-of dashboard_chat-N-...`` must not double the prefix.
+
+        A filename stem has no ``:``, so the CLI prefixes it to
+        ``dashboard:dashboard_chat-N-...``; ``_normalize_slot_key`` strips the
+        stacked prefix before the lookup.
+        """
+        monkeypatch.setattr("kiro_crew.history._sessions_dir", lambda: tmp_path)
+        ConversationLog(base_dir=tmp_path).append("dashboard:chat-9-1712799999", "user", "hello")
+        with (
+            patch("kiro_crew.cli_commands.CronService") as mock_svc_cls,
+            patch("kiro_crew.cli_commands.sel"),
+        ):
+            mock_svc_cls.return_value.adopt_job.return_value = True
+            _cron(_adopt_args(session_of="dashboard_chat-9-1712799999"))
+        assert "no recorded session" not in capsys.readouterr().err
+
+    def test_a_failing_lookup_stays_quiet(self, capsys):
+        """Cannot-tell is not evidence of a typo -- never cry wolf."""
+        with (
+            patch("kiro_crew.cli_commands.CronService") as mock_svc_cls,
+            patch("kiro_crew.cli_commands.sel"),
+            patch("kiro_crew.cli_commands.ConversationLog", side_effect=OSError("no dir")),
+        ):
+            mock_svc_cls.return_value.adopt_job.return_value = True
+            _cron(_adopt_args(session_of="chat-9"))
+        assert "no recorded session" not in capsys.readouterr().err
+
+    def test_release_does_not_warn(self, capsys):
+        with (
+            patch("kiro_crew.cli_commands.CronService") as mock_svc_cls,
+            patch("kiro_crew.cli_commands.sel"),
+        ):
+            mock_svc_cls.return_value.adopt_job.return_value = True
+            _cron(_adopt_args(release=True))
+        assert "no recorded session" not in capsys.readouterr().err
+
+
+class TestAdoptNamespaceHonesty:
+    """Ownership and delivery do not have the same reach, and the output says so.
+
+    ``_owned_by`` matches any namespace, but only a ``dashboard:`` key resolves to
+    a slot the delivery path can inject into.
+    """
+
+    def _adopt(self, target):
+        with (
+            patch("kiro_crew.cli_commands.CronService") as mock_svc_cls,
+            patch("kiro_crew.cli_commands.sel"),
+            patch("kiro_crew.cli_commands.ConversationLog") as mock_log_cls,
+        ):
+            mock_svc_cls.return_value.adopt_job.return_value = True
+            mock_log_cls.return_value.has_log.return_value = True
+            _cron(_adopt_args(session_of=target))
+
+    @pytest.mark.parametrize("target", ["slack:1712793600.001", "telegram:12345"])
+    def test_a_non_dashboard_owner_is_not_promised_delivery(self, target, capsys):
+        self._adopt(target)
+        cap = capsys.readouterr()
+        assert "results are delivered there" not in cap.out
+        assert "can manage it." in cap.out
+        assert "Ownership transferred; delivery did not." in cap.err
+
+    def test_a_dashboard_owner_is_promised_delivery(self, capsys):
+        self._adopt("chat-3-1712793600")
+        cap = capsys.readouterr()
+        assert "results are delivered there" in cap.out
+        assert "Ownership transferred; delivery did not." not in cap.err
+
+    def test_the_unknown_session_warning_is_dashboard_only(self, capsys):
+        """The history lookup only knows dashboard slots, so a `slack:` key must
+        not be run through it and reported as a typo."""
+        with (
+            patch("kiro_crew.cli_commands.CronService") as mock_svc_cls,
+            patch("kiro_crew.cli_commands.sel"),
+            patch("kiro_crew.cli_commands.ConversationLog") as mock_log_cls,
+        ):
+            mock_svc_cls.return_value.adopt_job.return_value = True
+            mock_log_cls.return_value.has_log.return_value = False
+            _cron(_adopt_args(session_of="slack:1712793600.001"))
+            mock_log_cls.return_value.has_log.assert_not_called()
+        assert "no recorded session" not in capsys.readouterr().err
+
+
+class TestAdoptIsDeniedFromBash:
+    """The narrow-writer design must be enforced, not merely undocumented.
+
+    An agent can run the CLI through bash, so without a ``BUILTIN_DENIED_RULES``
+    entry ``cron adopt --session-of <its own slot>`` would take over another
+    session's job, the power the MCP ``cron_update`` tool is denied.
+    """
+
+    def _rule(self):
+        from kiro_crew.security import BUILTIN_DENIED_RULES
+
+        return next(
+            (r for r in BUILTIN_DENIED_RULES if r.id == "self-protection-cron-adopt"),
+            None,
+        )
+
+    def test_a_rule_exists_in_the_builtin_set(self):
+        rule = self._rule()
+        assert rule is not None, "cron adopt must be covered by a DeniedCommandRule"
+        assert rule.category == "self-protection"
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "kirocrew cron adopt abc123 --session-of chat-3",
+            "kirocrew cron adopt abc123 --release",
+            "kiro-crew cron adopt abc123 --session-of dashboard:chat-3",
+            "kiro.crew cron adopt abc123 --session-of dashboard:chat-3",
+            "cd /tmp && kirocrew cron  adopt abc123 --session-of chat-3",
+            "KIROCREW_HOME=/tmp kirocrew cron adopt abc123 --session-of chat-3",
+            # The module spelling, which is how the CLI is invoked from a venv.
+            # `kiro.?crew` covers it because `.` matches the underscore.
+            "python3 -m kiro_crew cron adopt abc123 --release",
+            # Interposed top-level flags. The CLI really accepts these before a
+            # subcommand (`--verbose`/`-v` is a repeatable count and `--no-jail`
+            # is declared on the top-level parser as well as the jailed
+            # subparsers) -- verified by running `kirocrew -v cron list`, which
+            # executes normally.
+            "kirocrew -v cron adopt abc123 --session-of chat-3",
+            "kirocrew -vv cron adopt abc123 --session-of chat-3",
+            "kirocrew --verbose cron adopt abc123 --session-of chat-3",
+            "kirocrew --no-jail cron adopt abc123 --session-of chat-3",
+            "kirocrew -v --no-jail cron adopt abc123 --session-of chat-3",
+            # Separators that are not whitespace and not flags. A redirection is
+            # legal anywhere in a simple command, and $IFS is a word separator,
+            # so an allow-list of interlopers would need extending per spelling.
+            "kirocrew >/dev/null cron adopt abc123 --release",
+            "kirocrew 2>/dev/null cron adopt abc123 --release",
+            "kirocrew >/dev/null 2>&1 cron adopt abc123 --release",
+            "kirocrew${IFS}cron${IFS}adopt abc123 --release",
+            "kirocrew\tcron\tadopt abc123 --release",
+            "kirocrew cron >/dev/null adopt abc123 --release",
+        ],
+    )
+    def test_the_pattern_matches_the_forms_an_agent_would_reach_for(self, command):
+        import re
+
+        rule = self._rule()
+        assert re.search(rule.pattern, command, re.IGNORECASE), command
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # A command separator ends the match: the words must belong to ONE
+            # simple command, so an unrelated `adopt` in a LATER command does not
+            # combine with an earlier harmless `kirocrew cron` read.
+            pytest.param(
+                "kirocrew cron list; echo adopt", id="a_command_separator_ends_the_match-semicolon"
+            ),
+            pytest.param(
+                "kirocrew cron list && git adopt-nothing",
+                id="a_command_separator_ends_the_match-and",
+            ),
+            pytest.param(
+                "kirocrew cron list | grep adopt", id="a_command_separator_ends_the_match-pipe"
+            ),
+            pytest.param("kirocrew cron list", id="read_and_sibling_verbs-list"),
+            pytest.param(
+                "kirocrew cron add nightly 'sweep' --every 3600", id="read_and_sibling_verbs-add"
+            ),
+            pytest.param("kirocrew cron remove abc123", id="read_and_sibling_verbs-remove"),
+            pytest.param(
+                "git commit -m 'adopt a cron convention'", id="read_and_sibling_verbs-git-commit"
+            ),
+        ],
+    )
+    def test_the_pattern_does_not_catch_the_read_and_sibling_verbs(self, command):
+        import re
+
+        rule = self._rule()
+        assert not re.search(rule.pattern, command, re.IGNORECASE), command
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "kirocrew cron adopt abc123 --session-of chat-3",
+            "kirocrew -v cron adopt abc123 --session-of chat-3",
+        ],
+    )
+    def test_the_real_gate_denies_it_not_just_the_regex(self, command):
+        """Assert through ``is_denied`` -- the function the PreToolUse gate calls --
+        so the test proves enforcement rather than only pattern shape."""
+        from kiro_crew import security
+
+        assert security.is_denied(
+            command, denied_regexes=[r.pattern for r in security.BUILTIN_DENIED_RULES]
+        ), command
+
+    def test_the_real_gate_still_allows_reading_the_list(self):
+        from kiro_crew import security
+
+        assert not security.is_denied(
+            "kirocrew cron list",
+            denied_regexes=[r.pattern for r in security.BUILTIN_DENIED_RULES],
+        )
+
+
+class TestAdoptJobService:
+    """``adopt_job`` is the only writer of ``session_key`` outside creation."""
+
+    def test_adopt_and_release_persist(self, tmp_path):
+        from kiro_crew.cron import CronService
+
+        svc = CronService(base_dir=tmp_path)
+        job = svc.add_job(name="nightly", message="sweep", every_secs=3600)
+        assert job.session_key == ""
+
+        assert svc.adopt_job(job.id, "dashboard:chat-3-1712793600") is True
+        assert CronService(base_dir=tmp_path).get_job(job.id).session_key == (
+            "dashboard:chat-3-1712793600"
+        )
+
+        assert svc.adopt_job(job.id, "") is True
+        assert CronService(base_dir=tmp_path).get_job(job.id).session_key == ""
+
+    def test_adopt_missing_id_returns_false(self, tmp_path):
+        from kiro_crew.cron import CronService
+
+        svc = CronService(base_dir=tmp_path)
+        assert svc.adopt_job("deadbeef", "dashboard:chat-1") is False
+
+    def test_update_job_still_cannot_set_session_key(self, tmp_path):
+        """Ownership stays off the shared update path.
+
+        ``update_job`` is reachable from MCP ``cron_update`` and the dashboard
+        ``PATCH``; if it grew a ``session_key`` branch, those surfaces could
+        repoint where any job delivers. The CLI -- the one surface that is not
+        itself a session -- is deliberately the only writer.
+        """
+        from kiro_crew.cron import CronService
+
+        svc = CronService(base_dir=tmp_path)
+        job = svc.add_job(name="nightly", message="sweep", every_secs=3600)
+        svc.update_job(job.id, session_key="dashboard:chat-attacker")
+        assert CronService(base_dir=tmp_path).get_job(job.id).session_key == ""

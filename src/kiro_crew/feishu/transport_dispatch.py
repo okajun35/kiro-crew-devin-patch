@@ -1,0 +1,723 @@
+"""Full new-path dispatch: FeishuTransport -> TurnDriver -> FeishuRenderer.
+
+``FeishuTransport.receive()`` authorises + normalises an inbound message and
+hands the ``LarkInbound`` (carrying the ``message_id`` reply anchor) to
+:meth:`FeishuDispatcher.handle_message`, which mirrors the WeCom transport
+dispatch:
+
+    command intercept (/new, /compact, /agent, /stop, /help)
+    -> construct FeishuRenderer
+    -> session acquire -> context build
+    -> TurnDriver.run(provider, renderer)   # shared redaction + approval ladder
+    -> post-turn (record_success, persist, soft/hard threshold notice)
+    -> renderer.close() + session release   # in finally
+
+Feishu has no interactive buttons, so the dispatcher runs the driver
+``decider``-less (deny-by-default for INTERACTIVE; ``auto`` still
+auto-approves) and has no callback handler.  The security ``tool_gate`` and
+the ``spawn_run`` auto-approve are wired inline off ``ctx_builder.hooks``
+(channel-neutral) so this module never imports ``kiro_crew.slack``.
+
+Dependency direction is ``feishu -> messaging`` (allowed).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from typing import TYPE_CHECKING, Any
+
+from kiro_crew.agent_switch_command import ChannelAgentPicks, handle_channel_agent_command
+from kiro_crew.config import live
+from kiro_crew.config.sections import _normalize_threshold_pair
+from kiro_crew.feishu.client import CHAT_GROUP, CHAT_P2P
+from kiro_crew.feishu.commands import build_help, parse_command
+from kiro_crew.feishu.renderer import FeishuRenderer
+from kiro_crew.feishu.transport import (
+    FEISHU_CAPABILITIES,
+    SPOOL_DM_ROUTE_PREFIX,
+    SPOOL_GROUP_ROUTE_PREFIX,
+)
+from kiro_crew.history import mint_row_mid
+from kiro_crew.messaging.attachments import (
+    IngestResult,
+    append_attachment_context,
+    cleanup,
+    ingest_attachments,
+    transcribe_audio_attachments,
+)
+from kiro_crew.messaging.commands import (
+    COMPACT_TIMED_OUT_REPLY_ZH,
+    compact_unsupported_backend,
+    compact_unsupported_reply_zh,
+    context_recycle_warning_zh,
+    note_user_stop,
+    recycle_backend,
+    recycle_warning_should_send,
+)
+from kiro_crew.messaging.conversation import (
+    ConversationState,
+    reserve_new_generation,
+)
+from kiro_crew.messaging.dispatch import (
+    ChannelTurn,
+    admit_inbound_callback,
+    build_directive_consumer,
+    drive_turn,
+    inbound_permitted,
+)
+from kiro_crew.messaging.driver import APPROVAL_INTERACTIVE
+from kiro_crew.messaging.inbound_spool import InboundRoute
+from kiro_crew.messaging.link import (
+    CHAT_TYPE_DIRECT,
+    CHAT_TYPE_FORUM,
+    ChannelLink,
+    build_dm_session_key,
+    seed_generation,
+)
+from kiro_crew.messaging.pre_turn import resolve_pre_turn
+from kiro_crew.messaging.queue_drain import entries_queued_by, owner_token
+from kiro_crew.messaging.upload_gate import uploads_restricted
+from kiro_crew.safety_override import safety_override
+from kiro_crew.session_lifecycle import (
+    STOP_DECLINED_COMPACTING_TEXT,
+    compaction_in_flight,
+    consume_stop_declined,
+    decline_stop,
+    force_stop_keeping_others,
+)
+from kiro_crew.start_priority import person_priority
+
+if TYPE_CHECKING:
+    from kiro_crew.config.loader import KiroCrewConfig
+    from kiro_crew.context import ContextBuilder
+    from kiro_crew.feishu.client import LarkClient, LarkInbound
+    from kiro_crew.feishu.transport import FeishuTransport
+    from kiro_crew.history import ConversationLog
+    from kiro_crew.session import SessionManager
+
+logger = logging.getLogger(__name__)
+
+
+# Canonical kiro-cli agent fallback so Feishu sessions load kirocrew-core
+# (spawn_run etc.) instead of kiro-cli's bare built-in default.  Mirrors the
+# Slack / Telegram / WeCom paths' _DEFAULT_KIROCREW_AGENT.
+_DEFAULT_KIROCREW_AGENT = "kirocrew"
+
+# /stop's three replies, worded as Weixin's. The cancel is COOPERATIVE: it only
+# writes session/cancel, so the turn stops at its next safe point -- hence
+# "stopping", not "stopped".
+_STOPPING = "⏹ 正在停止当前回复…"
+_STOP_FAILED = "⚠ 停止失败，请重试。"
+_NOTHING_RUNNING = "ℹ 当前没有正在生成的回复。"
+
+
+class FeishuDispatcher:
+    """Coordinates Feishu turns onto the shared ``TurnDriver``.
+
+    One instance per gateway lifetime.  Holds per-user conversation state
+    (generation counter for ``/new`` resets).  ``handle_message`` is wired as
+    the transport's dispatch callback.  ``client`` is set by the gateway after
+    construction to break the construction cycle.
+    """
+
+    def __init__(
+        self,
+        *,
+        sessions: "SessionManager",
+        ctx_builder: "ContextBuilder",
+        cfg: "KiroCrewConfig",
+        agent: str | None = None,
+        conv_log: "ConversationLog | None" = None,
+        approval_mode: str = APPROVAL_INTERACTIVE,
+    ) -> None:
+        self.sessions = sessions
+        self.ctx_builder = ctx_builder
+        self.cfg = cfg
+        self.agent = agent
+        self.conv_log = conv_log
+        self.approval_mode = approval_mode
+        # Set by maybe_start_feishu after construction to avoid a cycle.
+        self.client: "LarkClient | None" = None
+        # Set the same way; the config applier pushes reloaded authorization
+        # fields at it.
+        self.transport: "FeishuTransport | None" = None
+        # Set by maybe_start_feishu when a dashboard runs; the upload ceiling reads
+        # the durable privacy flags through it.
+        self.dashboard_state: Any = None
+        # Conversation state keyed by ROUTE rather than by sender: a group turn
+        # must never share a bucket with the sender's private DM (see _route).
+        # ``seed_fn`` recovers the highest generation already on disk so /new
+        # advances past a stale one instead of resurrecting it after a restart.
+        self._conv: ConversationState[tuple[str, str]] = ConversationState(seed_fn=self._seed_gen)
+        # Per-conversation agent picked with /agent, keyed by ROUTE like _conv,
+        # because the agent is part of the session key.
+        self._agent_picks: ChannelAgentPicks[tuple[str, str]] = ChannelAgentPicks()
+        # Held on self: the watcher holds the owner WEAKLY.
+        self._config_sub = live.watch_section(
+            self, "feishu", "messaging", target="transport", name="FeishuDispatcher"
+        )
+
+    # ── Live config ───────────────────────────────────────────────────────
+
+    def _live_cfg(self) -> "KiroCrewConfig":
+        """The config in force NOW, for a per-turn read.
+
+        The watcher's snapshot when armed, else a fingerprint-cached ``load()``,
+        else the boot copy -- a threshold or a rotation window is not an
+        authorisation decision, so a momentarily unreadable file keeps the turn
+        running on the value the operator last had in force.
+        """
+        return live.current(self.cfg, log_prefix="feishu")
+
+    def _thresholds(self) -> tuple[int, int]:
+        """``(soft, hard)`` context thresholds from the live config.
+
+        Runs the loader's own pair normalization, whose FLOOR is 1 rather than 0:
+        a 0% threshold reads as "always over" and would compact every turn, and
+        an inverted pair would make the soft nudge unreachable because
+        ``_maybe_notice`` tests ``pct >= hard`` first.
+        """
+        section = self._live_cfg().feishu
+        return _normalize_threshold_pair(
+            int(getattr(section, "soft_threshold_pct", 80)),
+            int(getattr(section, "hard_threshold_pct", 95)),
+        )
+
+    # ── Turn dispatch (transport's dispatch callback) ─────────────────────
+
+    async def handle_message(self, inbound: "LarkInbound") -> None:
+        """Drive one authorised inbound Feishu message through TurnDriver."""
+        assert self.client is not None, "FeishuDispatcher.client must be set"
+
+        open_id = inbound.open_id
+        text = inbound.text
+        route = self._route(inbound)
+        inbound_route = InboundRoute(
+            conversation_id=inbound.message_id,
+            text=inbound.text,
+            user_id=open_id,
+            thread_id=(
+                f"{SPOOL_GROUP_ROUTE_PREFIX}{inbound.chat_id}"
+                if inbound.chat_type == CHAT_GROUP
+                else f"{SPOOL_DM_ROUTE_PREFIX}{open_id}"
+            ),
+            message_id=inbound.message_id,
+            attachments_dropped=len(inbound.resources),
+        )
+        if not await admit_inbound_callback(
+            self.sessions,
+            channel_type="feishu",
+            route=inbound_route,
+        ):
+            return
+
+        # Recheck governance only after this accepted callback is census-visible;
+        # otherwise the off-loop policy read opens an uncounted restart window.
+        # The pure-cancel exemption is claimed only for a message Feishu itself
+        # will act on as /stop: Feishu has no buttons, so a typed stop is the only
+        # way to halt a turn the channel already started. A cancel word another
+        # channel spells (`停止`, `!stop`) is no stop here, so it gets the strict
+        # gate rather than a pass into the busy path's steer.
+        raw_cmd = (inbound.command_text or text).strip()
+        cmd = parse_command(raw_cmd)
+        gate_text = raw_cmd if cmd == "stop" else ""
+        if not await inbound_permitted("feishu", text=gate_text):
+            return
+        logger.info("Feishu inbound from %s: %d chars", open_id, len(text or ""))
+
+        # ── Command intercept (no LLM session needed) ──────────────────────
+        # Matched against the mention-FREE body, not `text`: a group message must
+        # @-mention the bot, so `text` reads "@BotName /new" and a whole-string
+        # match would never fire -- the command would be dispatched to the model
+        # as a prompt instead. Falls back to `text` for a frame with no mentions.
+        # (`raw_cmd` / `cmd` were read above, ahead of the governance gate.)
+        if cmd == "stop":
+            # Before the busy check below: /stop is the one message that must
+            # not be folded into the running reply it exists to abort.
+            await self._handle_stop(inbound)
+            return
+        if cmd == "help":
+            await self.client.send_reply(inbound.message_id, build_help())
+            return
+        if cmd == "new":
+            self._conv.bump_gen(route)
+            saved = await reserve_new_generation(
+                self.sessions,
+                self._session_key(route),
+                channel_type="Feishu",
+            )
+            message = "✅ 已开始新对话"
+            if not saved:
+                message += "\n⚠️ 新对话无法保存，重启后可能恢复到上一段对话。"
+            await self.client.send_reply(inbound.message_id, message)
+            return
+        if cmd == "compact":
+            # Releasing the latch here is what keeps the soft notice a
+            # per-growth-cycle nudge rather than a once-ever one: the user
+            # just complied, so the next time context climbs back into the
+            # soft band they must be told again. Mirrors WeCom.
+            self._conv.clear_awaiting(route)
+            await self._handle_compact(inbound)
+            return
+        if raw_cmd.lower().split(maxsplit=1)[:1] == ["/agent"]:
+            # The name keeps its case: agent names are case-sensitive.
+            parts = raw_cmd.split(maxsplit=1)
+            reply = await handle_channel_agent_command(
+                self._agent_picks,
+                route,
+                parts[1] if len(parts) == 2 else "",
+                conv=self._conv,
+                configured=self._resolve_agent(),
+                sessions=self.sessions,
+                session_key=lambda: self._session_key(route),
+            )
+            await self.client.send_reply(inbound.message_id, reply)
+            return
+
+        # Busy check, then rotation, then a re-derived key -- the ordering and
+        # the reasons it matters live in messaging.pre_turn.
+        messaging = self._live_cfg().messaging
+        session_key = await resolve_pre_turn(
+            conv=self._conv,
+            sessions=self.sessions,
+            key=route,
+            session_key_for=self._session_key,
+            idle_minutes=messaging.idle_reset_minutes,
+            daily_reset_hour=messaging.daily_reset_hour,
+            on_busy=lambda sk: self._handle_busy(inbound, sk),
+        )
+        if session_key is None:
+            return  # folded into the running turn
+
+        conversation_id = f"feishu:{route[1]}"
+        agent = self._resolve_agent(route)
+
+        # Feishu has no interactive buttons -> no decider (deny-by-default for
+        # INTERACTIVE; auto/trust still auto-approve via the driver ladder).
+        renderer = FeishuRenderer(
+            self.client,
+            inbound.message_id,
+            FEISHU_CAPABILITIES,
+            # A group's members are not all on the allow-list, so a group turn keeps
+            # printing an image's path (as a Webex space does) instead of posting
+            # the file to them.
+            uploads_allowed=inbound.chat_type == CHAT_P2P
+            and not await self._uploads_restricted(session_key),
+        )
+
+        # Surface a newly-created Feishu session in the dashboard immediately
+        # (don't wait for the ~30s reconciler).  Circular-import safe via
+        # deferred local import.
+        async def _surface_new_session() -> None:
+            from kiro_crew.dashboard.channel_slots import (  # noqa: PLC0415
+                surface_dispatcher_session,
+            )
+
+            await surface_dispatcher_session(self)
+
+        # Files are fetched only now, after the allow-list, the governance
+        # re-check and the busy check, so a refused or folded message costs no
+        # download; the temp files go when the turn that reads them ends.
+        temp_paths: list[str] = []
+        try:
+            if inbound.resources:
+                ingested = await self._ingest(inbound)
+                temp_paths = ingested.temp_paths
+                ingested = await transcribe_audio_attachments(ingested, "Feishu")
+                text = append_attachment_context(text, ingested)
+            await drive_turn(
+                ChannelTurn(
+                    start_priority=person_priority(inbound.person_origin),
+                    channel_type="feishu",
+                    session_key=session_key,
+                    inbound_route=inbound_route,
+                    # Session-directive consumer: monitor_start /
+                    # autonudge_stop / ... return a marker TurnDriver decodes;
+                    # apply it against THIS turn's session key. Without it the
+                    # driver leaves the marker inert while the tool still
+                    # reports success to the model -- a silent no-op is worse
+                    # than a refusal. Dashboard-only directives stay refused
+                    # for a channel turn (slot=None, fail-closed).
+                    directive_consumer=build_directive_consumer(
+                        session_key=session_key, sessions=self.sessions, dispatcher=self
+                    ),
+                    conversation_id=conversation_id,
+                    # The DM's open_id or the group's chat_id: the address a
+                    # proactive send creates a message at, so a cron result or a
+                    # subagent completion for this session comes back here.
+                    origin_conversation=ChannelLink("feishu", channel_id=route[1]),
+                    agent=agent,
+                    user_text=text,
+                    renderer=renderer,
+                    approval_mode=self.approval_mode,
+                    decider=None,  # Feishu can't render approve/deny buttons
+                    # No buttons means no way to approve a tool in band, so without an
+                    # out-of-band grant the INTERACTIVE ladder denies every tool and the
+                    # agent can only talk. This is the SAME process-global grant the
+                    # dashboard toggle and Slack's `/kirocrew yolo` drive, so it needs no
+                    # Feishu command of its own and it still expires. Read per request,
+                    # not captured at boot, so arming it (or letting it lapse) takes
+                    # effect on the next tool rather than after a gateway restart. It
+                    # does NOT weaken the PreToolUse gate: TurnDriver runs the
+                    # sensitive-path keystone, the governance ceiling and the deny-list
+                    # ahead of this rung, so a hard deny still wins.
+                    auto_approve_session=lambda: safety_override().is_active(),
+                    # Private context is withheld whenever the SESSION is shared, not
+                    # merely when the sender is not the owner. ``_route`` already keys a
+                    # group on its ``chat_id``, so one session serves every member and a
+                    # group turn never resumes a DM -- but that only isolates the turn
+                    # HISTORY. Memory, lessons and skills come from the context builder,
+                    # and without this they would be assembled into a reply the whole
+                    # group reads. So a group turn is minimal for EVERYONE, including an
+                    # allow-listed sender: whatever the agent says in a group is visible
+                    # to the group anyway, and DMs are where context-rich work belongs.
+                    #
+                    # The ``not is_operator`` half of WhatsApp's rule does not transfer:
+                    # WhatsApp's transport IS the operator's own account, so it can tell
+                    # the operator from a peer. Feishu has a bot identity and authorises
+                    # against ``allowed_open_ids``, where every admitted DM sender is an
+                    # equally-trusted peer with their own ``open_id``-keyed session.
+                    minimal_context=inbound.chat_type == CHAT_GROUP,
+                    # Images upload only from the provider's OWN resolved cwd and its
+                    # `$KIROCREW_SCRATCH`, read when the provider binds: on a session's
+                    # first turn there is no provider before this point.
+                    bind_provider=lambda p: renderer.authorize_upload_root(
+                        getattr(p, "cwd", "") or "",
+                        scratch_root=str(getattr(p, "work_scratch_dir", None) or ""),
+                    ),
+                    persist=lambda user_text, reply, is_new: self._persist_turn(
+                        session_key, user_text, reply, is_new, agent
+                    ),
+                    notice=lambda sk, provider: self._maybe_notice(inbound, sk, provider),
+                    audit_caller=f"feishu:{open_id}",
+                    after_persist=_surface_new_session,
+                ),
+                sessions=self.sessions,
+                ctx_builder=self.ctx_builder,
+            )
+        finally:
+            if temp_paths:
+                # In a worker: one unlink per file, on a temp dir that may not be local.
+                await asyncio.to_thread(cleanup, temp_paths)
+
+    # ── Helpers ───────────────────────────────────────────────────────────
+
+    async def _ingest(self, inbound: "LarkInbound") -> IngestResult:
+        """Download *inbound*'s files and turn them into prompt material.
+
+        Transcription is the caller's next step, so the temp paths are already
+        in its ``finally`` while a voice note is being transcribed.
+        """
+        assert self.client is not None
+        client = self.client
+        resource_types = {att.url: kind for att, kind in inbound.resources}
+
+        async def _download(key: str, dest: str) -> None:
+            await client.download_resource(inbound.message_id, key, resource_types[key], dest)
+
+        return await ingest_attachments(
+            [att for att, _ in inbound.resources],
+            download=_download,
+            source="feishu",
+            handle_audio=True,
+        )
+
+    async def _uploads_restricted(self, session_key: str) -> bool:
+        """True when this session must not ship local file bytes to Feishu.
+
+        The shared ceiling (:func:`kiro_crew.messaging.upload_gate.uploads_restricted`):
+        an incognito or temporary conversation never uploads. The persisted-transcript
+        probe is passed in because ``messaging`` may not import ``dashboard``.
+        """
+        # circular import: the dashboard gateway imports the channel transports.
+        from kiro_crew.dashboard.handlers._shared import _probe_persisted_session
+
+        return await uploads_restricted(
+            self.dashboard_state,
+            session_key,
+            channel_type="feishu",
+            persisted_probe=_probe_persisted_session,
+        )
+
+    async def _handle_busy(self, inbound: "LarkInbound", session_key: str) -> None:
+        """Mid-turn message: try to steer; else ask the user to resend.
+
+        A message carrying files is never steered: steer forwards text only, so
+        the files would be dropped while the reply said they were folded in.
+        """
+        assert self.client is not None
+        # Re-check: the turn may have just finished between is_busy and here.
+        if not self.sessions.is_busy(session_key):
+            await self.handle_message(inbound)
+            return
+        provider = self.sessions.get_provider(session_key)
+        has_active = getattr(provider, "has_active_turn", None)
+        live = has_active is None or bool(has_active())
+        steer = getattr(provider, "steer", None)
+        steered = bool(
+            live
+            and not inbound.resources
+            and getattr(provider, "supports_steer", False)
+            and steer is not None
+            and await steer(inbound.text)
+        )
+        if steered:
+            await self.client.send_reply(inbound.message_id, "⏳ 已合并到当前回复")
+        else:
+            await self.client.send_reply(inbound.message_id, "⏳ 正在处理上一条，请稍后重发")
+
+    async def _handle_stop(self, inbound: "LarkInbound") -> None:
+        """Hard cancel: abort the reply that is running on this route's session.
+
+        Mirrors the Weixin ``/stop``. The cancel is COOPERATIVE -- an ACP
+        ``session/cancel`` with no ack wait -- so the reply goes out at once and
+        the turn stops at its next safe point; on a shared runtime that is the
+        only path that cannot take a co-tenant process down with it. Feishu
+        holds no queue of its own (a mid-turn message is steered or refused), so
+        the running turn is the whole of what ``/stop`` owns here.
+
+        The presser is the sender's ``open_id``, not the route: a group shares
+        one session, and one member's declined Stop must not arm another's.
+        """
+        assert self.client is not None
+        client = self.client
+        presser = inbound.open_id
+        session_key = self._session_key(self._route(inbound))
+        # Before the Stop record: a Stop the session's own automatic compaction
+        # declines ends nothing and must record nothing.
+        if compaction_in_flight(self.sessions, session_key):
+            # A repeat within the window is the second press and forces.
+            if not consume_stop_declined(session_key, presser):
+                # Sent before the marker is armed: an undelivered warning plus an
+                # armed escalation is a retry that hard-resets the session with
+                # this user never told that it would.
+                await decline_stop(
+                    session_key,
+                    presser,
+                    lambda: client.send_reply(inbound.message_id, STOP_DECLINED_COMPACTING_TEXT),
+                )
+                return
+            note_user_stop(self.sessions, session_key)
+            try:
+                # Through the queue-keeping helper: Feishu queues nothing, but
+                # under a unified ``dm_scope`` the key is shared with channels
+                # that do, and the hard reset would pop their queued messages.
+                # The presser's own token matches none of those entries.
+                forced = await force_stop_keeping_others(
+                    self.sessions,
+                    session_key,
+                    entries_queued_by(owner_token("feishu", (presser,))),
+                )
+            except Exception:
+                logger.warning("feishu /stop: force stop failed for %s", session_key, exc_info=True)
+                forced = False
+            await client.send_reply(inbound.message_id, _STOPPING if forced else _STOP_FAILED)
+            return
+        # Recorded before the busy check, so a Stop landing while the session is
+        # between an abandoned attempt and its replay still counts (see
+        # ``note_user_stop``).
+        note_user_stop(self.sessions, session_key)
+        ack = _NOTHING_RUNNING
+        if self.sessions.is_busy(session_key):
+            # Branch on the RETURNED outcome: ``cancel`` reports its own failures
+            # as ``"error"`` rather than raising, so a try/except alone would say
+            # "stopping" for a cancel that never happened.
+            ack = _STOP_FAILED
+            provider = self.sessions.get_provider(session_key)
+            cancel = getattr(provider, "cancel", None)
+            if cancel is not None:
+                try:
+                    outcome = await cancel(wait_ack_timeout=0)
+                except Exception:
+                    logger.warning("feishu /stop: cancel failed for %s", session_key, exc_info=True)
+                else:
+                    if outcome in ("acked", "timeout"):
+                        # timeout: the cancel WAS written, its ack has not landed.
+                        ack = _STOPPING
+                    elif outcome == "no_turn":
+                        # The turn finished between is_busy and the cancel.
+                        ack = _NOTHING_RUNNING
+                    else:
+                        logger.warning(
+                            "feishu /stop: cancel returned %r for %s", outcome, session_key
+                        )
+        await client.send_reply(inbound.message_id, ack)
+
+    async def _handle_compact(self, inbound: "LarkInbound") -> None:
+        """In-place ACP ``/compact`` on the user's current session."""
+        assert self.client is not None
+        session_key = self._session_key(self._route(inbound))
+        if not await self.sessions.try_acquire(session_key):
+            if self.sessions.has_session(session_key):
+                await self.client.send_reply(
+                    inbound.message_id, "⏳ 正在处理上一条消息，请稍后再试 /compact。"
+                )
+            else:
+                await self.client.send_reply(inbound.message_id, "ℹ️ 当前没有可压缩的对话。")
+            return
+        try:
+            provider = self.sessions.get_provider(session_key)
+            if provider is None:
+                await self.client.send_reply(inbound.message_id, "ℹ️ 当前没有可压缩的对话。")
+                return
+            # Capability gate (mirroring the dashboard's gate): a
+            # backend that cannot serve a manual /compact treats the prompt as
+            # ordinary text and never answers, so dispatching would strand the
+            # unbounded wait below. Informational (this surface speaks Chinese;
+            # the wording translates ``compact_unsupported_reply``), never an
+            # error.
+            unsupported = compact_unsupported_backend(provider)
+            if unsupported:
+                logger.debug("Feishu: manual /compact declined — %s compacts itself", unsupported)
+                await self.client.send_reply(
+                    inbound.message_id,
+                    compact_unsupported_reply_zh(unsupported),
+                )
+                return
+            await provider.compact()
+            # Failure and timeout come back as the result's ``type``, not as an
+            # exception, so the receipt is read off it rather than assumed.
+            cr = await provider.wait_for_compaction(
+                timeout=self.sessions.compact_wait_budget_secs()
+            )
+            if cr["type"] == "completed":
+                await self.client.send_reply(inbound.message_id, "🗜️ 已压缩上下文。")
+            elif cr["type"] == "failed":
+                await self.client.send_reply(inbound.message_id, "⚠️ 压缩失败，请重试。")
+            else:
+                await self.client.send_reply(inbound.message_id, COMPACT_TIMED_OUT_REPLY_ZH)
+        except Exception:
+            logger.exception("Feishu /compact failed for %s", session_key)
+            await self.client.send_reply(inbound.message_id, "⚠️ 压缩失败，请重试。")
+        finally:
+            self.sessions.release(session_key)
+
+    def _resolve_agent(self, route: tuple[str, str] | None = None) -> str:
+        """The agent *route* runs: its ``/agent`` pick, else the configured one."""
+        configured = self.agent or self.cfg.agent.default_agent or _DEFAULT_KIROCREW_AGENT
+        return self._agent_picks.resolve(route, configured)
+
+    @staticmethod
+    def _route(inbound: "LarkInbound") -> tuple[str, str]:
+        """The session namespace this message belongs to, as ``(slot, comp)``.
+
+        A group chat gets its OWN bucket keyed by ``chat_id`` under the
+        non-direct ``forum`` slot, so an allow-listed user writing in a group
+        never resumes their private DM session — otherwise prior DM content
+        would become model context for a reply every group member reads, and
+        under ``dm_scope="unified"`` group traffic would collapse into the
+        cross-channel DM bucket. A p2p message keeps the plain ``direct``
+        bucket keyed by ``open_id``.
+        """
+        if inbound.chat_type == CHAT_GROUP and inbound.chat_id:
+            return CHAT_TYPE_FORUM, inbound.chat_id
+        return CHAT_TYPE_DIRECT, inbound.open_id
+
+    def _seed_gen(self, route: tuple[str, str]) -> int:
+        """The highest generation already persisted for *route*'s bucket.
+
+        Injected into :class:`ConversationState` so the in-memory counter is
+        restart-safe: without it a restart would send ``/new`` back to
+        generation 0 and silently resurrect the conversation the user had
+        already discarded.
+        """
+        slot, comp = route
+        return seed_generation(
+            self.sessions,
+            channel="feishu",
+            agent=self._resolve_agent(route),
+            user_id=comp,
+            dm_scope=str(self.cfg.messaging.dm_scope),
+            chat_type=slot,
+        )
+
+    def _session_key(self, route: tuple[str, str]) -> str:
+        slot, comp = route
+        gen = self._conv.current_gen(route)
+        return build_dm_session_key(
+            "feishu",
+            self._resolve_agent(route),
+            comp,
+            gen=gen,
+            dm_scope=str(self.cfg.messaging.dm_scope),
+            chat_type=slot,
+        )
+
+    def _persist_turn(
+        self,
+        session_key: str,
+        user_text: str,
+        reply_text: str,
+        is_new: bool,
+        agent: str | None = None,
+    ) -> None:
+        """Record the turn to conversation_log (dashboard visibility + restart).
+
+        ``agent`` is the RESOLVED agent for this turn, not the configured
+        default: without it a custom-agent conversation persists with no agent
+        metadata and the dashboard attributes it to the default agent.
+        """
+        if self.conv_log is None:
+            return
+        self.conv_log.append(session_key, "user", user_text, agent=agent, mid=mint_row_mid())
+        if reply_text:
+            self.conv_log.append(
+                session_key, "assistant", reply_text, agent=agent, mid=mint_row_mid()
+            )
+        if is_new:
+            title = (user_text or "").strip().replace("\n", " ")[:40] or "Feishu"
+            self.conv_log.set_title(session_key, title)
+
+    async def _maybe_notice(self, inbound: "LarkInbound", session_key: str, provider: Any) -> None:
+        """Send a context-threshold notice as a separate reply post-turn.
+
+        The soft notice is latched per route: it fires once while usage sits
+        between the soft and hard thresholds, instead of repeating on every
+        turn. Compaction clears the latch so a later climb back past the soft
+        threshold notifies again. Latching per route keeps a group's notice
+        independent of the sender's DM.
+        """
+        assert self.client is not None
+        route = self._route(inbound)
+        pct = self.sessions.check_context_usage(session_key, provider)
+        soft, hard = self._thresholds()
+        if recycle_backend(provider):
+            # Crew restarts this backend's session at the threshold; warn once
+            # before it, offering a fresh start instead of a compaction.
+            if recycle_warning_should_send(self.sessions, self._conv, route, session_key, pct):
+                await self.client.send_reply(inbound.message_id, context_recycle_warning_zh())
+            return
+        if pct >= soft:
+            # Capability gate: no forced compaction to run and the
+            # soft nudge's /compact advice cannot work — the backend compacts
+            # on its own as context fills.
+            unsupported = compact_unsupported_backend(provider)
+            if unsupported:
+                logger.debug("Feishu: context notice skipped — %s compacts itself", unsupported)
+                return
+        if pct >= hard:
+            self._conv.clear_awaiting(route)
+            try:
+                await provider.compact()
+                # A failed or timed-out compaction is a RETURNED result, not an
+                # exception, so the notice is posted only for a completed one.
+                cr = await provider.wait_for_compaction(
+                    timeout=self.sessions.compact_wait_budget_secs()
+                )
+                if cr["type"] == "completed":
+                    await self.client.send_reply(
+                        inbound.message_id, "🗜️ 上下文接近上限，已自动压缩。"
+                    )
+                else:
+                    logger.warning("Feishu hard-threshold compaction reported %s", cr["type"])
+            except Exception:
+                logger.debug("Feishu hard-threshold compaction failed", exc_info=True)
+        elif pct >= soft and not self._conv.is_awaiting(route):
+            # Latch before awaiting the send so a turn arriving while this
+            # reply is in flight does not emit a duplicate notice.
+            self._conv.set_awaiting(route)
+            await self.client.send_reply(
+                inbound.message_id,
+                "⚠️ 对话上下文已较长，回复 /compact 压缩，或 /new 开始新对话。",
+            )

@@ -1,0 +1,111 @@
+# Slack App Manifest for KiroCrew
+# Import via https://api.slack.com/apps → Create New App → From a manifest
+#
+# After import you still need to:
+#   1. Socket Mode: toggle OFF then back ON to trigger token generation dialog
+#      → add scope connections:write → Generate → copy the xapp-... token
+#   2. Install the app to your workspace and copy the Bot Token (xoxb-...)
+#   3. Run `kirocrew setup` and paste both tokens
+#
+## Template notes (never rendered): a line ending in "#@<feature>" is rendered
+## only when that Slack Code switch (slack.<feature>, registered in
+## slack_manifest.FEATURE_SCOPES) is on; "#@a|b" means either one.
+## `kirocrew manifest` and Settings → Slack render this file for the
+## switches you have on.
+#
+# See docs/guides/slack-setup.md for the full walkthrough.
+
+display_information:
+  name: KiroCrew-{{ALIAS}}
+  description: AI agent management layer with persistent memory, scheduled jobs, and multi-session orchestration
+  background_color: "#1a1a2e"
+
+features:
+  app_home:
+    home_tab_enabled: true
+    messages_tab_enabled: true
+    messages_tab_read_only_enabled: false
+  # Declares the app a Slack agent: threads become agent sessions with a live  #@agent_sessions
+  # status, a title and Slack's native Stop button. Slack cannot switch an app  #@agent_sessions
+  # back from agent_view to assistant_view once this is saved.  #@agent_sessions
+  agent_view:  #@agent_sessions
+    agent_description: Your personal AI agent. Chat, run multi-step tasks unattended, schedule jobs, and keep memory across sessions.  #@agent_sessions
+  # Code channels: one channel per coding task, with a context bar, a diff tab  #@code_channels
+  # and channel commands. Socket Mode delivers the commands, so no URL is set.  #@code_channels
+  code_channels:  #@code_channels
+    enabled: true  #@code_channels
+  bot_user:
+    display_name: KiroCrew-{{ALIAS}}
+    always_online: true
+  slash_commands:
+    - command: /{{COMMAND}}
+      description: Dashboard access and channel tracking
+      usage_hint: "dashboard [duration] | #channel"
+      should_escape: true
+
+oauth_config:
+  scopes:
+    bot:
+      - app_mentions:read
+      # agents.sessions.* (status, title, Stop) for the agent_view feature.  #@agent_sessions
+      - assistant:write  #@agent_sessions
+      # agents.conversations.* (create, context bar, views, commands, archive);  #@code_channels
+      # the invite scopes let the agent add people to the channel it opens.  #@code_channels
+      - canvases:write  #@code_channels
+      - channels:history
+      - channels:read
+      - channels:write.invites  #@code_channels
+      - chat:write
+      - chat:write.customize  #@code_channels
+      - code_channels:manage  #@code_channels
+      - commands
+      - files:read
+      - files:write
+      - groups:history
+      - groups:read
+      - groups:write.invites  #@code_channels
+      - im:history
+      - im:read
+      - im:write
+      - reactions:write
+      - users:read
+      # Optional: uncomment for custom workspace emojis in Secretary emoji picker
+      # - emoji:read
+    user:
+      - channels:history
+      - channels:read
+      - groups:history
+      - groups:read
+      - im:history
+      - im:read
+      - mpim:history
+      - mpim:read
+      - search:read
+      - users:read
+
+settings:
+  event_subscriptions:
+    bot_events:
+      - message.im
+      - message.channels
+      - message.groups
+      - app_mention
+      - app_home_opened
+      # Slack's native Stop button on an agent session (shown only while it is  #@agent_sessions|code_channels
+      # processing), and a user's rename of a thread session.  #@agent_sessions|code_channels
+      - agent_session_stopped  #@agent_sessions|code_channels
+      - agent_session_title_changed  #@agent_sessions
+      # A code channel's archive state and name, shown on its dashboard badge.  #@code_channels
+      - channel_archive  #@code_channels
+      - channel_rename  #@code_channels
+      - channel_unarchive  #@code_channels
+      - group_archive  #@code_channels
+      - group_rename  #@code_channels
+      - group_unarchive  #@code_channels
+      - file_change
+      - member_joined_channel
+  interactivity:
+    is_enabled: true
+  org_deploy_enabled: false
+  socket_mode_enabled: true
+  token_rotation_enabled: false

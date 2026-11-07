@@ -1,0 +1,1608 @@
+// The composer's core: rendering, offline state, send keys, attachments,
+// resizing, caret-follow scroll, prompt history, the model chip and the
+// reasoning effort it carries, and the prompt optimizer.
+// ChatInput.busyAndUndo.test.tsx holds the rest of this suite; defaultProps lives
+// in ChatInputTestUtils.tsx.
+import React from 'react'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { act, screen, fireEvent } from '@testing-library/react'
+import { renderWithProviders } from './helpers'
+import ChatInput from '../components/ChatInput'
+import { PREVIEW_STRIP_H, stubStripHeights } from './stripHeights'
+
+// The composer's own drag floor.
+const INPUT_DRAG_MIN_H = 93
+import { SlotProvider } from '../providers/SlotContext'
+import { defaultProps } from './ChatInputTestUtils'
+
+// isTouchDevice gates the autoFocusKey effect (tapping a session must not pop
+// the soft keyboard). Default false so the desktop cases behave as before; a
+// touch-device case flips it on per-test.
+const touchEnv = vi.hoisted(() => ({ touch: false }))
+vi.mock('../utils/isTouchDevice', () => ({ isTouchDevice: () => touchEnv.touch }))
+
+const mobileEnv = vi.hoisted(() => ({ mobile: false }))
+vi.mock('../hooks/useIsMobile', () => ({ useIsMobile: () => mobileEnv.mobile }))
+
+beforeEach(() => {
+  vi.restoreAllMocks()
+  // After restoreAllMocks: it would otherwise undo the layout stub. jsdom does
+  // no layout, and the composer MEASURES its strips, so a strip with no stubbed
+  // box measures 0 and reads as no strip at all.
+  stubStripHeights()
+  localStorage.clear()
+  touchEnv.touch = false
+  mobileEnv.mobile = false
+})
+
+describe('ChatInput', () => {
+  describe('rendering', () => {
+    it('renders textarea with Message input label', () => {
+      renderWithProviders(<ChatInput {...defaultProps} />)
+      expect(screen.getByLabelText('Message input')).toBeInTheDocument()
+    })
+
+    it('renders Send button', () => {
+      renderWithProviders(<ChatInput {...defaultProps} />)
+      expect(screen.getByRole('button', { name: 'Send' })).toBeInTheDocument()
+    })
+
+    it('renders drag handle', () => {
+      renderWithProviders(<ChatInput {...defaultProps} />)
+      expect(screen.getByTitle(/Drag to resize/)).toBeInTheDocument()
+    })
+
+    it('uses custom placeholder', () => {
+      renderWithProviders(<ChatInput {...defaultProps} placeholder="Type here…" />)
+      expect(screen.getByPlaceholderText('Type here…')).toBeInTheDocument()
+    })
+
+    it('shows Stopping placeholder when disabled', () => {
+      renderWithProviders(<ChatInput {...defaultProps} disabled />)
+      expect(screen.getByPlaceholderText('Stopping…')).toBeInTheDocument()
+    })
+
+    it('keeps Stopping over a caller placeholder, and shows lockedPlaceholder instead when given', () => {
+      const { unmount } = renderWithProviders(<ChatInput {...defaultProps} disabled placeholder="Type here…" />)
+      expect(screen.getByPlaceholderText('Stopping…')).toBeInTheDocument()
+      unmount()
+      renderWithProviders(<ChatInput {...defaultProps} disabled placeholder="Type here…" lockedPlaceholder="Locked for now" />)
+      expect(screen.getByPlaceholderText('Locked for now')).toBeInTheDocument()
+    })
+
+    it('shows offline placeholder when connected=false', () => {
+      renderWithProviders(<ChatInput {...defaultProps} connected={false} />)
+      expect(screen.getByPlaceholderText(/Gateway offline/)).toBeInTheDocument()
+    })
+
+    it('makes the touch-device + control open the native file picker directly in a wide viewport', () => {
+      touchEnv.touch = true
+      // The collapsible host (the main chat): its overflow hosts Sketch, so "+"
+      // can open the picker directly.
+      renderWithProviders(<ChatInput {...defaultProps} collapsible onUploadFiles={vi.fn()} />)
+
+      const input = screen.getAllByLabelText('Attach files').find((element) => element.tagName === 'INPUT')
+      const mobilePlus = screen.getByTitle('Attach files').closest('label')
+      expect(input).toBeDefined()
+      expect(mobilePlus).toHaveAttribute('for', input?.id)
+      expect(screen.queryByRole('button', { name: 'Add files & options' })).not.toBeInTheDocument()
+      expect(screen.queryByText('Upload file')).not.toBeInTheDocument()
+    })
+
+    it('keeps the touch-device + menu on a host without the collapse, with Sketch inside it', () => {
+      touchEnv.touch = true
+      renderWithProviders(<ChatInput {...defaultProps} onUploadFiles={vi.fn()} />)
+      // One "+" and no second pencil button on the row.
+      expect(screen.queryByRole('button', { name: /^Sketch\b/ })).not.toBeInTheDocument()
+      fireEvent.click(screen.getByRole('button', { name: 'Add files & options' }))
+      expect(screen.getByText('Upload file')).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: /^Sketch\b/ })).toBeInTheDocument()
+    })
+  })
+
+  describe('above-composer stacking order', () => {
+    // The tip / folder-suggestion band must stay flush against the input box:
+    // options belong with the transcript above it, never between it and the
+    // composer. DOCUMENT_POSITION_FOLLOWING === 4.
+    const FOLLOWING = Node.DOCUMENT_POSITION_FOLLOWING
+
+    it('renders aboveComposer below the options row and above the textarea', () => {
+      renderWithProviders(
+        <ChatInput
+          {...defaultProps}
+          aboveComposer={<div data-testid="tip-band">tip</div>}
+          followUpOptions={['first option', 'second option']}
+          onFollowUpSelect={vi.fn()}
+        />
+      )
+      const option = screen.getByRole('button', { name: 'first option' })
+      const tip = screen.getByTestId('tip-band')
+      const textarea = screen.getByLabelText('Message input')
+
+      expect(option.compareDocumentPosition(tip) & FOLLOWING).toBe(FOLLOWING)
+      expect(tip.compareDocumentPosition(textarea) & FOLLOWING).toBe(FOLLOWING)
+    })
+
+    it('keeps aboveComposer below the knowledge chip', () => {
+      renderWithProviders(
+        <ChatInput
+          {...defaultProps}
+          aboveComposer={<div data-testid="tip-band">tip</div>}
+          knowledgeChip={<div data-testid="knowledge-chip">ctx</div>}
+        />
+      )
+      const chip = screen.getByTestId('knowledge-chip')
+      const tip = screen.getByTestId('tip-band')
+
+      expect(chip.compareDocumentPosition(tip) & FOLLOWING).toBe(FOLLOWING)
+    })
+
+    it('still renders aboveComposer when the options row is absent', () => {
+      renderWithProviders(
+        <ChatInput {...defaultProps} aboveComposer={<div data-testid="tip-band">tip</div>} />
+      )
+      expect(screen.getByTestId('tip-band')).toBeInTheDocument()
+    })
+  })
+
+  describe('offline state', () => {
+    it('disables Send button when connected=false even with text', () => {
+      renderWithProviders(<ChatInput {...defaultProps} value="hello" connected={false} />)
+      const btn = screen.getByRole('button', { name: /Send disabled/ })
+      expect(btn).toBeDisabled()
+    })
+
+    it('exposes offline-aware aria-label on Send button when offline', () => {
+      renderWithProviders(<ChatInput {...defaultProps} value="hi" connected={false} />)
+      expect(screen.getByLabelText('Send disabled — gateway offline')).toBeInTheDocument()
+    })
+
+    it('shows tooltip explaining offline state on Send button', () => {
+      renderWithProviders(<ChatInput {...defaultProps} value="hi" connected={false} />)
+      const btn = screen.getByRole('button', { name: /Send disabled/ })
+      expect(btn).toHaveAttribute('title', 'Gateway offline — reconnect to send')
+    })
+
+    it('keeps Send enabled when connected=true (default)', () => {
+      renderWithProviders(<ChatInput {...defaultProps} value="hi" />)
+      expect(screen.getByRole('button', { name: 'Send' })).not.toBeDisabled()
+    })
+
+    it('disables Optimize button when connected=false even with text', () => {
+      renderWithProviders(<ChatInput {...defaultProps} value="hello" connected={false} />)
+      // "Optimize prompt", not "Optimize": the offline name now reuses this
+      // control's own online accessible name instead of a second raw literal, so
+      // the two agree. It was the only offline name here that disagreed.
+      const btn = screen.getByRole('button', { name: /Optimize prompt disabled/ })
+      expect(btn).toBeDisabled()
+    })
+
+    it('exposes offline-aware aria-label and tooltip on Optimize button', () => {
+      renderWithProviders(<ChatInput {...defaultProps} value="hi" connected={false} />)
+      const btn = screen.getByLabelText('Optimize prompt disabled — gateway offline')
+      expect(btn).toHaveAttribute('title', 'Gateway offline — reconnect to optimize')
+    })
+
+    it('keeps Optimize enabled when connected=true with text', () => {
+      renderWithProviders(<ChatInput {...defaultProps} value="hi" />)
+      expect(screen.getByRole('button', { name: 'Optimize prompt' })).not.toBeDisabled()
+    })
+
+    // Keyboard send must not bypass the offline gate. Without it, hitting Enter
+    // while offline would call onSend() directly via handleKeyDown, triggering
+    // ChatPage.send() → setInput('') → createSlot network call → fail silently,
+    // losing the user's typed draft with no recovery path. The sendKey branch is
+    // gated on `connected`, with defense-in-depth in ChatPage.send(). These tests
+    // pin both legs.
+    it('Enter key when offline does NOT call onSend (default sendOnEnter=enter)', () => {
+      const onSend = vi.fn()
+      renderWithProviders(<ChatInput {...defaultProps} value="hello" onSend={onSend} connected={false} />)
+      const ta = screen.getByLabelText('Message input')
+      fireEvent.keyDown(ta, { key: 'Enter' })
+      expect(onSend).not.toHaveBeenCalled()
+    })
+
+    it('Ctrl+Enter when offline does NOT call onSend (sendOnEnter=ctrl-enter)', () => {
+      const onSend = vi.fn()
+      renderWithProviders(<ChatInput {...defaultProps} value="hello" onSend={onSend} connected={false} sendOnEnter="ctrl-enter" />)
+      const ta = screen.getByLabelText('Message input')
+      fireEvent.keyDown(ta, { key: 'Enter', ctrlKey: true })
+      expect(onSend).not.toHaveBeenCalled()
+    })
+
+    it('Enter key when connected DOES call onSend (positive control)', () => {
+      const onSend = vi.fn()
+      renderWithProviders(<ChatInput {...defaultProps} value="hello" onSend={onSend} connected={true} />)
+      const ta = screen.getByLabelText('Message input')
+      fireEvent.keyDown(ta, { key: 'Enter' })
+      expect(onSend).toHaveBeenCalled()
+    })
+
+    // Note: Cmd+Shift+Enter optimize-shortcut gating is exercised in code
+    // (handleKeyDown line ~1043 has `&& connected`) but NOT pinned with a
+    // dedicated test here. A meaningful test requires observing
+    // optimizePrompt() directly, which goes through a network/dispatch
+    // boundary not surfaced as a prop. The risk if the gate regresses is
+    // a no-op network call when offline (no data loss), so the shielding
+    // is lower-priority than the Enter→onSend path above.
+  })
+
+  describe('send behavior', () => {
+    it('disables Send button when input is empty', () => {
+      renderWithProviders(<ChatInput {...defaultProps} />)
+      expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled()
+    })
+
+    it('enables Send button when input has text', () => {
+      renderWithProviders(<ChatInput {...defaultProps} value="hello" />)
+      expect(screen.getByRole('button', { name: 'Send' })).not.toBeDisabled()
+    })
+
+    it('enables Send button when pendingFiles has items even without text', () => {
+      renderWithProviders(<ChatInput {...defaultProps} pendingFiles={['/tmp/img.png']} />)
+      expect(screen.getByRole('button', { name: 'Send' })).not.toBeDisabled()
+    })
+
+    it('disables Send button when disabled prop is true', () => {
+      renderWithProviders(<ChatInput {...defaultProps} value="hello" disabled />)
+      expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled()
+    })
+
+    it('calls onSend on button click', () => {
+      const onSend = vi.fn()
+      renderWithProviders(<ChatInput {...defaultProps} value="test" onSend={onSend} />)
+      fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+      expect(onSend).toHaveBeenCalledOnce()
+    })
+
+    it('calls onSend on Enter key when sendOnEnter is true', () => {
+      const onSend = vi.fn()
+      renderWithProviders(<ChatInput {...defaultProps} value="test" onSend={onSend} sendOnEnter="enter" />)
+      fireEvent.keyDown(screen.getByLabelText('Message input'), { key: 'Enter' })
+      expect(onSend).toHaveBeenCalledOnce()
+    })
+
+    it('does not call onSend on Shift+Enter', () => {
+      const onSend = vi.fn()
+      renderWithProviders(<ChatInput {...defaultProps} value="test" onSend={onSend} sendOnEnter="enter" />)
+      fireEvent.keyDown(screen.getByLabelText('Message input'), { key: 'Enter', shiftKey: true })
+      expect(onSend).not.toHaveBeenCalled()
+    })
+
+    it('does not call onSend on Enter during IME composition', () => {
+      const onSend = vi.fn()
+      renderWithProviders(<ChatInput {...defaultProps} value="test" onSend={onSend} sendOnEnter="enter" />)
+      const ta = screen.getByLabelText('Message input')
+      const event = new KeyboardEvent('keydown', { key: 'Enter', bubbles: true })
+      Object.defineProperty(event, 'isComposing', { value: true })
+      ta.dispatchEvent(event)
+      expect(onSend).not.toHaveBeenCalled()
+    })
+
+    it('does not send on Enter immediately after compositionEnd (50ms guard)', () => {
+      vi.useFakeTimers()
+      try {
+        const onSend = vi.fn()
+        renderWithProviders(<ChatInput {...defaultProps} value="hello" onSend={onSend} sendOnEnter={true} />)
+        const ta = screen.getByLabelText('Message input')
+        // Simulate: user types English in Chinese IME, presses Enter to commit
+        fireEvent.compositionStart(ta)
+        fireEvent.compositionEnd(ta)
+        // Enter arrives immediately after compositionEnd — isComposing is false
+        fireEvent.keyDown(ta, { key: 'Enter', isComposing: false })
+        expect(onSend).not.toHaveBeenCalled()
+        // After 50ms guard, Enter should work again
+        vi.advanceTimersByTime(50)
+        fireEvent.keyDown(ta, { key: 'Enter', isComposing: false })
+        expect(onSend).toHaveBeenCalledOnce()
+      } finally {
+        vi.useRealTimers()
+      }
+    })
+
+    // jsdom has no CompositionEvent, so carry the committed text the way a browser does.
+    const compositionEnd = (el: HTMLElement, data: string) => {
+      const event = new Event('compositionend', { bubbles: true })
+      Object.defineProperty(event, 'data', { value: data })
+      fireEvent(el, event)
+    }
+
+    it('sends on the first Enter after a Hangul commit (Korean has no candidate step)', () => {
+      const onSend = vi.fn()
+      renderWithProviders(<ChatInput {...defaultProps} value="안녕" onSend={onSend} sendOnEnter="enter" />)
+      const ta = screen.getByLabelText('Message input')
+      fireEvent.compositionStart(ta)
+      // The keydown that ends the composition is still flagged as composing.
+      fireEvent.keyDown(ta, { key: 'Enter', isComposing: true })
+      compositionEnd(ta, '녕')
+      // The browser's follow-up Enter is the user's own and must send.
+      fireEvent.keyDown(ta, { key: 'Enter', isComposing: false })
+      expect(onSend).toHaveBeenCalledOnce()
+    })
+
+    it('still guards the Enter right after a Japanese commit', () => {
+      const onSend = vi.fn()
+      renderWithProviders(<ChatInput {...defaultProps} value="にほん" onSend={onSend} sendOnEnter="enter" />)
+      const ta = screen.getByLabelText('Message input')
+      fireEvent.compositionStart(ta)
+      fireEvent.keyDown(ta, { key: 'Enter', isComposing: true })
+      compositionEnd(ta, 'にほん')
+      fireEvent.keyDown(ta, { key: 'Enter', isComposing: false })
+      expect(onSend).not.toHaveBeenCalled()
+    })
+
+    it('consumes the swallowed Enter so no newline lands in the draft', () => {
+      // The reported symptom: pick a candidate, press Enter to send, and the draft
+      // gains a line break instead. The guard is allowed to decline the submit; it is
+      // not allowed to let the textarea's default action edit the text. `fireEvent`
+      // returns false when a handler called preventDefault.
+      const onSend = vi.fn()
+      renderWithProviders(<ChatInput {...defaultProps} value="你好" onSend={onSend} sendOnEnter="enter" />)
+      const ta = screen.getByLabelText('Message input')
+      fireEvent.compositionStart(ta)
+      fireEvent.compositionEnd(ta)
+      const notCancelled = fireEvent.keyDown(ta, { key: 'Enter', isComposing: false })
+      expect(notCancelled).toBe(false)
+      expect(onSend).not.toHaveBeenCalled()
+    })
+
+    it('does not call onSend on Enter when sendOnEnter is false', () => {
+      const onSend = vi.fn()
+      renderWithProviders(<ChatInput {...defaultProps} value="test" onSend={onSend} sendOnEnter="ctrl-enter" />)
+      fireEvent.keyDown(screen.getByLabelText('Message input'), { key: 'Enter' })
+      expect(onSend).not.toHaveBeenCalled()
+    })
+
+    it('calls onSend on Enter when sendOnEnter is enter-ctrl-newline', () => {
+      const onSend = vi.fn()
+      renderWithProviders(<ChatInput {...defaultProps} value="test" onSend={onSend} sendOnEnter="enter-ctrl-newline" />)
+      fireEvent.keyDown(screen.getByLabelText('Message input'), { key: 'Enter' })
+      expect(onSend).toHaveBeenCalledOnce()
+    })
+
+    it('does not call onSend on Ctrl+Enter when sendOnEnter is enter-ctrl-newline', () => {
+      const onSend = vi.fn()
+      renderWithProviders(<ChatInput {...defaultProps} value="test" onSend={onSend} sendOnEnter="enter-ctrl-newline" />)
+      fireEvent.keyDown(screen.getByLabelText('Message input'), { key: 'Enter', ctrlKey: true })
+      expect(onSend).not.toHaveBeenCalled()
+    })
+
+    it('inserts newline on Ctrl+Enter when sendOnEnter is enter-ctrl-newline', () => {
+      const onChange = vi.fn()
+      renderWithProviders(<ChatInput {...defaultProps} value="hello" onChange={onChange} sendOnEnter="enter-ctrl-newline" />)
+      const ta = screen.getByLabelText('Message input') as HTMLTextAreaElement
+      Object.defineProperty(ta, 'selectionStart', { value: 3, writable: true })
+      Object.defineProperty(ta, 'selectionEnd', { value: 3, writable: true })
+      fireEvent.keyDown(ta, { key: 'Enter', ctrlKey: true })
+      expect(onChange).toHaveBeenCalledWith('hel\nlo')
+    })
+  })
+
+  describe('onChange', () => {
+    it('calls onChange when typing', () => {
+      const onChange = vi.fn()
+      renderWithProviders(<ChatInput {...defaultProps} onChange={onChange} />)
+      fireEvent.change(screen.getByLabelText('Message input'), { target: { value: 'hi' } })
+      expect(onChange).toHaveBeenCalledWith('hi')
+    })
+  })
+
+  describe('prefill hint', () => {
+    it('shows prefill hint when enabled', () => {
+      renderWithProviders(<ChatInput {...defaultProps} prefillHint />)
+      expect(screen.getByText(/Prompt pre-filled/)).toBeInTheDocument()
+    })
+
+    it('does not show prefill hint by default', () => {
+      renderWithProviders(<ChatInput {...defaultProps} />)
+      expect(screen.queryByText(/Prompt pre-filled/)).not.toBeInTheDocument()
+    })
+  })
+
+  describe('file action buttons', () => {
+    it('does not show attach/screenshot buttons by default', () => {
+      renderWithProviders(<ChatInput {...defaultProps} />)
+      expect(screen.queryByTitle('Add files & options')).not.toBeInTheDocument()
+      expect(screen.queryByText('Screenshot')).not.toBeInTheDocument()
+    })
+
+    it('shows attach button with onUploadFiles', () => {
+      renderWithProviders(<ChatInput {...defaultProps} onUploadFiles={vi.fn()} />)
+      expect(screen.getByTitle('Add files & options')).toBeInTheDocument()
+    })
+
+    it('shows Screenshot in the + menu on macOS with onScreenshot', () => {
+      renderWithProviders(<ChatInput {...defaultProps} isMac onUploadFiles={vi.fn()} onScreenshot={vi.fn()} />)
+      fireEvent.click(screen.getByTitle('Add files & options'))
+      expect(screen.getByText('Screenshot')).toBeInTheDocument()
+    })
+
+    it('opening the menu and clicking "Upload file" triggers the hidden file input click', () => {
+      const clickSpy = vi.spyOn(HTMLInputElement.prototype, 'click')
+      renderWithProviders(<ChatInput {...defaultProps} onUploadFiles={vi.fn()} />)
+      fireEvent.click(screen.getByTitle('Add files & options'))
+      fireEvent.click(screen.getByText('Upload file'))
+      expect(clickSpy).toHaveBeenCalled()
+      clickSpy.mockRestore()
+    })
+
+    it('disables the + menu button when uploading', () => {
+      renderWithProviders(<ChatInput {...defaultProps} isMac onUploadFiles={vi.fn()} onScreenshot={vi.fn()} uploading />)
+      expect(screen.getByTitle('Add files & options')).toBeDisabled()
+    })
+
+    /* #5744: while an upload is in flight every attach entry point is
+     * disabled, so without this control the only way out of a slow transfer
+     * is reloading the page. */
+    it('offers a cancel control only while uploading', () => {
+      const { unmount } = renderWithProviders(<ChatInput {...defaultProps} onUploadFiles={vi.fn()} onCancelUpload={vi.fn()} />)
+      expect(screen.queryByRole('button', { name: 'Cancel upload' })).not.toBeInTheDocument()
+      unmount()
+      renderWithProviders(<ChatInput {...defaultProps} onUploadFiles={vi.fn()} onCancelUpload={vi.fn()} uploading />)
+      expect(screen.getByRole('button', { name: 'Cancel upload' })).toBeInTheDocument()
+    })
+
+    it('renders no cancel control when the host passes no onCancelUpload', () => {
+      renderWithProviders(<ChatInput {...defaultProps} onUploadFiles={vi.fn()} uploading />)
+      expect(screen.queryByRole('button', { name: 'Cancel upload' })).not.toBeInTheDocument()
+    })
+
+    it('calls onCancelUpload when the cancel control is pressed', () => {
+      const onCancelUpload = vi.fn()
+      renderWithProviders(<ChatInput {...defaultProps} onUploadFiles={vi.fn()} onCancelUpload={onCancelUpload} uploading />)
+      fireEvent.click(screen.getByRole('button', { name: 'Cancel upload' }))
+      expect(onCancelUpload).toHaveBeenCalledTimes(1)
+    })
+
+    /* #13071: one press aborts every upload in flight, so with two or more the
+     * label says how many stop rather than claiming a single one. */
+    it('names the count on the cancel control only when more than one upload is live', () => {
+      const { rerender } = renderWithProviders(<ChatInput {...defaultProps} onUploadFiles={vi.fn()} onCancelUpload={vi.fn()} uploading uploadCount={1} />)
+      const single = screen.getByRole('button', { name: 'Cancel upload' })
+      expect(single).toHaveAttribute('title', 'Cancel upload')
+
+      rerender(<ChatInput {...defaultProps} onUploadFiles={vi.fn()} onCancelUpload={vi.fn()} uploading uploadCount={2} />)
+      const counted = screen.getByRole('button', { name: 'Cancel 2 uploads' })
+      expect(counted).toHaveAttribute('title', 'Cancel 2 uploads')
+      expect(screen.queryByRole('button', { name: 'Cancel upload' })).not.toBeInTheDocument()
+
+      rerender(<ChatInput {...defaultProps} onUploadFiles={vi.fn()} onCancelUpload={vi.fn()} uploading uploadCount={1} />)
+      expect(screen.getByRole('button', { name: 'Cancel upload' })).toBeInTheDocument()
+    })
+
+    /* A send fired mid-upload left without the file, and the file then landed
+     * in the emptied composer as a stray attachment for the next message. */
+    it('holds Send and Enter while an attachment is on its way', () => {
+      const onSend = vi.fn()
+      renderWithProviders(<ChatInput {...defaultProps} value="look at this" onSend={onSend} onUploadFiles={vi.fn()} uploading holdSend />)
+      const send = screen.getByRole('button', { name: 'Send' })
+      expect(send).toBeDisabled()
+      expect(send).toHaveAttribute('title', 'Waiting for the attachment to finish')
+      fireEvent.keyDown(screen.getByLabelText('Message input'), { key: 'Enter' })
+      expect(onSend).not.toHaveBeenCalled()
+    })
+
+    it('holds the busy steer/queue send while an attachment is on its way', () => {
+      const onSend = vi.fn()
+      const onSteer = vi.fn()
+      renderWithProviders(
+        <ChatInput {...defaultProps} value="look at this" onSend={onSend} onSteer={onSteer} canSteer isRunning onStop={vi.fn()} onUploadFiles={vi.fn()} uploading holdSend />,
+      )
+      fireEvent.keyDown(screen.getByLabelText('Message input'), { key: 'Enter' })
+      expect(onSteer).not.toHaveBeenCalled()
+      expect(onSend).not.toHaveBeenCalled()
+      // The split button's fire half says why it is dimmed, like the other sends.
+      const held = screen.getByTestId('busy-send-button')
+      expect(held).toHaveAttribute('title', 'Steer — Waiting for the attachment to finish')
+      expect(held).toBeDisabled()
+    })
+
+    it('keeps Queue message in the held queue tooltip before the wait reason', () => {
+      renderWithProviders(
+        <ChatInput
+          {...defaultProps}
+          value="look at this"
+          isRunning
+          onStop={vi.fn()}
+          onUploadFiles={vi.fn()}
+          uploading
+          holdSend
+        />,
+      )
+      expect(screen.getByRole('button', { name: 'Queue message' })).toHaveAttribute(
+        'title',
+        'Queue message — Waiting for the attachment to finish',
+      )
+    })
+
+    it('says in words why a held draft is waiting', () => {
+      // The Send tooltip reaches no touch or screen-reader user, and a held
+      // Enter would otherwise do nothing visible.
+      const { unmount } = renderWithProviders(<ChatInput {...defaultProps} value="look at this" onUploadFiles={vi.fn()} uploading holdSend />)
+      expect(screen.getByTestId('composer-send-held')).toHaveTextContent('Waiting for the attachment to finish')
+      expect(screen.getByTestId('composer-send-held')).toHaveAttribute('role', 'status')
+      unmount()
+      // No draft: the upload spinner already says enough.
+      const empty = renderWithProviders(<ChatInput {...defaultProps} value="" onUploadFiles={vi.fn()} uploading holdSend />)
+      expect(screen.queryByTestId('composer-send-held')).not.toBeInTheDocument()
+      empty.unmount()
+      renderWithProviders(<ChatInput {...defaultProps} value="hi" onUploadFiles={vi.fn()} uploading />)
+      expect(screen.queryByTestId('composer-send-held')).not.toBeInTheDocument()
+    })
+
+    it('says why a refs-only composer is waiting', () => {
+      // The idle Send counts a staged session ref as a payload, so it dims for
+      // the hold; the row explaining it must not go by the text-or-files draft.
+      renderWithProviders(
+        <ChatInput
+          {...defaultProps}
+          value=""
+          pendingSessions={[{ key: 'chat-9', title: 'Release notes', messages: 12 }]}
+          onUploadFiles={vi.fn()}
+          uploading
+          holdSend
+        />,
+      )
+      expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled()
+      expect(screen.getByTestId('composer-send-held')).toHaveTextContent('Waiting for the attachment to finish')
+    })
+
+    it('keeps Send live when the upload belongs to another composer', () => {
+      // `uploading` alone only drives the attach controls: an upload started in
+      // another slot lands in that slot's draft and must not hold this send.
+      const onSend = vi.fn()
+      renderWithProviders(<ChatInput {...defaultProps} value="hi" onSend={onSend} onUploadFiles={vi.fn()} uploading />)
+      fireEvent.keyDown(screen.getByLabelText('Message input'), { key: 'Enter' })
+      expect(onSend).toHaveBeenCalled()
+    })
+  })
+
+  describe('drag-to-resize handle', () => {
+    it('initiates drag on pointerdown on handle', () => {
+      renderWithProviders(<ChatInput {...defaultProps} value="test" />)
+      const handle = screen.getByTitle(/Drag to resize/)
+      fireEvent.pointerDown(handle, { clientX: 100, clientY: 200 })
+      expect(document.body.style.cursor).toBe('row-resize')
+      expect(document.body.style.userSelect).toBe('none')
+      fireEvent.pointerUp(handle)
+    })
+
+    it('restores body styles if unmounted mid-drag', () => {
+      const { unmount } = renderWithProviders(<ChatInput {...defaultProps} value="test" />)
+      const handle = screen.getByTitle(/Drag to resize/)
+      fireEvent.pointerDown(handle, { clientX: 100, clientY: 200 })
+      expect(document.body.style.cursor).toBe('row-resize')
+      // Unmount mid-drag with no pointerup — the teardown guard must restore the
+      // global body styles (onEnd can't fire once the element is gone).
+      unmount()
+      expect(document.body.style.cursor).toBe('')
+      expect(document.body.style.userSelect).toBe('')
+    })
+
+    it('resets height on double-click', () => {
+      localStorage.setItem('mc-input-height', '300')
+      renderWithProviders(<ChatInput {...defaultProps} value="test" />)
+      const handle = screen.getByTitle(/Drag to resize/)
+      fireEvent.doubleClick(handle)
+      expect(localStorage.getItem('mc-input-height')).toBeNull()
+    })
+  })
+
+  // applyHeight snaps an overflowing textarea to the bottom when the
+  // caret is at the end, so typing past the ~6-line cap keeps the caret visible.
+  // jsdom has no layout, so we stub the relevant props (and make height='0' zero
+  // scrollTop, as a real browser does) and stub document.activeElement rather
+  // than calling ta.focus().
+  describe('caret-follow scroll', () => {
+    afterEach(() => {
+      delete (document as unknown as { activeElement?: unknown }).activeElement
+    })
+    function setActive(el: Element | null) {
+      Object.defineProperty(document, 'activeElement', { configurable: true, get: () => el })
+    }
+
+    function instrument(
+      ta: HTMLTextAreaElement,
+      opts: { initialScrollTop: number; scrollHeight?: number; clientHeight?: number },
+    ) {
+      let scrollTop = opts.initialScrollTop
+      const scrollHeight = opts.scrollHeight ?? 400
+      const clientHeight = opts.clientHeight ?? 140
+      Object.defineProperty(ta, 'scrollTop', {
+        configurable: true,
+        get: () => scrollTop,
+        set: v => { scrollTop = v },
+      })
+      Object.defineProperty(ta, 'scrollHeight', { configurable: true, get: () => scrollHeight })
+      Object.defineProperty(ta, 'clientHeight', { configurable: true, get: () => clientHeight })
+      let heightVal = ta.style.height
+      Object.defineProperty(ta.style, 'height', {
+        configurable: true,
+        get: () => heightVal,
+        set: v => { heightVal = v; if (v === '0') scrollTop = 0 }, // mirror browser: collapse zeroes scrollTop
+      })
+    }
+
+    it('snaps to the bottom when typing at the end so the caret stays visible', () => {
+      const value = 'a\nb\nc\nd\ne\nf\ng\nh'
+      renderWithProviders(<ChatInput {...defaultProps} value={value} />)
+      const ta = screen.getByLabelText('Message input') as HTMLTextAreaElement
+      ta.setSelectionRange(value.length, value.length) // caret at end (forward typing)
+      setActive(ta)
+      // Pre-measurement scrollTop is stale (e.g. the value-commit just reset it).
+      instrument(ta, { initialScrollTop: 71, scrollHeight: 289 })
+      fireEvent.input(ta)
+      // Caret-at-end + overflowing ⇒ snap to bottom. Otherwise scrollTop would
+      // be stuck at 71 and the caret line would sit below the fold.
+      expect(ta.scrollTop).toBe(289)
+    })
+
+    it('preserves scroll position for a mid-text caret (no jump to bottom)', () => {
+      const value = 'a\nb\nc\nd\ne\nf\ng\nh'
+      renderWithProviders(<ChatInput {...defaultProps} value={value} />)
+      const ta = screen.getByLabelText('Message input') as HTMLTextAreaElement
+      ta.setSelectionRange(2, 2) // caret mid-text, NOT at end
+      setActive(ta)
+      instrument(ta, { initialScrollTop: 120, scrollHeight: 289 })
+      fireEvent.input(ta)
+      // Mid-text edits must not yank the view to the bottom; keep the place.
+      expect(ta.scrollTop).toBe(120)
+    })
+
+    it('does not snap when content fits within the cap (not overflowing)', () => {
+      const value = 'a\nb'
+      renderWithProviders(<ChatInput {...defaultProps} value={value} />)
+      const ta = screen.getByLabelText('Message input') as HTMLTextAreaElement
+      ta.setSelectionRange(value.length, value.length)
+      setActive(ta)
+      // scrollHeight <= clientHeight ⇒ nothing to scroll.
+      instrument(ta, { initialScrollTop: 0, scrollHeight: 100, clientHeight: 140 })
+      fireEvent.input(ta)
+      expect(ta.scrollTop).toBe(0)
+    })
+
+    // The snap is for a caret the user placed. A value the PARENT set -- an error
+    // hand-off's report seeded into a fresh session, a slot's draft restore -- is
+    // not that, and the same focused + caret-at-end + overflowing state yanked
+    // the view to the last line of the seed, hiding the sentence that says what
+    // broke. The caret is not at risk there: it only moves on a real edit, and a
+    // real edit arrives through the `input` event above.
+    it('does not snap for a parent-driven value change (a seeded prompt is read from its first line)', () => {
+      const seed = 'This error just came up.\n\n```error-report\n- Route: /apps/x\n- Request: /api/apps/x -> HTTP 500\n- Message: boom\n```'
+      const { rerender } = renderWithProviders(<ChatInput {...defaultProps} value="" />)
+      const ta = screen.getByLabelText('Message input') as HTMLTextAreaElement
+      setActive(ta)
+      instrument(ta, { initialScrollTop: 0, scrollHeight: 352, clientHeight: 140 })
+      // Programmatic value set: the browser leaves the caret at the end.
+      ta.setSelectionRange(seed.length, seed.length)
+      rerender(<ChatInput {...defaultProps} value={seed} prefillHint />)
+      expect(ta.scrollTop).toBe(0)
+    })
+
+    // The other half of the rule: a re-measure at an UNCHANGED value (the hint
+    // expiring after the user typed, which drops the cap from 320 to 140) is a
+    // viewport change under a caret the user placed, so the caret is followed --
+    // otherwise the line they just typed would be below the fold.
+    it('follows the caret when the cap shrinks under an unchanged value', () => {
+      const value = 'a\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk\nl'
+      const { rerender } = renderWithProviders(<ChatInput {...defaultProps} value={value} prefillHint />)
+      const ta = screen.getByLabelText('Message input') as HTMLTextAreaElement
+      ta.setSelectionRange(value.length, value.length)
+      setActive(ta)
+      instrument(ta, { initialScrollTop: 0, scrollHeight: 289, clientHeight: 140 })
+      rerender(<ChatInput {...defaultProps} value={value} />)
+      expect(ta.scrollTop).toBe(289)
+    })
+
+    it('resets the scroll offset when a seed replaces the box, so it starts at its first line', () => {
+      const value = 'a\nb\nc\nd\ne\nf\ng\nh'
+      const { rerender } = renderWithProviders(<ChatInput {...defaultProps} value={value} />)
+      const ta = screen.getByLabelText('Message input') as HTMLTextAreaElement
+      // The box was scrolled for the previous text; the seed swaps the value under it.
+      instrument(ta, { initialScrollTop: 120, scrollHeight: 352, clientHeight: 140 })
+      rerender(<ChatInput {...defaultProps} value={'This error just came up.\n\n```error-report\n- Message: boom\n```'} prefillHint />)
+      expect(ta.scrollTop).toBe(0)
+    })
+
+    it('keeps the scroll offset when the seed was appended to the draft the user was writing', () => {
+      // The widget send path joins its text onto the trimmed draft and raises
+      // the same hint; the appended tail is the new text, so the offset the user
+      // had is the right one and a jump to the top would hide what just arrived.
+      const draft = 'a\nb\nc\nd\ne\nf\ng\nh  '
+      const { rerender } = renderWithProviders(<ChatInput {...defaultProps} value={draft} />)
+      const ta = screen.getByLabelText('Message input') as HTMLTextAreaElement
+      instrument(ta, { initialScrollTop: 120, scrollHeight: 352, clientHeight: 320 })
+      rerender(<ChatInput {...defaultProps} value={`${draft.trimEnd()}\nwidget text`} prefillHint />)
+      expect(ta.scrollTop).toBe(120)
+    })
+  })
+
+  describe('drag-and-drop zone', () => {
+    it('calls onDrop when files are dropped', () => {
+      const onDrop = vi.fn()
+      renderWithProviders(<ChatInput {...defaultProps} onDrop={onDrop} />)
+      const ta = screen.getByLabelText('Message input')
+      fireEvent.drop(ta)
+      expect(onDrop).toHaveBeenCalledOnce()
+    })
+
+    it('forwards dragover on textarea to parent handler', () => {
+      const onDragOver = vi.fn()
+      renderWithProviders(<ChatInput {...defaultProps} onDragOver={onDragOver} />)
+      fireEvent.dragOver(screen.getByLabelText('Message input'))
+      expect(onDragOver).toHaveBeenCalledOnce()
+    })
+
+    it('stops drop propagation so parent drop zone does not double-fire', () => {
+      const childOnDrop = vi.fn()
+      const parentOnDrop = vi.fn()
+      renderWithProviders(
+        // Intentionally-plain parent drop zone; only exists to assert the child
+        // stops drop propagation. No a11y role needed for this test harness.
+        // eslint-disable-next-line jsx-a11y/no-static-element-interactions
+        <div onDrop={parentOnDrop}>
+          <ChatInput {...defaultProps} onDrop={childOnDrop} />
+        </div>
+      )
+      fireEvent.drop(screen.getByLabelText('Message input'))
+      expect(childOnDrop).toHaveBeenCalledOnce()
+      expect(parentOnDrop).not.toHaveBeenCalled()
+    })
+  })
+
+  describe('file preview strip', () => {
+    it('does not render strip when pendingFiles is empty', () => {
+      renderWithProviders(<ChatInput {...defaultProps} pendingFiles={[]} />)
+      expect(screen.queryByRole('img')).not.toBeInTheDocument()
+    })
+
+    it('renders thumbnails for pending images', () => {
+      renderWithProviders(<ChatInput {...defaultProps} pendingFiles={['/tmp/a.png', '/tmp/b.png']} />)
+      const imgs = screen.getAllByRole('img')
+      expect(imgs).toHaveLength(2)
+    })
+
+    it('calls onRemoveFile when ✕ clicked', () => {
+      const onRemove = vi.fn()
+      renderWithProviders(<ChatInput {...defaultProps} pendingFiles={['/tmp/a.png']} onRemoveFile={onRemove} />)
+      fireEvent.click(screen.getByTitle('Remove'))
+      expect(onRemove).toHaveBeenCalledWith('/tmp/a.png')
+    })
+
+    it('renders file chip for non-image files', () => {
+      renderWithProviders(<ChatInput {...defaultProps} pendingFiles={['/tmp/code.ts']} />)
+      expect(screen.getByText('code.ts')).toBeInTheDocument()
+      expect(screen.queryByRole('img')).not.toBeInTheDocument()
+    })
+
+    it('dispatches lightbox event when thumbnail clicked', () => {
+      const spy = vi.fn()
+      window.addEventListener('lightbox', spy)
+      renderWithProviders(<ChatInput {...defaultProps} pendingFiles={['/tmp/a.png']} />)
+      fireEvent.click(screen.getByRole('img'))
+      expect(spy).toHaveBeenCalledOnce()
+      window.removeEventListener('lightbox', spy)
+    })
+
+    it('increases wrapper minHeight when files are attached and manually sized', () => {
+      localStorage.setItem('mc-input-height', '150')
+      const { container } = renderWithProviders(<ChatInput {...defaultProps} pendingFiles={['/tmp/a.png']} />)
+      const wrapper = container.firstElementChild as HTMLElement
+      // The drag floor plus whatever the strip MEASURED -- not a restatement of
+      // a predicted constant, which is what this used to assert.
+      expect(wrapper.style.minHeight).toBe(`${INPUT_DRAG_MIN_H + PREVIEW_STRIP_H}px`)
+    })
+
+    it('uses base minHeight when no files attached and manually sized', () => {
+      localStorage.setItem('mc-input-height', '150')
+      const { container } = renderWithProviders(<ChatInput {...defaultProps} pendingFiles={[]} />)
+      const wrapper = container.firstElementChild as HTMLElement
+      // No strip mounted, so it measures nothing and reserves nothing.
+      expect(wrapper.style.minHeight).toBe(`${INPUT_DRAG_MIN_H}px`)
+    })
+
+    it('wrapper uses flex-col layout for proper space distribution with file strip', () => {
+      const { container } = renderWithProviders(<ChatInput {...defaultProps} pendingFiles={['/tmp/a.png']} />)
+      const wrapper = container.firstElementChild as HTMLElement
+      expect(wrapper.className).toContain('flex-col')
+    })
+
+    it('grows wrapper height when files are added with manual sizing', () => {
+      localStorage.setItem('mc-input-height', '200')
+      const { rerender } = renderWithProviders(<ChatInput {...defaultProps} pendingFiles={[]} />)
+      const wrapper = screen.getByTestId('input-wrapper')
+      expect(wrapper.style.height).toBe('200px')
+      rerender(<ChatInput {...defaultProps} pendingFiles={['/tmp/a.png']} />)
+      expect(wrapper.style.height).toBe(`${200 + PREVIEW_STRIP_H}px`)
+    })
+
+    it('shrinks wrapper height when files are removed with manual sizing', () => {
+      localStorage.setItem('mc-input-height', String(200 + PREVIEW_STRIP_H))
+      const { rerender } = renderWithProviders(<ChatInput {...defaultProps} pendingFiles={['/tmp/a.png']} />)
+      rerender(<ChatInput {...defaultProps} pendingFiles={[]} />)
+      const wrapper = screen.getByTestId('input-wrapper')
+      expect(wrapper.style.height).toBe('200px')
+    })
+  })
+
+  describe('prompt history', () => {
+    const sent = [{ text: 'first' }, { text: 'second' }, { text: 'third' }]
+
+    it('keeps the recalled prompt when older history loads in front mid-browse', () => {
+      const onChange = vi.fn()
+      const { rerender } = renderWithProviders(<ChatInput {...defaultProps} onChange={onChange} sentMessages={sent} value="" />)
+      const ta = screen.getByLabelText('Message input') as HTMLTextAreaElement
+      fireEvent.keyDown(ta, { key: 'ArrowUp' })
+      rerender(<ChatInput {...defaultProps} onChange={onChange} sentMessages={sent} value="third" />)
+      ta.setSelectionRange(0, 0)
+      fireEvent.keyDown(ta, { key: 'ArrowUp' })
+      expect(onChange).toHaveBeenLastCalledWith('second')
+      const grown = [{ text: 'older-a' }, { text: 'older-b' }, ...sent]
+      rerender(<ChatInput {...defaultProps} onChange={onChange} sentMessages={grown} value="second" />)
+      ta.setSelectionRange(0, 0)
+      fireEvent.keyDown(ta, { key: 'ArrowUp' })
+      expect(onChange).toHaveBeenLastCalledWith('first')
+    })
+
+    it('ArrowUp on empty input recalls newest message', () => {
+      const onChange = vi.fn()
+      renderWithProviders(<ChatInput {...defaultProps} onChange={onChange} sentMessages={sent} />)
+      fireEvent.keyDown(screen.getByLabelText('Message input'), { key: 'ArrowUp' })
+      expect(onChange).toHaveBeenLastCalledWith('third')
+    })
+
+    it('Ctrl+Up on empty input fires the edit-last request instead of recalling (#11402)', () => {
+      const onChange = vi.fn()
+      const onEditLastRequest = vi.fn()
+      renderWithProviders(
+        <ChatInput {...defaultProps} onChange={onChange} sentMessages={sent} onEditLastRequest={onEditLastRequest} />,
+      )
+      fireEvent.keyDown(screen.getByLabelText('Message input'), { key: 'ArrowUp', ctrlKey: true })
+      expect(onEditLastRequest).toHaveBeenCalledTimes(1)
+      expect(onChange).not.toHaveBeenCalled()
+    })
+
+    it('Ctrl+Up with composer content is unclaimed (no edit request, no recall)', () => {
+      const onChange = vi.fn()
+      const onEditLastRequest = vi.fn()
+      renderWithProviders(
+        <ChatInput {...defaultProps} value="draft text" onChange={onChange} sentMessages={sent} onEditLastRequest={onEditLastRequest} />,
+      )
+      fireEvent.keyDown(screen.getByLabelText('Message input'), { key: 'ArrowUp', ctrlKey: true })
+      expect(onEditLastRequest).not.toHaveBeenCalled()
+      expect(onChange).not.toHaveBeenCalled()
+    })
+
+    it('repeated ArrowUp walks from newest to oldest', () => {
+      const onChange = vi.fn()
+      const { rerender } = renderWithProviders(<ChatInput {...defaultProps} onChange={onChange} sentMessages={sent} />)
+      const ta = screen.getByLabelText('Message input') as HTMLTextAreaElement
+      fireEvent.keyDown(ta, { key: 'ArrowUp' })
+      rerender(<ChatInput {...defaultProps} onChange={onChange} sentMessages={sent} value="third" />)
+      ta.setSelectionRange(0, 0)
+      fireEvent.keyDown(ta, { key: 'ArrowUp' })
+      rerender(<ChatInput {...defaultProps} onChange={onChange} sentMessages={sent} value="second" />)
+      ta.setSelectionRange(0, 0)
+      fireEvent.keyDown(ta, { key: 'ArrowUp' })
+      expect(onChange).toHaveBeenNthCalledWith(1, 'third')
+      expect(onChange).toHaveBeenNthCalledWith(2, 'second')
+      expect(onChange).toHaveBeenNthCalledWith(3, 'first')
+    })
+
+    it('ArrowUp at oldest stays on oldest (does not wrap)', () => {
+      const onChange = vi.fn()
+      const { rerender } = renderWithProviders(<ChatInput {...defaultProps} onChange={onChange} sentMessages={sent} value="" />)
+      const ta = screen.getByLabelText('Message input') as HTMLTextAreaElement
+      fireEvent.keyDown(ta, { key: 'ArrowUp' })
+      rerender(<ChatInput {...defaultProps} onChange={onChange} sentMessages={sent} value="third" />)
+      ta.setSelectionRange(0, 0)
+      fireEvent.keyDown(ta, { key: 'ArrowUp' })
+      rerender(<ChatInput {...defaultProps} onChange={onChange} sentMessages={sent} value="second" />)
+      ta.setSelectionRange(0, 0)
+      fireEvent.keyDown(ta, { key: 'ArrowUp' })
+      rerender(<ChatInput {...defaultProps} onChange={onChange} sentMessages={sent} value="first" />)
+      ta.setSelectionRange(0, 0)
+      onChange.mockClear()
+      fireEvent.keyDown(ta, { key: 'ArrowUp' })
+      expect(onChange).not.toHaveBeenCalled()
+    })
+
+    it('ArrowDown past newest restores saved draft', () => {
+      const onChange = vi.fn()
+      const { rerender } = renderWithProviders(<ChatInput {...defaultProps} onChange={onChange} sentMessages={sent} value="my draft" />)
+      const ta = screen.getByLabelText('Message input')
+      // Caret at start so ArrowUp engages history
+      ta.setSelectionRange(0, 0)
+      fireEvent.keyDown(ta, { key: 'ArrowUp' })
+      expect(onChange).toHaveBeenLastCalledWith('third')
+      rerender(<ChatInput {...defaultProps} onChange={onChange} sentMessages={sent} value="third" />)
+      // Caret at end so ArrowDown engages history-exit
+      ta.setSelectionRange('third'.length, 'third'.length)
+      fireEvent.keyDown(ta, { key: 'ArrowDown' })
+      expect(onChange).toHaveBeenLastCalledWith('my draft')
+    })
+
+    it('ArrowDown within history recalls the next newer message', () => {
+      const onChange = vi.fn()
+      const { rerender } = renderWithProviders(<ChatInput {...defaultProps} onChange={onChange} sentMessages={sent} value="" />)
+      const ta = screen.getByLabelText('Message input') as HTMLTextAreaElement
+      // Go up three times to reach "first"
+      fireEvent.keyDown(ta, { key: 'ArrowUp' })
+      rerender(<ChatInput {...defaultProps} onChange={onChange} sentMessages={sent} value="third" />)
+      ta.setSelectionRange(0, 0)
+      fireEvent.keyDown(ta, { key: 'ArrowUp' })
+      rerender(<ChatInput {...defaultProps} onChange={onChange} sentMessages={sent} value="second" />)
+      ta.setSelectionRange(0, 0)
+      fireEvent.keyDown(ta, { key: 'ArrowUp' })
+      rerender(<ChatInput {...defaultProps} onChange={onChange} sentMessages={sent} value="first" />)
+      // Now go down one step — should recall "second"
+      ta.setSelectionRange('first'.length, 'first'.length)
+      fireEvent.keyDown(ta, { key: 'ArrowDown' })
+      expect(onChange).toHaveBeenLastCalledWith('second')
+    })
+
+    it('ArrowUp is ignored when caret is mid-text and value non-empty', () => {
+      const onChange = vi.fn()
+      renderWithProviders(<ChatInput {...defaultProps} onChange={onChange} sentMessages={sent} value="hello world" />)
+      const ta = screen.getByLabelText('Message input') as HTMLTextAreaElement
+      ta.setSelectionRange(5, 5)
+      fireEvent.keyDown(ta, { key: 'ArrowUp' })
+      expect(onChange).not.toHaveBeenCalled()
+    })
+
+    it('ignores an auto-repeat ArrowUp that reaches the start of a typed draft', () => {
+      const onChange = vi.fn()
+      renderWithProviders(<ChatInput {...defaultProps} onChange={onChange} sentMessages={sent} value="my long draft" />)
+      const ta = screen.getByLabelText('Message input') as HTMLTextAreaElement
+      ta.setSelectionRange(0, 0)
+      fireEvent.keyDown(ta, { key: 'ArrowUp', repeat: true })
+      expect(onChange).not.toHaveBeenCalled()
+      // Letting go and pressing again is a deliberate recall.
+      fireEvent.keyDown(ta, { key: 'ArrowUp' })
+      expect(onChange).toHaveBeenLastCalledWith('third')
+    })
+
+    it('keeps walking history on auto-repeat once a prompt is recalled', () => {
+      const onChange = vi.fn()
+      const { rerender } = renderWithProviders(<ChatInput {...defaultProps} onChange={onChange} sentMessages={sent} value="" />)
+      const ta = screen.getByLabelText('Message input') as HTMLTextAreaElement
+      fireEvent.keyDown(ta, { key: 'ArrowUp' })
+      rerender(<ChatInput {...defaultProps} onChange={onChange} sentMessages={sent} value="third" />)
+      ta.setSelectionRange(0, 0)
+      fireEvent.keyDown(ta, { key: 'ArrowUp', repeat: true })
+      expect(onChange).toHaveBeenLastCalledWith('second')
+    })
+
+    it('recalls on an auto-repeat ArrowUp from an empty composer', () => {
+      const onChange = vi.fn()
+      renderWithProviders(<ChatInput {...defaultProps} onChange={onChange} sentMessages={sent} value="" />)
+      fireEvent.keyDown(screen.getByLabelText('Message input'), { key: 'ArrowUp', repeat: true })
+      expect(onChange).toHaveBeenLastCalledWith('third')
+    })
+
+    it('ArrowDown is ignored when not in history mode', () => {
+      const onChange = vi.fn()
+      renderWithProviders(<ChatInput {...defaultProps} onChange={onChange} sentMessages={sent} />)
+      fireEvent.keyDown(screen.getByLabelText('Message input'), { key: 'ArrowDown' })
+      expect(onChange).not.toHaveBeenCalled()
+    })
+
+    it('ArrowUp with no sent messages is a no-op', () => {
+      const onChange = vi.fn()
+      renderWithProviders(<ChatInput {...defaultProps} onChange={onChange} sentMessages={[]} />)
+      fireEvent.keyDown(screen.getByLabelText('Message input'), { key: 'ArrowUp' })
+      expect(onChange).not.toHaveBeenCalled()
+    })
+
+    it('ignores ArrowUp with modifier keys (leaves native navigation)', () => {
+      const onChange = vi.fn()
+      renderWithProviders(<ChatInput {...defaultProps} onChange={onChange} sentMessages={sent} />)
+      fireEvent.keyDown(screen.getByLabelText('Message input'), { key: 'ArrowUp', metaKey: true })
+      expect(onChange).not.toHaveBeenCalled()
+    })
+
+    it('ignores ArrowUp when slash command menu is open', () => {
+      const onChange = vi.fn()
+      const { rerender } = renderWithProviders(<ChatInput {...defaultProps} onChange={onChange} sentMessages={sent} value="" />)
+      const ta = screen.getByLabelText('Message input') as HTMLTextAreaElement
+      // Typing "/" opens the slash menu via internal onChange
+      fireEvent.change(ta, { target: { value: '/' } })
+      rerender(<ChatInput {...defaultProps} onChange={onChange} sentMessages={sent} value="/" />)
+      onChange.mockClear()
+      ta.setSelectionRange(0, 0)
+      fireEvent.keyDown(ta, { key: 'ArrowUp' })
+      expect(onChange).not.toHaveBeenCalled()
+    })
+
+    it('editing a recalled message exits history mode so next ArrowUp starts from newest', () => {
+      const onChange = vi.fn()
+      const { rerender } = renderWithProviders(<ChatInput {...defaultProps} onChange={onChange} sentMessages={sent} value="" />)
+      const ta = screen.getByLabelText('Message input') as HTMLTextAreaElement
+      // Enter history, recall 'third'
+      fireEvent.keyDown(ta, { key: 'ArrowUp' })
+      rerender(<ChatInput {...defaultProps} onChange={onChange} sentMessages={sent} value="third" />)
+      // User edits the recalled text — useEffect resets historyIdxRef to -1
+      rerender(<ChatInput {...defaultProps} onChange={onChange} sentMessages={sent} value="third edited" />)
+      // Next ArrowUp starts from newest again, not from the stale index
+      ta.setSelectionRange(0, 0)
+      onChange.mockClear()
+      fireEvent.keyDown(ta, { key: 'ArrowUp' })
+      expect(onChange).toHaveBeenLastCalledWith('third')
+    })
+
+    it('ArrowDown in history mode is ignored when caret is not at end', () => {
+      const onChange = vi.fn()
+      const multiLine = [{ text: 'first' }, { text: 'line1\nline2' }, { text: 'third' }]
+      const { rerender } = renderWithProviders(<ChatInput {...defaultProps} onChange={onChange} sentMessages={multiLine} value="" />)
+      const ta = screen.getByLabelText('Message input') as HTMLTextAreaElement
+      fireEvent.keyDown(ta, { key: 'ArrowUp' })
+      rerender(<ChatInput {...defaultProps} onChange={onChange} sentMessages={multiLine} value="third" />)
+      ta.setSelectionRange(0, 0)
+      fireEvent.keyDown(ta, { key: 'ArrowUp' })
+      // JS expression so the value contains a real newline matching the array entry.
+      // A string attribute like value="line1\nline2" would pass literal backslash-n
+      // and mismatch the recalled message, exiting history mode before ArrowDown fires.
+      rerender(<ChatInput {...defaultProps} onChange={onChange} sentMessages={multiLine} value={'line1\nline2'} />)
+      // Caret mid-text, not at end — native cursor movement preserved
+      ta.setSelectionRange(3, 3)
+      onChange.mockClear()
+      fireEvent.keyDown(ta, { key: 'ArrowDown' })
+      expect(onChange).not.toHaveBeenCalled()
+    })
+
+    it('moves caret to the end after ArrowUp recall, and the next ↑ keeps walking older', () => {
+      const rafCbs: FrameRequestCallback[] = []
+      const rafSpy = vi.spyOn(window, 'requestAnimationFrame').mockImplementation(cb => { rafCbs.push(cb); return 0 })
+      try {
+        const onChange = vi.fn()
+        const { rerender } = renderWithProviders(<ChatInput {...defaultProps} onChange={onChange} sentMessages={sent} value="" />)
+        const ta = screen.getByLabelText('Message input') as HTMLTextAreaElement
+        fireEvent.keyDown(ta, { key: 'ArrowUp' })
+        // Commit the recalled value before the deferred caret-move runs (real browser ordering).
+        rerender(<ChatInput {...defaultProps} onChange={onChange} sentMessages={sent} value="third" />)
+        rafCbs.splice(0).forEach(cb => cb(0))
+        expect(ta.selectionStart).toBe('third'.length)
+        expect(ta.selectionEnd).toBe('third'.length)
+        // No Home press needed: ↑ from the end of a one-line recall steps older.
+        fireEvent.keyDown(ta, { key: 'ArrowUp' })
+        expect(onChange).toHaveBeenLastCalledWith('second')
+        rerender(<ChatInput {...defaultProps} onChange={onChange} sentMessages={sent} value="second" />)
+        rafCbs.splice(0).forEach(cb => cb(0))
+        expect(ta.selectionStart).toBe('second'.length)
+        // ↓ from the same caret steps straight back to the newer prompt.
+        fireEvent.keyDown(ta, { key: 'ArrowDown' })
+        expect(onChange).toHaveBeenLastCalledWith('third')
+      } finally {
+        rafSpy.mockRestore()
+      }
+    })
+
+    it('walks a multi-line recall by line: ↑ steps older only from its first line, ↓ newer only from its last', () => {
+      const onChange = vi.fn()
+      const multiLine = [{ text: 'first' }, { text: 'line1\nline2\nline3' }, { text: 'third' }]
+      const recalled = 'line1\nline2\nline3'
+      const { rerender } = renderWithProviders(<ChatInput {...defaultProps} onChange={onChange} sentMessages={multiLine} value="" />)
+      const ta = screen.getByLabelText('Message input') as HTMLTextAreaElement
+      fireEvent.keyDown(ta, { key: 'ArrowUp' })
+      rerender(<ChatInput {...defaultProps} onChange={onChange} sentMessages={multiLine} value="third" />)
+      ta.setSelectionRange('third'.length, 'third'.length)
+      fireEvent.keyDown(ta, { key: 'ArrowUp' })
+      expect(onChange).toHaveBeenLastCalledWith(recalled)
+      rerender(<ChatInput {...defaultProps} onChange={onChange} sentMessages={multiLine} value={recalled} />)
+      onChange.mockClear()
+      // Last and middle lines: ↑ is caret movement, not a history step.
+      ta.setSelectionRange(recalled.length, recalled.length)
+      fireEvent.keyDown(ta, { key: 'ArrowUp' })
+      ta.setSelectionRange(8, 8)
+      fireEvent.keyDown(ta, { key: 'ArrowUp' })
+      expect(onChange).not.toHaveBeenCalled()
+      // First and middle lines: ↓ is caret movement too.
+      ta.setSelectionRange(3, 3)
+      fireEvent.keyDown(ta, { key: 'ArrowDown' })
+      ta.setSelectionRange(8, 8)
+      fireEvent.keyDown(ta, { key: 'ArrowDown' })
+      expect(onChange).not.toHaveBeenCalled()
+      // Anywhere on the last line, ↓ steps newer.
+      ta.setSelectionRange(14, 14)
+      fireEvent.keyDown(ta, { key: 'ArrowDown' })
+      expect(onChange).toHaveBeenLastCalledWith('third')
+      rerender(<ChatInput {...defaultProps} onChange={onChange} sentMessages={multiLine} value="third" />)
+      ta.setSelectionRange('third'.length, 'third'.length)
+      fireEvent.keyDown(ta, { key: 'ArrowUp' })
+      rerender(<ChatInput {...defaultProps} onChange={onChange} sentMessages={multiLine} value={recalled} />)
+      // Anywhere on the first line, ↑ steps older.
+      ta.setSelectionRange(3, 3)
+      fireEvent.keyDown(ta, { key: 'ArrowUp' })
+      expect(onChange).toHaveBeenLastCalledWith('first')
+    })
+
+    it('keeps the caret in place when ↑ on the oldest multi-line prompt has nowhere older to go', () => {
+      const rafCbs: FrameRequestCallback[] = []
+      const rafSpy = vi.spyOn(window, 'requestAnimationFrame').mockImplementation(cb => { rafCbs.push(cb); return 0 })
+      try {
+        const onChange = vi.fn()
+        const oldest = 'line1\nline2'
+        const history = [{ text: oldest }, { text: 'newest' }]
+        const { rerender } = renderWithProviders(<ChatInput {...defaultProps} onChange={onChange} sentMessages={history} value="" />)
+        const ta = screen.getByLabelText('Message input') as HTMLTextAreaElement
+        fireEvent.keyDown(ta, { key: 'ArrowUp' })
+        rerender(<ChatInput {...defaultProps} onChange={onChange} sentMessages={history} value="newest" />)
+        ta.setSelectionRange(0, 0)
+        fireEvent.keyDown(ta, { key: 'ArrowUp' })
+        expect(onChange).toHaveBeenLastCalledWith(oldest)
+        rerender(<ChatInput {...defaultProps} onChange={onChange} sentMessages={history} value={oldest} />)
+        rafCbs.splice(0).forEach(cb => cb(0))
+        onChange.mockClear()
+        ta.setSelectionRange(3, 3)
+        expect(fireEvent.keyDown(ta, { key: 'ArrowUp' })).toBe(false)
+        rafCbs.splice(0).forEach(cb => cb(0))
+        expect(onChange).not.toHaveBeenCalled()
+        expect(ta.selectionStart).toBe(3)
+        expect(ta.selectionEnd).toBe(3)
+      } finally {
+        rafSpy.mockRestore()
+      }
+    })
+
+    it('ArrowUp on the first line of the user\'s own draft moves the caret, not the draft', () => {
+      const onChange = vi.fn()
+      renderWithProviders(<ChatInput {...defaultProps} onChange={onChange} sentMessages={sent} value="my draft" />)
+      const ta = screen.getByLabelText('Message input') as HTMLTextAreaElement
+      ta.setSelectionRange('my draft'.length, 'my draft'.length)
+      fireEvent.keyDown(ta, { key: 'ArrowUp' })
+      expect(onChange).not.toHaveBeenCalled()
+    })
+  })
+
+  // ── Reasoning effort merged into model button ──
+  describe('reasoning effort button', () => {
+    it('renders for acp provider', () => {
+      renderWithProviders(
+        <ChatInput {...defaultProps}
+          providerId="acp"
+          reasoningEffort="high"
+          hasEffort
+          modelName="claude-opus-4.7"
+          onModelClick={vi.fn()}
+        />
+      )
+      expect(screen.getByText('High')).toBeInTheDocument()
+    })
+
+    it('leaves the level out when effort is empty', () => {
+      renderWithProviders(
+        <ChatInput {...defaultProps}
+          providerId="acp"
+          reasoningEffort=""
+          hasEffort
+          modelName="claude-opus-4.7"
+          onModelClick={vi.fn()}
+        />
+      )
+      expect(screen.getByTestId('composer-model-chip')).toHaveTextContent(/^claude-opus-4\.7$/)
+    })
+
+    it('shown when hasEffort is set regardless of providerId', () => {
+      renderWithProviders(
+        <ChatInput {...defaultProps}
+          providerId="acp"
+          reasoningEffort="high"
+          hasEffort
+          modelName="claude-opus-4.7"
+          onModelClick={vi.fn()}
+        />
+      )
+      expect(screen.getByText('High')).toBeInTheDocument()
+    })
+
+    it('hidden when hasEffort is unset even on supported provider', () => {
+      renderWithProviders(
+        <ChatInput {...defaultProps} providerId="acp" reasoningEffort="high" modelName="claude-opus-4.7" onModelClick={vi.fn()} />
+      )
+      expect(screen.queryByText('High')).not.toBeInTheDocument()
+    })
+
+    it('shown when providerId is undefined but hasEffort is set', () => {
+      renderWithProviders(
+        <ChatInput {...defaultProps} reasoningEffort="high" hasEffort modelName="claude-opus-4.7" onModelClick={vi.fn()} />
+      )
+      expect(screen.getByText('High')).toBeInTheDocument()
+    })
+
+    // Model + effort are ONE control (docs/decisions/2026-06-14): the effort
+    // level rides inside the model chip and is edited inside the model
+    // picker. The composer never grows a second, standalone effort button.
+    it.each(['claude-opus-4.7', 'gpt-6-sol', 'global.anthropic.claude-opus-4-8[1m]'])(
+      'never renders a standalone effort button for %s', modelName => {
+        renderWithProviders(
+          <ChatInput {...defaultProps}
+            providerId="acp"
+            reasoningEffort="high"
+            hasEffort
+            modelName={modelName}
+            onModelClick={vi.fn()}
+          />
+        )
+        expect(screen.queryByTestId('composer-effort-chip')).toBeNull()
+        expect(screen.queryByRole('button', { name: 'Reasoning effort' })).toBeNull()
+        expect(screen.getByTestId('composer-model-chip')).toHaveTextContent('High')
+      },
+    )
+
+    it('stays enabled while running and says a pick applies from the next message', () => {
+      renderWithProviders(
+        <ChatInput {...defaultProps}
+          providerId="acp"
+          reasoningEffort="medium"
+          hasEffort
+          modelName="claude-opus-4.7"
+          onModelClick={vi.fn()}
+          isRunning
+        />
+      )
+      // A pick during a response is committed and applied from the next
+      // message (the project chip's contract), so the chip is never disabled.
+      // It still shows the level while running, so the title (the only
+      // readout on a narrow shelf) and the accessible name keep carrying it,
+      // followed by the one line that matters then.
+      const label = 'Model: claude-opus-4.7 · Reasoning effort: Medium\nYour next message runs on the model you pick. This reply finishes on the model it started with.'
+      const btn = screen.getByTestId('composer-model-chip')
+      expect(btn).toBeEnabled()
+      expect(btn).toHaveAttribute('title', label)
+      expect(btn).toHaveAccessibleName(label)
+    })
+
+    it('carries the effort level on the routed chip too', () => {
+      renderWithProviders(
+        <ChatInput {...defaultProps}
+          providerId="acp"
+          reasoningEffort="high"
+          hasEffort
+          modelName="auto"
+          modelIsJevRouted
+          onModelClick={vi.fn()}
+        />
+      )
+      const chip = screen.getByTestId('composer-model-chip')
+      expect(chip).toHaveTextContent('High')
+      expect(chip).toHaveAccessibleName(/ · Reasoning effort: High$/)
+      expect(chip).toHaveAttribute('title', chip.getAttribute('aria-label'))
+    })
+
+    it('marks a model picked for the user as auto, never as default', () => {
+      renderWithProviders(
+        <ChatInput {...defaultProps}
+          providerId="acp"
+          modelName="claude-sonnet-5"
+          modelIsAutoChosen
+          onModelClick={vi.fn()}
+        />
+      )
+      const chip = screen.getByTestId('composer-model-chip')
+      expect(chip).toHaveTextContent('claude-sonnet-5·auto')
+      expect(chip).not.toHaveTextContent('default')
+      expect(chip).toHaveAccessibleName('Model: claude-sonnet-5 · auto')
+      expect(chip).toHaveAttribute('title', 'Model: claude-sonnet-5 · auto')
+    })
+
+    it('invokes onModelClick with click rect', () => {
+      const onModelClick = vi.fn()
+      renderWithProviders(
+        <ChatInput {...defaultProps}
+          providerId="acp"
+          reasoningEffort="low"
+          hasEffort
+          modelName="claude-opus-4.7"
+          onModelClick={onModelClick}
+        />
+      )
+      fireEvent.click(screen.getByTitle('Model: claude-opus-4.7 · Reasoning effort: Low'))
+      expect(onModelClick).toHaveBeenCalledOnce()
+      // First arg should be a DOMRect-like object
+      expect(onModelClick.mock.calls[0][0]).toBeTruthy()
+    })
+
+    it('opens the model and agent pickers on the mouse press, once per press', () => {
+      const onModelClick = vi.fn()
+      const onAgentClick = vi.fn()
+      renderWithProviders(
+        <ChatInput {...defaultProps}
+          providerId="acp"
+          modelName="claude-opus-4.7"
+          onModelClick={onModelClick}
+          agentName="kirocrew"
+          onAgentClick={onAgentClick}
+        />
+      )
+      const model = screen.getByTestId('composer-model-chip')
+      fireEvent.pointerDown(model, { pointerType: 'mouse', button: 0 })
+      expect(onModelClick).toHaveBeenCalledOnce()
+      fireEvent.click(model, { detail: 1 })
+      expect(onModelClick).toHaveBeenCalledOnce()
+
+      const agent = screen.getByRole('button', { name: 'Agent: kirocrew' })
+      fireEvent.pointerDown(agent, { pointerType: 'mouse', button: 0 })
+      expect(onAgentClick).toHaveBeenCalledOnce()
+      fireEvent.click(agent, { detail: 1 })
+      expect(onAgentClick).toHaveBeenCalledOnce()
+    })
+
+    it('reports composer focus captured at the press, before focus moves to the chip', () => {
+      const onModelClick = vi.fn()
+      renderWithProviders(
+        <ChatInput {...defaultProps} providerId="acp" modelName="claude-opus-4.7" onModelClick={onModelClick} />
+      )
+      const editor = screen.getByRole('textbox')
+      editor.focus()
+      fireEvent.pointerDown(screen.getByTestId('composer-model-chip'), { pointerType: 'mouse', button: 0 })
+      expect(onModelClick.mock.calls[0][2]).toBe(true)
+    })
+  })
+
+  describe('prompt optimizer (slot binding)', () => {
+    // jsdom doesn't implement document.execCommand. Install a stub before each
+    // test so we can spy on the call site that setTextUndoable uses to write
+    // optimized text into the textarea.
+    let originalExec: typeof document.execCommand | undefined
+    beforeEach(() => {
+      originalExec = (document as any).execCommand // eslint-disable-line @typescript-eslint/no-explicit-any
+        ; (document as any).execCommand = () => true // eslint-disable-line @typescript-eslint/no-explicit-any
+    })
+    afterEach(() => {
+      if (originalExec === undefined) delete (document as any).execCommand // eslint-disable-line @typescript-eslint/no-explicit-any
+      else (document as any).execCommand = originalExec // eslint-disable-line @typescript-eslint/no-explicit-any
+    })
+
+    // A session switch is a change to the slot the ChatInput binds to
+    // (useSlotId), which the SlotProvider supplies. Wrapping ChatInput in a
+    // provider and re-rendering with a new slotId reproduces exactly what
+    // ChatPage does on session switch — it flips the value Stage 1/Stage 2 key
+    // on (`slotId`), not merely the `value` prop. `value` also changes because
+    // ChatPage swaps in the target session's draft.
+    const renderInSlot = (
+      slotId: string,
+      props: Record<string, unknown>,
+    ) =>
+      renderWithProviders(
+        <SlotProvider slotId={slotId}>
+          <ChatInput {...defaultProps} {...props} />
+        </SlotProvider>,
+      )
+    const rerenderInSlot = (
+      rerender: (ui: React.ReactElement) => void,
+      slotId: string,
+      props: Record<string, unknown>,
+    ) =>
+      rerender(
+        <SlotProvider slotId={slotId}>
+          <ChatInput {...defaultProps} {...props} />
+        </SlotProvider>,
+      )
+
+    it('starts no optimize while the composer is locked, from the button or the chord', async () => {
+      // A memory-mode switch locks the composer (disabled) while it moves the
+      // draft; an optimize started then would write into the deleted slot.
+      const fetchSpy = vi.spyOn(global, 'fetch').mockImplementation(() => new Promise<Response>(() => {}))
+      const optimizeCalls = () => fetchSpy.mock.calls.filter(c => String(c[0]).includes('optimize'))
+      // The same settle step for both halves: the unlocked half proves an
+      // optimize reaches fetch within it, so the locked half's empty list is
+      // an absence and not a request that had not got there yet.
+      const settle = async () => { for (let i = 0; i < 5; i++) await act(async () => { await Promise.resolve() }) }
+      const chord = () => fireEvent.keyDown(screen.getByLabelText('Message input'), { key: 'Enter', metaKey: true, shiftKey: true })
+      try {
+        const onChange = vi.fn()
+        const { rerender } = renderInSlot('slot-A', { value: 'fix bug', onChange, disabled: true })
+        const btn = screen.getByRole('button', { name: 'Optimize prompt' })
+        expect(btn).toBeDisabled()
+        await act(async () => {
+          fireEvent.click(btn)
+          chord()
+        })
+        await settle()
+        expect(optimizeCalls()).toEqual([])
+
+        rerenderInSlot(rerender, 'slot-A', { value: 'fix bug', onChange, disabled: false })
+        await act(async () => { chord() })
+        await settle()
+        expect(optimizeCalls()).toHaveLength(1)
+      } finally {
+        fetchSpy.mockRestore()
+      }
+    })
+
+    it('routes optimize result to the originating session when the user switched away', async () => {
+      // The originating session (slot A) starts an optimize, then the user
+      // navigates to slot B before it settles. The result must NOT be written
+      // into the on-screen textarea (that would corrupt slot B's draft), and
+      // must NOT be silently dropped — it goes to the parent via
+      // onOptimizeResult tagged with slot A so ChatPage can route it into A's
+      // draft.
+      let resolveFetch: ((value: Response) => void) | null = null
+      const fetchSpy = vi.spyOn(global, 'fetch').mockImplementation(() =>
+        new Promise<Response>(res => { resolveFetch = res })
+      )
+      // execCommand is the in-place write path; it must never fire for the
+      // cross-session case (that would write into the on-screen session).
+      const execSpy = vi.spyOn(document, 'execCommand').mockReturnValue(true)
+      try {
+        const onChange = vi.fn()
+        const onOptimizeResult = vi.fn()
+        const { rerender } = renderInSlot('slot-A', { value: 'fix bug', onChange, onOptimizeResult })
+        fireEvent.click(screen.getByRole('button', { name: 'Optimize prompt' }))
+        // Let the mutation start so variables.slotId is captured as 'slot-A'.
+        await new Promise(r => setTimeout(r, 10))
+        // Switch to slot B (new slotId + that session's draft as value).
+        rerenderInSlot(rerender, 'slot-B', { value: 'review CR-123', onChange, onOptimizeResult })
+        await new Promise(r => setTimeout(r, 10))
+        execSpy.mockClear()
+        resolveFetch!(new Response(
+          JSON.stringify({ optimized: 'OPTIMIZED FIX BUG WITH MORE DETAIL', changed: true }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        ))
+        await new Promise(r => setTimeout(r, 50))
+        // No in-place write on the now-displayed slot B.
+        const insertCalls = execSpy.mock.calls.filter(c => c[0] === 'insertText')
+        expect(insertCalls).toEqual([])
+        // Result handed back to the parent, tagged with the ORIGINATING slot.
+        expect(onOptimizeResult).toHaveBeenCalledWith('slot-A', 'OPTIMIZED FIX BUG WITH MORE DETAIL')
+      } finally {
+        execSpy.mockRestore()
+        fetchSpy.mockRestore()
+      }
+    })
+
+    it('routes original prompt to the originating session when fetch fails after a switch (onError path)', async () => {
+      // Same cross-session hazard on the failure path: onError must not touch
+      // the on-screen textarea, and must hand the ORIGINAL prompt back to the
+      // originating session so the user's text isn't lost.
+      let rejectFetch: ((reason?: Error) => void) | null = null
+      const fetchSpy = vi.spyOn(global, 'fetch').mockImplementation(() =>
+        new Promise<Response>((_res, rej) => { rejectFetch = rej })
+      )
+      const execSpy = vi.spyOn(document, 'execCommand').mockReturnValue(true)
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => { })
+      try {
+        const onChange = vi.fn()
+        const onOptimizeResult = vi.fn()
+        const { rerender } = renderInSlot('slot-A', { value: 'fix bug', onChange, onOptimizeResult })
+        fireEvent.click(screen.getByRole('button', { name: 'Optimize prompt' }))
+        await new Promise(r => setTimeout(r, 10))
+        rerenderInSlot(rerender, 'slot-B', { value: 'review CR-123', onChange, onOptimizeResult })
+        await new Promise(r => setTimeout(r, 10))
+        execSpy.mockClear()
+        rejectFetch!(new Error('network'))
+        await new Promise(r => setTimeout(r, 50))
+        const insertCalls = execSpy.mock.calls.filter(c => c[0] === 'insertText')
+        expect(insertCalls).toEqual([])
+        expect(onOptimizeResult).toHaveBeenCalledWith('slot-A', 'fix bug')
+      } finally {
+        warnSpy.mockRestore()
+        execSpy.mockRestore()
+        fetchSpy.mockRestore()
+      }
+    })
+
+    it('writes the result in place (not via onOptimizeResult) when the originating session is still on screen', async () => {
+      // No switch: the optimize completes on the same slot it started on. The
+      // result is written in place (execCommand insertText) and onOptimizeResult
+      // is never invoked — the cross-session escape hatch stays dormant.
+      let resolveFetch: ((value: Response) => void) | null = null
+      const fetchSpy = vi.spyOn(global, 'fetch').mockImplementation(() =>
+        new Promise<Response>(res => { resolveFetch = res })
+      )
+      const execSpy = vi.spyOn(document, 'execCommand').mockReturnValue(true)
+      try {
+        const onChange = vi.fn()
+        const onOptimizeResult = vi.fn()
+        renderInSlot('slot-A', { value: 'fix bug', onChange, onOptimizeResult })
+        fireEvent.click(screen.getByRole('button', { name: 'Optimize prompt' }))
+        await new Promise(r => setTimeout(r, 10))
+        execSpy.mockClear()
+        resolveFetch!(new Response(
+          JSON.stringify({ optimized: 'OPTIMIZED FIX BUG', changed: true }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        ))
+        await new Promise(r => setTimeout(r, 50))
+        const insertCalls = execSpy.mock.calls.filter(c => c[0] === 'insertText')
+        expect(insertCalls.length).toBe(1)
+        expect(insertCalls[0][2]).toBe('OPTIMIZED FIX BUG')
+        expect(onOptimizeResult).not.toHaveBeenCalled()
+      } finally {
+        execSpy.mockRestore()
+        fetchSpy.mockRestore()
+      }
+    })
+
+    it('hides the optimizing overlay after switching to another session, and restores it on return', async () => {
+      // The overlay must be scoped to the originating session. It shows
+      // on slot A while optimizing, disappears when the user navigates to slot
+      // B (even though the request is still in flight), and reappears if they
+      // switch back to A before it settles.
+      const fetchSpy = vi.spyOn(global, 'fetch').mockImplementation(() =>
+        new Promise<Response>(() => { /* never resolves — stays pending */ })
+      )
+      try {
+        const onChange = vi.fn()
+        const { rerender } = renderInSlot('slot-A', { value: 'fix bug', onChange })
+        fireEvent.click(screen.getByRole('button', { name: 'Optimize prompt' }))
+        await new Promise(r => setTimeout(r, 10))
+        // Overlay present on the originating session.
+        expect(screen.getByText(/Optimizing prompt/)).toBeInTheDocument()
+        // Switch away → overlay gone even though the request is still pending.
+        rerenderInSlot(rerender, 'slot-B', { value: 'review CR-123', onChange })
+        await new Promise(r => setTimeout(r, 10))
+        expect(screen.queryByText(/Optimizing prompt/)).not.toBeInTheDocument()
+        // Switch back → overlay returns (request still in flight).
+        rerenderInSlot(rerender, 'slot-A', { value: 'fix bug', onChange })
+        await new Promise(r => setTimeout(r, 10))
+        expect(screen.getByText(/Optimizing prompt/)).toBeInTheDocument()
+      } finally {
+        fetchSpy.mockRestore()
+      }
+    })
+
+    it('disables the Optimize button on another session while an optimize is in flight', async () => {
+      // A single mutation backs the instance, so only one optimize runs at a
+      // time. The button must READ as busy (disabled) on the session the user
+      // navigated to, matching the re-entrancy guard — not look clickable then
+      // silently no-op. The originating session shows the spinner; the other
+      // session shows a disabled Sparkles button with an explanatory label.
+      const fetchSpy = vi.spyOn(global, 'fetch').mockImplementation(() =>
+        new Promise<Response>(() => { /* never resolves — stays pending */ })
+      )
+      try {
+        const onChange = vi.fn()
+        const { rerender } = renderInSlot('slot-A', { value: 'fix bug', onChange })
+        fireEvent.click(screen.getByRole('button', { name: 'Optimize prompt' }))
+        await new Promise(r => setTimeout(r, 10))
+        // Navigate to slot B — its own draft, its own value, request still pending.
+        rerenderInSlot(rerender, 'slot-B', { value: 'review CR-123', onChange })
+        await new Promise(r => setTimeout(r, 10))
+        // Button is present under a busy-aware label and is disabled.
+        const btn = screen.getByRole('button', { name: /busy optimizing another chat/i })
+        expect(btn).toBeDisabled()
+        expect(btn).toHaveAttribute('title', 'Optimizing another chat — please wait')
+      } finally {
+        fetchSpy.mockRestore()
+      }
+    })
+
+    it('collapses a streaming optimize into a single undo boundary', async () => {
+      // The recording effect skips writes while the optimizer owns the textarea,
+      // and the completion effect records one boundary when it finishes — so even
+      // if runOptimize ever wrote its result incrementally, a single Ctrl+Z
+      // reverses the whole optimize rather than peeling off streamed chunks.
+      let resolveFetch: ((value: Response) => void) | null = null
+      const fetchSpy = vi.spyOn(global, 'fetch').mockImplementation(() =>
+        new Promise<Response>(res => { resolveFetch = res }),
+      )
+      try {
+        const onChange = vi.fn()
+        const { rerender } = renderWithProviders(
+          <ChatInput {...defaultProps} value="fix bug" onChange={onChange} />,
+        )
+        fireEvent.click(screen.getByRole('button', { name: 'Optimize prompt' }))
+        await new Promise(r => setTimeout(r, 10)) // mutation starts → optimizing = true
+        // Two streamed chunks arrive as prop updates while optimizing. Each must
+        // be skipped by the recording effect (not recorded as its own boundary).
+        rerender(<ChatInput {...defaultProps} value="fix bug WITH" onChange={onChange} />)
+        rerender(<ChatInput {...defaultProps} value="fix bug WITH MORE DETAIL" onChange={onChange} />)
+        // Completing the optimize flips optimizing → false; the completion effect
+        // records the final value as a single boundary. (The mid-flight value
+        // diverged from the prompt, so onSuccess drops its own write — irrelevant
+        // here; we only need the optimizing transition.)
+        resolveFetch!(new Response(
+          JSON.stringify({ optimized: 'IGNORED', changed: true }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        ))
+        await new Promise(r => setTimeout(r, 50))
+        fireEvent.keyDown(screen.getByLabelText('Message input'), { key: 'z', ctrlKey: true })
+        // One undo lands on the pre-optimize text, not an intermediate chunk —
+        // proving the streamed writes collapsed into a single boundary.
+        expect(onChange).toHaveBeenLastCalledWith('fix bug')
+      } finally {
+        fetchSpy.mockRestore()
+      }
+    })
+  })
+})

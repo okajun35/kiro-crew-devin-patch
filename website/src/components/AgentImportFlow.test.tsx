@@ -1,0 +1,914 @@
+import { fireEvent, screen, waitFor, within } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
+import type {
+  AgentImportApplyResponse,
+  AgentImportScanResponse,
+} from '../api/client'
+import { api, ApiError } from '../api/client'
+import { renderWithProviders } from '../test/helpers'
+import { namedCeiling } from '../test/namedCeiling'
+import AgentImportFlow, { skipReasonText } from './AgentImportFlow'
+import { i18next } from '../i18n/all'
+import { LocalOverlayRoot } from './overlayRoot'
+
+// Spread the real module rather than replacing it: the component branches on
+// `error instanceof ApiError`, which needs the real class identity.
+vi.mock('../api/client', async (importOriginal) => {
+  const mod = await importOriginal<typeof import('../api/client')>()
+  return {
+    ...mod,
+    api: {
+      onboardingImportScan: vi.fn(),
+      onboardingImportApply: vi.fn(),
+      onboardingImportState: vi.fn(),
+    },
+  }
+})
+
+const SCAN_RESPONSE: AgentImportScanResponse = {
+  sources: [
+    {
+      id: 'claude_code',
+      name: 'Claude Code',
+      detected: true,
+      detail: '~/.claude',
+      categories: [
+        { id: 'skills', label: 'Skills', count: 4, description: 'Reusable workflows' },
+        { id: 'mcp_servers', label: 'MCP servers', count: 2 },
+        { id: 'hooks', label: 'Hooks', count: 3 },
+        { id: 'raw_instructions', label: 'Raw instructions', count: 1 },
+      ],
+    },
+    {
+      id: 'cursor',
+      name: 'Cursor',
+      detected: true,
+      detail: '~/.cursor',
+      categories: [{ id: 'skills', label: 'Skills', count: 8 }],
+    },
+    {
+      // Deliberately given a SUPPORTED, non-zero category: Quick must be
+      // excluded because it is not an import source at all, not incidentally
+      // because its categories fail the category filter.
+      id: 'quick',
+      name: 'Quick',
+      detected: true,
+      categories: [{ id: 'skills', label: 'Skills', count: 9 }],
+    },
+    {
+      id: 'codex',
+      name: 'Codex',
+      detected: false,
+      categories: [{ id: 'skills', label: 'Skills', count: 0 }],
+    },
+  ],
+  skipped: [
+    { source: 'Claude Code', category: 'Credentials', reason: 'Secrets are never imported', count: 2 },
+  ],
+  merge_only: true,
+}
+
+const APPLY_RESPONSE: AgentImportApplyResponse = {
+  ok: true,
+  conflict_strategy: 'skip',
+  summary: {
+    imported: 10,
+    deduplicated: 1,
+    skipped: 2,
+    conflicts: 0,
+    resolvable_conflicts: 0,
+  },
+}
+
+const CONFLICTED_APPLY_RESPONSE: AgentImportApplyResponse = {
+  ok: true,
+  conflict_strategy: 'skip',
+  summary: {
+    imported: 0,
+    deduplicated: 0,
+    skipped: 2,
+    conflicts: 2,
+    resolvable_conflicts: 2,
+  },
+}
+
+function mockSuccessfulRequests(scan = SCAN_RESPONSE) {
+  vi.mocked(api.onboardingImportScan).mockResolvedValue(scan)
+  vi.mocked(api.onboardingImportApply).mockResolvedValue(APPLY_RESPONSE)
+  vi.mocked(api.onboardingImportState).mockResolvedValue({ ok: true })
+}
+
+async function goToCategories() {
+  await screen.findByRole('heading', { name: 'Choose sources' })
+  await userEvent.click(screen.getByRole('button', { name: 'Continue' }))
+  return screen.findByRole('heading', { name: 'Select items to import' })
+}
+
+async function goToReview() {
+  await goToCategories()
+  await userEvent.click(screen.getByRole('button', { name: 'Continue' }))
+  return screen.findByRole('heading', { name: 'Review import' })
+}
+
+async function startImport() {
+  await goToReview()
+  await userEvent.click(screen.getByRole('button', { name: 'Import selected' }))
+}
+
+describe('AgentImportFlow', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('shows only detected supported sources in the first stage', async () => {
+    mockSuccessfulRequests()
+
+    renderWithProviders(<AgentImportFlow initialOpen onComplete={vi.fn()} />)
+
+    const dialog = await screen.findByRole('dialog', { name: 'Import agent setup' })
+    // The checkbox renders before the useEffect that pre-selects all eligible
+    // sources fires, so wait for the checked state rather than asserting inline.
+    await waitFor(() => {
+      expect(within(dialog).getByRole('checkbox', { name: /Claude Code/ })).toBeChecked()
+    })
+    expect(within(dialog).getByRole('checkbox', { name: /Cursor/ })).toBeChecked()
+    expect(within(dialog).queryByText('Codex')).not.toBeInTheDocument()
+    expect(within(dialog).queryByText('Quick')).not.toBeInTheDocument()
+    expect(api.onboardingImportScan).toHaveBeenCalledOnce()
+  })
+
+  it('renders the stage counter inside one catalog sentence', async () => {
+    // en-XA brackets every catalog value, so "Import setup" + " · 1 of 4" reads `[Import setup] · 1 of 4`.
+    await i18next.changeLanguage('en-XA')
+    mockSuccessfulRequests()
+    renderWithProviders(<AgentImportFlow initialOpen onComplete={vi.fn()} />)
+    expect(await screen.findByText(/^\[[^[\]]* · 1 [^[\]]* \d[^[\]]*\]$/)).toBeInTheDocument()
+  })
+
+  it('closes when persisted onboarding state resolves after the first render', async () => {
+    mockSuccessfulRequests()
+    const { rerender } = renderWithProviders(
+      <AgentImportFlow initialOpen onComplete={vi.fn()} />,
+    )
+
+    expect(await screen.findByRole('dialog', { name: 'Import agent setup' }))
+      .toBeInTheDocument()
+
+    rerender(<AgentImportFlow initialOpen={false} onComplete={vi.fn()} />)
+
+    await waitFor(() => {
+      expect(screen.queryByRole('dialog', { name: 'Import agent setup' }))
+        .not.toBeInTheDocument()
+    })
+  })
+
+  it('shows real category counts without unsupported import toggles', async () => {
+    mockSuccessfulRequests()
+    renderWithProviders(<AgentImportFlow initialOpen onComplete={vi.fn()} />)
+
+    await goToCategories()
+
+    const claude = screen.getByRole('group', { name: 'Claude Code categories' })
+    expect(within(claude).getByRole('checkbox', { name: /Skills.*4/ })).toBeChecked()
+    expect(within(claude).getByRole('checkbox', { name: /MCP servers.*2/ })).toBeChecked()
+    expect(screen.queryByRole('checkbox', { name: /Quick/i })).not.toBeInTheDocument()
+    expect(screen.queryByRole('checkbox', { name: /Hooks/i })).not.toBeInTheDocument()
+    expect(screen.queryByRole('checkbox', { name: /Raw instructions/i })).not.toBeInTheDocument()
+  })
+
+  it('reviews merge-only handling and sends the selected source categories', async () => {
+    mockSuccessfulRequests()
+    renderWithProviders(<AgentImportFlow initialOpen onComplete={vi.fn()} />)
+
+    await goToCategories()
+    await userEvent.click(screen.getByRole('checkbox', { name: /MCP servers.*2/ }))
+    await userEvent.click(screen.getByRole('button', { name: 'Continue' }))
+
+    expect(
+      screen.getByText(/existing Kiro Crew setup is never overwritten by default/i),
+    ).toBeInTheDocument()
+    expect(screen.getByText(/matching items are deduplicated/i)).toBeInTheDocument()
+    expect(screen.getByText(/Secrets are never imported/i)).toBeInTheDocument()
+
+    await userEvent.click(screen.getByRole('button', { name: 'Import selected' }))
+    await waitFor(() => {
+      expect(api.onboardingImportApply).toHaveBeenCalledWith({
+        sources: [
+          { id: 'claude_code', categories: ['skills'] },
+          { id: 'cursor', categories: ['skills'] },
+        ],
+        // The first apply is always the non-destructive strategy; rename and
+        // overwrite require an explicit click on the conflict notice.
+        conflict_strategy: 'skip',
+      })
+    })
+  })
+
+  it('prefers the localized fallback when the refusal carries a backend code', async () => {
+    // The backend's own prose for these routes is generic English produced in
+    // Python ("request failed") that never passes through the i18n catalog.
+    // Once it also sends a `code`, the failure is identified and the catalog
+    // string wins. The plain-Error test below is the control: with no code, the
+    // message still renders.
+    mockSuccessfulRequests()
+    vi.mocked(api.onboardingImportApply).mockRejectedValueOnce(
+      new ApiError(500, 'request failed', '{"error":"request failed","code":"apply_failed"}'),
+    )
+    renderWithProviders(<AgentImportFlow initialOpen onComplete={vi.fn()} />)
+
+    await startImport()
+
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent('The import did not finish. Please try again.')
+    expect(alert).not.toHaveTextContent('request failed')
+  })
+
+  it('preserves the actionable auth-recovery copy instead of offering a retry', async () => {
+    mockSuccessfulRequests()
+    vi.mocked(api.onboardingImportApply).mockRejectedValueOnce(
+      new ApiError(
+        403,
+        'Session expired. Run kirocrew token, then use the banner to sign back in.',
+        '{"error":"invalid session","code":"invalid_token"}',
+        true,
+      ),
+    )
+    renderWithProviders(<AgentImportFlow initialOpen onComplete={vi.fn()} />)
+
+    await startImport()
+
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent('Session expired. Run kirocrew token')
+    expect(alert).not.toHaveTextContent('The import did not finish. Please try again.')
+  })
+
+  it('does not tell an unauthenticated caller that retrying the import can recover', async () => {
+    mockSuccessfulRequests()
+    vi.mocked(api.onboardingImportApply).mockRejectedValueOnce(
+      new ApiError(
+        401,
+        'authentication required',
+        '{"error":"authentication required","code":"auth_required"}',
+      ),
+    )
+    renderWithProviders(<AgentImportFlow initialOpen onComplete={vi.fn()} />)
+
+    await startImport()
+
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent('Sign in again to continue.')
+    expect(alert).not.toHaveTextContent('The import did not finish. Please try again.')
+  })
+
+  it('keeps a failed apply visible and retries the same import', async () => {
+    mockSuccessfulRequests()
+    vi.mocked(api.onboardingImportApply)
+      .mockRejectedValueOnce(new Error('Import service unavailable'))
+      .mockResolvedValueOnce(APPLY_RESPONSE)
+    renderWithProviders(<AgentImportFlow initialOpen onComplete={vi.fn()} />)
+
+    await startImport()
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('Import service unavailable')
+    await userEvent.click(screen.getByRole('button', { name: 'Import selected' }))
+    expect(await screen.findByText('Import complete')).toBeInTheDocument()
+    expect(api.onboardingImportApply).toHaveBeenCalledTimes(2)
+    expect(screen.getByText('10')).toBeInTheDocument()
+  })
+
+  it('keeps Skip and Escape disabled while an import is applying', async () => {
+    let resolveApply: ((value: AgentImportApplyResponse) => void) | undefined
+    mockSuccessfulRequests()
+    vi.mocked(api.onboardingImportApply).mockReturnValue(
+      new Promise(resolve => { resolveApply = resolve }),
+    )
+    renderWithProviders(<AgentImportFlow initialOpen onComplete={vi.fn()} />)
+
+    await startImport()
+    expect(screen.getByRole('button', { name: 'Skip all setup and onboarding' })).toBeDisabled()
+
+    fireEvent.keyDown(document, { key: 'Escape' })
+    expect(api.onboardingImportState).not.toHaveBeenCalled()
+
+    resolveApply?.(APPLY_RESPONSE)
+    expect(await screen.findByText('Import complete')).toBeInTheDocument()
+  })
+
+  it('treats Escape as "Skip all", not "Skip import"', async () => {
+    mockSuccessfulRequests()
+    const onComplete = vi.fn()
+    const onSkipAll = vi.fn()
+    renderWithProviders(
+      <AgentImportFlow initialOpen onComplete={onComplete} onSkipAll={onSkipAll} />,
+    )
+    await screen.findByRole('dialog', { name: 'Import agent setup' })
+
+    fireEvent.keyDown(document, { key: 'Escape' })
+
+    // Skipping the WHOLE flow, so the host is told to skip the remaining
+    // chapters (and route through the mandatory Privacy chapter) rather than
+    // continue into Customize as a plain "Skip import" would.
+    await waitFor(() => expect(onSkipAll).toHaveBeenCalledTimes(1))
+    expect(onComplete).not.toHaveBeenCalled()
+  })
+
+  it('ignores Escape and Tab while hidden behind a remote Crew', async () => {
+    mockSuccessfulRequests()
+    const onSkipAll = vi.fn()
+    renderWithProviders(
+      <LocalOverlayRoot hidden>
+        <AgentImportFlow initialOpen onComplete={vi.fn()} onSkipAll={onSkipAll} />
+      </LocalOverlayRoot>,
+    )
+    await screen.findByRole('dialog', { name: 'Import agent setup', hidden: true })
+
+    // The keys belong to the Crew in front: neither skips first run unseen nor
+    // is claimed by the hidden chapter's Tab trap.
+    expect(fireEvent.keyDown(document, { key: 'Escape' })).toBe(true)
+    expect(fireEvent.keyDown(document, { key: 'Tab' })).toBe(true)
+    await new Promise(resolve => setTimeout(resolve, 0))
+    expect(onSkipAll).not.toHaveBeenCalled()
+    expect(api.onboardingImportState).not.toHaveBeenCalled()
+  })
+
+  // Both "Skip all" paths (the header control and Escape) write through
+  // skipAllMutation, whose failure was previously rendered nowhere — the dialog
+  // just stayed open in silence.
+  it('surfaces a rejected "Skip all" write instead of failing silently', async () => {
+    mockSuccessfulRequests()
+    vi.mocked(api.onboardingImportState).mockRejectedValueOnce(
+      new Error('Onboarding state service unavailable'),
+    )
+    const onSkipAll = vi.fn()
+    renderWithProviders(
+      <AgentImportFlow initialOpen onComplete={vi.fn()} onSkipAll={onSkipAll} />,
+    )
+    await screen.findByRole('dialog', { name: 'Import agent setup' })
+
+    fireEvent.keyDown(document, { key: 'Escape' })
+
+    expect(await screen.findByRole('alert'))
+      .toHaveTextContent('Onboarding state service unavailable')
+    // The flow stays open and does NOT report a skip it failed to persist.
+    expect(onSkipAll).not.toHaveBeenCalled()
+    expect(screen.getByRole('dialog', { name: 'Import agent setup' })).toBeInTheDocument()
+  })
+
+  it('wraps Shift+Tab when focus starts on the dialog heading', async () => {
+    mockSuccessfulRequests()
+    renderWithProviders(<AgentImportFlow initialOpen onComplete={vi.fn()} />)
+
+    const dialog = await screen.findByRole('dialog', { name: 'Import agent setup' })
+    const heading = await within(dialog).findByRole('heading', { name: 'Choose sources' })
+    await waitFor(() => expect(heading).toHaveFocus())
+
+    fireEvent.keyDown(document, { key: 'Tab', shiftKey: true })
+
+    const focusable = within(dialog).getAllByRole('button')
+    expect(document.activeElement).toBe(focusable[focusable.length - 1])
+  })
+
+  it('declines a boundary Tab that belongs to an IME composition', async () => {
+    // On WebKit the keydown that commits a candidate arrives AFTER
+    // compositionend with `isComposing` already false — unguarded, the trap
+    // would yank focus and abort the composition (issue class of the shared
+    // hook's own guard).
+    mockSuccessfulRequests()
+    renderWithProviders(<AgentImportFlow initialOpen onComplete={vi.fn()} />)
+
+    const dialog = await screen.findByRole('dialog', { name: 'Import agent setup' })
+    const heading = await within(dialog).findByRole('heading', { name: 'Choose sources' })
+    await waitFor(() => expect(heading).toHaveFocus())
+
+    fireEvent.compositionStart(heading)
+    fireEvent.compositionEnd(heading)
+    fireEvent.keyDown(document, { key: 'Tab', shiftKey: true })
+
+    // Declined: focus stays where it was instead of wrapping to the last button.
+    expect(document.activeElement).toBe(heading)
+  })
+
+  it('waits for completion state to persist before calling onComplete', async () => {
+    mockSuccessfulRequests()
+    let resolveState: ((value: { ok: boolean }) => void) | undefined
+    vi.mocked(api.onboardingImportState).mockReturnValue(
+      new Promise(resolve => { resolveState = resolve }),
+    )
+    const onComplete = vi.fn()
+    renderWithProviders(<AgentImportFlow initialOpen onComplete={onComplete} />)
+
+    await startImport()
+    await screen.findByText('Import complete')
+    await userEvent.click(screen.getByRole('button', { name: 'Continue' }))
+
+    expect(api.onboardingImportState).toHaveBeenCalledWith({ completed: true })
+    expect(onComplete).not.toHaveBeenCalled()
+    resolveState?.({ ok: true })
+    await waitFor(() => expect(onComplete).toHaveBeenCalledOnce())
+  })
+
+  it('keeps state errors visible and does not complete until retry succeeds', async () => {
+    mockSuccessfulRequests()
+    vi.mocked(api.onboardingImportState)
+      .mockRejectedValueOnce(new Error('Could not save onboarding state'))
+      .mockResolvedValueOnce({ ok: true })
+    const onComplete = vi.fn()
+    renderWithProviders(<AgentImportFlow initialOpen onComplete={onComplete} />)
+
+    await startImport()
+    await screen.findByText('Import complete')
+    await userEvent.click(screen.getByRole('button', { name: 'Continue' }))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('Could not save onboarding state')
+    expect(onComplete).not.toHaveBeenCalled()
+    // The footer button re-sends the write, and now says so.
+    await userEvent.click(screen.getByRole('button', { name: 'Try again' }))
+    await waitFor(() => expect(onComplete).toHaveBeenCalledOnce())
+  })
+
+  it('replays from a fresh scan when the app reopens the flow', async () => {
+    const firstScan = { ...SCAN_RESPONSE, sources: [SCAN_RESPONSE.sources[0]] }
+    const replayScan = { ...SCAN_RESPONSE, sources: [SCAN_RESPONSE.sources[1]] }
+    vi.mocked(api.onboardingImportScan)
+      .mockResolvedValueOnce(firstScan)
+      .mockResolvedValueOnce(replayScan)
+    vi.mocked(api.onboardingImportState).mockResolvedValue({ ok: true })
+    const { rerender, unmount } = renderWithProviders(
+      <AgentImportFlow initialOpen={false} onComplete={vi.fn()} />,
+    )
+    rerender(<AgentImportFlow initialOpen onComplete={vi.fn()} />)
+    expect(await screen.findByRole('checkbox', { name: /Claude Code/ })).toBeInTheDocument()
+    unmount()
+
+    const { rerender: replayRerender } = renderWithProviders(
+      <AgentImportFlow initialOpen={false} onComplete={vi.fn()} />,
+    )
+    replayRerender(<AgentImportFlow initialOpen onComplete={vi.fn()} />)
+    expect(await screen.findByRole('checkbox', { name: /Cursor/ })).toBeInTheDocument()
+    expect(screen.queryByRole('checkbox', { name: /Claude Code/ })).not.toBeInTheDocument()
+  })
+
+  it('automatically completes when no supported setup is detected', async () => {
+    mockSuccessfulRequests({
+      sources: [
+        { id: 'codex', name: 'Codex', detected: false, categories: [] },
+        {
+          // A real source id, so this exercises the CATEGORY filter in isolation
+          // rather than overlapping with the not-a-source denylist.
+          id: 'cursor',
+          name: 'Cursor',
+          detected: true,
+          categories: [{ id: 'unsupported_only', label: 'Unsupported', count: 3 }],
+        },
+      ],
+      skipped: [],
+      merge_only: true,
+    })
+    const onComplete = vi.fn()
+    renderWithProviders(<AgentImportFlow initialOpen onComplete={onComplete} />)
+
+    // The scan resolves, an effect sends the completed write, and its onSuccess
+    // calls onComplete before the close re-renders: the unmount is part of the wait.
+    await waitFor(() => {
+      expect(api.onboardingImportState).toHaveBeenCalledWith({ completed: true })
+      expect(onComplete).toHaveBeenCalledOnce()
+      expect(screen.queryByRole('dialog', { name: 'Import agent setup' })).not.toBeInTheDocument()
+    }, namedCeiling('AUTO_COMPLETE_CLOSED', 5000))
+  })
+  // The scan runs because the user asked for it (Settings, Import from another
+  // agent), not because first run reached the chapter. First run ends the chapter
+  // on an empty scan without a word; for a user who just clicked, that is a dialog
+  // that closes before it shows anything.
+  describe('when the user replays the importer and the scan finds nothing', () => {
+    const NOTHING_TO_IMPORT: AgentImportScanResponse = {
+      sources: [{ id: 'codex', name: 'Codex', detected: false, categories: [] }],
+      skipped: [],
+      merge_only: true,
+    }
+
+    it('says so instead of finishing the chapter', async () => {
+      mockSuccessfulRequests(NOTHING_TO_IMPORT)
+      const onComplete = vi.fn()
+      renderWithProviders(
+        <AgentImportFlow initialOpen keepOpenWhenEmpty onComplete={onComplete} />,
+      )
+
+      expect(await screen.findByRole('heading', { name: 'No supported setup found' }))
+        .toBeInTheDocument()
+      expect(screen.getByRole('dialog', { name: 'Import agent setup' })).toBeInTheDocument()
+      expect(api.onboardingImportState).not.toHaveBeenCalled()
+      expect(onComplete).not.toHaveBeenCalled()
+    })
+
+    it('still lets the user leave from the empty result, once', async () => {
+      mockSuccessfulRequests(NOTHING_TO_IMPORT)
+      const onComplete = vi.fn()
+      renderWithProviders(
+        <AgentImportFlow initialOpen keepOpenWhenEmpty onComplete={onComplete} />,
+      )
+
+      await screen.findByRole('heading', { name: 'No supported setup found' })
+      await userEvent.click(screen.getByRole('button', { name: 'Skip import' }))
+
+      await waitFor(() => expect(onComplete).toHaveBeenCalledOnce())
+      expect(api.onboardingImportState).toHaveBeenCalledOnce()
+      expect(api.onboardingImportState).toHaveBeenCalledWith({ completed: true })
+    })
+  })
+
+
+  it('does not auto-complete when the only detected source could not be read', async () => {
+    // Degrade-don't-fail turned a reader crash into zero eligible sources, which
+    // the auto-complete effect read as "nothing to import" — marking first-run
+    // import done and closing the dialog. The user never learned their setup was
+    // detected and was never re-offered it, so a reader bug silently cost them
+    // the whole import.
+    mockSuccessfulRequests({
+      sources: [{ id: 'codex', name: 'Codex', detected: false, categories: [] }],
+      skipped: [{ source: 'Codex', category: '', reason: 'source_unreadable' }],
+      merge_only: true,
+    })
+    const onComplete = vi.fn()
+    renderWithProviders(<AgentImportFlow initialOpen onComplete={onComplete} />)
+
+    await waitFor(() => {
+      expect(screen.getByText(/could not read the files/i)).toBeInTheDocument()
+    })
+    expect(api.onboardingImportState).not.toHaveBeenCalledWith({ completed: true })
+    expect(onComplete).not.toHaveBeenCalled()
+    expect(screen.getByRole('button', { name: /try again/i })).toBeInTheDocument()
+    // Retry alone would dead-end: the reader failure is persistent, so the user
+    // needs a way to settle this state without forfeiting the whole tour.
+    expect(screen.getByRole('button', { name: /skip import/i })).toBeInTheDocument()
+    expect(screen.queryByText(/no supported setup found/i)).not.toBeInTheDocument()
+    // The heading must not claim the scan failed — it ran and found the source.
+    expect(screen.queryByText(/we could not scan agent setup/i)).not.toBeInTheDocument()
+  })
+
+  it('names an unreadable source at stage 1 when other sources are readable', async () => {
+    // The full-panel state only fires when NOTHING is readable, so with one good
+    // source the failed one used to leave no trace on the screen where the user
+    // decides what to import — they would read its absence as "unsupported".
+    mockSuccessfulRequests({
+      sources: [
+        {
+          id: 'codex',
+          name: 'Codex',
+          detected: true,
+          categories: [{ id: 'instructions', label: 'Instructions', count: 2 }],
+        },
+      ],
+      skipped: [{ source: 'Claude Code', category: '', reason: 'source_unreadable' }],
+      merge_only: true,
+    })
+    renderWithProviders(<AgentImportFlow initialOpen />)
+
+    await waitFor(() => {
+      expect(screen.getByText(/could not read Claude Code/i)).toBeInTheDocument()
+    })
+    // Still a normal picker — one bad source must not block the readable one.
+    expect(screen.getByText('Codex')).toBeInTheDocument()
+  })
+
+  it('keeps the import gate open when skip state cannot be persisted', async () => {
+    mockSuccessfulRequests()
+    vi.mocked(api.onboardingImportState).mockRejectedValue(
+      new Error('Could not save onboarding state'),
+    )
+    const onComplete = vi.fn()
+    renderWithProviders(<AgentImportFlow initialOpen onComplete={onComplete} />)
+
+    await screen.findByRole('heading', { name: 'Choose sources' })
+    await userEvent.click(screen.getByRole('button', { name: 'Skip import' }))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'Could not save onboarding state',
+    )
+    expect(screen.getByRole('dialog', { name: 'Import agent setup' })).toBeInTheDocument()
+    expect(onComplete).not.toHaveBeenCalled()
+  })
+
+  // A failed state write must not be a dead end. The write fails for reasons no
+  // retry clears (an unparseable config.json reads as defaults, so the flag is
+  // false and this flow reopens on every load while the fail-closed write
+  // refuses every exit), and before this every button, "Skip all" included,
+  // re-sent the same failing PUT.
+  it('names an unreadable config and still lets Skip all leave the flow', async () => {
+    mockSuccessfulRequests()
+    vi.mocked(api.onboardingImportState).mockRejectedValue(
+      new ApiError(500, 'request failed', '{"error":"request failed","code":"config_unreadable"}'),
+    )
+    const onComplete = vi.fn()
+    const onSkipAll = vi.fn()
+    renderWithProviders(
+      <AgentImportFlow initialOpen onComplete={onComplete} onSkipAll={onSkipAll} />,
+    )
+    await screen.findByRole('dialog', { name: 'Import agent setup' })
+
+    fireEvent.keyDown(document, { key: 'Escape' })
+
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent('config.json')
+    // The exit says what happens: the import is kept and setup comes back.
+    expect(alert).toHaveTextContent('Your imported items are kept. Setup opens again next time.')
+    expect(onSkipAll).not.toHaveBeenCalled()
+    await userEvent.click(within(alert).getByRole('button', { name: 'Close setup for now' }))
+
+    expect(onSkipAll).toHaveBeenCalledOnce()
+    expect(onComplete).not.toHaveBeenCalled()
+    expect(screen.queryByRole('dialog', { name: 'Import agent setup' })).not.toBeInTheDocument()
+    // Leaving is local: no further write is attempted on the way out.
+    expect(api.onboardingImportState).toHaveBeenCalledOnce()
+  })
+
+  it('lets a finished import continue when only the completed flag failed to save', async () => {
+    mockSuccessfulRequests()
+    vi.mocked(api.onboardingImportState).mockRejectedValue(
+      new ApiError(500, 'request failed', '{"error":"request failed","code":"state_failed"}'),
+    )
+    const onComplete = vi.fn()
+    const onSkipAll = vi.fn()
+    renderWithProviders(
+      <AgentImportFlow initialOpen onComplete={onComplete} onSkipAll={onSkipAll} />,
+    )
+
+    await startImport()
+    await screen.findByText('Import complete')
+    await userEvent.click(screen.getByRole('button', { name: 'Continue' }))
+
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent('Could not save onboarding state.')
+    await userEvent.click(within(alert).getByRole('button', { name: 'Close setup for now' }))
+
+    // The exit the user asked for, not a different one.
+    expect(onComplete).toHaveBeenCalledOnce()
+    expect(onSkipAll).not.toHaveBeenCalled()
+  })
+
+  it('shows the exit on the scan-failed panel too when Skip all cannot save', async () => {
+    vi.mocked(api.onboardingImportScan).mockRejectedValue(
+      new ApiError(500, 'request failed', '{"error":"request failed","code":"scan_failed"}'),
+    )
+    vi.mocked(api.onboardingImportState).mockRejectedValue(
+      new ApiError(500, 'request failed', '{"error":"request failed","code":"config_unreadable"}'),
+    )
+    const onSkipAll = vi.fn()
+    renderWithProviders(<AgentImportFlow initialOpen onComplete={vi.fn()} onSkipAll={onSkipAll} />)
+    await screen.findByRole('heading', { name: 'We could not scan agent setup' })
+
+    fireEvent.keyDown(document, { key: 'Escape' })
+
+    const leave = await screen.findByRole('button', { name: 'Close setup for now' })
+    expect(screen.getByTestId('agent-import-completion-error')).toHaveTextContent('config.json')
+    // One notice and one hand-off link for the panel, not a second red box.
+    expect(screen.getAllByRole('alert')).toHaveLength(1)
+    expect(screen.getAllByText('Ask the agent')).toHaveLength(1)
+    await userEvent.click(leave)
+    expect(onSkipAll).toHaveBeenCalledOnce()
+  })
+
+  it('does not offer the unsaved exit while an import is in flight', async () => {
+    mockSuccessfulRequests()
+    vi.mocked(api.onboardingImportState).mockRejectedValueOnce(
+      new ApiError(500, 'request failed', '{"error":"request failed","code":"state_failed"}'),
+    )
+    let finishApply: (value: typeof APPLY_RESPONSE) => void = () => {}
+    vi.mocked(api.onboardingImportApply).mockReturnValue(
+      new Promise(resolve => { finishApply = resolve }),
+    )
+    const onComplete = vi.fn()
+    renderWithProviders(<AgentImportFlow initialOpen onComplete={onComplete} />)
+
+    await screen.findByRole('heading', { name: 'Choose sources' })
+    await userEvent.click(screen.getByRole('button', { name: 'Skip import' }))
+    await screen.findByRole('button', { name: 'Close setup for now' })
+    await userEvent.click(screen.getByRole('button', { name: 'Continue' }))
+    await userEvent.click(screen.getByRole('button', { name: 'Continue' }))
+    await userEvent.click(screen.getByRole('button', { name: 'Import selected' }))
+
+    expect(screen.getByRole('button', { name: 'Close setup for now' })).toBeDisabled()
+    finishApply(APPLY_RESPONSE)
+    await screen.findByText('Import complete')
+    expect(onComplete).not.toHaveBeenCalled()
+  })
+
+  it('says the import is not live when the agent spec was not rewritten', async () => {
+    mockSuccessfulRequests()
+    vi.mocked(api.onboardingImportApply).mockResolvedValue({ ...APPLY_RESPONSE, agent_spec_rewritten: false })
+
+    renderWithProviders(<AgentImportFlow initialOpen onComplete={vi.fn()} />)
+    await startImport()
+    await screen.findByText('Import complete')
+
+    expect(await screen.findByTestId('agent-spec-not-rewritten')).toHaveTextContent(
+      'Saved, but this copy of Kiro Crew could not update the agent config',
+    )    // "Ready" would contradict the notice.
+    expect(screen.queryByText(/ready in Kiro Crew/i)).not.toBeInTheDocument()
+  })
+
+  it('shows no notice when the agent spec was rewritten', async () => {
+    mockSuccessfulRequests()
+    vi.mocked(api.onboardingImportApply).mockResolvedValue({ ...APPLY_RESPONSE, agent_spec_rewritten: true })
+
+    renderWithProviders(<AgentImportFlow initialOpen onComplete={vi.fn()} />)
+    await startImport()
+    await screen.findByText('Import complete')
+
+    expect(screen.queryByTestId('agent-spec-not-rewritten')).not.toBeInTheDocument()
+  })
+
+  it('offers a resolution when items conflict, and does not by default', async () => {
+    mockSuccessfulRequests()
+    vi.mocked(api.onboardingImportApply).mockResolvedValue(CONFLICTED_APPLY_RESPONSE)
+
+    renderWithProviders(<AgentImportFlow initialOpen onComplete={vi.fn()} />)
+    await startImport()
+    await screen.findByText('Import complete')
+
+    // The user is told nothing changed, and given both ways out.
+    await screen.findByText('2 items already exist with different content.')
+    const keepBoth = screen.getByRole('button', { name: 'Keep both' })
+    expect(screen.getByRole('button', { name: 'Replace mine' })).toBeInTheDocument()
+
+    await userEvent.click(keepBoth)
+
+    // The retry re-sends the SAME selection with the chosen strategy. It must be
+    // the FIRST call after the click: passing the strategy through the mutation
+    // (rather than relying on a re-render landing first) is what stops the click
+    // from repeating the unresolved 'skip' import.
+    await waitFor(() => {
+      expect(api.onboardingImportApply).toHaveBeenCalledTimes(2)
+    })
+    expect(api.onboardingImportApply).toHaveBeenLastCalledWith(
+      expect.objectContaining({ conflict_strategy: 'rename' }),
+    )
+    expect(
+      vi.mocked(api.onboardingImportApply).mock.calls.filter(
+        ([body]) => body?.conflict_strategy === 'skip',
+      ),
+    ).toHaveLength(1)
+  })
+
+  it('keeps the results and the resolution after a failed conflict resolution, and says it failed', async () => {
+    mockSuccessfulRequests()
+    vi.mocked(api.onboardingImportApply)
+      .mockResolvedValueOnce(CONFLICTED_APPLY_RESPONSE)
+      .mockRejectedValueOnce(new Error('Import service unavailable'))
+    renderWithProviders(<AgentImportFlow initialOpen onComplete={vi.fn()} />)
+    await startImport()
+    await screen.findByText('2 items already exist with different content.')
+
+    await userEvent.click(screen.getByRole('button', { name: 'Keep both' }))
+
+    const resolveError = await screen.findByTestId('agent-import-resolve-error')
+    expect(resolveError).toHaveTextContent('Import service unavailable')
+    // It says the import itself is saved and only the conflict choice failed.
+    expect(resolveError).toHaveTextContent('Your import is saved, but Keep both or Replace mine did not go through.')
+    // No hand-off: it would unmount the only place these conflicts resolve.
+    expect(within(resolveError).queryByText('Ask the agent')).toBeNull()
+    // The import before the failed resolution stands: its counts and both ways
+    // out are still on screen, so the person can try again.
+    expect(screen.getByText('2 items already exist with different content.')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Keep both' })).not.toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Replace mine' })).not.toBeDisabled()
+  })
+
+  it('holds Import another and Continue while a conflict resolution runs', async () => {
+    let resolveRetry: ((value: AgentImportApplyResponse) => void) | undefined
+    mockSuccessfulRequests()
+    vi.mocked(api.onboardingImportApply)
+      .mockResolvedValueOnce(CONFLICTED_APPLY_RESPONSE)
+      .mockReturnValueOnce(new Promise(resolve => { resolveRetry = resolve }))
+    renderWithProviders(<AgentImportFlow initialOpen onComplete={vi.fn()} />)
+    await startImport()
+    await screen.findByText('2 items already exist with different content.')
+
+    await userEvent.click(screen.getByRole('button', { name: 'Replace mine' }))
+
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Import another' })).toBeDisabled())
+    // The pressed resolution says it is running; the other does not.
+    expect(screen.getByRole('button', { name: 'Replace mine' })).toHaveAttribute('aria-busy', 'true')
+    expect(screen.getByRole('button', { name: 'Keep both' })).toHaveAttribute('aria-busy', 'false')
+    expect(screen.getByRole('button', { name: 'Continue' })).toBeDisabled()
+    // The counts stay while it runs, rather than dropping to zero.
+    expect(screen.getByText('2 items already exist with different content.')).toBeInTheDocument()
+
+    resolveRetry?.(APPLY_RESPONSE)
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Continue' })).not.toBeDisabled())
+    expect(screen.getByText('10')).toBeInTheDocument()
+  })
+
+  it('names each skip reason in words, and keeps a prose reason as sent', async () => {
+    mockSuccessfulRequests({
+      ...SCAN_RESPONSE,
+      skipped: [
+        { source: 'Claude Code', category: 'Memories', reason: 'row_count_limit', count: 3 },
+        { source: 'Claude Code', category: 'Schedules', reason: 'unsupported_schedule_schema' },
+        { source: 'Claude Code', category: 'MCP servers', reason: 'credential_bearing_server' },
+        { source: 'Claude Code', category: 'Skills', reason: 'a_code_no_one_knows_yet' },
+        { source: 'Claude Code', category: 'Credentials', reason: 'Secrets are never imported' },
+        { source: 'Claude Code', category: 'Rules', reason: 'read_failed' },
+        { source: 'Claude Code', category: 'Settings', reason: 'invalid_config' },
+        { source: 'Claude Code', category: 'Hooks', reason: 'sensitive_path_rejected' },
+      ],
+    })
+    renderWithProviders(<AgentImportFlow initialOpen onComplete={vi.fn()} />)
+    await goToReview()
+
+    expect(screen.getByText('Over a size or count limit')).toHaveAttribute('data-reason', 'row_count_limit')
+    expect(screen.getByText('Not supported yet')).toHaveAttribute('data-reason', 'unsupported_schedule_schema')
+    expect(screen.getByText('Holds credentials, so it stays with its source')).toHaveAttribute('data-reason', 'credential_bearing_server')
+    expect(screen.getByText('Skipped')).toHaveAttribute('data-reason', 'a_code_no_one_knows_yet')
+    expect(screen.getByText('Secrets are never imported')).toBeInTheDocument()
+    expect(screen.queryByText('row_count_limit')).toBeNull()
+    // Pinned until the scan sends a failed flag (#29216): a caught failure
+    // reads in words but is still a note, like every other skip.
+    expect(screen.getByText('Files could not be read')).toHaveAttribute('data-reason', 'read_failed')
+    expect(screen.getByText('Could not be read as valid settings')).toHaveAttribute('data-reason', 'invalid_config')
+    expect(screen.queryByTestId('agent-import-skip-read-error')).toBeNull()
+  })
+
+  it('reads a skip code by its kind, not by a suffix another kind shares', () => {
+    // An unreachable workspace is a bad setting, not a missing feature.
+    expect(skipReasonText('workspace_unavailable')).toBe('Could not be read as valid settings')
+    expect(skipReasonText('workspace_path_too_long')).toBe('Over a size or count limit')
+    expect(skipReasonText('scoped_memory_unsupported')).toBe('Not supported yet')
+    expect(skipReasonText('source_workspace_excluded')).toBe('Left out on purpose')
+    // The scan flags these unsupported, not broken.
+    expect(skipReasonText('unstable_memory_store')).toBe('Not supported yet')
+    expect(skipReasonText('timezone_required')).toBe('Not supported yet')
+    expect(skipReasonText('ambiguous_schedule_trigger')).toBe('Not supported yet')
+    expect(skipReasonText('sensitive_path_rejected')).toBe('Left out on purpose')
+    expect(skipReasonText('unknown_source')).toBe('Skipped')
+    expect(skipReasonText('database_open_failed')).toBe('Files could not be read')
+  })
+
+  it('shows no conflict resolution when nothing conflicted', async () => {
+    mockSuccessfulRequests()
+
+    renderWithProviders(<AgentImportFlow initialOpen onComplete={vi.fn()} />)
+    await startImport()
+    await screen.findByText('Import complete')
+
+    expect(screen.queryByRole('button', { name: 'Keep both' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Replace mine' })).not.toBeInTheDocument()
+  })
+
+  it('renders a source with an unknown id as eligible when detected with supported categories', async () => {
+    // No source-id allowlist exists — any source the backend returns is eligible
+    // provided it is detected and has at least one supported category with count > 0.
+    mockSuccessfulRequests({
+      sources: [
+        {
+          id: 'some-registered-agent',
+          name: 'Some Registered Agent',
+          detected: true,
+          detail: '~/.some-agent',
+          categories: [{ id: 'skills', label: 'Skills', count: 3 }],
+        },
+      ],
+      skipped: [],
+      merge_only: true,
+    })
+    renderWithProviders(<AgentImportFlow initialOpen onComplete={vi.fn()} />)
+
+    const dialog = await screen.findByRole('dialog', { name: 'Import agent setup' })
+    await waitFor(() => {
+      expect(within(dialog).getByRole('checkbox', { name: /Some Registered Agent/ })).toBeChecked()
+    })
+  })
+
+  it('filters out a detected source whose categories are all unsupported or zero-count', async () => {
+    // A source with only unsupported category ids (or zero counts) must not appear.
+    mockSuccessfulRequests({
+      sources: [
+        {
+          id: 'claude_code',
+          name: 'Claude Code',
+          detected: true,
+          detail: '~/.claude',
+          categories: [{ id: 'skills', label: 'Skills', count: 4 }],
+        },
+        {
+          id: 'exotic_agent',
+          name: 'Exotic Agent',
+          detected: true,
+          categories: [
+            { id: 'unsupported_cat', label: 'Unsupported', count: 10 },
+            { id: 'skills', label: 'Skills', count: 0 },
+          ],
+        },
+      ],
+      skipped: [],
+      merge_only: true,
+    })
+    renderWithProviders(<AgentImportFlow initialOpen onComplete={vi.fn()} />)
+
+    const dialog = await screen.findByRole('dialog', { name: 'Import agent setup' })
+    await waitFor(() => {
+      expect(within(dialog).getByRole('checkbox', { name: /Claude Code/ })).toBeChecked()
+    })
+    expect(within(dialog).queryByText('Exotic Agent')).not.toBeInTheDocument()
+  })
+})

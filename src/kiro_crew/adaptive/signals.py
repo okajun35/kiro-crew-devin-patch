@@ -1,0 +1,449 @@
+"""Signals the adaptive controller reads, and the pure pressure classifier.
+
+A :class:`Sample` is one periodic observation of the host and of the two
+admission points (the gateway's subagent cap and the daemon's spawn gate).
+:func:`classify` turns a sample into a :class:`PressureReport` -- WHICH
+signals fired, whether they corroborate each other, whether the pressure is
+severe enough to pause dispatch, and which provider scopes are throttled.
+
+Three things the classifier deliberately keeps apart:
+
+* **Work evidence** (fd/proc counts, start latency, attributable timeouts,
+  completion rate, slow MCP servers, spawn-gate init failures) says whether the
+  work already admitted is failing. It drives BOTH caps, the subagent
+  execution cap and the spawn gate, and only when two distinct signals
+  corroborate each other (:attr:`PressureReport.exec_corroborated`).
+* **Host-only evidence** (:data:`HOST_ONLY_SIGNALS`: the gateway's own loop
+  lag and free memory) is never read by the execution cap: free memory is the
+  per-start spawn floor's to judge (``agent.spawn_min_memory_gb``), and the
+  gateway's loop lag says nothing about whether a subagent's own process is
+  healthy. A lag spike that halved the execution cap throttled every chat's
+  subagents at once.
+* **The spawn gate's evidence** (:attr:`PressureReport.gate_signals`) is every
+  signal EXCEPT the gateway's loop lag, plus the daemon's own slow inits
+  (:data:`SIGNAL_GATE_SLOW_INITS`). The gate bounds forks in the MCP daemon, a
+  separate process: the dashboard gateway's lag is not evidence about it, and
+  cutting on it pins the gate at its floor on an idle host whose backends
+  never fail. Memory at the critical line, gate init
+  failures and slow inits are each sufficient alone.
+* **Provider throttling** (per-provider 429s) is scoped to that provider's
+  dependency channel. It is reported, never counted as a host signal: one
+  provider's rate limit must not halve the concurrency every other provider
+  still has (SPEC 二.3, addendum §4).
+
+Errors that are not congestion -- permission denied, invalid params, context
+length, deny-rule refusals -- are the caller's job to exclude before they
+reach ``attributable_timeout_rate``; this module only reads the rate.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any, Mapping
+
+# Signal names. Closed set: they appear in Decision.reason, the resource_status
+# summary and the audit line, never as free-form text.
+SIGNAL_LOOP_LAG = "loop_lag"
+SIGNAL_MEMORY = "memory"
+SIGNAL_FDS = "fds"
+SIGNAL_PROCS = "procs"
+SIGNAL_START_LATENCY = "start_latency"
+SIGNAL_TIMEOUTS = "timeouts"
+SIGNAL_COMPLETION = "completion_rate"
+SIGNAL_SLOW_KEYS = "slow_keys"
+SIGNAL_GATE_FAILURES = "gate_failures"
+SIGNAL_GATE_SLOW_INITS = "gate_slow_inits"
+
+HEALTH_ACTIVE_SESSIONS = "health_active_sessions"
+HEALTH_CRON_QUEUE = "health_cron_queue"
+HEALTH_CPU = "health_cpu"
+HEALTH_LOOP_LAG = "health_loop_lag"
+HEALTH_SAMPLE_STALE = "health_sample_stale"
+
+HEALTH_SIGNALS = frozenset(
+    {
+        HEALTH_ACTIVE_SESSIONS,
+        HEALTH_CRON_QUEUE,
+        HEALTH_CPU,
+        HEALTH_LOOP_LAG,
+        HEALTH_SAMPLE_STALE,
+    }
+)
+
+HEALTH_STALE_FLOOR_SECS = 15.0
+HEALTH_STALE_CADENCE_MULTIPLE = 3.0
+
+#: Signals the EXECUTION cap never reads: the gateway's own event loop and the
+#: host's free memory. They shape the spawn gate only; the per-start memory
+#: floor owns memory for subagent starts.
+HOST_ONLY_SIGNALS = frozenset({SIGNAL_LOOP_LAG, SIGNAL_MEMORY})
+
+#: Signals individually sufficient for a SPAWN-GATE decrease. Everything else
+#: needs corroboration (>= 2 distinct signals in one sample). Nothing is
+#: sufficient alone for the execution cap: it needs two distinct work signals
+#: (:attr:`PressureReport.exec_corroborated`).
+SUFFICIENT_ALONE = HOST_ONLY_SIGNALS
+
+#: Signals the SPAWN GATE never reads: the dashboard gateway's own event loop,
+#: which is not the process the gate admits forks into.
+GATE_IGNORED_SIGNALS = frozenset({SIGNAL_LOOP_LAG})
+
+#: Signals individually sufficient for a spawn-gate decrease: critical memory
+#: and the daemon's own evidence that its backend starts are failing or slow.
+GATE_SUFFICIENT_ALONE = frozenset({SIGNAL_MEMORY, SIGNAL_GATE_FAILURES, SIGNAL_GATE_SLOW_INITS})
+
+
+@dataclass(frozen=True)
+class Thresholds:
+    """Every knob the classifier reads. Defaults are RFC §5.2 starting values.
+
+    Memory thresholds are in MB and default to the ``resource_pressure_gb`` /
+    ``resource_critical_gb`` pair the ``[RESOURCES]`` advisory already uses,
+    so the controller and the advisory never disagree about "tight".
+    """
+
+    lag_decrease_ms: float = 250.0
+    lag_increase_ms: float = 100.0
+    lag_severe_ms: float = 2000.0
+    mem_pressure_mb: float = 4096.0
+    mem_critical_mb: float = 2048.0
+    #: Fraction of the fd / proc budget above which the signal fires.
+    fd_ratio: float = 0.8
+    proc_ratio: float = 0.9
+    #: Attributable start-timeout / stall rate over the window (0..1).
+    timeout_rate: float = 0.2
+    #: p95 session-start latency that counts as a slow start.
+    start_p95_ms: float = 30_000.0
+    #: Completion rate (done / admitted over the window) below which the host
+    #: is not finishing what it admits. Only read once the window has admitted
+    #: enough work to be meaningful (see ``completion_min_admitted``).
+    completion_rate: float = 0.5
+    completion_min_admitted: int = 5
+    #: Distinct PoolKeys with slow or failing starts in the window that count
+    #: as correlated (one key failing is that server, not the host).
+    slow_keys: int = 2
+    #: Spawn-gate init failures in the window that corroborate other signals
+    #: (read from ``Sample.gate_failures_in_window``, a per-window delta).
+    gate_failures: int = 2
+    #: Length of that window: the daemon reports lifetime counters, so the
+    #: policy counts the failures that landed in the last this-many seconds.
+    gate_failure_window_secs: float = 60.0
+    #: Slow successful backend inits in the daemon's window (each took >= 80%
+    #: of its own effective ``initialize_timeout_secs``, cold-start floor
+    #: included) that count as the gate's starts being slow. Two, so one slow
+    #: but healthy server is not enough. 0 disables.
+    gate_slow_inits: int = 2
+    #: Consecutive severe samples before dispatch pauses.
+    severe_samples: int = 2
+
+
+@dataclass(frozen=True)
+class SpawnGateStats:
+    """The daemon gate's ``stats.admission.spawn_gate`` snapshot, typed."""
+
+    capacity: int = 0
+    floor: int = 1
+    ceiling: int = 8
+    in_flight: int = 0
+    queued: int = 0
+    #: LIFETIME outcome counters as the daemon reports them (``outcomes.*``
+    #: in the stats frame are never reset while the daemon lives). The policy
+    #: diffs them; nothing reads them as a per-window count.
+    successes: int = 0
+    failures: int = 0
+    neutral: int = 0
+    #: Slow successful inits over the daemon's recent window (see
+    #: ``admission.SLOW_INIT_FRACTION``). 0 from a daemon that does not report it.
+    slow_inits: int = 0
+
+    @classmethod
+    def from_snapshot(cls, snap: Mapping[str, object] | None) -> "SpawnGateStats":
+        if not snap:
+            return cls()
+        outcomes = snap.get("outcomes")
+        out = outcomes if isinstance(outcomes, Mapping) else {}
+        return cls(
+            capacity=_as_int(snap.get("capacity")),
+            floor=_as_int(snap.get("floor"), 1),
+            ceiling=_as_int(snap.get("ceiling"), 8),
+            in_flight=_as_int(snap.get("in_flight")),
+            queued=_as_int(snap.get("queued")),
+            successes=_as_int(out.get("success")),
+            failures=_as_int(out.get("failure")),
+            neutral=_as_int(out.get("neutral")),
+            slow_inits=_as_int(snap.get("slow_inits")),
+        )
+
+
+@dataclass(frozen=True)
+class Sample:
+    """One controller observation. Every field has a "not measured" value."""
+
+    t: float
+    loop_lag_ms: float = 0.0
+    rss_mb: float = -1.0
+    free_mem_mb: float = -1.0
+    fd_count: int = -1
+    fd_limit: int = 0
+    proc_count: int = -1
+    proc_limit: int = 0
+    start_latency_p50_ms: float = 0.0
+    start_latency_p95_ms: float = 0.0
+    #: Attributable start timeouts / stalls over the window, as a rate 0..1.
+    attributable_timeout_rate: float = 0.0
+    #: done / admitted over the window (1.0 when nothing was admitted).
+    completion_rate: float = 1.0
+    admitted_in_window: int = 0
+    #: Cumulative completions (successful runs) seen so far. The policy diffs it.
+    completions: int = 0
+    #: Distinct PoolKeys with slow or failing starts in the window.
+    slow_or_failing_keys: int = 0
+    #: Per-provider 429 counts in the window. Provider ids are scopes, not
+    #: host signals.
+    per_provider_429: Mapping[str, int] = field(default_factory=dict)
+    spawn_gate: SpawnGateStats = field(default_factory=SpawnGateStats)
+    #: Spawn-gate init failures INSIDE the evidence window. Derived by the
+    #: policy from the cumulative ``spawn_gate.failures`` (see
+    #: ``AdaptivePolicy._windowed_gate_failures``); ``classify`` reads only
+    #: this, never the lifetime counter, so two failures a daemon saw an hour
+    #: ago cannot keep the cap pinned.
+    gate_failures_in_window: int = 0
+    #: Gateway-side demand: running + queued subagent spawns.
+    running: int = 0
+    queued: int = 0
+    #: In-flight starts that are still healthy (not timed out). A decrease
+    #: never targets below this: natural shrink cannot free what is working.
+    healthy_in_flight: int = 0
+    #: Running sessions with new stream activity since the previous observation.
+    #: Unlike healthy_in_flight, merely occupying a slot is not evidence here.
+    progressing: int = 0
+    #: The largest running count at a SINGLE admission point (the sub-agent
+    #: manager or the runner lane), not their sum. Each point is bounded by the
+    #: same effective cap on its own, so "a slot is in use at the cap" is a
+    #: per-point question: the progress probe reads this, not ``running``, so a
+    #: long in-flight run buys an exploratory slot only once one point's own
+    #: running fills the cap. Defaults to ``running`` for samples built before
+    #: the lane was folded in.
+    saturating: int = -1
+    #: The largest demand (running + queued) at a SINGLE admission point, not
+    #: the sum across points. The earn gate reads this for its pressure test,
+    #: so demand SPLIT across two points earns nothing until one point alone
+    #: carries cap-deep demand -- two manager plus two lane runs at cap 4 is
+    #: neither point saturated. A deep queue at one point is still demand, so a
+    #: slow-start increase earned by a completion with running below the cap
+    #: holds. Defaults to ``demand`` for samples built before the lane folded
+    #: in.
+    saturating_demand: int = -1
+    active_sessions: int = -1
+    cron_queue_depth: int = -1
+    cpu_pressure: float = -1.0
+    observed_at: float = -1.0
+
+    @property
+    def age_secs(self) -> float:
+        if self.observed_at < 0:
+            return 0.0
+        return max(0.0, self.t - self.observed_at)
+
+    @property
+    def at_cap_running(self) -> int:
+        """Per-admission-point running for the in-use-at-cap test. Falls back
+        to the total ``running`` when ``saturating`` was not measured."""
+        return self.saturating if self.saturating >= 0 else self.running
+
+    @property
+    def at_cap_demand(self) -> int:
+        """Per-admission-point demand for the earn gate's pressure test. Falls
+        back to the total ``demand`` when it was not measured per point."""
+        return self.saturating_demand if self.saturating_demand >= 0 else self.demand
+
+    @property
+    def demand(self) -> int:
+        return self.running + self.queued
+
+
+@dataclass(frozen=True)
+class PressureReport:
+    """What one sample says about the host."""
+
+    signals: frozenset[str]
+    #: Enough evidence to decrease the SPAWN GATE: a signal from
+    #: SUFFICIENT_ALONE, or >= 2 distinct signals in the same sample.
+    corroborated: bool
+    #: Memory below critical or loop lag beyond the severe line. Pauses the
+    #: spawn gate only.
+    severe: bool
+    #: Nothing fired AND the hysteresis "increase" side holds (lag well below
+    #: the decrease line, memory above the pressure line). The spawn gate's
+    #: increase test.
+    clear_for_increase: bool
+    #: Provider scopes throttled in this sample. Reported, not a host signal.
+    throttled_providers: frozenset[str]
+    #: The spawn gate's increase test: none of ITS signals fired and memory is
+    #: above the pressure line. Loop lag plays no part.
+    gate_clear_for_increase: bool = False
+
+    @property
+    def any(self) -> bool:
+        return bool(self.signals)
+
+    @property
+    def exec_signals(self) -> frozenset[str]:
+        """The signals the execution cap reads: everything but HOST_ONLY_SIGNALS."""
+        return self.signals - HOST_ONLY_SIGNALS
+
+    @property
+    def exec_corroborated(self) -> bool:
+        """Enough evidence to decrease the EXECUTION cap: >= 2 distinct work signals."""
+        return len(self.exec_signals) >= 2
+
+    @property
+    def gate_signals(self) -> frozenset[str]:
+        """The signals the spawn gate reads: everything but GATE_IGNORED_SIGNALS."""
+        return self.signals - GATE_IGNORED_SIGNALS
+
+    @property
+    def gate_corroborated(self) -> bool:
+        """Enough evidence to decrease the SPAWN GATE."""
+        gs = self.gate_signals
+        return bool(gs & GATE_SUFFICIENT_ALONE) or len(gs) >= 2
+
+    @property
+    def gate_severe(self) -> bool:
+        """Severe for the gate: memory at the critical line. Loop lag never is."""
+        return SIGNAL_MEMORY in self.signals
+
+
+def classify(sample: Sample, th: Thresholds) -> PressureReport:
+    """Pure: one sample + thresholds -> :class:`PressureReport`."""
+    signals: set[str] = set()
+    severe = False
+
+    if sample.loop_lag_ms >= th.lag_decrease_ms:
+        signals.add(SIGNAL_LOOP_LAG)
+    if sample.loop_lag_ms >= th.lag_severe_ms:
+        severe = True
+
+    if sample.free_mem_mb >= 0 and th.mem_critical_mb > 0:
+        if sample.free_mem_mb <= th.mem_critical_mb:
+            signals.add(SIGNAL_MEMORY)
+            severe = True
+
+    if sample.fd_limit > 0 and sample.fd_count >= 0:
+        if sample.fd_count >= th.fd_ratio * sample.fd_limit:
+            signals.add(SIGNAL_FDS)
+    if sample.proc_limit > 0 and sample.proc_count >= 0:
+        if sample.proc_count >= th.proc_ratio * sample.proc_limit:
+            signals.add(SIGNAL_PROCS)
+
+    if sample.start_latency_p95_ms >= th.start_p95_ms > 0:
+        signals.add(SIGNAL_START_LATENCY)
+    if sample.attributable_timeout_rate >= th.timeout_rate > 0:
+        signals.add(SIGNAL_TIMEOUTS)
+    if (
+        sample.admitted_in_window >= th.completion_min_admitted
+        and sample.completion_rate < th.completion_rate
+    ):
+        signals.add(SIGNAL_COMPLETION)
+    if sample.slow_or_failing_keys >= th.slow_keys > 0:
+        signals.add(SIGNAL_SLOW_KEYS)
+    if sample.gate_failures_in_window >= th.gate_failures > 0:
+        signals.add(SIGNAL_GATE_FAILURES)
+    if sample.spawn_gate.slow_inits >= th.gate_slow_inits > 0:
+        signals.add(SIGNAL_GATE_SLOW_INITS)
+
+    corroborated = bool(signals & SUFFICIENT_ALONE) or len(signals) >= 2
+
+    mem_ok = (
+        sample.free_mem_mb < 0
+        or th.mem_pressure_mb <= 0
+        or (sample.free_mem_mb >= th.mem_pressure_mb)
+    )
+    clear = not signals and sample.loop_lag_ms < th.lag_increase_ms and mem_ok
+    gate_clear = not (signals - GATE_IGNORED_SIGNALS) and mem_ok
+
+    throttled = frozenset(
+        str(scope) for scope, count in sample.per_provider_429.items() if _as_int(count) > 0
+    )
+    return PressureReport(
+        signals=frozenset(signals),
+        corroborated=corroborated,
+        severe=severe,
+        clear_for_increase=clear,
+        throttled_providers=throttled,
+        gate_clear_for_increase=gate_clear,
+    )
+
+
+def _as_int(value: object, default: int = 0) -> int:
+    try:
+        return int(value)  # type: ignore[call-overload]
+    except (TypeError, ValueError):
+        return default
+
+
+@dataclass(frozen=True)
+class HealthThresholds:
+
+    active_sessions: int = 16
+    cron_queue_depth: int = 8
+    cpu_pressure: float = 0.9
+    loop_lag_ms: float = 250.0
+    sample_max_age_secs: float = HEALTH_STALE_FLOOR_SECS
+
+    @classmethod
+    def for_cadence(cls, sample_secs: float, **over: Any) -> "HealthThresholds":
+        cutoff = max(HEALTH_STALE_FLOOR_SECS, HEALTH_STALE_CADENCE_MULTIPLE * float(sample_secs))
+        return cls(sample_max_age_secs=cutoff, **over)
+
+
+@dataclass(frozen=True)
+class HealthTelemetry:
+
+    signals: frozenset[str]
+    stale: bool
+    age_secs: float
+    cron_collision_suspected: bool
+    renderer_suspected: bool
+
+
+def health_telemetry(
+    sample: Sample, th: HealthThresholds, *, now: float | None = None
+) -> HealthTelemetry:
+    signals: set[str] = set()
+
+    if (
+        sample.active_sessions >= 0
+        and th.active_sessions > 0
+        and sample.active_sessions >= th.active_sessions
+    ):
+        signals.add(HEALTH_ACTIVE_SESSIONS)
+    if (
+        sample.cron_queue_depth >= 0
+        and th.cron_queue_depth > 0
+        and sample.cron_queue_depth >= th.cron_queue_depth
+    ):
+        signals.add(HEALTH_CRON_QUEUE)
+    if sample.cpu_pressure >= 0 and th.cpu_pressure > 0 and sample.cpu_pressure >= th.cpu_pressure:
+        signals.add(HEALTH_CPU)
+    if th.loop_lag_ms > 0 and sample.loop_lag_ms >= th.loop_lag_ms:
+        signals.add(HEALTH_LOOP_LAG)
+
+    age = sample.age_secs
+    if now is not None and sample.observed_at >= 0:
+        age = max(0.0, now - sample.observed_at)
+    stale = th.sample_max_age_secs > 0 and age > th.sample_max_age_secs
+    if stale:
+        signals.add(HEALTH_SAMPLE_STALE)
+
+    contention = HEALTH_CPU in signals or HEALTH_LOOP_LAG in signals
+    cron_collision = (not stale) and HEALTH_CRON_QUEUE in signals and contention
+    renderer = (not stale) and HEALTH_ACTIVE_SESSIONS in signals and HEALTH_LOOP_LAG in signals
+
+    return HealthTelemetry(
+        signals=frozenset(signals),
+        stale=stale,
+        age_secs=age,
+        cron_collision_suspected=cron_collision,
+        renderer_suspected=renderer,
+    )

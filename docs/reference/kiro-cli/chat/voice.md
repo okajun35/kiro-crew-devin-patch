@@ -1,0 +1,283 @@
+# Voice Input & Output
+
+> **Not a mirror.** This page has no upstream source: it documents Kiro Crew's
+> own voice setup. The surrounding tree's do-not-author rule does not reach it.
+
+Kiro Crew supports hands-free interaction through voice input (speech-to-text)
+and voice output (text-to-speech). Input works in the dashboard and on supported
+messaging attachments; output works in the dashboard, Slack, and Telegram.
+
+## Voice Input (Speech-to-Text)
+
+### Dashboard Chat Box
+
+The chat input bar has a microphone button. Here's how it works:
+
+1. Click the mic button, and your browser asks for microphone permission.
+2. Speak your message. Words appear in the message box as you talk.
+3. Stop by clicking the mic button again, or (on the default local provider)
+   just by pausing: a silence of `stt.silence_ms` ends the utterance for you.
+4. Review and edit the text, then press Enter to send.
+
+Recognition runs on your own machine by default, on a model Kiro Crew keeps
+loaded, so no audio leaves your device and a finished phrase becomes text in
+tens of milliseconds. Turning `stt.streaming` off transcribes once at the end
+instead, and the button shows a spinner while it works. If recognition fails or
+returns nothing, nothing is inserted.
+
+**Browser requirements:** Chrome, Edge, Firefox, or Safari with microphone
+access. Live transcription needs `getUserMedia`, `AudioWorklet` and `WebSocket`;
+a browser missing any of them falls back to recording the whole utterance with
+`MediaRecorder` and transcribing it on release (WebM/Opus preferred, MP4/OGG
+fallback).
+
+### Messaging Voice Notes
+
+When STT is enabled, audio and voice attachments received through Slack, Discord,
+Teams, Telegram, Webex, WeCom, Weixin, and WhatsApp are automatically transcribed
+through the shared attachment path. Kiro Crew responds to the transcribed text as
+if it had been typed. A channel may impose its own attachment-size and media-type
+limits before transcription.
+
+### Setup
+
+Speech-to-text is on by default, and the default provider runs on this machine.
+Desktop releases already contain the recognizer and audio decoder; users only
+download their selected model. For a source install, add the recognizer to the environment that runs the
+gateway:
+
+```bash
+pip install 'pywhispercpp>=1.5,<2'
+```
+
+Compressed input still needs an authenticated FFmpeg decoder for WebM, M4A, and
+ogg/Opus. Desktop releases carry and verify a pinned decoder, except on Intel
+Macs, which use a system FFmpeg (`brew install ffmpeg`). A source install
+first checks fixed system locations and, if no usable binary exists, **Settings >
+Voice** offers a one-click download of the pinned audio-only FFmpeg executable
+into `<data home>/models/ffmpeg/`; its SHA-256 is verified before every execution.
+Kiro Crew deliberately does not execute a decoder from an agent-writable project
+venv. Platforms without a pinned artifact must install FFmpeg into one of the
+trusted system locations reported by `kirocrew doctor`.
+
+Prebuilt recognizer wheels cover Apple silicon macOS, glibc and musl Linux on
+x86_64 and arm64, and Windows. An Intel Mac has none, so `pip` builds from source
+there and needs a C++ toolchain plus CMake. Settings reports that as its own state,
+not as a missing extra.
+
+Then open **Settings > Voice**. The Speech-to-Text card reports whether the
+recognizer and decoder loaded and names the reason when either did not, and it
+lets you pick the model:
+
+| Model | One-time download | Use it when |
+|-------|-------------------|-------------|
+| `tiny` | 78 MB | The machine is short of memory |
+| `base` | 148 MB | The default, and right for most dictation |
+| `small` | 488 MB | Accents or jargon are being misheard |
+| `large-v3-turbo` | 1.6 GB | You want the accuracy ceiling |
+
+Choose the model and click **Download now**. The download is verified against a
+pinned sha256 digest before it is used and is reused from disk after that.
+Once the recognizer and decoder are available, there is no separate transcription
+program or provider-specific runtime to install. `kirocrew doctor` reports the
+recognizer, model, and resolved decoder.
+
+The other two providers, the full setting list and the retired providers are in
+Kiro Crew's own [configuration reference](../../../../src/kiro_crew/docs/configuration.md).
+
+### CPU threads (many-core hosts)
+
+Kiro Crew derives the recognizer's thread count from the host: **half the
+available cores**, capped at 16. The count comes from `sched_getaffinity` where
+available, so a CPU-restricted container gets its real budget rather than the
+whole machine's.
+
+Why not use every core: Whisper decodes one output step at a time, and each step
+is a small matmul that ends in a thread barrier. Wide thread pools therefore cost
+latency per step instead of buying throughput, and on a host that is doing other
+work (a Kiro Crew host runs the gateway and agent sessions alongside) the workers
+get time-sliced, so each barrier waits on threads the scheduler has not run yet.
+
+Measured on a 32-vCPU Graviton3 host with an 11-second clip, 16 threads beat 31
+(`base` 4.9s vs 7.3s, `large-v3-turbo` 20.8s vs 26.9s), and restricted to 16
+cores with `taskset`, 8 threads beat 16 (5s vs 7s). The headroom buys
+predictability more than raw speed: 8 threads measured 4.9-5.0s across repeats,
+while taking all 32 ranged 8.1-68.4s depending on how busy the machine was.
+
+The cap is where both model shapes stop gaining. On the same clip in-process,
+`base` runs 0.96s at 8 threads, 1.13s at 16 and 1.18s at 24, while the
+encoder-heavy `large-v3-turbo` keeps improving (6.26s / 5.13s / 4.81s), so 16 is
+the width that leaves both within a few percent of their own best rather than
+extrapolating onto a 64-core host nobody measured.
+
+## Voice Output (Text-to-Speech)
+
+Kiro Crew can speak responses aloud. Two providers are available, and the
+default needs nothing installed:
+
+| Provider | What it needs | Notes |
+|---|---|---|
+| `system` (default) | nothing on macOS and Windows | The host's own engine: `say` on macOS, `System.Speech` through Windows PowerShell on Windows, `espeak-ng` (or legacy `espeak`) on Linux/BSD when installed. Linux is the one platform where it can be missing; install `espeak-ng` or pick another provider. |
+| `polly` | the `aws` CLI, AWS credentials, network | Paid AWS service, and it asks you to confirm the account first. |
+
+The `piper` provider was removed ([#23154](https://github.com/kirodotdev/KiroCrew/issues/23154)): its engine and voice models were installed unpinned and unverified, and the engine is GPL-licensed. A config that still names `piper`, or still carries `piper_model`, speaks with `system` and logs one warning per gateway start; set `provider` to `system` (or `polly`) in `config.json` to silence it. The `piper_*` keys are ignored and nothing on disk is removed; delete a Piper install or voice files yourself if you no longer want them.
+
+Two playback modes are available:
+
+### Auto-Speak (Non-Interruptive Streaming)
+
+When enabled, responses are spoken **as they stream in** — you don't wait for
+the full response. The system detects sentence boundaries in real time and
+synthesizes each sentence as soon as it's complete.
+
+**How it works:**
+1. The assistant starts streaming a response.
+2. As each sentence completes (detected by `.` `!` `?` boundaries), it's sent
+   for synthesis. Polly streams sentence by sentence; the built-in engine
+   returns one clip per request.
+3. Audio chunks arrive via WebSocket and play sequentially.
+4. When the response finishes, any remaining text is spoken.
+
+**Non-interruptive behavior:** Sending a new message while voice is playing
+immediately stops playback. The old response's remaining audio is discarded,
+and voice output resumes from the new response's first sentence. This means
+you can interrupt at any time by typing or speaking your next message.
+
+**Enable it:**
+1. Open **Settings > Voice**.
+2. Toggle **Auto-speak Responses** on.
+3. Nothing else on macOS or Windows — the built-in engine is already selected.
+   Pick a voice matching your language if the OS default speaks another one.
+
+### Manual Replay
+
+Open the **More actions** menu on any non-blank assistant reply and choose
+**Read aloud** to hear it. This works independently of auto-speak.
+
+### Slack Voice Replies
+
+Use the `/kirocrew voice` slash command to open a settings modal where you can
+configure voice, engine, speed, and pitch.
+
+The legacy `!voice` inline commands still work but are deprecated:
+
+| Command | Effect |
+|---------|--------|
+| `!voice on` | Enable voice replies in this thread |
+| `!voice off` | Disable voice replies |
+| `!voice Ruth` | Switch to a specific Polly voice |
+| `!voice engine generative` | Change engine type |
+| `!voice speed 120%` | Adjust speech rate |
+| `!voice pitch +10%` | Adjust pitch (neural/standard engines only) |
+
+Voice replies are uploaded to the Slack thread alongside the text response.
+File format depends on the provider (MP3 for Polly, WAV for the built-in engine).
+
+### Telegram Voice Replies
+
+Set `telegram.voice_replies: true` for the default, or use `/voice on` and
+`/voice off` in one conversation to override it. Telegram always receives the
+text answer first; TTS is then delivered silently as a voice/audio message, so a
+synthesis failure never removes the usable text response.
+
+### WhatsApp Voice Replies
+
+Set `whatsapp.auto_reply_to_voice: true` and a WhatsApp voice note is answered
+with a voice note after the text answer; a text message still gets text only.
+It needs `provider: "polly"`: a WhatsApp voice note plays Ogg/Opus, which Polly
+writes directly and the built-in engine does not.
+
+### Configuration
+
+Settings are in **Settings > Voice**, or directly in
+`~/.kiro/crew/config.json`. The `voice_reply` section is a loose dictionary
+(not part of the typed config schema), so you edit it by hand:
+
+```json
+{
+  "voice_reply": {
+    "enabled": true,
+    "provider": "system",
+    "auto_reply_to_voice": true,
+
+    "voice_id": "Ruth",
+    "engine": "generative",
+    "rate": "100%",
+    "pitch": "+0%",
+    "aws_profile": "",
+    "region": "",
+
+    "system_voice": ""
+  }
+}
+```
+
+| Setting | Default | Purpose |
+|---------|---------|---------|
+| `enabled` | `false` | Turn on voice replies for **every** Kiro Crew response (text-triggered). Also seeds the `auto_reply_to_voice` default — see below. |
+| `provider` | `"system"` | TTS backend: `"system"` (the host's built-in engine, nothing to install) or `"polly"` (AWS, cloud, and billed). An unrecognized value falls back to `system` with a warning logged: reaching for a paid service is not a choice a typo may make for you. The removed `"piper"`, or an absent key beside a leftover `piper_model`, also resolves to `system`, with one warning. |
+| `auto_reply_to_voice` | _follows `enabled`_ | **Voice-triggered**: when the user sends a voice memo, auto-respond with voice. Defaults to whatever `enabled` is — set explicitly to override. |
+| `rate` | `100%` | 50%–200%. Shared by `polly` and `system` |
+| **Built-in-engine-specific** | | ignored by the other providers |
+| `system_voice` | _(OS default)_ | The engine's own voice selector: a voice name for `say` and Windows, a language code for `espeak-ng`. Pick one in **Settings > Voice** rather than typing it |
+| **Polly-specific** | | ignored by the other providers |
+| `voice_id` | `Ruth` | Any [Amazon Polly voice](https://docs.aws.amazon.com/polly/latest/dg/voicelist.html) |
+| `engine` | `generative` | `generative`, `neural`, `long-form`, `standard` |
+| `pitch` | `+0%` | -20% to +20% (neural/standard only) |
+| `aws_profile` | _(empty)_ | AWS CLI profile; empty = default credentials |
+| `region` | _(empty)_ | AWS region for Polly; empty = CLI default |
+### Voice-in → voice-out (symmetric voice)
+
+`auto_reply_to_voice` controls whether sending a Slack voice memo
+automatically triggers a voice reply. By default it follows `enabled`:
+
+| `enabled` | `auto_reply_to_voice` (unset) | Behavior |
+|-----------|-------------------------------|----------|
+| `false` | defaults to `false` | No voice anywhere — explicit opt-out is preserved. |
+| `true`  | defaults to `true`  | Every reply is voice (incl. voice-memo replies). |
+
+You can also set `auto_reply_to_voice: true` explicitly while leaving
+`enabled: false` if you want voice **only** as a response to voice memos —
+i.e. text replies stay text, voice memos get a spoken reply.
+
+If TTS is **not configured** (missing `aws` CLI for Polly, or no built-in
+engine on the host), Kiro Crew posts a one-shot **ephemeral** explaining why and
+replies with text only. The ephemeral fires for every opt-in path —
+globally enabled, per-thread `!voice on`, or voice-memo auto-reply — so
+silent fallback never surprises the user.
+
+**Caveat — Polly credentials fail silently.** The availability check for
+Polly only verifies that the `aws` CLI is on `PATH`, not that credentials are
+valid. If your AWS credentials are expired or missing, the `aws polly`
+invocation fails inside synthesis, is logged, and the reply falls back to
+text — **no ephemeral is posted** in this case. If voice replies stop working
+after your AWS credentials expire, refresh them (e.g. `aws configure` or your
+credential provider) and try again.
+
+### Content Handling
+
+Responses are cleaned for natural speech before synthesis:
+
+- Code blocks → "(code block)"
+- Diff blocks → "(diff block)"
+- Tables → "(table with N rows)"
+- File paths → "(file path)"
+- URLs → "(link)" or just the link label
+- Emoji, markdown formatting → stripped
+- Credentials → redacted
+
+### Prerequisites — Amazon Polly (`provider: "polly"`)
+
+- **AWS credentials** with `polly:SynthesizeSpeech` permission. Kiro Crew
+  calls the AWS CLI (`aws polly synthesize-speech`) under the hood, so any
+  credential method the CLI supports will work:
+
+  1. Run `aws configure --profile polly` (or your credential provider) in your
+     terminal to set up a named profile.
+  2. In **Settings > Voice**, enter `polly` in the
+     **AWS Profile** field (or set `"aws_profile": "polly"` in config.json).
+  3. Leave the profile blank to use your default AWS CLI credentials
+     (`~/.aws/credentials` default profile or environment variables).
+
+- **ffmpeg** for audio stitching (replay/Slack uploads). Not needed for
+  streaming playback in the dashboard.

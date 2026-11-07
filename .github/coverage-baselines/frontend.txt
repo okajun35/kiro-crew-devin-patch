@@ -1,0 +1,28 @@
+# Per-file coverage baseline — files below the floor when the gate landed.
+#
+# The gate (scripts/check_per_file_coverage.py) requires every measured file to
+# meet the per-file floor EXCEPT the ones listed here. This list may only
+# shrink. A refresh DELETES graduated and vanished entries and copies every
+# surviving line through verbatim, so a recorded rate is never rewritten and no
+# path can be added -- neither a new offender nor a regression can be cleared by
+# refreshing instead of by adding tests. Each line therefore stays an accurate
+# record of the moment it was taken.
+#
+# Refresh after a file graduates, is deleted, or is renamed:
+#   python3 scripts/check_per_file_coverage.py <report> --label <lane> \
+#       --floor <n> --baseline <this file> --update-baseline
+#
+# Format: <path> <rate-when-recorded>   # <covered>/<statements>
+src/app-sdk/shared-modules.ts 0.0   # 0/1
+src/apps/crew-companion/ToggleRow.tsx 66.7   # 2/3
+src/apps/issue-radar/views/ComingSoon.tsx 0.0   # 0/2
+src/apps/issue-radar/views/SettingsView.tsx 0.0   # 0/3
+src/apps/meetings/MeetingView.tsx 0.0   # 0/32
+src/apps/mochi/mochiHelpers.ts 0.0   # 0/2
+src/apps/spec-builder/components/ChatColumn.tsx 0.0   # 0/2
+src/components/AddJobSplitButton.tsx 66.7   # 2/3
+src/components/Strands.tsx 52.2   # 71/136
+src/hooks/useCronActions.ts 31.0   # 9/29
+src/lib/embedded.ts 75.0   # 3/4
+src/main.tsx 0.0   # 0/26
+src/pages/settings/OverviewPanel.tsx 0.0   # 0/2

@@ -1,0 +1,78 @@
+name: Python Client Tests
+
+# The standalone `kirocrew-client` package (packages/kirocrew-client-py) is its
+# own distribution with its own pytest config, so the repo-wide backend suite
+# never collects it (scripts/check_testpaths_coverage.py exempts nested
+# distributions on the understanding that they run on their own). This is that
+# run. Path-scoped: a change that touches neither the package nor this file
+# cannot change its result.
+
+on:
+  pull_request:
+    paths:
+      - "packages/kirocrew-client-py/**"
+      - ".github/workflows/client-py.yml"
+  push:
+    branches: [main]
+    paths:
+      - "packages/kirocrew-client-py/**"
+      - ".github/workflows/client-py.yml"
+  # The merge queue's required check waits on this run, so every merge group
+  # gets one. `paths:` is not honoured on merge_group, and that is acceptable:
+  # the suite is ten minutes on a hosted runner and the point of the queue is
+  # that everything main's own push would test has passed before the commit
+  # lands.
+  merge_group:
+    types: [checks_requested]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: client-py-${{ github.event.pull_request.number || github.ref }}
+  # A pull request's superseded revision is cancelled; a push to main is not.
+  # Pushes to main carry no pull_request number, so they all share one key
+  # through `github.ref`, and a bare `true` let a second push kill the first
+  # one's in-flight run. Merge-group entries are unaffected either way: their
+  # `github.ref` is the unique gh-readonly-queue ref, so each queue entry
+  # already has a key of its own and never collided with another.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    name: kirocrew-client (py${{ matrix.python }})
+    # `kirocrew-runners` larger-runner group, reached by its runner LABEL rather
+    # than by GROUP. A fork PR arrives on `pull_request`, which executes here,
+    # so it takes the group too; the fallback is for a fork running its own copy
+    # of this file on `push` or `workflow_dispatch`, where an organization
+    # runner group is unreachable and a job asking for a label no runner there
+    # carries would wait out GitHub's pending limit instead of running. See
+    # "Larger runners for the review lanes and CodeQL" in
+    # docs/ci/ci-and-reviews.md.
+    runs-on: ${{ github.repository == 'kirodotdev/KiroCrew' && 'kirocrew-linux-4-core' || 'ubuntu-latest' }}
+    timeout-minutes: 10
+    strategy:
+      max-parallel: 4
+      fail-fast: false
+      matrix:
+        # The package's floor and the main package's current floor.
+        python: ["3.9", "3.12"]
+    defaults:
+      run:
+        working-directory: packages/kirocrew-client-py
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install
+        run: python -m pip install -e ".[dev]"
+      - name: Test
+        run: |
+          # setup-python registers a matcher that turns any Python traceback in
+          # the log into an annotation; drop it so only real failures annotate.
+          echo "::remove-matcher owner=python::"
+          python -m pytest -q

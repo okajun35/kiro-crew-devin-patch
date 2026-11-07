@@ -1,0 +1,712 @@
+"""Contract tests for the curated Connections launch registry."""
+
+import json
+import time
+import warnings
+from datetime import date, datetime, timedelta, timezone
+
+import pytest
+
+from kiro_crew.connections import (
+    RegistryValidationError,
+    get_all_providers,
+    get_all_registry_providers,
+    get_visible_providers,
+    stale_l0_baselines,
+)
+from kiro_crew.connections.registry import (
+    L0_VERIFICATION_MAX_AGE_DAYS,
+    L0_VERIFICATION_WARN_AGE_DAYS,
+    REVOKE_VERIFICATION_MAX_AGE_DAYS,
+    _load_registry,
+    utc_today,
+)
+
+EXPECTED_LAUNCH_REGISTRY = {
+    "atlassian",
+    "github",
+    "gitlab",
+    "linear",
+    "notion",
+    "stripe",
+    "superhuman",
+    "vercel",
+    # Industry-baseline batch 1 (ChatGPT + Claude both list them, public remote
+    # MCP with OAuth discovery, L0-green). Registered so the nightly L0 probe
+    # and the OAuth banner allowlist cover them; every one is held back from
+    # the Connect grid until its manual launch-gate check.
+    "airtable",
+    "asana",
+    "paypal",
+    "sentry",
+    "supabase",
+    # Industry-baseline batch 2, same hold-back as batch 1 (launch-gated until
+    # the manual gate): seven are listed by both the ChatGPT and Claude
+    # connector directories (amplitude, cloudflare, huggingface, miro, mixpanel,
+    # netlify, webflow), five by one directory only (neon, postman, prisma,
+    # zapier, and square below). A single-directory listing is the admission
+    # floor for a gated entry -- see the spec's rung 1.
+    "amplitude",
+    "cloudflare",
+    "huggingface",
+    "miro",
+    "mixpanel",
+    "neon",
+    "netlify",
+    "postman",
+    "prisma",
+    "webflow",
+    "zapier",
+    # Listed by both connector directories (ChatGPT's app directory and Claude's
+    # connector directory); launch-gated until the manual gate, like batch 2.
+    "todoist",
+    # Google Workspace: pre-registered (Google refuses DCR), so visible as
+    # "needs configuration" while launch-gated; one user-owned Google client
+    # can serve all six cards.
+    "gmail",
+    "google-calendar",
+    "google-docs",
+    "google-drive",
+    "google-sheets",
+    "google-slides",
+    # TickTick's own hosted server (mcp.ticktick.com), documented for Claude,
+    # ChatGPT, Cursor and VS Code; launch-gated until the manual gate, like Todoist.
+    "ticktick",
+    # Railway's hosted server (mcp.railway.com), listed by Claude's connector
+    # directory and ChatGPT's; launch-gated until the manual gate, like TickTick.
+    "railway",
+    # Quo's own hosted server (mcp.quo.com/mcp), listed by both connector
+    # directories; launch-gated until the manual gate, like TickTick.
+    "quo",
+}
+# Tier 3: the vendor admits OAuth clients from an allowlist or waitlist, so no
+# amount of local verification can pass the gate until Kiro is admitted. They
+# are excluded from get_all_providers() as well as from the grid.
+VENDOR_APPROVAL_PENDING = {"canva", "dropbox", "figma", "square"}
+# Registered so the OAuth banner allowlist stays registry-derived, but held back
+# from the Connect grid: GitHub until the Kiro app is registered, Superhuman until
+# a logged-in check records its revoke surface and walks the consent flow, and
+# the industry-baseline entries until each has a manual launch-gate check.
+LAUNCH_GATED = {
+    "github",
+    "superhuman",
+    "airtable",
+    "asana",
+    "paypal",
+    "sentry",
+    "supabase",
+    "amplitude",
+    "cloudflare",
+    "huggingface",
+    "miro",
+    "mixpanel",
+    "neon",
+    "netlify",
+    "postman",
+    "prisma",
+    "webflow",
+    "zapier",
+    "todoist",
+    "gmail",
+    "google-calendar",
+    "google-docs",
+    "google-drive",
+    "google-sheets",
+    "google-slides",
+    "ticktick",
+    "railway",
+    "quo",
+} | VENDOR_APPROVAL_PENDING
+
+
+def test_registry_contains_only_the_agreed_launch_set():
+    assert {provider["slug"] for provider in get_all_providers()} == EXPECTED_LAUNCH_REGISTRY
+
+
+def test_probe_accessor_includes_every_entry_even_when_launch_gated():
+    providers = get_all_registry_providers()
+    assert {provider["slug"] for provider in providers} == (
+        EXPECTED_LAUNCH_REGISTRY | VENDOR_APPROVAL_PENDING
+    )
+    gated = {p["slug"] for p in providers if p["launch_gate_passed"] is False}
+    assert gated == LAUNCH_GATED
+    pending = {p["slug"] for p in providers if p["vendor_approval_pending"]}
+    assert pending == VENDOR_APPROVAL_PENDING
+
+
+# Pre-registered providers (registry ``auth.mode``) are visible REGARDLESS of the
+# launch gate: their card renders an operator instruction until a client is
+# configured, and hiding an instruction is how the step never gets done. The gate
+# still governs the entry's own quality claims, so they stay in LAUNCH_GATED.
+PREREGISTERED = {
+    "github",
+    "asana",
+    "gmail",
+    "google-drive",
+    "google-calendar",
+    "google-sheets",
+    "google-docs",
+    "google-slides",
+}
+
+
+def test_only_gated_launch_services_are_visible():
+    assert {provider["slug"] for provider in get_visible_providers()} == (
+        (EXPECTED_LAUNCH_REGISTRY - LAUNCH_GATED) | PREREGISTERED
+    )
+
+
+def test_every_registry_mcp_authorization_server_is_banner_allowlisted():
+    """A registry entry whose consent URL the banner gate rejects cannot be connected.
+
+    The gate exempts OAuth entropy only at an exact ``(host, path)`` in the
+    builtin set, so every provider's advertised authorization server must have
+    an entry there -- gated providers included, because the gate is what a
+    hand-configured MCP server for the same provider hits today.
+
+    The registry stores the RFC 8414 issuer while the gate keys on the consent
+    URL the browser opens. For most providers those share a host; the two that
+    do not are mapped here, so the allowlist can carry only URLs a vendor
+    actually advertises rather than a synthetic pair per issuer host.
+    """
+    from urllib.parse import urlsplit
+
+    from kiro_crew.security import _OAUTH_AUTHORIZATION_ENDPOINTS
+
+    consent_host_for_issuer_host = {
+        "api.figma.com": "www.figma.com",
+        "auth.mixpanel.com": "mixpanel.com",
+    }
+    allowlisted_hosts = {host for host, _path in _OAUTH_AUTHORIZATION_ENDPOINTS}
+    for provider in get_all_registry_providers():
+        issuer_host = urlsplit(provider["l0_expectations"]["authorization_server"]).hostname
+        consent_host = consent_host_for_issuer_host.get(issuer_host, issuer_host)
+        assert consent_host in allowlisted_hosts, provider["slug"]
+
+
+def test_linear_installs_its_read_only_endpoint():
+    """Linear's card promises read access; the installed URL must match."""
+    (linear,) = [p for p in get_all_providers() if p["slug"] == "linear"]
+    assert linear["mcp_url"] == "https://mcp.linear.app/mcp/readonly"
+
+
+def test_gitlab_installs_the_official_remote_endpoint():
+    """The MCP URL is the resource GitLab's own RFC 9728 metadata advertises."""
+    (gitlab,) = [p for p in get_all_providers() if p["slug"] == "gitlab"]
+    assert gitlab["mcp_url"] == "https://gitlab.com/api/v4/mcp"
+    assert gitlab["l0_expectations"]["authorization_server"] == "https://gitlab.com"
+
+
+def test_atlassian_installs_the_ga_v2_endpoint():
+    """Atlassian's card must install the GA endpoint its tools are served from.
+
+    The auth server's ``authv2`` path segment names the AUTH SERVER's version,
+    not MCP v2, and the endpoint behind it serves the v1 tools. Those check
+    classic OAuth scopes, so the ``*:agent-interface`` grant the flow obtains is
+    rejected by every Jira and Confluence tool with ``401 scope does not match``
+    while the identity tools still succeed -- a card that signs in cleanly and
+    then fails on first use. The GA endpoint at ``/v2/mcp`` advertises the
+    agent-interface scopes the grant actually carries.
+
+    Both URLs pass the static L0 checks (same authorization server, DCR and
+    PKCE all unchanged), so this is pinned here rather than left to a live call.
+    """
+    (atlassian,) = [p for p in get_all_providers() if p["slug"] == "atlassian"]
+    assert atlassian["mcp_url"] == "https://mcp.atlassian.com/v2/mcp"
+    # The auth server is shared by both endpoint versions, which is why the
+    # static checks cannot tell them apart; pinning it keeps that assumption
+    # explicit if Atlassian ever splits them.
+    assert atlassian["l0_expectations"]["authorization_server"].startswith(
+        "https://auth.atlassian.com/"
+    )
+
+
+def test_atlassian_requests_no_classic_oauth_scopes():
+    """Atlassian's endpoint is scope-gated by its own metadata, not by a grant.
+
+    ``recommended_scopes`` is empty, so ``_registry_server_entry`` puts no
+    ``scopes`` on the entry and the flow takes the endpoint's advertised
+    defaults. Naming a classic scope here is what produced the mismatch, so an
+    empty list is the load-bearing value and is pinned against a future edit
+    that helpfully adds one.
+    """
+    (atlassian,) = [p for p in get_all_providers() if p["slug"] == "atlassian"]
+    assert atlassian["recommended_scopes"] == []
+
+
+def test_gitlab_card_copy_admits_its_only_scope_can_write():
+    """GitLab ships no read-only scope: `mcp` also opens issues and merge
+    requests and runs pipelines. A card that implied read-only would lie, so the
+    single scope and the disclosure are pinned together."""
+    (gitlab,) = [p for p in get_all_providers() if p["slug"] == "gitlab"]
+    assert gitlab["recommended_scopes"] == ["mcp"]
+    assert "can write" in gitlab["gotcha_copy"]
+
+
+def test_todoist_requests_deletes_but_never_whole_project_deletes():
+    """The grant can delete tasks, labels and filters (data:delete) but not whole
+    projects: project:delete also deletes every task inside the project, so it
+    stays out and the copy points at archiving instead. The server's own metadata
+    lists only data:read_write, so the delete scope is a deliberate addition."""
+    (todoist,) = [p for p in get_all_providers() if p["slug"] == "todoist"]
+    assert todoist["mcp_url"] == "https://ai.todoist.net/mcp"
+    assert todoist["recommended_scopes"] == ["data:read_write", "data:delete"]
+    assert "project:delete" not in todoist["recommended_scopes"]
+    assert "archive the project instead" in todoist["gotcha_copy"]
+
+
+def test_ticktick_requests_both_scopes_and_admits_the_grant_can_write():
+    """TickTick's resource metadata publishes exactly tasks:read and tasks:write
+    and no read-only MCP endpoint exists, so the entry asks for both and the card
+    says so. The server's delete tools (tasks, tags, project groups, focus records,
+    comments) run at the user's own permission level, so the copy names them
+    rather than implying a task-only surface."""
+    (ticktick,) = [p for p in get_all_providers() if p["slug"] == "ticktick"]
+    assert ticktick["mcp_url"] == "https://mcp.ticktick.com"
+    assert ticktick["recommended_scopes"] == ["tasks:read", "tasks:write"]
+    assert "no read-only scope" in ticktick["gotcha_copy"]
+    assert "can write" in ticktick["gotcha_copy"]
+    for tool in ("delete_task", "delete_tag", "delete_project_group", "delete_focus", "delete_comment"):
+        assert tool in ticktick["gotcha_copy"], tool
+    assert ticktick["tool_aliases"] == {
+        "search": "ticktick_search",
+        "fetch": "ticktick_fetch",
+        "list_projects": "ticktick_list_projects",
+    }
+
+
+def test_railway_requests_the_one_published_scope_and_names_its_writers():
+    """Railway's resource metadata publishes only workspace:member, so the entry
+    asks for it and the card names the tools that deploy or delete."""
+    (railway,) = [p for p in get_all_registry_providers() if p["slug"] == "railway"]
+    assert railway["recommended_scopes"] == ["workspace:member"]
+    assert "the only scope the server publishes" in railway["gotcha_copy"]
+    for tool in ("redeploy", "accept-deploy", "delete-feature-flag", "railway-agent"):
+        assert tool in railway["gotcha_copy"], tool
+
+
+def test_quo_requests_only_read_scopes_and_names_the_tools_that_send_or_spend():
+    """Quo publishes separate read and write scopes, so the entry asks only for the
+    read ones. Its server still ships tools that text or call real people, spend
+    credits or file a billed registration, so the copy names each of them."""
+    (quo,) = [p for p in get_all_providers() if p["slug"] == "quo"]
+    assert quo["mcp_url"] == "https://mcp.quo.com/mcp"
+    assert quo["recommended_scopes"] == ["read:account", "read:conversations", "read:calls"]
+    for tool in (
+        "send-message",
+        "send-group-message",
+        "send-bulk-messages",
+        "start-agent-call",
+        "start-agent-conversation",
+        "submit-a2p-registration",
+        "update-inbox-settings",
+    ):
+        assert tool in quo["gotcha_copy"], tool
+
+
+def test_client_id_is_optional_and_unset_for_every_launch_provider():
+    """GitHub is the intended first consumer, still pending its app registration."""
+    assert all("client_id" not in provider for provider in get_all_registry_providers())
+
+
+def test_every_provider_declares_a_category_from_the_closed_vocabulary():
+    """``category`` feeds the directory-coverage report; a free-text value would
+    let one typo mint a one-provider bucket that report then counts as coverage."""
+    from kiro_crew.connections.registry import PROVIDER_CATEGORIES
+
+    for provider in get_all_registry_providers():
+        assert provider["category"] in PROVIDER_CATEGORIES, provider["slug"]
+
+
+def test_category_outside_the_vocabulary_is_rejected(tmp_path):
+    payload = get_all_registry_providers()
+    payload[0]["category"] = "misc"
+    registry_path = tmp_path / "registry.json"
+    registry_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(RegistryValidationError, match="category must be one of"):
+        _load_registry(registry_path)
+
+
+@pytest.mark.parametrize("bad", [[], "jira", ["Jira"], ["ji"], ["jira issues"], [7]])
+def test_sign_in_words_must_be_lowercase_single_words(tmp_path, bad):
+    payload = get_all_registry_providers()
+    payload[0]["sign_in_words"] = bad
+    registry_path = tmp_path / "registry.json"
+    registry_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(RegistryValidationError, match="sign_in_words must be"):
+        _load_registry(registry_path)
+
+
+def test_only_atlassian_declares_sign_in_words():
+    from kiro_crew.connections.registry import sign_in_words
+
+    assert sign_in_words("atlassian") == ("jira", "confluence")
+    declared = [p["slug"] for p in get_all_registry_providers() if "sign_in_words" in p]
+    assert declared == ["atlassian"]
+    assert sign_in_words("not-a-provider") == ()
+
+
+def test_category_stays_optional_for_an_entry_that_predates_it(tmp_path):
+    payload = get_all_registry_providers()
+    del payload[0]["category"]
+    registry_path = tmp_path / "registry.json"
+    registry_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    loaded = {p["slug"]: p for p in _load_registry(registry_path)}
+    assert "category" not in loaded[payload[0]["slug"]]
+
+
+def test_client_id_is_accepted_when_a_provider_declares_one(tmp_path):
+    payload = get_all_registry_providers()
+    github = next(p for p in payload if p["slug"] == "github")
+    github["client_id"] = "Iv1.public-identifier"
+    registry_path = tmp_path / "registry.json"
+    registry_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    loaded = {p["slug"]: p for p in _load_registry(registry_path)}
+    assert loaded["github"]["client_id"] == "Iv1.public-identifier"
+
+
+@pytest.mark.parametrize("bad", ["", "   ", 42, None, ["id"]])
+def test_client_id_must_be_a_non_empty_string_when_present(tmp_path, bad):
+    payload = get_all_registry_providers()
+    payload[0]["client_id"] = bad
+    registry_path = tmp_path / "registry.json"
+    registry_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(RegistryValidationError, match="client_id"):
+        _load_registry(registry_path)
+
+
+def test_unknown_fields_are_still_rejected(tmp_path):
+    """Optional client_id must not widen the schema to arbitrary keys."""
+    payload = get_all_registry_providers()
+    payload[0]["client_secret"] = "nope"
+    registry_path = tmp_path / "registry.json"
+    registry_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(RegistryValidationError, match="unknown fields: client_secret"):
+        _load_registry(registry_path)
+
+
+@pytest.mark.parametrize(
+    "expectations",
+    [
+        {"dcr": True},
+        {
+            "authorization_server": "https://auth.example.com",
+            "dcr": True,
+            "pkce": True,
+            "verified_on": "2026-01-01",
+            "unexpected": False,
+        },
+        # verified_on is required: an entry nobody has re-derived is not tracked.
+        {
+            "authorization_server": "https://auth.example.com",
+            "dcr": True,
+            "pkce": True,
+        },
+        {
+            "authorization_server": "https://auth.example.com",
+            "dcr": "yes",
+            "pkce": True,
+            "verified_on": "2026-01-01",
+        },
+        {
+            "authorization_server": "https://auth.example.com:not-a-port",
+            "dcr": True,
+            "pkce": True,
+            "verified_on": "2026-01-01",
+        },
+        {
+            "authorization_server": "http://auth.example.com",
+            "dcr": True,
+            "pkce": True,
+            "verified_on": "2026-01-01",
+        },
+        # The issuer is the one URL the recorder may fetch, so an IP literal or a
+        # local name is refused outright rather than merely discouraged.
+        {
+            "authorization_server": "https://127.0.0.1",
+            "dcr": True,
+            "pkce": True,
+            "verified_on": "2026-01-01",
+        },
+        {
+            "authorization_server": "https://10.0.0.5/tenant",
+            "dcr": True,
+            "pkce": True,
+            "verified_on": "2026-01-01",
+        },
+        {
+            "authorization_server": "https://[::1]/tenant",
+            "dcr": True,
+            "pkce": True,
+            "verified_on": "2026-01-01",
+        },
+        {
+            "authorization_server": "https://metadata.internal/token",
+            "dcr": True,
+            "pkce": True,
+            "verified_on": "2026-01-01",
+        },
+        {
+            "authorization_server": "https://auth.example.com?tenant=a",
+            "dcr": True,
+            "pkce": True,
+            "verified_on": "2026-01-01",
+        },
+        {
+            "authorization_server": "https://auth.example.com",
+            "dcr": True,
+            "pkce": True,
+            "verified_on": "not-a-date",
+        },
+        # A real-looking date that is not a real date.
+        {
+            "authorization_server": "https://auth.example.com",
+            "dcr": True,
+            "pkce": True,
+            "verified_on": "2026-02-31",
+        },
+    ],
+)
+def test_l0_expectations_are_exact_and_valid(tmp_path, expectations):
+    payload = get_all_registry_providers()
+    payload[0]["l0_expectations"] = expectations
+    registry_path = tmp_path / "registry.json"
+    registry_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(RegistryValidationError, match="l0_expectations"):
+        _load_registry(registry_path)
+
+
+def test_an_issuer_may_carry_a_path():
+    """Three of seven providers put a tenant or realm path in their issuer.
+
+    Storing only the origin is what let a realm substitution pass before, so a
+    path is not merely tolerated here -- it is the point.
+    """
+    by_slug = {p["slug"]: p for p in get_all_registry_providers()}
+
+    assert by_slug["stripe"]["l0_expectations"]["authorization_server"] == (
+        "https://access.stripe.com/mcp"
+    )
+    assert by_slug["github"]["l0_expectations"]["authorization_server"] == (
+        "https://github.com/login/oauth"
+    )
+
+
+def test_l0_baseline_cannot_be_stamped_in_the_future(tmp_path):
+    """A future stamp is the one way a hand-typed baseline could evade the gate."""
+
+    payload = get_all_registry_providers()
+    payload[0]["l0_expectations"]["verified_on"] = (
+        utc_today() + timedelta(days=1)
+    ).isoformat()
+    registry_path = tmp_path / "registry.json"
+    registry_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(RegistryValidationError, match="must not be in the future"):
+        _load_registry(registry_path)
+
+
+#: ``time.tzset`` is POSIX-only. Without it, setting ``TZ`` does not move the
+#: interpreter's local zone at all, so the two tests below would assert against
+#: an unshifted clock and pass no matter what ``utc_today`` read -- a vacuous
+#: green that is worse than an honest skip. The behaviour under test is
+#: platform-independent, so POSIX coverage is enough to catch a regression.
+_needs_tzset = pytest.mark.skipif(
+    not hasattr(time, "tzset"), reason="shifting the local zone needs POSIX time.tzset"
+)
+
+
+@_needs_tzset
+def test_utc_today_is_the_utc_date_whatever_the_local_zone(monkeypatch):
+    """The guard must read UTC, not the local clock.
+
+    Deterministic at any hour: UTC-12 puts the local date a day BEHIND whenever
+    the UTC hour is under 12, and UTC+14 puts it a day AHEAD whenever the UTC hour
+    is 10 or more. Those windows cover the whole clock, so at least one zone here
+    always disagrees with UTC -- which is what makes this catch a local-date
+    regression rather than passing by luck.
+    """
+
+    expected = datetime.now(timezone.utc).date()
+
+    for zone in ("Etc/GMT+12", "Etc/GMT-14", "UTC"):
+        monkeypatch.setenv("TZ", zone)
+        time.tzset()
+        try:
+            assert utc_today() == expected, zone
+        finally:
+            monkeypatch.undo()
+            time.tzset()
+
+
+@_needs_tzset
+@pytest.mark.parametrize("zone", ["Etc/GMT+12", "Etc/GMT-14"])
+def test_a_utc_stamp_is_valid_from_a_shifted_timezone(tmp_path, monkeypatch, zone):
+    """A baseline --record just wrote must validate wherever the user sits.
+
+    ``--record`` stamps the UTC date. When the guard compared against the LOCAL
+    date, a user west of UTC got a stamp that read as the future and the registry
+    refused to load until local midnight caught up.
+    """
+
+    monkeypatch.setenv("TZ", zone)
+    time.tzset()
+    try:
+        payload = get_all_registry_providers()
+        payload[0]["l0_expectations"]["verified_on"] = utc_today().isoformat()
+        registry_path = tmp_path / "registry.json"
+        registry_path.write_text(json.dumps(payload), encoding="utf-8")
+
+        # Must not raise: the stamp is today in UTC, which is what wrote it.
+        _load_registry(registry_path)
+    finally:
+        monkeypatch.undo()
+        time.tzset()
+
+
+def test_the_warn_tier_fires_before_the_hard_tier():
+    """The lead time is the whole point: warn must land strictly earlier."""
+
+    assert L0_VERIFICATION_WARN_AGE_DAYS < L0_VERIFICATION_MAX_AGE_DAYS
+
+
+@pytest.mark.parametrize(
+    ("age_days", "expected_stale"),
+    [(89, False), (90, False), (91, True)],
+)
+def test_a_baseline_is_stale_only_strictly_past_the_window(age_days, expected_stale):
+    as_of = date(2026, 6, 1)
+    providers = [
+        {
+            "slug": "example",
+            "l0_expectations": {"verified_on": (as_of - timedelta(days=age_days)).isoformat()},
+        }
+    ]
+
+    stale = stale_l0_baselines(providers, as_of=as_of, max_age_days=90)
+
+    assert bool(stale) is expected_stale
+
+
+def test_the_hard_tier_cannot_fire_on_a_dark_provider():
+    """Scoping is what keeps a stale baseline from failing every PR in the repo.
+
+    The remedy for a stale baseline is ``l0_probe --record``, which needs live
+    network that CI does not have, so the hard tier is deliberately narrow: only
+    providers actually shipped to users. Superhuman is launch-gated today (and,
+    unlike GitHub, not pre-registered, so the gate really does hide it), so it
+    must appear in the all-entries view and NOT in the visible one.
+    """
+    far_future = utc_today() + timedelta(days=10_000)
+
+    everything = stale_l0_baselines(
+        get_all_registry_providers(), as_of=far_future, max_age_days=1
+    )
+    visible_only = stale_l0_baselines(
+        get_visible_providers(), as_of=far_future, max_age_days=1
+    )
+
+    assert "superhuman" in everything
+    assert "superhuman" not in visible_only
+    assert set(visible_only) < set(everything)
+
+
+def test_l0_baselines_due_for_re_recording_are_surfaced_without_failing():
+    """WARN tier. This test MUST NOT fail on age -- that is the whole design.
+
+    A hard age threshold on every PR would be a scheduled repo-wide outage: the
+    nightly cannot refresh the stamps (it is read-only by design) so nothing
+    resets the timer, and CI has no network to run the remedy. So the early
+    signal is a warning here plus a red NIGHTLY, which is where someone who can
+    act will see it.
+    """
+    aging = stale_l0_baselines(
+        get_all_registry_providers(),
+        as_of=utc_today(),
+        max_age_days=L0_VERIFICATION_WARN_AGE_DAYS,
+    )
+    if aging:
+        warnings.warn(
+            "L0 baselines are due for re-recording: "
+            f"{aging}. Run `python -m kiro_crew.connections.l0_probe --record` "
+            "on a networked machine and commit the result.",
+            stacklevel=2,
+        )
+
+
+def test_visible_provider_l0_baselines_have_not_aged_out():
+    """HARD tier, visible providers only, after the warn tier's lead time.
+
+    Failing here means running ``python -m kiro_crew.connections.l0_probe
+    --record`` on a networked machine and committing the result -- not widening
+    the window or hand-editing dates.
+    """
+    stale = stale_l0_baselines(
+        get_visible_providers(),
+        as_of=utc_today(),
+        max_age_days=L0_VERIFICATION_MAX_AGE_DAYS,
+    )
+    assert not stale, f"visible-provider L0 baselines need re-recording: {stale}"
+
+
+def test_every_visible_provider_revoke_link_was_verified_recently():
+    """A shipped revoke link must carry a check no older than the max age.
+
+    The link is the user's route to undoing a grant, and providers move these
+    settings pages. Failing here means re-checking the page (logged in, on the
+    real account) and refreshing ``revoke_verified_on`` -- not widening the
+    window.
+    """
+    oldest_allowed = date.today() - timedelta(days=REVOKE_VERIFICATION_MAX_AGE_DAYS)
+    stale = {
+        provider["slug"]: provider["revoke_verified_on"]
+        for provider in get_visible_providers()
+        if date.fromisoformat(provider["revoke_verified_on"]) < oldest_allowed
+    }
+    assert not stale, f"revoke links need re-verification: {stale}"
+
+
+def test_every_registry_entry_records_how_its_revoke_link_was_verified():
+    for provider in get_all_registry_providers():
+        assert provider["revoke_verified_note"].strip()
+
+
+@pytest.mark.parametrize("bad", ["", "2026-8-7", "07-08-2026", "2026-02-31", "yesterday", 20260807])
+def test_revoke_verified_on_must_be_a_real_iso_date(tmp_path, bad):
+    payload = get_all_registry_providers()
+    payload[0]["revoke_verified_on"] = bad
+    registry_path = tmp_path / "registry.json"
+    registry_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(RegistryValidationError, match="revoke_verified_on"):
+        _load_registry(registry_path)
+
+
+@pytest.mark.parametrize("bad", ["", "   ", None])
+def test_revoke_verified_note_must_be_a_non_empty_string(tmp_path, bad):
+    payload = get_all_registry_providers()
+    payload[0]["revoke_verified_note"] = bad
+    registry_path = tmp_path / "registry.json"
+    registry_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(RegistryValidationError, match="revoke_verified_note"):
+        _load_registry(registry_path)
+
+
+def test_notion_card_copy_names_the_surface_that_actually_lists_the_grant():
+    notion = next(p for p in get_visible_providers() if p["slug"] == "notion")
+    # Notion's grant list is a settings-modal page with no address of its own, so
+    # two rounds of deep-link guessing both landed users somewhere the grant is
+    # not. The link is the workspace home and the path carries the navigation --
+    # and www.notion.so is not that home: it bounces a logged-in user out to the
+    # notion.com marketing site.
+    assert notion["revoke_page_url"] == "https://app.notion.com"
+    assert "127.0.0.1" in notion["gotcha_copy"]
+    assert "Notion MCP" in notion["gotcha_copy"]

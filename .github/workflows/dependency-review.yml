@@ -1,0 +1,122 @@
+name: Dependency License Gate
+
+# Fails a PR that ADDS or CHANGES a dependency whose license is not on the
+# curated allowlist, keeping this Apache-2.0 project's distributed licenses
+# clean. Allowlist + override rules live in .github/dependency-review-config.yml.
+#
+# Runs on every PR, including Dependabot bumps (same-repo, read-only token is
+# sufficient — the action only reads the dependency graph) and external forks
+# (the gate still evaluates; it just can't post its summary comment there).
+#
+# OVERRIDE: a maintainer (triage/write) can bypass the gate for the COMMIT they
+# reviewed by applying the `license-override` label. The bypass is honored ONLY
+# on the `labeled` event for that specific label, so it is scoped to the commit
+# that was present when the label was applied. Any later push arrives as a
+# `synchronize` event, which re-runs the gate — a new, unvetted dependency can
+# never ride in on a stale override. Re-apply the label to re-approve after a
+# push; removing it (`unlabeled`) likewise re-runs the gate.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+# Read-only for the graph; PR-write lets the action post its failure summary
+# on same-repo PRs. No id-token / contents:write — this job runs no untrusted
+# code and needs no cloud credentials.
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: dependency-license-gate-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  license-gate:
+    name: Dependency License Gate
+    runs-on: ${{ github.repository == 'kirodotdev/KiroCrew' && contains(fromJSON(vars.CODEBUILD_ACTOR_IDS || '[]'), github.actor_id) && (github.event_name == 'push' || (github.event_name == 'pull_request' && (github.event.action == 'opened' || github.event.action == 'synchronize') && github.event.pull_request.head.repo.full_name == github.repository)) && format('codebuild-kirocrew-gha-linux-{0}-{1}', github.run_id, github.run_attempt) || github.repository == 'kirodotdev/KiroCrew' && 'kirocrew-linux-4-core' || 'ubuntu-latest' }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The gate runs on every event EXCEPT the one that applies the override
+      # label. Because a new push is a `synchronize` event (not `labeled`), the
+      # gate always re-runs on new commits — the override never carries over to
+      # unreviewed code.
+      # GitHub's dependency-graph API has outages in which the action fails with
+      # "Dependency review is not supported on this repository" for every PR at
+      # once, which reads like a policy failure. So a failed review is retried
+      # once after a pause, and when the retry fails too the API is probed: an
+      # API that still errors makes the job fail as "could not run", naming
+      # the API answer, not as a license finding. Fail-closed either way.
+      - name: Review dependency licenses
+        id: review
+        if: ${{ !(github.event.action == 'labeled' && github.event.label.name == 'license-override') }}
+        continue-on-error: true
+        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          config-file: ./.github/dependency-review-config.yml
+
+      - name: Pause before retrying a failed review
+        if: ${{ steps.review.outcome == 'failure' }}
+        run: sleep 60
+
+      - name: Review dependency licenses (retry)
+        id: review_retry
+        if: ${{ steps.review.outcome == 'failure' }}
+        continue-on-error: true
+        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          config-file: ./.github/dependency-review-config.yml
+
+      - name: Report the review verdict
+        if: ${{ steps.review.outcome == 'failure' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+          RETRY: ${{ steps.review_retry.outcome }}
+        run: |
+          if [ "$RETRY" = "success" ]; then
+            echo "::warning::The first dependency review failed and the retry passed;" \
+                 "the first failure was transient."
+            exit 0
+          fi
+          # Both attempts failed. Ask the dependency-graph API directly whether it
+          # answers for this PR's range; a read that works means the failure above
+          # is the action's own verdict on the dependencies.
+          err="${RUNNER_TEMP:-/tmp}/dep-graph-probe.txt"
+          for attempt in 1 2 3; do
+            if gh api --method GET "repos/$REPO/dependency-graph/compare/$BASE...$HEAD" \
+                --silent 2>"$err"; then
+              echo "::error::Dependency review failed twice while the dependency-graph" \
+                   "API answers, so this is the action's license verdict: see its summary above."
+              exit 1
+            fi
+            [ "$attempt" -lt 3 ] && sleep 20
+          done
+          answer="$(head -c 300 "$err" | tr '\n' ' ')"
+          echo "::error::Dependency review could not run: GitHub's dependency-graph API" \
+               "does not answer for this PR (${answer:-no output}). This is not a license" \
+               "finding; re-run this job once the API recovers."
+          exit 1
+
+      - name: Record maintainer license override
+        if: ${{ github.event.action == 'labeled' && github.event.label.name == 'license-override' }}
+        run: |
+          {
+            echo "## Dependency License Gate — ⚠️ overridden for this commit"
+            echo
+            echo "A maintainer applied the \`license-override\` label, so the"
+            echo "license allowlist check was skipped for **this commit only**"
+            echo "(\`${{ github.event.pull_request.head.sha }}\`). The PR"
+            echo "timeline records who applied the label."
+            echo
+            echo "Any later push re-runs the gate; re-apply the label to approve"
+            echo "the new commit. For a permanent exception, prefer adding the"
+            echo "package to \`allow-dependencies-licenses\` in"
+            echo "\`.github/dependency-review-config.yml\` instead."
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,1065 @@
+"""Papyrus — on-disk project layout and path containment.
+
+Every paper lives under ``~/.kiro/crew/apps/papyrus/data/projects/<name>/`` (via
+:func:`kiro_crew.apps.manager.app_data_dir`, the platform-standard app-scoped
+data dir). Nothing is stored outside that tree and nothing is uploaded anywhere.
+
+``root`` is accepted on every function (mirroring ``issue_radar``'s ``store.py``)
+so tests can point at a tmp dir instead of the real app data dir.
+
+**This module is the app's path-containment gate.** A LaTeX editor writes
+user-controlled relative paths and hands a directory to an external compiler, so
+two rules hold everywhere:
+
+* every caller-supplied path goes through :func:`safe_child` before it reaches
+  the filesystem — it rejects absolute paths, ``..`` in any segment, backslashes
+  (a Windows-style separator that would sidestep a ``/``-only check), NUL bytes,
+  and — after ``resolve()`` — anything that does not land inside the project;
+* a project NAME goes through :func:`safe_project_dir`, which additionally
+  refuses anything that is not a single slug segment, so a project name can
+  never introduce a path separator of its own.
+
+Both are synchronous filesystem code: call them from a worker thread
+(``asyncio.to_thread`` / ``run_in_executor``), never on the event loop for a
+large tree.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import re
+import secrets
+import stat
+import threading
+import unicodedata
+import weakref
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from kiro_crew import platform_compat
+from kiro_crew.apps.manager import app_data_dir
+from kiro_crew.atomic_write import atomic_write
+from kiro_crew.constants import WINDOWS_DEVICE_STEMS
+from kiro_crew.hooks import FileTooLargeError, safe_read_file_bytes_nolink
+from kiro_crew.security import is_sensitive_path
+
+logger = logging.getLogger("kirocrew.app.papyrus")
+
+APP_NAME = "papyrus"
+
+#: Per-project config file holding the chosen main ``.tex`` document.
+PROJECT_CONFIG_FILENAME = ".papyrus.json"
+# `.papyrus.json` holds a main-file name and a capped title; anything larger is
+# not a config this app wrote, and is read as absent rather than parsed.
+PROJECT_CONFIG_MAX_BYTES = 64 * 1024
+
+#: The document compiled when a project has no configured main file.
+DEFAULT_MAIN_FILE = "main.tex"
+
+#: Candidate main documents probed, in order, when ``main.tex`` is absent.
+MAIN_FILE_CANDIDATES = ("main.tex", "paper.tex", "article.tex", "manuscript.tex")
+
+#: Config key holding a display name the USER chose for the paper.
+#:
+#: Separate from the directory name on purpose: the directory name is the app's
+#: identifier — it appears in every route (``?name=``), in the PDF URL, in the
+#: "last opened paper" pointer and in the key of the paper's co-author session —
+#: so renaming the directory would break links a rename has no business
+#: touching. This key renames only what the list DISPLAYS.
+PROJECT_TITLE_KEY = "title"
+
+#: Ceiling on a displayed title, in characters.
+#:
+#: A set name is untrusted (see :func:`project_title`), so it is text from a
+#: cloned repository landing in a table cell: without a cap, 40 kB of it is a
+#: layout attack on the paper list, and every project row carries it in the list
+#: payload.
+MAX_TITLE_CHARS = 120
+
+#: How long a raw title :func:`sanitize_title` accepts. Generous against the
+#: 120-char display cap, small enough that the work stays bounded whatever a
+#: cloned ``.papyrus.json`` ships. A longer raw title is treated as no title
+#: rather than cut, and the display cap itself is applied by
+#: the route AFTER redaction: cutting first can split a credential across the
+#: boundary, and the half left behind does not match the pattern that would have
+#: redacted it.
+_TITLE_INPUT_CHARS = MAX_TITLE_CHARS * 64
+
+#: A project name must be one lowercase slug segment. Anything else (a slash, a
+#: dot, a leading dash) is refused rather than sanitized, because a "cleaned up"
+#: name silently addresses a different project than the one the user typed.
+#: Anchored at ``\Z``: Python's ``$`` matches before a trailing newline, so a
+#: ``$`` anchor would accept ``"name\n"`` and mint a directory whose name
+#: carries the newline into every later ``git``/``pdflatex`` argv.
+#:
+#: ASCII on purpose, not by oversight: the name is the project's directory and an
+#: argument to ``git``/``pdflatex``, so it must mean one thing on every platform
+#: and filesystem (no normalization form, no case folding, no case-insensitive
+#: collision to reason about). A name in another script is refused with
+#: :class:`InvalidProjectName`, which the routes answer with the refused character
+#: so the dashboard can explain the rule in the user's own language. The class is
+#: :data:`kiro_crew.slugs.SLUG_CHARS`, which tests pin it to.
+PROJECT_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}\Z")
+
+#: Ceiling on how many files ``list_files`` will walk/return. A cloned repo can
+#: contain a build tree; an unbounded walk would be both a slow response and an
+#: unbounded JSON body.
+MAX_PROJECT_FILES = 4000
+
+#: Ceiling on a single file body accepted by ``write_file`` / returned by
+#: ``read_text_file``. Generous for a thesis, small enough that a hostile client
+#: cannot balloon the gateway's memory.
+MAX_FILE_BYTES = 8 * 1024 * 1024
+
+#: Suffixes that mark a LaTeX build artifact rather than paper source.
+#:
+#: Read only by ``is_artifact``. ``list_files`` does NOT filter on it, so the
+#: tree the API returns still carries artifacts and the UI is what drops them
+#: (``website/src/apps/papyrus/lib.ts``). The two lists have already drifted:
+#: the UI also lists ``.pdf`` and spells ``.synctex.gz`` as one suffix, where
+#: this set has ``.synctex`` and ``.gz`` separately -- so this one would also
+#: hide any plain ``.gz``. Reconcile them before wiring either side to the
+#: other.
+ARTIFACT_SUFFIXES = frozenset(
+    {
+        ".aux", ".bbl", ".blg", ".fdb_latexmk", ".fls", ".log", ".out",
+        ".synctex", ".gz", ".toc", ".lof", ".lot", ".nav", ".snm", ".vrb",
+    }
+)
+
+
+class PathRejected(Exception):
+    """A caller-supplied project name or relative path was refused."""
+
+
+class InvalidProjectName(PathRejected):
+    """A project name is not one :data:`PROJECT_NAME_RE` slug segment.
+
+    Its own type so a route can answer with a coded refusal that names the
+    character the user typed (:func:`kiro_crew.slugs.refused_slug_char` over the
+    name BEFORE :func:`normalize_project_name`); the store only ever sees the
+    normalized name, so it does not compute that character itself.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("invalid project name")
+
+
+@dataclass(frozen=True)
+class ProjectSummary:
+    """One row of the project list."""
+
+    name: str
+    modified: float
+    has_pdf: bool
+    #: What to DISPLAY for this paper — see :func:`project_title`. Never the
+    #: identifier: ``name`` stays the key every route and stored pointer uses.
+    title: str = ""
+    #: Which paper this row is — see :func:`project_generation`. A rename sends it
+    #: back, so a row loaded before a delete and same-name create cannot rename
+    #: the paper that replaced it.
+    generation: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "modified": self.modified,
+            "has_pdf": self.has_pdf,
+            # Falls back to the identifier rather than shipping "", so a client
+            # can render `title` unconditionally and never print an empty row.
+            "title": self.title or self.name,
+            "generation": self.generation,
+        }
+
+
+def data_dir(root: Path | None = None) -> Path:
+    """Return the app's data dir, creating it if missing."""
+    data = root if root is not None else app_data_dir(APP_NAME)
+    data.mkdir(parents=True, exist_ok=True)
+    return data
+
+
+def projects_dir(root: Path | None = None) -> Path:
+    """Return ``<data>/projects``, creating it if missing."""
+    d = data_dir(root) / "projects"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def normalize_project_name(raw: str) -> str:
+    """Slugify a user-typed project name: trim, collapse spaces to hyphens, lower.
+
+    The RESULT is still validated by :func:`safe_project_dir`, so this only
+    handles the friendly cases (``"My Paper"`` -> ``"my-paper"``); it never makes
+    a traversal attempt safe.
+    """
+    return re.sub(r"\s+", "-", (raw or "").strip()).lower()
+
+
+def is_unportable_project_name(name: str) -> bool:
+    """Whether Windows would store the slug *name* under another name, or as a device.
+
+    Windows strips a trailing dot (``draft.`` becomes ``draft``) and resolves a
+    device stem (``nul``, ``con.paper``) in every directory. Create and clone refuse
+    such a name on every platform, so it cannot break when the data home moves to
+    Windows; opening an existing one is unchanged.
+    """
+    return name.endswith(".") or name.split(".", 1)[0] in WINDOWS_DEVICE_STEMS
+
+
+#: ``os.path.isjunction`` exists only on Python 3.12+. Preferred when present; the
+#: fallback below covers 3.10/3.11, which this project still supports.
+_ISJUNCTION = getattr(os.path, "isjunction", None)
+
+#: Windows marks every reparse point (junction, symlink, and others) with this
+#: attribute bit. ``stat`` exports it on every platform and every supported
+#: version, so it is safe to reference unconditionally.
+_FILE_ATTRIBUTE_REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+
+#: The reparse tag for a directory junction (a "mount point"). ``stat`` does not
+#: export a constant for it, so the documented value is named here.
+_IO_REPARSE_TAG_MOUNT_POINT = 0xA0000003
+
+
+def _is_junction_fallback(path: Path) -> bool:
+    """``os.path.isjunction`` for Python 3.10/3.11, which lack it.
+
+    Mirrors what CPython's own implementation does: a junction is a reparse point
+    (``FILE_ATTRIBUTE_REPARSE_POINT``) whose tag is ``IO_REPARSE_TAG_MOUNT_POINT``.
+    Both fields are Windows-only additions to ``os.stat_result``, so their absence
+    off Windows makes this ``False`` — which is correct, since junctions do not
+    exist there.
+
+    ``follow_symlinks=False``: the question is what THIS name is, not what it
+    points at.
+    """
+    try:
+        info = path.stat(follow_symlinks=False)
+    except (OSError, ValueError, TypeError):
+        return False
+    attrs = getattr(info, "st_file_attributes", 0)
+    if not attrs & _FILE_ATTRIBUTE_REPARSE_POINT:
+        return False
+    return getattr(info, "st_reparse_tag", 0) == _IO_REPARSE_TAG_MOUNT_POINT
+
+
+def is_reparse_link(path: Path) -> bool:
+    """True when *path* is a symlink **or** a Windows directory junction.
+
+    A junction is a reparse point that ``islink()`` / ``is_symlink()`` does NOT
+    report, so a symlink-only guard is bypassable on Windows by the one link type
+    a user can create there without elevation. ``resolve()`` follows a junction
+    like any other indirection, so every place this module refuses a link at a name
+    KiroCrew owns has to refuse a junction too, or the refusal is POSIX-only.
+
+    Detected WITHOUT depending on ``os.path.isjunction``'s availability: that
+    helper only exists on 3.12+, and this project supports 3.10, so keying the
+    guard on it left the protection silently absent on two supported interpreters —
+    the failure mode being a no-op guard, which is worse than a loud one.
+
+    Shared so the project-entry guard and ``gitops``'s attributes guard cannot
+    drift apart on which link types they cover.
+    """
+    if path.is_symlink():
+        return True
+    if _ISJUNCTION is not None:
+        try:
+            return bool(_ISJUNCTION(str(path)))
+        except (OSError, ValueError):
+            return False
+    return _is_junction_fallback(path)
+
+
+def safe_project_dir(name: str, root: Path | None = None) -> Path:
+    """Return the directory for project *name*, or raise :class:`PathRejected`.
+
+    The name must match :data:`PROJECT_NAME_RE` — ONE slug segment — so it can
+    never contribute a path separator, a ``..``, a drive letter, or a leading
+    dash that a later ``git``/``pdflatex`` argv could read as an option. The
+    resolved directory is then re-checked for STRICT containment under
+    ``projects_dir()``, and a symlink or junction at the project entry is refused
+    outright.
+    """
+    if not PROJECT_NAME_RE.match(name or ""):
+        raise InvalidProjectName()
+    base = projects_dir(root)
+    candidate = base / name
+    # A LINK at the project entry is illegitimate wherever it points — same
+    # reasoning as `_config_path`: this is a directory KiroCrew owns and creates.
+    # Refused before containment is asked about, because a link can satisfy
+    # containment while still not being the directory it claims to be.
+    #
+    # Junctions included: they are the link type a Windows user can create WITHOUT
+    # elevation, and `is_symlink()` does not report them — so a symlink-only check
+    # leaves the whole guard bypassable on Windows.
+    if is_reparse_link(candidate):
+        raise PathRejected("project path is a symlink")
+    try:
+        resolved = candidate.resolve()
+        base_resolved = base.resolve()
+    except OSError as exc:
+        raise PathRejected("project path could not be resolved") from exc
+    # STRICT containment: `resolved` must be a CHILD of the projects dir, never the
+    # projects dir itself. The old check allowed `resolved == base_resolved`, and
+    # `projects/<name> -> .` satisfied exactly that — making every other paper a
+    # "child" of the fake project, so `safe_child` then happily resolved
+    # `other-paper/main.tex` as an in-project path (cross-project read AND write),
+    # and `DELETE /project` ran `rmtree` on the projects ROOT, destroying every
+    # paper. `projects_dir` itself is never a project, so nothing legitimate needs
+    # the equality case.
+    if base_resolved not in resolved.parents:
+        raise PathRejected("project path escapes the projects directory")
+    if is_sensitive_path(str(resolved)):
+        raise PathRejected("project path is sensitive")
+    return resolved
+
+
+def safe_child(project: Path, relative: str) -> Path:
+    """Resolve *relative* inside *project*, or raise :class:`PathRejected`.
+
+    Forward slashes in the middle are allowed so papers with ``sections/intro.tex``
+    work (a ``\\input{sections/intro}`` is the norm in conference templates).
+    Everything else is refused:
+
+    * empty, or longer than a filesystem component budget;
+    * an absolute POSIX path (``/etc/passwd``) or a Windows/UNC one
+      (``C:\\...``, ``\\\\host\\share``) — backslash is rejected outright, since
+      it IS a separator on Windows and would otherwise pass a ``/``-only check;
+    * any ``..`` segment, anywhere;
+    * a NUL byte (truncates the path at the syscall boundary);
+    * a resolved target outside *project* — this is what catches a **symlink
+      escape**, where every segment looks innocent but a link points out of the
+      tree (a cloned repo can ship one);
+    * anything under ``.git`` — see below;
+    * a resolved target the shared sensitive-path gate rejects, so a project that
+      somehow sits beside a credential store still cannot read it.
+
+    **``.git`` is refused outright**, because it is not document content: it is the
+    machinery that decides what ``git`` EXECUTES. ``.git/config`` names
+    ``filter.<x>.clean`` and ``core.*Command`` programs, ``.git/info/attributes``
+    is the highest-precedence attributes source, and ``.git/hooks/*`` is run
+    directly — so a write there converts "edit a file in my paper" into code
+    execution on the next commit or push, on the one path that deliberately keeps
+    ``~/.ssh`` readable. Containment does not cover this: those paths are all
+    legitimately INSIDE the project, so every other rule here passes them. The
+    app's own git work goes through :mod:`.gitops`, and ``list_files`` already
+    hides dotfiles, so nothing legitimate is lost.
+    """
+    if not relative or len(relative) > 1024:
+        raise PathRejected("invalid path")
+    if "\0" in relative or "\\" in relative:
+        raise PathRejected("invalid path")
+    if relative.startswith("/") or re.match(r"^[A-Za-z]:", relative):
+        raise PathRejected("invalid path")
+    parts = relative.split("/")
+    if any(p in ("", ".", "..") for p in parts):
+        raise PathRejected("invalid path")
+    try:
+        resolved = (project / relative).resolve()
+        project_resolved = project.resolve()
+    except OSError as exc:
+        raise PathRejected("path could not be resolved") from exc
+    # Compared with Windows' ``\\?\`` prefix folded off both sides: one resolve
+    # can keep it while the other does not, and the lone prefix would read as an
+    # escape. Lexical only, so no redirect is blessed.
+    plain_resolved = platform_compat.strip_extended_length_prefix(resolved)
+    plain_project = platform_compat.strip_extended_length_prefix(project_resolved)
+    if plain_project not in plain_resolved.parents:
+        raise PathRejected("path escapes the project")
+    # Checked on the REQUESTED segments **and** the RESOLVED ones. Neither alone is
+    # sufficient, because a symlink can move `.git` in either direction:
+    #
+    #   * requested-only misses `meta -> .git` + `meta/config` — no `.git` component
+    #     in the request, resolves straight into the machinery;
+    #   * resolved-only misses `.git/config -> ../repo-config` — the request names
+    #     `.git`, but resolution lands outside it, so the resolved parts are clean
+    #     while git still READS the file through its own path.
+    #
+    # The second is the subtler one: it is not about where the bytes live, it is that
+    # the app must not write anything git will treat as its config, whatever the file
+    # is really called.
+    #
+    # Case-insensitively, because macOS and Windows resolve `.GIT` to the same
+    # directory; at any depth, because a submodule's `.git` has the same execution
+    # surface. The resolved check is against the PROJECT-RELATIVE part only, so a
+    # `.git` component in the absolute path ABOVE the project (a data home that
+    # itself sits inside a checkout) cannot refuse every legitimate file.
+    if any(p.lower() == ".git" for p in parts):
+        raise PathRejected("invalid path")
+    try:
+        rel_parts = plain_resolved.relative_to(plain_project).parts
+    except ValueError:  # pragma: no cover - containment above already guarantees this
+        raise PathRejected("path escapes the project") from None
+    if any(p.lower() == ".git" for p in rel_parts):
+        raise PathRejected("invalid path")
+    if is_sensitive_path(str(resolved)):
+        raise PathRejected("path is sensitive")
+    return resolved
+
+
+def _config_path(project: Path) -> Path | None:
+    """The project's config file, or ``None`` when it is not contained.
+
+    ``.papyrus.json`` is a file a CLONED REPOSITORY can ship, including as a symlink —
+    and both accessors below follow one: the reader would ``read_text`` whatever it
+    points at, and the writer would replace it. So it goes through :func:`safe_child`
+    like every other path in this module, which resolves the link and applies the
+    sensitive-path gate.
+
+    This is the same omission the deck readers, ``pdf_path`` and ``resolve_main_file``
+    each had: a filename the code supplies itself still lands in a directory the
+    repository controls.
+    """
+    # A SYMLINK at the literal path is refused outright, before containment is even
+    # asked about. `safe_child` answers "does this resolve inside the project", and an
+    # IN-PROJECT link satisfies it — so `.papyrus.json -> paper.tex` passed, and
+    # `set_main_file` (reached from `resolve_main_file`, i.e. every compile) replaced the
+    # user's manuscript with JSON. Containment was never the whole question here: this
+    # file is one KiroCrew owns and writes, so a link at that name is illegitimate
+    # wherever it points.
+    #
+    # Same reasoning as the generated-artifact guard in `latex`: for a path the app
+    # writes by name, the presence of a link is itself the problem.
+    #
+    # `is_reparse_link`, not `is_symlink()`: a Windows directory JUNCTION is a reparse
+    # point `is_symlink()` does not report, and it is the one link type a user can
+    # create there without elevation, so a symlink-only check makes this refusal
+    # POSIX-only -- which is exactly what that helper's docstring says every guard in
+    # this module must avoid. A junction is directory-only, so it cannot stand in for
+    # the `.papyrus.json -> paper.tex` overwrite above; what it does is slip past the
+    # refusal, take the write no further than an opaque later failure, and lose the
+    # warning that says why.
+    candidate = project / PROJECT_CONFIG_FILENAME
+    try:
+        if is_reparse_link(candidate):
+            logger.warning(
+                "papyrus: refused a linked project config in %s", project.name
+            )
+            return None
+    except OSError:  # pragma: no cover - defensive
+        return None
+    try:
+        return safe_child(project, PROJECT_CONFIG_FILENAME)
+    except PathRejected:
+        logger.warning("papyrus: refused an uncontained project config in %s", project.name)
+        return None
+
+
+class TitleRejected(ValueError):
+    """A non-blank rename that sanitizes to nothing (only invisible characters).
+
+    Only a blank field clears the override; a name with no displayable text is
+    refused rather than read as a request to clear.
+    """
+
+
+class ConfigWriteRefused(Exception):
+    """``.papyrus.json`` is a link, outside the project, unreadable or would exceed its cap.
+
+    Raised by the callers whose success the user sees — a rename and ``PUT /main``
+    — instead of answering "saved" over a write that never happened. The compile
+    path ignores :func:`set_main_file`'s answer: it calls it implicitly and must
+    not fail.
+    """
+
+
+# Weak values: a lock lives only while a writer holds it, so a deleted paper leaves
+# no entry behind. A concurrent writer still gets the SAME lock, because the one
+# holding it keeps it alive for as long as it matters.
+# Storing a bare `threading.Lock` here does NOT raise TypeError: `_thread.lock`
+# has a C-level weak-reference slot, so `weakref.ref(threading.Lock())` works on
+# every Python this package runs on (>= 3.12) even though the object exposes no
+# `__weakref__` attribute. The `_AgentLock` docstring in `subagent_persistence.py`
+# says otherwise; it is wrong, and no wrapper is needed. The route tests take these
+# locks on every rename, delete and main-file write, so a TypeError would fail them.
+_CONFIG_LOCKS: weakref.WeakValueDictionary[str, threading.Lock] = weakref.WeakValueDictionary()
+_CONFIG_LOCKS_GUARD = threading.Lock()
+
+
+def _state_key(project: Path) -> str:
+    """The key every per-paper in-memory table uses for *project*.
+
+    Resolved, because callers spell the same paper differently: the listing walks
+    :func:`projects_dir` as built, while a route goes through
+    :func:`safe_project_dir`, which resolves. Behind a symlinked ancestor
+    (``/home`` -> ``/var/home`` on rpm-ostree Fedora, a home moved to another
+    volume on macOS) the two strings differ, and a raw ``str(project)`` would give
+    one paper two locks and two generations.
+    """
+    try:
+        return str(project.resolve())
+    except (OSError, RuntimeError):
+        return str(project.absolute())
+
+
+def _config_lock(project: Path) -> threading.Lock:
+    """Return the lock serializing *project*'s config read-modify-write.
+
+    Two mutators (the main document and the display title) each read the whole
+    file and write it back; run concurrently, both read the same stale config and
+    the later write silently discards the other's key. Keyed per project so two
+    papers never wait on each other.
+    """
+    key = _state_key(project)
+    with _CONFIG_LOCKS_GUARD:
+        return _CONFIG_LOCKS.setdefault(key, threading.Lock())
+
+
+def _canonical_project_root(project: Path) -> Path:
+    """The admission root for a read inside *project*.
+
+    The projects dir (owned by Kiro Crew, resolved for a symlinked ancestor) plus
+    the entry name taken LITERALLY. Resolving the entry itself would let a project
+    directory swapped for a link redefine its own root.
+    """
+    return project.parent.resolve() / project.name
+
+
+def read_project_config(project: Path) -> dict[str, Any]:
+    """Read ``.papyrus.json``, returning ``{}`` when absent, corrupt, oversized or uncontained."""
+    try:
+        return _read_config_for_update(project)
+    except ConfigUnreadable:
+        return {}
+
+
+class ConfigUnreadable(Exception):
+    """``.papyrus.json`` exists but was not read (oversized or refused).
+
+    A writer must not take it for an empty config: rewriting it would discard
+    every key it holds.
+    """
+
+
+def _read_config_for_update(project: Path) -> dict[str, Any]:
+    """:func:`read_project_config` for a writer: ``{}`` when there is no file, or
+    when it holds nothing to keep (not valid JSON, or not a JSON object).
+
+    A file that exists but cannot be used raises :class:`ConfigUnreadable`. The
+    bytes are read through :func:`safe_read_file_bytes_nolink`, pinned to the
+    project root on the opened descriptor: `_config_path` refuses a link at the
+    name, but a pull can swap the file for one between that check and the read.
+    That read answers ``None`` for an absent file and for every refusal alike
+    (a hardlink, a descriptor it cannot verify), so the two are told apart here.
+    """
+    path = _config_path(project)
+    if path is None:
+        # A link or an uncontained name: `write_project_config` refuses it too.
+        return {}
+    try:
+        root = _canonical_project_root(project)
+        raw = safe_read_file_bytes_nolink(
+            str(path),
+            str(root),
+            max_bytes=PROJECT_CONFIG_MAX_BYTES,
+            within_root_is_canonical=True,
+        )
+    except (OSError, FileTooLargeError) as exc:
+        raise ConfigUnreadable(project.name) from exc
+    if raw is None:
+        if os.path.lexists(path):
+            raise ConfigUnreadable(project.name)
+        return {}
+    # Bytes that do not parse into an object hold no key to keep, so the writer
+    # starts from an empty config instead of refusing every write forever.
+    try:
+        loaded = json.loads(raw.decode("utf-8"))
+    except ValueError:
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def write_project_config(project: Path, config: dict[str, Any]) -> bool:
+    """Persist ``.papyrus.json`` atomically (crash mid-write keeps the old file).
+
+    Refuses an uncontained path for the mirror of the reason the reader does: a
+    symlinked config would have this WRITE land on whatever it points at.
+    Returns whether it wrote, so a caller that must not report a refused write
+    as saved can tell the two apart.
+
+    Also refuses once the project directory is gone: a write that lands after
+    :func:`delete_project` would recreate the directory, and the deleted paper's
+    name would stay taken. Callers hold :func:`_config_lock`, which the delete
+    holds too, so the check and the write cannot straddle a removal.
+
+    Refuses a payload over the read cap too: it would save, then read back as absent.
+    """
+    path = _config_path(project)
+    if path is None or not project.is_dir():
+        return False
+    payload = json.dumps(config, indent=2)
+    if len(payload.encode("utf-8")) > PROJECT_CONFIG_MAX_BYTES:
+        return False
+    # This function calls atomic_write() with the full path
+    # projects/<id>/.papyrus.json. If another program replaced the
+    # projects/<id> folder with a symlink just before that call, the file
+    # would be written in the folder that symlink points to. Accepted:
+    # Papyrus never creates symlinks or moves folders, so only a program
+    # running as this same user could do it, and that program can already
+    # write .papyrus.json itself.
+    atomic_write(path, payload, fsync=True, newline="")
+    return True
+
+
+def get_main_file(project: Path) -> str:
+    """Return the configured main ``.tex`` file, defaulting to ``main.tex``.
+
+    The configured value is UNTRUSTED: ``.papyrus.json`` can arrive inside a
+    cloned repository, so a hostile one could name ``../../etc/passwd.tex`` and
+    pivot through the PDF-serving route. It is therefore re-validated through
+    :func:`safe_child` on every read and ignored when it fails.
+    """
+    configured = read_project_config(project).get("main_file")
+    if isinstance(configured, str) and configured:
+        try:
+            safe_child(project, configured)
+        except PathRejected:
+            logger.warning("papyrus: ignoring unsafe main_file in %s", project.name)
+        else:
+            return configured
+    return DEFAULT_MAIN_FILE
+
+
+def resolve_main_file(project: Path) -> str | None:
+    """Resolve the main document, persisting a non-default discovery.
+
+    Order: the configured value, then :data:`MAIN_FILE_CANDIDATES`, then the
+    first ``*.tex`` in sorted order. Returns ``None`` when the project holds no
+    ``.tex`` file at all.
+    """
+    # Every candidate is probed through `_contained_file`, never `(project / x)`
+    # directly. A cloned repo can ship `main.tex` as a SYMLINK to a document outside
+    # the project, and the compiler is then pointed at that path — so external content
+    # is typeset and served, and the escape is invisible to a plain `is_file()` because
+    # every path segment looks innocent. Same omission as `pdf_path` had, one function
+    # over: a name that is derived rather than caller-supplied still lands in a
+    # directory the repository controls.
+    main_file = get_main_file(project)
+    if _contained_file(project, main_file):
+        return main_file
+    for candidate in MAIN_FILE_CANDIDATES:
+        if _contained_file(project, candidate):
+            if candidate != DEFAULT_MAIN_FILE:
+                set_main_file(project, candidate)
+            return candidate
+    # The glob branch too: `p.is_file()` follows a link exactly as the probes above do.
+    tex_files = sorted(
+        p.name for p in project.glob("*.tex") if _contained_file(project, p.name)
+    )
+    if not tex_files:
+        return None
+    discovered = tex_files[0]
+    if discovered != DEFAULT_MAIN_FILE:
+        set_main_file(project, discovered)
+    return discovered
+
+
+def _contained_file(project: Path, relative: str) -> bool:
+    """True when *relative* is a regular file that stays inside *project*.
+
+    The containment half is what a bare ``(project / relative).is_file()`` misses: it
+    follows symlinks, so a cloned repository shipping ``main.tex -> /etc/passwd`` (or
+    anything else readable) passes it. :func:`safe_child` resolves the link and rejects
+    the escape.
+    """
+    try:
+        return safe_child(project, relative).is_file()
+    except PathRejected:
+        return False
+
+
+#: Directory path -> (inode, random token). Held in memory, never in the paper:
+#: ``.papyrus.json`` travels with a cloned repository, so a token stored there
+#: would come back identical when the same repository is cloned again under the
+#: same name — exactly the replacement this has to tell apart.
+_GENERATIONS: dict[str, tuple[int, str]] = {}
+_GENERATIONS_GUARD = threading.Lock()
+#: Entry cap for :data:`_GENERATIONS`. A delete through Papyrus forgets its entry,
+#: but a directory removed outside it leaves one behind. At the cap, entries whose
+#: directory is gone (or holds another inode) are dropped first; if it is still
+#: full, a new paper gets no token rather than evicting one already handed out, so
+#: a listing never returns a row whose token it has just invalidated, and
+#: :func:`list_projects` leaves that paper out and logs how many it left out. Far
+#: above any real paper count. An entry is a path and a token, so the cap bounds
+#: the registry to a few megabytes.
+_MAX_GENERATIONS = 65536
+
+
+class ProjectReplaced(Exception):
+    """The paper a client names is not the one it loaded (see :func:`project_generation`)."""
+
+
+def project_generation(project: Path) -> str:
+    """A token that changes whenever *project* is deleted and created again.
+
+    Random per directory and forgotten on delete, so a paper recreated under the
+    same name gets a new one. The inode is kept alongside it to catch a directory
+    removed and recreated outside Papyrus. A restart forgets every token: a list
+    loaded before it then has its rename refused, which is the safe failure (the
+    client reloads the list and retries).
+
+    The inode alone cannot catch a removal outside Papyrus that the OS answers
+    with the SAME inode on the recreate. That is accepted: the token guards only
+    the display-only ``title`` key (``name`` stays every route's identifier), the
+    wrong name shows in the next list and is retyped or cleared with the same
+    route. Adding ctime to the identity, the obvious remedy, would be worse: a
+    directory's ctime moves whenever an entry in it is created, renamed or removed,
+    including the atomic write of ``.papyrus.json`` each rename does and the PDF
+    each first compile creates, so ordinary renames would be refused.
+    """
+    try:
+        inode = project.stat().st_ino
+    except OSError:
+        return ""
+    key = _state_key(project)
+    with _GENERATIONS_GUARD:
+        entry = _GENERATIONS.get(key)
+        if entry is None or entry[0] != inode:
+            if entry is None and len(_GENERATIONS) >= _MAX_GENERATIONS:
+                _drop_stale_generations_locked()
+                if len(_GENERATIONS) >= _MAX_GENERATIONS:
+                    return ""
+            entry = (inode, secrets.token_hex(16))
+            _GENERATIONS[key] = entry
+        return entry[1]
+
+
+def _drop_stale_generations_locked() -> None:
+    """Forget entries whose directory is gone or holds another inode.
+
+    The caller holds :data:`_GENERATIONS_GUARD`. Runs only at the cap.
+    """
+    for key, (inode, _token) in list(_GENERATIONS.items()):
+        try:
+            if os.stat(key).st_ino == inode:
+                continue
+        except OSError:
+            pass
+        del _GENERATIONS[key]
+
+
+def _delete_locked(project: Path, lock: threading.Lock) -> bool:
+    """Body of :func:`delete_project`; the caller holds *lock*."""
+    key = _state_key(project)
+    gone = platform_compat.rmtree_force(project)
+    with _GENERATIONS_GUARD:
+        _GENERATIONS.pop(key, None)
+    return gone
+
+
+def delete_project(project: Path) -> bool:
+    """Remove *project*'s tree, returning whether it is gone afterwards.
+
+    Holds the config lock so a rename or main-document write in flight either
+    finishes before the removal or sees the directory gone and writes nothing.
+    """
+    lock = _config_lock(project)
+    with lock:
+        return _delete_locked(project, lock)
+
+
+def set_main_file(project: Path, main_file: str) -> bool:
+    """Set the main document (validated), preserving other config keys.
+
+    Returns whether it was saved: ``False`` for a config that is a link, outside
+    the project or oversized. The compile path ignores the answer; ``PUT /main``
+    reports it.
+    """
+    safe_child(project, main_file)
+    with _config_lock(project):
+        try:
+            config = _read_config_for_update(project)
+        except ConfigUnreadable:
+            logger.warning("papyrus: not rewriting an unreadable config in %s", project.name)
+            return False
+        config["main_file"] = main_file
+        return write_project_config(project, config)
+
+
+def sanitize_title(raw: str) -> str:
+    """Return *raw* as a displayable name, or ``""`` to refuse it.
+
+    A name is plain text, so ``%`` and a backslash are ordinary characters.
+    Unicode control and format characters (categories ``Cc``/``Cf``, where a bidi
+    override lives) are removed, a line break or tab becoming a space:
+    ``.papyrus.json`` can arrive inside a cloned repository. Runs of spaces
+    collapse to one, and a name with nothing left is refused, which falls back
+    to the directory name.
+
+    Does NOT apply :data:`MAX_TITLE_CHARS`: the route cuts to that length after
+    redacting, so a token that straddles the cap is redacted whole instead of
+    being split into a fragment the redactor does not recognize.
+    """
+    if len(raw) > _TITLE_INPUT_CHARS:
+        return ""
+    visible = "".join(
+        char
+        for char in raw
+        if char.isspace() or unicodedata.category(char) not in ("Cc", "Cf")
+    )
+    return re.sub(r"\s+", " ", visible).strip()
+
+
+def project_title(project: Path) -> str:
+    """Resolve what the paper list should CALL this project.
+
+    The name the user set, else the directory name. The set name is UNTRUSTED
+    text — ``.papyrus.json`` can arrive inside a cloned repository — so it goes
+    through :func:`sanitize_title`, and an empty result falls back to the
+    directory name rather than showing a blank row.
+    """
+    configured = read_project_config(project).get(PROJECT_TITLE_KEY)
+    if isinstance(configured, str) and (chosen := sanitize_title(configured)):
+        return chosen
+    return project.name
+
+
+def config_lock(project: Path) -> threading.Lock:
+    """The lock a caller holds across authorizing *project* and writing its config.
+
+    :func:`set_project_title_locked` expects it held: taken BEFORE the route's
+    existence check, it keeps a delete (which holds it too) and a same-name
+    create from landing between that check and the write.
+    """
+    return _config_lock(project)
+
+
+def set_project_title_locked(project: Path, title: str) -> None:
+    """Set (or clear) the user's display name; the caller holds :func:`config_lock`.
+
+    An empty *title* REMOVES the override instead of storing a blank, so the
+    field doubles as "go back to the directory name" — which is the only
+    way back once a paper has been renamed, and needs no second control.
+    """
+    cleaned = sanitize_title(title)
+    if title.strip() and not cleaned:
+        raise TitleRejected(project.name)
+    try:
+        config = _read_config_for_update(project)
+    except ConfigUnreadable:
+        raise ConfigWriteRefused(project.name) from None
+    if cleaned:
+        config[PROJECT_TITLE_KEY] = cleaned
+    else:
+        config.pop(PROJECT_TITLE_KEY, None)
+    # The path is re-checked at write time: a link at `.papyrus.json`, or a
+    # directory deleted meanwhile, is refused there and must not answer as saved.
+    if not write_project_config(project, config):
+        raise ConfigWriteRefused(project.name)
+
+
+def pdf_path(project: Path, main_file: str) -> Path | None:
+    """Return the PDF the compiler emits for *main_file*, or ``None`` if uncontained.
+
+    Goes through :func:`safe_child` like every other caller-influenced path in this
+    module. It looks derived-and-therefore-safe — the stem comes from the configured
+    main file and the suffix is a literal — but the RESULT is a name in a directory a
+    cloned repository controls, and ``safe_child`` is what resolves symlinks.
+
+    A repo shipping ``main.pdf -> ~/.kiro/crew/.local_secret`` had that file served
+    verbatim by the ``/pdf`` route, which renders it inline in the browser. Plain
+    concatenation could not see it: every segment is innocent and the link is the whole
+    trick. This is the same containment the editor's file reads have always had; the
+    PDF was simply never routed through it.
+
+    ``None`` rather than raising, because every caller here already treats a missing
+    PDF as "not compiled yet" and an uncontained one deserves exactly that answer —
+    they are indistinguishable to a user and neither is servable.
+    """
+    try:
+        return safe_child(project, Path(main_file).stem + ".pdf")
+    except PathRejected:
+        logger.warning("papyrus: refused an uncontained PDF path in %s", project.name)
+        return None
+
+
+def list_files(project: Path) -> list[str]:
+    """Return POSIX-style relative paths of the project's editable files.
+
+    Hidden entries are skipped (``.git`` would explode the tree, ``.papyrus.json``
+    is config), symlinks are skipped entirely (a link is not a file the editor
+    should follow — and following one is how a tree walk escapes containment),
+    and the walk is bounded by :data:`MAX_PROJECT_FILES`.
+
+    Synchronous filesystem walk — call it off the event loop.
+    """
+    files: list[str] = []
+    stack = [project]
+    while stack and len(files) < MAX_PROJECT_FILES:
+        current = stack.pop()
+        try:
+            entries = sorted(current.iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            if entry.name.startswith("."):
+                continue
+            # `is_reparse_link`, not `is_symlink()`: a junction is a DIRECTORY
+            # link `is_symlink()` does not report, so it fell through to the
+            # `is_dir()` arm below and the walk followed it out of the project,
+            # returning outside names under project-relative paths.
+            if is_reparse_link(entry):
+                continue
+            if entry.is_dir():
+                stack.append(entry)
+            elif entry.is_file():
+                files.append(entry.relative_to(project).as_posix())
+                if len(files) >= MAX_PROJECT_FILES:
+                    break
+    files.sort()
+    return files
+
+
+def list_projects(root: Path | None = None) -> list[ProjectSummary]:
+    """Return every project that has a resolvable main document.
+
+    Synchronous filesystem scan — call it off the event loop.
+    """
+    out: list[ProjectSummary] = []
+    no_token = 0
+    for entry in sorted(projects_dir(root).iterdir()):
+        # Same helper as `safe_project_dir`, which refuses a linked project entry
+        # outright: a junction under `projects/` is a directory `is_symlink()`
+        # misses, so it was enumerated here as a real project.
+        if not entry.is_dir() or is_reparse_link(entry) or entry.name.startswith("."):
+            continue
+        # Sampled BEFORE the row's fields and checked again after them: a delete
+        # and same-name create in between would otherwise pair the replacement's
+        # generation with the deleted paper's title, and a rename from that row
+        # would pass the generation check. Such a row is left out; the next list
+        # shows the paper that replaced it.
+        generation = project_generation(entry)
+        if not generation:
+            # Besides a folder deleted mid-listing, `project_generation` returns ""
+            # only when :data:`_MAX_GENERATIONS` papers that still exist already
+            # hold a token: it never erases a token it handed out, and drops those
+            # of deleted folders first. That case fails the whole list below.
+            no_token += 1
+            continue
+        main_file = resolve_main_file(entry)
+        if main_file is None:
+            continue
+        tex = entry / main_file
+        try:
+            modified = tex.stat().st_mtime
+        except OSError:
+            continue
+        row = ProjectSummary(
+            name=entry.name,
+            modified=modified,
+            # An uncontained PDF reads as "no PDF": not servable either way.
+            has_pdf=bool((_pdf := pdf_path(entry, main_file)) and _pdf.is_file()),
+            title=project_title(entry),
+            generation=generation,
+        )
+        if project_generation(entry) != generation:
+            continue
+        out.append(row)
+    if no_token:
+        logger.warning(
+            "papyrus: left %d paper(s) out of the list: no generation token "
+            "(unreadable directory, or the registry is at its cap of %d)",
+            no_token,
+            _MAX_GENERATIONS,
+        )
+        # At the cap the rows left out still exist: a successful list would tell
+        # the page they were deleted, and it would forget their co-author chats.
+        if len(_GENERATIONS) >= _MAX_GENERATIONS:
+            raise RuntimeError("papyrus: generation registry full, paper list incomplete")
+    return out
+
+
+def read_text_file(project: Path, relative: str) -> str:
+    """Read a project file as UTF-8 text.
+
+    Raises :class:`PathRejected` for a refused path, ``FileNotFoundError`` when
+    absent, ``ValueError`` when the file is binary or over
+    :data:`MAX_FILE_BYTES`.
+    """
+    target = safe_child(project, relative)
+    if not target.is_file():
+        raise FileNotFoundError(relative)
+    size = target.stat().st_size
+    if size > MAX_FILE_BYTES:
+        raise ValueError("file too large")
+    try:
+        return target.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("binary file") from exc
+
+
+def write_file(project: Path, relative: str, content: str) -> None:
+    """Write a project file atomically, creating parent directories as needed.
+
+    ``newline=""`` so a document that is read, edited and saved repeatedly lands
+    byte-for-byte instead of accumulating carriage returns on Windows.
+    """
+    target = safe_child(project, relative)
+    if len(content.encode("utf-8")) > MAX_FILE_BYTES:
+        raise ValueError("content too large")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write(target, content, newline="")
+
+
+def create_file(project: Path, relative: str, content: str = "") -> None:
+    """Create a project file, refusing to clobber an existing one.
+
+    Uses EXCLUSIVE creation (``O_CREAT | O_EXCL``) rather than an ``exists()`` probe
+    followed by a write. The probe leaves a check/use window, and this function runs on
+    worker threads, so two concurrent creates for the same path both passed it and both
+    answered 201 — while ``write_file``'s atomic replace meant the second silently
+    overwrote the first. Both callers were told their content was created; only one
+    copy survived.
+
+    ``O_EXCL`` is the filesystem answering the same question with no window in front of
+    it. The size check stays ahead of the open, so an oversized body is refused before
+    anything is created.
+    """
+    target = safe_child(project, relative)
+    if len(content.encode("utf-8")) > MAX_FILE_BYTES:
+        raise ValueError("content too large")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    # `x` is `O_CREAT | O_EXCL`: it raises FileExistsError itself, which is exactly the
+    # error the probe raises, so callers need no second case. `newline=""` matches
+    # `write_file` so a round-tripped document does not accumulate carriage returns.
+    with open(target, "x", encoding="utf-8", newline="") as handle:
+        handle.write(content)
+
+
+def delete_file(project: Path, relative: str) -> None:
+    """Delete a project file. The main document is refused.
+
+    The guard compares RESOLVED PATHS, not the request string against the configured
+    name. A string comparison protects only the exact spelling in ``.papyrus.json``,
+    and a cloned repository can contain a symlink: with ``alias.tex -> main.tex``
+    configured as the main file, deleting ``main.tex`` passed the check (the strings
+    differ) and removed the real document, leaving the configured main dangling and
+    every compile broken. The file tree offers exactly that deletion.
+
+    ``safe_child`` already refuses the string-level dodges (``./main.tex``,
+    ``sections/../main.tex``, a trailing slash), so a symlink is the case it cannot
+    see — and it is the one a hostile or merely careless repository actually brings.
+    """
+    target = safe_child(project, relative)
+    main = safe_child(project, get_main_file(project))
+    # `os.path.realpath`, not `Path.resolve(strict=True)`: the main document may not
+    # exist yet (a fresh project, or a config naming a file the clone omitted), and a
+    # missing main must not make deletion of everything else raise.
+    # Compared with Windows' ``\\?\`` prefix folded off both sides, as in
+    # ``safe_child``: one realpath can keep it while the other does not, and the
+    # main document would then read as a different file. The unlink below still
+    # acts on ``target`` as resolved.
+    fold = platform_compat.strip_extended_length_prefix
+    if fold(os.path.realpath(target)) == fold(os.path.realpath(main)):
+        raise ValueError("cannot delete the main document")
+    if not target.is_file():
+        raise FileNotFoundError(relative)
+    target.unlink()
+
+
+def is_artifact(relative: str) -> bool:
+    """True when *relative* is a LaTeX build artifact rather than source."""
+    return Path(relative).suffix.lower() in ARTIFACT_SUFFIXES

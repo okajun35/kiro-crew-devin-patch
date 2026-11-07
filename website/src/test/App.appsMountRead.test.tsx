@@ -1,0 +1,291 @@
+/**
+ * The shell's mount read of `GET /api/apps` shares the request an ['apps']
+ * observer mounted in the same commit already started, instead of sending a
+ * second identical one; a refresh after `mc:apps-changed` still reads the
+ * server again. Same isolation shape as App.appNavHiddenFilter.test.tsx.
+ */
+import { describe, it, expect, vi, beforeEach, onTestFinished } from 'vitest'
+import { render, screen, waitFor, act } from '@testing-library/react'
+import { MemoryRouter } from 'react-router-dom'
+import { Provider } from 'react-redux'
+import { QueryClientProvider } from '@tanstack/react-query'
+import { configureStore } from '@reduxjs/toolkit'
+import dashboardReducer from '../store/dashboardSlice'
+import chatReducer from '../store/chatSlice'
+import notificationsReducer from '../store/notificationsSlice'
+import instancesReducer from '../store/instancesSlice'
+import App from '../App'
+import { ThemeProvider } from '../hooks/useTheme'
+import { api } from '../api/client'
+import { newQueryClient } from '../api/queryClient'
+
+// Mock the routed pages so App mounts without real page trees — the test
+// asserts the NAV RAIL's rows, not page content.
+// The chat page stands in for every ['apps'] observer the real page mounts in
+// the same commit as the shell (the composer's session controls, the panel-tab
+// registry): it reads the list through the shared key, as they do.
+vi.mock('../pages/ChatPage', async () => {
+  const { useQuery } = await import('@tanstack/react-query')
+  const { api: mocked } = await import('../api/client')
+  function ChatPageAppsObserver() {
+    const { data } = useQuery({ queryKey: ['apps'], queryFn: () => mocked.listApps() })
+    return <div data-testid="chat-page">{Array.isArray(data) ? data.length : 'none'}</div>
+  }
+  return { default: ChatPageAppsObserver }
+})
+vi.mock('../pages/apps/DiscoverPage', () => ({ default: () => <div data-testid="discover-page" /> }))
+vi.mock('../pages/apps/LibraryPage', () => ({ default: () => <div data-testid="library-page" /> }))
+vi.mock('../pages/AppPage', () => ({ default: () => <div data-testid="app-page" /> }))
+vi.mock('../pages/AppDetailPage', () => ({ default: () => <div data-testid="app-detail-page" /> }))
+vi.mock('../pages/MigrationPage', () => ({ default: () => <div data-testid="migration-page" /> }))
+vi.mock('../pages/NotificationsPage', () => ({ default: () => null }))
+vi.mock('../pages/KiroCrewAgentsPage', () => ({ default: () => null }))
+vi.mock('../pages/ProjectsPage', () => ({ default: () => null }))
+vi.mock('../pages/LogsPage', () => ({ default: () => null }))
+vi.mock('../pages/SettingsPage', () => ({ default: () => null }))
+vi.mock('../pages/SchedulePage', () => ({ default: () => null }))
+vi.mock('../pages/HooksPage', () => ({ default: () => null }))
+vi.mock('../pages/CapabilitiesPage', () => ({ default: () => null }))
+vi.mock('../pages/KnowledgePage', () => ({ default: () => null }))
+vi.mock('../pages/DeveloperPage', () => ({ default: () => null }))
+vi.mock('../pages/ArtifactsPage', () => ({ default: () => null }))
+vi.mock('../pages/ArtifactDetailPage', () => ({ default: () => null }))
+vi.mock('../pages/ArtifactDeployPage', () => ({ default: () => null }))
+vi.mock('../pages/EmbedSettingsPage', () => ({ default: () => null }))
+// The lazy overlay layers observe ['apps'] too. Whether their chunks resolve
+// inside this test's window is import timing, not the shell's nav read that
+// these tests count, so they are left out of the count.
+vi.mock('../linkPreview/LinkPreviewLayer', () => ({ default: () => null }))
+vi.mock('../messageActions/MessageActionLayer', () => ({ default: () => null }))
+vi.mock('../selectionActions/SelectionActionLayer', () => ({ default: () => null }))
+vi.mock('../pages/PopoutFrame', () => ({ default: () => null }))
+vi.mock('../pages/ArtifactPopoutFrame', () => ({ default: () => null }))
+vi.mock('../hooks/useWebSocket', () => ({ useWebSocket: () => ({ subscribeLogs: () => {}, subscribeSubagents: () => {}, forceReconnect: () => {} }) }))
+vi.mock('../hooks/useAgents', () => ({ useAgents: vi.fn(() => ({ agents: [{ name: 'kirocrew' }], defaultAgent: 'kirocrew' })) }))
+vi.mock('../hooks/useDashboardHealthProbe', () => ({ useDashboardHealthProbe: () => {} }))
+vi.mock('../providers/context', () => ({ useProvider: () => ({ id: 'acp' }) }))
+vi.mock('../components/MarkdownRenderer', () => ({ default: ({ content }: { content: string }) => <span>{content}</span>, Lightbox: () => null }))
+vi.mock('../api/client', () => ({
+  api: {
+    chatSlots: vi.fn().mockResolvedValue([]),
+    notifications: vi.fn().mockResolvedValue({ notifications: [] }),
+    status: vi.fn().mockResolvedValue({ uptime: '1h', sessions: 0, messages: 0, cron_jobs: 0, subagents: 0, lessons: 0 }),
+    sessionsUsage: vi.fn().mockResolvedValue({ usage: { available: false } }),
+    listApps: vi.fn().mockResolvedValue([]),
+    listRegistry: vi.fn().mockResolvedValue({ apps: [], categoryOrder: [], editorialSections: [] }),
+    system: vi.fn().mockResolvedValue({ mem_used_gb: 4.0, mem_total_gb: 16.0, cpu_pct: 25.0, disk_total_gb: 100.0, disk_free_gb: 60.0 }),
+    chatSlotAgent: vi.fn().mockResolvedValue({}),
+    chatSlotReasoningEffort: vi.fn().mockResolvedValue({}),
+    chatSlotModel: vi.fn().mockResolvedValue({}),
+    chatMode: vi.fn().mockResolvedValue({}),
+    listInstances: vi.fn().mockResolvedValue({ instances: [], warm_set_cap: 5 }),
+    approvals: vi.fn().mockResolvedValue([]),
+  },
+  isAuthBannerShown: vi.fn(() => false),
+  ApiError: class extends Error { status: number; constructor(s: number, m: string) { super(m); this.status = s } },
+}))
+
+Object.defineProperty(window, 'matchMedia', {
+  writable: true,
+  value: vi.fn().mockImplementation(query => ({
+    matches: false, media: query, onchange: null,
+    addListener: vi.fn(), removeListener: vi.fn(),
+    addEventListener: vi.fn(), removeEventListener: vi.fn(),
+    dispatchEvent: vi.fn(),
+  })),
+})
+globalThis.ResizeObserver = class {
+  observe() {}
+  unobserve() {}
+  disconnect() {}
+} as unknown as typeof ResizeObserver
+
+/** An installed app with a UI page, so it gets a sidebar row. */
+const keeperApp = {
+  name: 'keeper-demo',
+  displayName: 'Keeper Demo',
+  enabled: true,
+  origin: 'registry',
+  lifecycle: 'gateway',
+  manifest: { ui: { entry: 'index.mjs', pages: [{ route: '/', label: 'Keeper Demo' }] } },
+}
+
+const refreshedApp = {
+  ...keeperApp,
+  name: 'refreshed-demo',
+  displayName: 'Refreshed Demo',
+  manifest: { ui: { entry: 'index.mjs', pages: [{ route: '/', label: 'Refreshed Demo' }] } },
+}
+
+/** Renders App at /chat (nav rail visible, no store page mounted). */
+function renderApp() {
+  const store = configureStore({
+    reducer: {
+      dashboard: dashboardReducer,
+      chat: chatReducer,
+      notifications: notificationsReducer,
+      instances: instancesReducer,
+    },
+  })
+  // The dashboard's own client policy (staleTime: Infinity), not a bare
+  // client. The lazy LinkPreviewLayer and MessageActionLayer are ['apps']
+  // observers whose mount can land after the boot read settles; when it does
+  // depends on whether an earlier test already loaded their modules, and on
+  // runner load. Under a bare client's staleTime 0 each such late mount sent
+  // another GET, so the read counts below depended on test order. The
+  // dashboard serves those mounts from cache. retry stays off: the shell's
+  // own backoff owns retries.
+  const qc = newQueryClient()
+  qc.setDefaultOptions({ queries: { ...qc.getDefaultOptions().queries, retry: false } })
+  render(
+    <Provider store={store}>
+      <QueryClientProvider client={qc}>
+        <ThemeProvider>
+          <MemoryRouter initialEntries={['/chat']}>
+            <App />
+          </MemoryRouter>
+        </ThemeProvider>
+      </QueryClientProvider>
+    </Provider>,
+  )
+  return qc
+}
+
+const listAppsCalls = () => vi.mocked(api.listApps).mock.calls.length
+
+describe('App apps-nav mount read', () => {
+  beforeEach(() => {
+    localStorage.clear()
+    vi.mocked(api.listApps).mockClear()
+    vi.mocked(api.listApps).mockResolvedValue([keeperApp])
+  })
+
+  it('issues one GET /api/apps when an ["apps"] observer mounts with the shell', async () => {
+    renderApp()
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Keeper Demo' })).toBeInTheDocument())
+    await waitFor(() => expect(screen.getByTestId('chat-page')).toHaveTextContent('1'))
+    expect(listAppsCalls()).toBe(1)
+  })
+
+  it('still refetches after mc:apps-changed', async () => {
+    renderApp()
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Keeper Demo' })).toBeInTheDocument())
+    const before = listAppsCalls()
+    act(() => { window.dispatchEvent(new Event('mc:apps-changed')) })
+    await waitFor(() => expect(listAppsCalls()).toBe(before + 1))
+  })
+
+  it('keeps the changed apps list when the slower boot GET resolves last', async () => {
+    let resolveBoot!: (apps: typeof keeperApp[]) => void
+    const boot = new Promise<typeof keeperApp[]>(resolve => { resolveBoot = resolve })
+    vi.mocked(api.listApps)
+      .mockReset()
+      .mockImplementationOnce(() => boot)
+      .mockResolvedValueOnce([refreshedApp])
+
+    const qc = renderApp()
+    await waitFor(() => expect(listAppsCalls()).toBe(1))
+
+    act(() => { window.dispatchEvent(new Event('mc:apps-changed')) })
+    await waitFor(() => expect(listAppsCalls()).toBe(2))
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Refreshed Demo' })).toBeInTheDocument())
+
+    await act(async () => { resolveBoot([keeperApp]); await boot })
+
+    expect(qc.getQueryData(['apps'])).toEqual([refreshedApp])
+    expect(screen.queryByRole('button', { name: 'Keeper Demo' })).not.toBeInTheDocument()
+  })
+
+  it('does not cancel an in-flight ["apps", "migration", <name>] query on mc:apps-changed', async () => {
+    // Query filters match by key prefix, so a bare ['apps'] cancel would also
+    // abort MigrationPage's first load (keyed ['apps', 'migration', name]) and
+    // revert it to pending with no data. The refresh must cancel only the
+    // exact ['apps'] list query.
+    const qc = renderApp()
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Keeper Demo' })).toBeInTheDocument())
+
+    let resolveMigration!: (v: { plan: string }) => void
+    const migrationFetch = new Promise<{ plan: string }>(resolve => { resolveMigration = resolve })
+    const migrationKey = ['apps', 'migration', 'x']
+    const migrationRead = qc.fetchQuery({ queryKey: migrationKey, queryFn: () => migrationFetch, retry: false })
+    // Swallow the rejection a cancel would produce; the assertions below decide.
+    migrationRead.catch(() => {})
+    expect(qc.getQueryState(migrationKey)?.fetchStatus).toBe('fetching')
+
+    const before = listAppsCalls()
+    act(() => { window.dispatchEvent(new Event('mc:apps-changed')) })
+    // The refresh went through the cancel branch (the list query was idle, so
+    // it was not joined) and issued its own read...
+    await waitFor(() => expect(listAppsCalls()).toBe(before + 1))
+    // ...while the sibling query is still in flight, not reverted to idle.
+    expect(qc.getQueryState(migrationKey)?.fetchStatus).toBe('fetching')
+
+    await act(async () => { resolveMigration({ plan: 'ok' }); await migrationFetch })
+    await expect(migrationRead).resolves.toEqual({ plan: 'ok' })
+    expect(qc.getQueryData(migrationKey)).toEqual({ plan: 'ok' })
+  })
+})
+
+// #28740: an app installed or removed OUTSIDE this tab (the CLI, another tab)
+// announces nothing here, so the shell re-reads the list when the user returns.
+describe('App apps list after a change made outside the tab', () => {
+  beforeEach(() => {
+    localStorage.clear()
+    vi.mocked(api.listApps).mockReset()
+    vi.mocked(api.listApps).mockResolvedValue([keeperApp])
+  })
+
+  it('picks up an app installed elsewhere when the tab regains focus, without a reload', async () => {
+    const qc = renderApp()
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Keeper Demo' })).toBeInTheDocument())
+
+    // `kirocrew app install` in a terminal: the server list changes, no event here.
+    vi.mocked(api.listApps).mockResolvedValue([keeperApp, refreshedApp])
+    act(() => { window.dispatchEvent(new Event('focus')) })
+
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Refreshed Demo' })).toBeInTheDocument())
+    // The shared cache the link-preview layer reads is updated too.
+    expect(qc.getQueryData(['apps'])).toEqual([keeperApp, refreshedApp])
+  })
+
+  it('drops an app removed elsewhere when the tab becomes visible again', async () => {
+    const qc = renderApp()
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Keeper Demo' })).toBeInTheDocument())
+
+    vi.mocked(api.listApps).mockResolvedValue([])
+    act(() => { document.dispatchEvent(new Event('visibilitychange')) })
+
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Keeper Demo' })).not.toBeInTheDocument())
+    expect(qc.getQueryData(['apps'])).toEqual([])
+  })
+
+  it('reads once for the focus + visibilitychange pair of one return', async () => {
+    const qc = renderApp()
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Keeper Demo' })).toBeInTheDocument())
+    // Each re-read synchronously cancels the list query before its GET, so
+    // counting those cancels right after dispatch counts re-reads without waiting.
+    const cancel = vi.spyOn(qc, 'cancelQueries')
+    act(() => {
+      document.dispatchEvent(new Event('visibilitychange'))
+      window.dispatchEvent(new Event('focus'))
+    })
+    expect(cancel.mock.calls).toEqual([[{ queryKey: ['apps'], exact: true }]])
+    await waitFor(() => expect(screen.getByTestId('chat-page')).toHaveTextContent('1'))
+  })
+
+  it('does not re-read when focus comes back from one of its own app iframes', async () => {
+    const qc = renderApp()
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Keeper Demo' })).toBeInTheDocument())
+    const cancel = vi.spyOn(qc, 'cancelQueries')
+    const frame = document.createElement('iframe')
+    document.body.appendChild(frame)
+    onTestFinished(() => frame.remove())
+    frame.focus()
+    expect(document.activeElement).toBe(frame)
+    act(() => {
+      window.dispatchEvent(new Event('blur'))
+      window.dispatchEvent(new Event('focus'))
+    })
+    expect(cancel).not.toHaveBeenCalled()
+  })
+})

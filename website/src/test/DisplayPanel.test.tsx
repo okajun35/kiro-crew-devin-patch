@@ -1,0 +1,965 @@
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { screen, waitFor, within, fireEvent, act } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
+import { DisplayPanel } from '../pages/settings/DisplayPanel'
+import { renderWithProviders } from './helpers'
+import { api } from '../api/client'
+import { experiencePack, readExperience, saveExperienceChoice } from '../utils/themeConsent'
+
+// The rail mounts one item at a time; each describe sets the item it exercises
+// in its beforeEach and renders through this helper.
+let displaySub = 'view'
+const renderPanel = () => renderWithProviders(<DisplayPanel />, { route: `/settings?tab=display&sub=${displaySub}` })
+
+// Mock useZoomCtx — DisplayPanel uses it for zoom/font controls. The object is
+// module-scoped and mutable so individual tests can flip zoomSupported to
+// cover both the desktop stepper and the plain-browser shortcut hint.
+const zoomCtx = {
+  zoom: 100,
+  zoomSupported: true,
+  zoomIn: vi.fn(),
+  zoomOut: vi.fn(),
+  reset: vi.fn(),
+  setZoom: vi.fn(),
+  family: 'sans',
+  setFontFamily: vi.fn(),
+  cycleFamily: vi.fn(),
+}
+vi.mock('../hooks/ZoomProvider', () => ({
+  useZoomCtx: () => zoomCtx,
+}))
+
+// Mock useTheme — provides color theme state. ThemeProvider is a passthrough
+// so renderWithProviders (in helpers.tsx) can still wrap children without
+// pulling in the real provider's state machine. `mockUseTheme` is mutable so a
+// test can flip `themeSwitching` on; a top-level beforeEach restores the default.
+const { mockUseTheme, DEFAULT_THEME } = vi.hoisted(() => {
+  const DEFAULT_THEME = {
+    preference: 'dark',
+    setTheme: vi.fn(),
+    colorTheme: 'default',
+    setColorTheme: vi.fn(),
+    allThemes: [{ value: 'default', label: 'Default', custom: false }],
+    customThemes: [],
+    customThemesUpdatedAt: 0,
+    theme: 'dark',
+    themeVersion: 0,
+    themeSwitching: false,
+    addCustomTheme: vi.fn(),
+    deleteCustomTheme: vi.fn(),
+    loadCustomThemes: vi.fn(),
+    installedThemeLoadFailed: false,
+    customThemeDataMap: new Map(),
+  }
+  return { mockUseTheme: vi.fn(() => DEFAULT_THEME), DEFAULT_THEME }
+})
+vi.mock('../hooks/useTheme', () => ({
+  useTheme: () => mockUseTheme(),
+  ThemeProvider: ({ children }: { children: React.ReactNode }) => children,
+  CUSTOM_THEMES_CHANGED_EVENT: 'custom-themes-changed',
+}))
+
+// Reset to the default theme shape before every test in this file (runs before
+// the describe-scoped beforeEach hooks). clearAllMocks keeps implementations.
+beforeEach(() => {
+  mockUseTheme.mockReset()
+  mockUseTheme.mockImplementation(() => DEFAULT_THEME)
+})
+
+// Mock useUIMode — provides chat/cli interface paradigm. UIModeProvider is a
+// passthrough so the test doesn't need real provider wiring.
+vi.mock('../hooks/useUIMode', () => ({
+  useUIMode: () => ({
+    uiMode: 'chat',
+    setUIMode: vi.fn(),
+    toggleUIMode: vi.fn(),
+  }),
+  UIModeProvider: ({ children }: { children: React.ReactNode }) => children,
+}))
+
+// Mock useSessionPalette — provides sidebar color palette data
+vi.mock('../hooks/useSessionPalette', () => ({
+  useSessionPalette: () => ({
+    paletteColors: ['#ff0000', '#00ff00', '#0000ff'],
+    colorMode: 'tint' as const,
+    paletteName: 'trailhead',
+    intensity: 'clear',
+    boost: {
+      activePct: [60, 60, 60],
+      idlePct: [30, 30, 30],
+    },
+  }),
+}))
+
+describe('DisplayPanel – ThemeEditorPanel overlay', () => {
+  beforeEach(() => {
+    displaySub = 'theme'
+    vi.clearAllMocks()
+  })
+
+  it('hides the Theme section behind the modal backdrop when ThemeEditorPanel is open', async () => {
+    const user = userEvent.setup()
+    renderPanel()
+
+    // Verify the Theme section (which hosts the + New Theme button) is visible initially
+    expect(screen.getByText('Install Theme')).toBeInTheDocument()
+
+    // Open the theme editor
+    const newThemeBtn = screen.getByText('+ New Theme')
+    await user.click(newThemeBtn)
+
+    // ThemeEditorPanel modal should be open
+    await waitFor(() => {
+      expect(screen.getByText('Create Theme')).toBeInTheDocument()
+    })
+
+    // The modal backdrop should be present and cover the content
+    const dialog = screen.getByRole('dialog', { name: 'Create Theme' })
+    const backdrop = document.querySelector('.fixed.inset-0.bg-bg\\/60') as HTMLElement
+    expect(backdrop).toBeInTheDocument()
+
+    // The overlay used to be a hand-rolled `fixed inset-0 z-[49] bg-black/50`
+    // div. The shared Modal owns the backdrop now and puts the dialog on its
+    // own z-[100]/[101] layer, above the page rather than one step under the
+    // floating theme-experience toggle.
+    expect(document.querySelector('.bg-black\\/50')).toBeNull()
+    expect(backdrop.className).toContain('z-[100]')
+    expect((dialog.parentElement as HTMLElement).className).toContain('z-[101]')
+
+    // Modal portals to document.body, so the dialog is no longer a sibling of
+    // the Theme section in the panel's own tree: it is a child of body,
+    // which is what places it above every section regardless of DOM order.
+    expect(dialog.closest('body')).toBe(document.body)
+    expect(screen.getByText('Install Theme').closest('[role="dialog"]')).toBeNull()
+  })
+
+  it('renders ThemeEditorPanel modal outside of SettingsCard to avoid card-glow stacking context', async () => {
+    const user = userEvent.setup()
+    renderPanel()
+
+    await user.click(screen.getByText('+ New Theme'))
+
+    await waitFor(() => {
+      expect(screen.getByText('Create Theme')).toBeInTheDocument()
+    })
+
+    // Walk up the DOM tree from the portalled dialog — no ancestor should have
+    // card-glow class (a transform/filter ancestor would clip `fixed`).
+    let el: HTMLElement | null = screen.getByRole('dialog', { name: 'Create Theme' })
+    while (el) {
+      expect(el.className).not.toContain('card-glow')
+      el = el.parentElement
+    }
+  })
+
+  it('closes ThemeEditorPanel and shows the Theme section again', async () => {
+    const user = userEvent.setup()
+    renderPanel()
+
+    // Open theme editor
+    await user.click(screen.getByText('+ New Theme'))
+    await waitFor(() => {
+      expect(screen.getByText('Create Theme')).toBeInTheDocument()
+    })
+
+    // Close via Modal's own header close button
+    await user.click(screen.getByRole('button', { name: 'Close' }))
+
+    // Modal should be gone
+    await waitFor(() => {
+      expect(screen.queryByText('Create Theme')).not.toBeInTheDocument()
+    })
+
+    // Theme section should still be visible and interactive
+    expect(screen.getByText('Install Theme')).toBeInTheDocument()
+  })
+
+  it('dismisses the theme editor on Escape and on a backdrop click', async () => {
+    // Escape is the capability the hand-rolled overlay lacked; the backdrop
+    // click it already had must survive the conversion. Both are the ACCIDENTAL
+    // exits, so both are only available while the form is untouched.
+    const user = userEvent.setup()
+    renderPanel()
+
+    await user.click(screen.getByText('+ New Theme'))
+    await screen.findByRole('dialog', { name: 'Create Theme' })
+    fireEvent.keyDown(window, { key: 'Escape' })
+    await waitFor(() => expect(screen.queryByText('Create Theme')).not.toBeInTheDocument())
+
+    await user.click(screen.getByText('+ New Theme'))
+    await screen.findByRole('dialog', { name: 'Create Theme' })
+    fireEvent.click(document.querySelector('.fixed.inset-0.bg-bg\\/60') as HTMLElement)
+    await waitFor(() => expect(screen.queryByText('Create Theme')).not.toBeInTheDocument())
+  })
+
+  it('refuses Escape and backdrop dismissal once the theme draft has content', async () => {
+    // Escape is a path this conversion ADDS, and closeEditor discards the draft
+    // unconditionally — so on a part-filled form the accidental exits must not
+    // fire. Only the explicit ones (header close, the panel's Cancel) close it.
+    const user = userEvent.setup()
+    renderPanel()
+
+    await user.click(screen.getByText('+ New Theme'))
+    await screen.findByRole('dialog', { name: 'Create Theme' })
+    await user.type(screen.getByPlaceholderText('My Custom Theme'), 'Midnight')
+
+    // Settle past Modal's exit animation before asserting PRESENCE: the panel
+    // lingers in the DOM while AnimatePresence plays the exit, so a short wait
+    // would pass whether or not the dismissal was refused.
+    fireEvent.keyDown(window, { key: 'Escape' })
+    await new Promise(r => setTimeout(r, 600))
+    expect(screen.getByRole('dialog', { name: 'Create Theme' })).toBeInTheDocument()
+
+    fireEvent.click(document.querySelector('.fixed.inset-0.bg-bg\\/60') as HTMLElement)
+    await new Promise(r => setTimeout(r, 600))
+    expect(screen.getByRole('dialog', { name: 'Create Theme' })).toBeInTheDocument()
+    // The draft survived both, name included.
+    expect(screen.getByPlaceholderText('My Custom Theme')).toHaveValue('Midnight')
+
+    // The explicit exit still works on the same dirty form.
+    await user.click(screen.getByRole('button', { name: 'Close' }))
+    await waitFor(() => expect(screen.queryByText('Create Theme')).not.toBeInTheDocument())
+  })
+
+  it('locks page scroll and puts initial focus inside the dialog while the editor is open', async () => {
+    // Both come from the shared Modal (scroll lock + focus trap) and neither
+    // existed on the hand-rolled overlay.
+    const user = userEvent.setup()
+    renderPanel()
+
+    await user.click(screen.getByText('+ New Theme'))
+    const dialog = await screen.findByRole('dialog', { name: 'Create Theme' })
+    expect(document.body.style.overflow).toBe('hidden')
+    expect(dialog.contains(document.activeElement)).toBe(true)
+  })
+})
+
+
+describe('DisplayPanel – theme install', () => {
+  beforeEach(() => {
+    displaySub = 'theme'
+    vi.clearAllMocks()
+  })
+
+  it('renders the renamed "Theme" section with an Install control', () => {
+    renderPanel()
+    expect(screen.getByText('Install Theme')).toBeInTheDocument()
+    expect(screen.getByLabelText('Theme source')).toBeInTheDocument()
+    expect(screen.getByLabelText('Theme source location')).toBeInTheDocument()
+  })
+
+  it('installs a theme from a GitHub URL via api.installTheme', async () => {
+    const user = userEvent.setup()
+    const spy = vi
+      .spyOn(api, 'installTheme')
+      .mockResolvedValue({ ok: true, slug: 'lcars' })
+    renderPanel()
+
+    await user.type(
+      screen.getByLabelText('Theme source location'),
+      'https://github.com/u/lcars'
+    )
+    await user.click(screen.getByText('Install'))
+
+    await waitFor(() => {
+      expect(spy).toHaveBeenCalledWith({
+        type: 'github',
+        url: 'https://github.com/u/lcars',
+      })
+    })
+    spy.mockRestore()
+  })
+
+  it('picking "Local folder" retargets the install at a filesystem path', async () => {
+    // Regression guard for the native-<select> → SimpleSelect migration: the
+    // source picker is a Radix Select, so a `change` event on the trigger does
+    // nothing — open it, then click the option. The placeholder and the
+    // installTheme payload are the two observable consequences of the state move.
+    const spy = vi
+      .spyOn(api, 'installTheme')
+      .mockResolvedValue({ ok: true, slug: 'lcars' })
+    renderPanel()
+
+    const trigger = screen.getByRole('combobox', { name: 'Theme source' })
+    expect(trigger).toHaveTextContent('GitHub')
+    expect(screen.getByLabelText('Theme source location')).toHaveAttribute(
+      'placeholder',
+      'https://github.com/user/theme'
+    )
+
+    fireEvent.click(trigger)
+    fireEvent.click(await screen.findByRole('option', { name: 'Local folder' }))
+
+    expect(trigger).toHaveTextContent('Local folder')
+    const location = screen.getByLabelText('Theme source location')
+    expect(location).toHaveAttribute('placeholder', '/path/to/theme')
+
+    fireEvent.change(location, { target: { value: '/srv/themes/lcars' } })
+    fireEvent.click(screen.getByText('Install'))
+
+    await waitFor(() => {
+      expect(spy).toHaveBeenCalledWith({ type: 'local', path: '/srv/themes/lcars' })
+    })
+    spy.mockRestore()
+  })
+
+  describe('Browse… for a local theme folder', () => {
+    const setBridge = (bridge: unknown) => {
+      ;(window as { folderPickAPI?: unknown }).folderPickAPI = bridge
+    }
+    afterEach(() => {
+      delete (window as { folderPickAPI?: unknown }).folderPickAPI
+    })
+    const chooseLocalFolder = async () => {
+      fireEvent.click(screen.getByRole('combobox', { name: 'Theme source' }))
+      fireEvent.click(await screen.findByRole('option', { name: 'Local folder' }))
+    }
+
+    it('is absent in a plain browser tab, where no native chooser exists', async () => {
+      renderPanel()
+      await chooseLocalFolder()
+      expect(screen.queryByRole('button', { name: 'Browse…' })).toBeNull()
+    })
+
+    it('is absent for a GitHub source even when the shell can pick', async () => {
+      setBridge({ available: vi.fn().mockResolvedValue(true), pick: vi.fn() })
+      renderPanel()
+      expect(screen.queryByRole('button', { name: 'Browse…' })).toBeNull()
+    })
+
+    it('fills the location with the chosen folder and installs only on Install', async () => {
+      const pick = vi.fn().mockResolvedValue('/Users/me/themes/haunted')
+      setBridge({ available: vi.fn().mockResolvedValue(true), pick })
+      const spy = vi.spyOn(api, 'installTheme').mockResolvedValue({ ok: true, slug: 'haunted' })
+      renderPanel()
+      await chooseLocalFolder()
+      expect(screen.getByRole('button', { name: 'Install' })).toBeDisabled()
+
+      fireEvent.click(await screen.findByRole('button', { name: 'Browse…' }))
+      await waitFor(() => {
+        expect(screen.getByLabelText('Theme source location')).toHaveValue('/Users/me/themes/haunted')
+      })
+      // With a location in place, Install is the enabled next step.
+      expect(screen.getByRole('button', { name: 'Install' })).toBeEnabled()
+      expect(spy).not.toHaveBeenCalled()
+
+      fireEvent.click(screen.getByText('Install'))
+      await waitFor(() => {
+        expect(spy).toHaveBeenCalledWith({ type: 'local', path: '/Users/me/themes/haunted' })
+      })
+      spy.mockRestore()
+    })
+
+    it('leaves the field alone on cancel and explains a chooser that could not open', async () => {
+      const pick = vi.fn().mockResolvedValueOnce(null).mockRejectedValueOnce(new Error('dialog failed'))
+      setBridge({ available: vi.fn().mockResolvedValue(true), pick })
+      renderPanel()
+      await chooseLocalFolder()
+      const location = screen.getByLabelText('Theme source location')
+      fireEvent.change(location, { target: { value: '/typed/path' } })
+
+      fireEvent.click(await screen.findByRole('button', { name: 'Browse…' }))
+      await waitFor(() => expect(pick).toHaveBeenCalledTimes(1))
+      expect(location).toHaveValue('/typed/path')
+
+      fireEvent.click(screen.getByRole('button', { name: 'Browse…' }))
+      expect(await screen.findByText('The folder chooser could not open. Type the path instead.')).toBeInTheDocument()
+      expect(location).toHaveValue('/typed/path')
+    })
+  })
+
+  it('picking "Zip file" installs the picked archive via api.installThemeZip', async () => {
+    // The folder-path source names a directory on the GATEWAY host, so a phone
+    // or a browser through a tunnel has nothing to type there. The zip source
+    // uploads the file the browser picked instead.
+    const setColorTheme = vi.fn()
+    mockUseTheme.mockImplementation(() => ({
+      ...DEFAULT_THEME,
+      setColorTheme,
+      loadCustomThemes: vi.fn().mockResolvedValue(true),
+    }))
+    const zipSpy = vi.spyOn(api, 'installThemeZip').mockResolvedValue({ ok: true, slug: 'haunted-crew' })
+    const pathSpy = vi.spyOn(api, 'installTheme')
+    renderPanel()
+
+    const trigger = screen.getByRole('combobox', { name: 'Theme source' })
+    fireEvent.click(trigger)
+    fireEvent.click(await screen.findByRole('option', { name: 'Zip file' }))
+    expect(trigger).toHaveTextContent('Zip file')
+    expect(screen.queryByLabelText('Theme source location')).not.toBeInTheDocument()
+
+    const install = screen.getByText('Install').closest('button')!
+    expect(install).toBeDisabled()
+
+    const file = new File([new Uint8Array([0x50, 0x4b, 0x03, 0x04])], 'haunted-crew.zip', {
+      type: 'application/zip',
+    })
+    fireEvent.change(screen.getByTestId('theme-zip-input'), { target: { files: [file] } })
+    expect(screen.getByRole('button', { name: 'haunted-crew.zip' })).toBeInTheDocument()
+    expect(install).toBeEnabled()
+
+    fireEvent.click(install)
+    await waitFor(() => expect(zipSpy).toHaveBeenCalledWith(file))
+    await waitFor(() => expect(setColorTheme).toHaveBeenCalledWith('custom-haunted-crew'))
+    expect(pathSpy).not.toHaveBeenCalled()
+    // A finished install clears the pick, so a second click cannot resend it.
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Choose a .zip file' })).toBeInTheDocument())
+    zipSpy.mockRestore()
+    pathSpy.mockRestore()
+  })
+
+  it('an install whose list refresh failed never selects the pack on its own', async () => {
+    // Install lands, the list refresh fails: the notice under the picker says
+    // so at once. When a catalog fetch later LANDS (Retry, a background refetch,
+    // another tab) the notice is withdrawn -- keyed on `customThemesUpdatedAt`,
+    // because a reinstall of an already-listed pack yields a deep-equal listing
+    // whose array reference React Query keeps -- and NOTHING is selected: a
+    // theme swap made by a refetch minutes later is not the user's choice.
+    const setColorTheme = vi.fn()
+    const customThemes = [{ value: 'custom-lcars', label: 'LCARS', custom: true }]
+    let customThemesUpdatedAt = 1000
+    mockUseTheme.mockImplementation(() => ({
+      ...DEFAULT_THEME,
+      setColorTheme,
+      // Rebuilt every render, as the provider does; must not withdraw the notice.
+      allThemes: [{ value: 'default', label: 'Default', custom: false }, ...customThemes],
+      customThemes, // same reference throughout: the reinstall case
+      customThemesUpdatedAt,
+      loadCustomThemes: vi.fn().mockResolvedValue(false),
+    }))
+    const spy = vi.spyOn(api, 'installTheme').mockResolvedValue({ ok: true, slug: 'lcars' })
+    const { rerender } = renderPanel()
+
+    fireEvent.change(screen.getByLabelText('Theme source location'), {
+      target: { value: 'https://github.com/u/lcars' },
+    })
+    fireEvent.click(screen.getByText('Install'))
+    await screen.findByText(/Press Retry to refresh the list and apply it/)
+    rerender(<DisplayPanel />)
+    expect(screen.getByText(/Press Retry to refresh the list and apply it/)).toBeInTheDocument()
+    expect(setColorTheme).not.toHaveBeenCalled()
+
+    // A catalog fetch lands (deep-equal listing, same array): the notice goes,
+    // nothing is selected.
+    customThemesUpdatedAt = 2000
+    rerender(<DisplayPanel />)
+    await waitFor(() => {
+      expect(screen.queryByText(/Press Retry to refresh the list and apply it/)).not.toBeInTheDocument()
+    })
+    expect(setColorTheme).not.toHaveBeenCalled()
+    spy.mockRestore()
+  })
+
+  it('a user-initiated Retry that succeeds finishes the install by selecting the pack', async () => {
+    // The Retry click is the user's action, so its success may complete what
+    // the failed refresh left undone: the just-installed pack is selected. Only
+    // this path selects; a background refetch never does (previous test).
+    const setColorTheme = vi.fn()
+    const loadCustomThemes = vi.fn().mockResolvedValueOnce(false).mockResolvedValueOnce(true)
+    mockUseTheme.mockImplementation(() => ({
+      ...DEFAULT_THEME,
+      setColorTheme,
+      customThemesLoaded: true,
+      loadCustomThemes,
+    }))
+    const spy = vi.spyOn(api, 'installTheme').mockResolvedValue({ ok: true, slug: 'lcars' })
+    renderPanel()
+
+    fireEvent.change(screen.getByLabelText('Theme source location'), {
+      target: { value: 'https://github.com/u/lcars' },
+    })
+    fireEvent.click(screen.getByText('Install'))
+    await screen.findByText(/Press Retry to refresh the list and apply it/)
+    expect(setColorTheme).not.toHaveBeenCalled()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
+    await waitFor(() => expect(setColorTheme).toHaveBeenCalledWith('custom-lcars'))
+    expect(loadCustomThemes).toHaveBeenCalledTimes(2)
+    spy.mockRestore()
+  })
+
+  it('shows the "Applying…" status indicator while a theme switch is in flight', () => {
+    mockUseTheme.mockImplementation(() => ({ ...DEFAULT_THEME, themeSwitching: true }))
+    renderPanel()
+    expect(screen.getByText(/Applying/)).toBeInTheDocument()
+  })
+
+  it('does not show the "Applying…" indicator when no switch is in flight', () => {
+    renderPanel()
+    expect(screen.queryByText(/Applying/)).not.toBeInTheDocument()
+  })
+
+  it('shows "Fetching…" on the install button while installTheme is pending', async () => {
+    const user = userEvent.setup()
+    const spy = vi
+      .spyOn(api, 'installTheme')
+      .mockReturnValue(new Promise(() => {}) as ReturnType<typeof api.installTheme>)
+    renderPanel()
+
+    await user.type(screen.getByLabelText('Theme source location'), 'https://github.com/u/x')
+    await user.click(screen.getByText('Install'))
+
+    // installTheme never resolves → the button stays in the 'fetching' phase.
+    expect(await screen.findByRole('button', { name: /Fetching/ })).toBeInTheDocument()
+    spy.mockRestore()
+  })
+})
+
+describe('DisplayPanel – font family setting', () => {
+  beforeEach(() => {
+    displaySub = 'zoom'
+    vi.clearAllMocks()
+  })
+
+  it('tells the user the code font tracks the theme, not this preference', () => {
+    // A theme pack's `mono` face reaches code blocks, inline code and diffs
+    // under EVERY option here, System included (website/docs/theming-contract.md
+    // § Fonts). Without this sentence a user who picks System and still sees the
+    // code font change reads the option as broken.
+    // Since OpenDyslexic shipped, the description also carves out that option:
+    // it applies its own OpenDyslexicMono to code surfaces, so the "follows the
+    // active theme" rule doesn't hold for it. The assertion pins both halves so
+    // a future edit can't silently drop either.
+    renderPanel()
+
+    expect(screen.getByText('Font Family')).toBeInTheDocument()
+    // The sentence is the row's info tip (its `title` while closed).
+    expect(
+      screen.getByTitle('UI font family for the dashboard. Code font follows the active theme, except OpenDyslexic which supplies its own.'),
+    ).toBeInTheDocument()
+  })
+})
+
+describe('DisplayPanel – plain diffs setting lives on the Chat tab', () => {
+  beforeEach(() => {
+    displaySub = 'view'
+    vi.clearAllMocks()
+    localStorage.clear()
+  })
+
+  // The toggle governs how a diff READS in the transcript, so it belongs beside
+  // File change chips in Chat → Messages, not in Display → View, which holds
+  // Language and Interface (app-shell scope). Its behaviour is covered by
+  // ChatPanel.plainDiff.test.tsx; this guards only against it reappearing here
+  // and shipping as two switches over one localStorage key.
+  it('does not render the toggle', () => {
+    renderPanel()
+    expect(screen.queryByRole('switch', { name: 'Plain diffs' })).toBeNull()
+  })
+})
+
+// Settings > Display > View > Desktop app (#12204). The row mounts only after
+// the main window's close-action read succeeds, so these drive it through the
+// real panel: its late-mount highlight anchor and its save-failure notice are
+// composed here, not in the hook or the toggle primitive.
+describe('DisplayPanel – desktop app close-button row', () => {
+  const ROW_ID = 'display.keep-running-in-the-background-after-closing-the-window'
+  const LABEL = 'Keep running in the background after closing the window'
+
+  beforeEach(() => {
+    displaySub = 'view'
+    vi.clearAllMocks()
+    localStorage.clear()
+  })
+  afterEach(() => {
+    delete (window as unknown as { closeActionAPI?: unknown }).closeActionAPI
+  })
+
+  it('stays absent without the bridge (browser, PWA)', () => {
+    renderPanel()
+    expect(screen.queryByRole('switch', { name: LABEL })).toBeNull()
+  })
+
+  it('mounts after the read with its highlight anchor, and reports a failed save', async () => {
+    let answerGet: (v: string) => void = () => {}
+    let refuseSet: () => void = () => {}
+    const closeActionAPI = {
+      get: vi.fn(() => new Promise<string>(resolve => { answerGet = resolve })),
+      set: vi.fn(() => new Promise<string>((_resolve, reject) => {
+        refuseSet = () => reject(new Error("close-action:set is restricted to the main window's dashboard"))
+      })),
+    }
+    ;(window as unknown as { closeActionAPI?: unknown }).closeActionAPI = closeActionAPI
+    const { container } = renderPanel()
+
+    // Not yet answered: no row, so a deep link must wait for its anchor.
+    expect(container.querySelector(`[data-setting-id="${ROW_ID}"]`)).toBeNull()
+    await act(async () => { answerGet('background') })
+    const row = await waitFor(() => {
+      const el = container.querySelector(`[data-setting-id="${ROW_ID}"]`)
+      expect(el).not.toBeNull()
+      return el as HTMLElement
+    })
+    const toggle = within(row).getByRole('switch', { name: LABEL })
+    expect(toggle).toHaveAttribute('aria-checked', 'true')
+
+    fireEvent.click(toggle)
+    expect(closeActionAPI.set).toHaveBeenCalledWith('quit')
+    await act(async () => { refuseSet() })
+
+    expect(await screen.findByText("Couldn't save this setting. Nothing changed. Try again.")).toBeInTheDocument()
+    const after = within(container.querySelector(`[data-setting-id="${ROW_ID}"]`) as HTMLElement)
+      .getByRole('switch', { name: LABEL })
+    expect(after).toHaveAttribute('aria-checked', 'true')
+    expect(after).not.toBeDisabled()
+  })
+})
+
+describe('DisplayPanel – zoom setting', () => {
+  beforeEach(() => {
+    displaySub = 'zoom'
+    vi.clearAllMocks()
+    zoomCtx.zoomSupported = true
+    zoomCtx.zoom = 100
+  })
+
+  /** Scope queries to the zoom stepper's button row — the panel has other
+   *  steppers (e.g. "Highlight recent sessions") with identical
+   *  Increase/Decrease labels. The zoom value is a number input named
+   *  "Zoom Level"; its readout box sits in the row. */
+  const zoomInput = () => screen.getByRole('spinbutton', { name: 'Zoom Level' }) as HTMLInputElement
+  const zoomRow = () => within(zoomInput().parentElement?.parentElement as HTMLElement)
+
+  it('desktop: renders the native zoom stepper and drives the bridge callbacks', async () => {
+    const user = userEvent.setup()
+    zoomCtx.zoom = 125
+    renderPanel()
+
+    expect(screen.getByText('Zoom Level')).toBeInTheDocument()
+    expect(zoomInput().value).toBe('125')
+    // Single zoom control only — the legacy Font Size stepper must be gone.
+    expect(screen.queryByText('Font Size')).not.toBeInTheDocument()
+
+    await user.click(zoomRow().getByLabelText('Increase'))
+    expect(zoomCtx.zoomIn).toHaveBeenCalledTimes(1)
+    await user.click(zoomRow().getByLabelText('Decrease'))
+    expect(zoomCtx.zoomOut).toHaveBeenCalledTimes(1)
+    await user.clear(zoomInput())
+    await user.type(zoomInput(), '113{Enter}')
+    expect(zoomCtx.setZoom).toHaveBeenCalledWith(113)
+  })
+
+  it('browser: shows the shortcut hint instead of a stepper', () => {
+    zoomCtx.zoomSupported = false
+    renderPanel()
+
+    expect(screen.getByText('Zoom Level')).toBeInTheDocument()
+    expect(screen.getByText(/Use your browser's zoom/)).toBeInTheDocument()
+    // No zoom % value button renders in browser mode (other steppers keep theirs).
+    expect(screen.queryByText(/^\d+%$/)).not.toBeInTheDocument()
+    expect(screen.queryByText('Font Size')).not.toBeInTheDocument()
+  })
+})
+
+describe('DisplayPanel – dropped overrides notice', () => {
+  // The runtime scoper silently removes overrides.css rules the theming
+  // contract disallows; the ONLY other signal is a console warning no dashboard
+  // user has open. These pin the Settings-side surface: shown for the active
+  // pack with the rule names an author needs, absent otherwise.
+  beforeEach(() => {
+    displaySub = 'theme'
+    vi.clearAllMocks()
+  })
+
+  const REPORT = { slug: 'manrope', rules: ['body { --font-body }', '.session-card'] }
+
+  it('names the dropped rules when the active theme had rules removed', () => {
+    mockUseTheme.mockImplementation(() => ({
+      ...DEFAULT_THEME,
+      colorTheme: 'custom-manrope',
+      overridesDropReport: REPORT,
+    }))
+    renderPanel()
+    expect(screen.getByText("Some of this theme's styles were ignored")).toBeInTheDocument()
+    // The rule names are the actionable part — a bare count tells an author
+    // nothing to edit.
+    expect(screen.getByText(/body \{ --font-body \}/)).toBeInTheDocument()
+    expect(screen.getByText(/\.session-card/)).toBeInTheDocument()
+    const link = screen.getByRole('link', { name: 'Theming guide' })
+    expect(link).toHaveAttribute('target', '_blank')
+    expect(link).toHaveAttribute('rel', expect.stringContaining('noopener'))
+  })
+
+  it('renders nothing when no rules were dropped', () => {
+    mockUseTheme.mockImplementation(() => ({
+      ...DEFAULT_THEME,
+      colorTheme: 'custom-manrope',
+      overridesDropReport: null,
+    }))
+    renderPanel()
+    expect(screen.queryByText("Some of this theme's styles were ignored")).not.toBeInTheDocument()
+  })
+
+  it('ignores a report that belongs to a theme other than the active one', () => {
+    // Belt-and-braces for the switch race: the provider clears the report on
+    // theme change, but a stale report must still never be attributed to the
+    // wrong pack in the UI.
+    mockUseTheme.mockImplementation(() => ({
+      ...DEFAULT_THEME,
+      colorTheme: 'custom-other',
+      overridesDropReport: REPORT,
+    }))
+    renderPanel()
+    expect(screen.queryByText("Some of this theme's styles were ignored")).not.toBeInTheDocument()
+  })
+})
+
+describe('DisplayPanel – Experience parts of the active Level-2 pack', () => {
+  const RECORD_KEY = 'mc-theme-experience-bikini-bottom'
+  const GRANT_KEY = 'mc-theme-consent-bikini-bottom'
+  const THEMES = [
+    { value: 'default', label: 'Default', custom: false },
+    { value: 'custom-bikini-bottom', label: 'Bikini Bottom', custom: true, installed: true },
+  ]
+  const FULL_ASSETS = {
+    overlays: ['bubbles'],
+    hasAudio: true,
+    hasPersona: true,
+    personaInfo: { sha256: 'sha-abc', chars: 4, text: 'You are Karen.' },
+  }
+  const withTheme = (colorTheme: string, level: number, assets: Record<string, unknown> = FULL_ASSETS) =>
+    mockUseTheme.mockImplementation(() => ({
+      ...DEFAULT_THEME,
+      colorTheme,
+      allThemes: THEMES,
+      customThemeDataMap: new Map([['bikini-bottom', { slug: 'bikini-bottom', level, assets }]]),
+    }))
+  const part = (name: string) => screen.queryByRole('switch', { name })
+  const record = () => JSON.parse(localStorage.getItem(RECORD_KEY) ?? 'null')
+
+  beforeEach(() => {
+    displaySub = 'theme'
+    vi.clearAllMocks()
+    localStorage.clear()
+  })
+
+  it('lists only the parts the active pack ships', () => {
+    withTheme('custom-bikini-bottom', 2, { overlays: ['bubbles'], hasAudio: true })
+    renderPanel()
+    expect(screen.getByRole('group', { name: 'Experience' })).toBeInTheDocument()
+    expect(part('Sounds')).toBeInTheDocument()
+    expect(part('Overlays')).toBeInTheDocument()
+    expect(part('Persona')).not.toBeInTheDocument()
+  })
+
+  it.each([
+    ['the pack is not Level 2', 'custom-bikini-bottom', 1],
+    ['the pack is not the active theme', 'default', 2],
+  ])('is absent when %s', (_label, colorTheme, level) => {
+    withTheme(colorTheme, level)
+    renderPanel()
+    expect(screen.queryByRole('group', { name: 'Experience' })).not.toBeInTheDocument()
+  })
+
+  it('Sounds and Overlays apply as soon as they are toggled, without a grant', () => {
+    localStorage.setItem(RECORD_KEY, JSON.stringify({ sounds: false, overlays: false, persona: false }))
+    withTheme('custom-bikini-bottom', 2)
+    renderPanel()
+    fireEvent.click(part('Sounds') as HTMLElement)
+    expect(record()).toEqual({ sounds: true, overlays: false, persona: false })
+    expect(part('Sounds')).toHaveAttribute('aria-checked', 'true')
+    fireEvent.click(part('Overlays') as HTMLElement)
+    expect(record()).toEqual({ sounds: true, overlays: true, persona: false })
+    expect(localStorage.getItem(GRANT_KEY)).toBeNull()
+  })
+
+  it('Persona on stores the persona as wanted without a grant, so the consent dialog asks about it', () => {
+    localStorage.setItem(RECORD_KEY, JSON.stringify({ sounds: true, overlays: true, persona: false }))
+    withTheme('custom-bikini-bottom', 2)
+    renderPanel()
+    fireEvent.click(part('Persona') as HTMLElement)
+    expect(record()).toEqual({ sounds: true, overlays: true, persona: true })
+    expect(localStorage.getItem(GRANT_KEY)).toBeNull()
+    expect(readExperience('bikini-bottom', experiencePack(FULL_ASSETS)).ask).toEqual(['persona'])
+    // Settings has no confirm step of its own; the switch turns on once the dialog's Save writes the grant.
+    expect(screen.queryByLabelText('Persona text')).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Save' })).not.toBeInTheDocument()
+    expect(part('Persona')).toHaveAttribute('aria-checked', 'false')
+  })
+
+  it('Persona off revokes the grant at once', () => {
+    localStorage.setItem(RECORD_KEY, JSON.stringify({ sounds: true, overlays: true, persona: true }))
+    localStorage.setItem(GRANT_KEY, 'sha-abc')
+    withTheme('custom-bikini-bottom', 2)
+    renderPanel()
+    expect(part('Persona')).toHaveAttribute('aria-checked', 'true')
+    fireEvent.click(part('Persona') as HTMLElement)
+    expect(localStorage.getItem(GRANT_KEY)).toBeNull()
+    expect(record()).toEqual({ sounds: true, overlays: true, persona: false })
+  })
+
+  it('Persona on a changed persona drops the old grant and leaves the persona asked about', () => {
+    localStorage.setItem(RECORD_KEY, JSON.stringify({ sounds: true, overlays: true, persona: true }))
+    localStorage.setItem(GRANT_KEY, 'sha-OLD')
+    withTheme('custom-bikini-bottom', 2)
+    renderPanel()
+    expect(part('Persona')).toHaveAttribute('aria-checked', 'false')
+    fireEvent.click(part('Persona') as HTMLElement)
+    expect(record()).toEqual({ sounds: true, overlays: true, persona: true })
+    expect(localStorage.getItem(GRANT_KEY)).toBeNull()
+    expect(readExperience('bikini-bottom', experiencePack(FULL_ASSETS)).ask).toEqual(['persona'])
+  })
+
+  it('follows a choice saved by the layer while the panel is open', () => {
+    withTheme('custom-bikini-bottom', 2)
+    renderPanel()
+    expect(part('Overlays')).toHaveAttribute('aria-checked', 'false')
+    act(() => saveExperienceChoice('bikini-bottom', { overlays: true }, null))
+    expect(part('Overlays')).toHaveAttribute('aria-checked', 'true')
+  })
+
+  it('a toggle storage refuses shows an error under the section until the next stored toggle', () => {
+    const SAVE_FAILED = "Couldn't save. Browser storage is full or turned off."
+    localStorage.setItem(RECORD_KEY, JSON.stringify({ sounds: false, overlays: false, persona: false }))
+    withTheme('custom-bikini-bottom', 2)
+    renderPanel()
+    expect(screen.queryByText(SAVE_FAILED)).not.toBeInTheDocument()
+    const setItem = vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => {
+      throw new DOMException('full', 'QuotaExceededError')
+    })
+    try {
+      fireEvent.click(part('Sounds') as HTMLElement)
+      // The choice is kept for this tab, so the switch moves and the error says it was not stored.
+      expect(part('Sounds')).toHaveAttribute('aria-checked', 'true')
+      expect(screen.getByText(SAVE_FAILED)).toBeInTheDocument()
+    } finally {
+      setItem.mockRestore()
+    }
+    fireEvent.click(part('Overlays') as HTMLElement)
+    expect(record()).toEqual({ sounds: true, overlays: true, persona: false })
+    expect(screen.queryByText(SAVE_FAILED)).not.toBeInTheDocument()
+  })
+})
+
+describe('DisplayPanel – theme load-error notice', () => {
+  // The provider derives `installedThemeLoadFailed` from the selection, the
+  // catalog and `customThemeDataMap`: true only while the active pack is listed
+  // and its detail is absent, so a failed RELOAD whose last good detail
+  // (render-cache seed or carry-forward) is still applied reads false. The
+  // panel shows the notice on that boolean alone, and its copy must offer a
+  // recovery the pack actually has: reinstall for an installed pack,
+  // edit-or-swap for an editor-created one.
+  beforeEach(() => {
+    displaySub = 'theme'
+    vi.clearAllMocks()
+  })
+
+  const INSTALLED_COPY = 'The installed theme could not be loaded. Reinstall it or choose another theme.'
+  const EDITOR_COPY = 'This theme could not be loaded. Choose another theme or edit this one.'
+  const THEMES = [
+    { value: 'default', label: 'Default', custom: false },
+    { value: 'custom-manrope', label: 'Manrope', custom: true, installed: true },
+    { value: 'custom-mine', label: 'Mine', custom: true, installed: false },
+  ]
+
+  it('shows the reinstall copy for an unstyled installed theme', () => {
+    mockUseTheme.mockImplementation(() => ({
+      ...DEFAULT_THEME,
+      colorTheme: 'custom-manrope',
+      allThemes: THEMES,
+      installedThemeLoadFailed: true,
+    }))
+    renderPanel()
+    expect(screen.getByText(INSTALLED_COPY)).toBeInTheDocument()
+    expect(screen.queryByText(EDITOR_COPY)).not.toBeInTheDocument()
+  })
+
+  it('shows the edit-or-swap copy for an unstyled editor-created theme', () => {
+    mockUseTheme.mockImplementation(() => ({
+      ...DEFAULT_THEME,
+      colorTheme: 'custom-mine',
+      allThemes: THEMES,
+      installedThemeLoadFailed: true,
+    }))
+    renderPanel()
+    expect(screen.getByText(EDITOR_COPY)).toBeInTheDocument()
+    // An editor theme has no install source, so "reinstall" is not a way out.
+    expect(screen.queryByText(INSTALLED_COPY)).not.toBeInTheDocument()
+  })
+
+  it('renders no notice when the failed reload left the last good detail applied', () => {
+    // The provider's derived flag is false while the carried-forward detail is
+    // in the map; the panel must not second-guess it into a notice.
+    mockUseTheme.mockImplementation(() => ({
+      ...DEFAULT_THEME,
+      colorTheme: 'custom-manrope',
+      allThemes: THEMES,
+      installedThemeLoadFailed: false,
+      customThemeDataMap: new Map([['manrope', { slug: 'manrope' }]]),
+    }))
+    renderPanel()
+    expect(screen.queryByText(INSTALLED_COPY)).not.toBeInTheDocument()
+    expect(screen.queryByText(EDITOR_COPY)).not.toBeInTheDocument()
+  })
+
+  it('renders no notice without a load failure', () => {
+    mockUseTheme.mockImplementation(() => ({
+      ...DEFAULT_THEME,
+      colorTheme: 'custom-manrope',
+      allThemes: THEMES,
+      installedThemeLoadFailed: false,
+    }))
+    renderPanel()
+    expect(screen.queryByText(INSTALLED_COPY)).not.toBeInTheDocument()
+    expect(screen.queryByText(EDITOR_COPY)).not.toBeInTheDocument()
+  })
+})
+
+describe('DisplayPanel – Font Family picker (OpenDyslexic option)', () => {
+  beforeEach(() => {
+    displaySub = 'zoom'
+    vi.clearAllMocks()
+  })
+
+  // The Font Family row is a SettingsButtonGroup that lists Sans / Mono /
+  // System, plus OpenDyslexic as a fourth built-in a11y option. The buttons
+  // render their label as accessible text; asserting on the button role is
+  // enough to prove the option is discoverable — actually clicking it would
+  // just re-verify the shared SettingsButtonGroup wiring, which has its own
+  // tests.
+  it('lists OpenDyslexic as a fourth font family option alongside Sans/Mono/System', () => {
+    renderPanel()
+    expect(screen.getByRole('radio', { name: 'Sans' })).toBeInTheDocument()
+    expect(screen.getByRole('radio', { name: 'Mono' })).toBeInTheDocument()
+    expect(screen.getByRole('radio', { name: 'System' })).toBeInTheDocument()
+    expect(screen.getByRole('radio', { name: 'OpenDyslexic' })).toBeInTheDocument()
+  })
+})
+
+describe('DisplayPanel – sidebar session colors', () => {
+  beforeEach(() => {
+    displaySub = 'sidebar'
+    vi.clearAllMocks()
+  })
+
+  // The four sidebar-color controls write straight to the store. The buttons
+  // render their labels as accessible text, so clicking each and reading the
+  // slice back proves the wiring end to end — the fixed-color swatches and the
+  // No color / Auto choices are one exclusive group over the same field.
+  it('dispatches palette, intensity, display mode and default color to the store', () => {
+    const { store } = renderPanel()
+    const state = () => store.getState().dashboard
+
+    fireEvent.click(screen.getByRole('radio', { name: 'Gradient' }))
+    expect(state().sessionColorsMode).toBe('gradient')
+    fireEvent.click(screen.getByRole('radio', { name: 'Solid Tint' }))
+    expect(state().sessionColorsMode).toBe('tint')
+
+    fireEvent.click(screen.getByRole('radio', { name: 'Vivid' }))
+    expect(state().sessionColorsIntensity).toBe('vivid')
+
+    fireEvent.click(screen.getByRole('radio', { name: 'Horizon' }))
+    expect(state().sessionColorsPalette).toBe('horizon')
+
+    const defaults = within(
+      screen.getByText('Default for New Sessions').parentElement as HTMLElement,
+    )
+    fireEvent.click(defaults.getByRole('radio', { name: 'Auto' }))
+    expect(state().sessionDefaultColor).toBe('auto')
+    fireEvent.click(defaults.getByRole('radio', { name: 'Color 2' }))
+    expect(state().sessionDefaultColor).toBe(1)
+    expect(defaults.getByRole('radio', { name: 'Color 2' })).toHaveAttribute('aria-checked', 'true')
+    fireEvent.click(defaults.getByRole('radio', { name: 'No color' }))
+    expect(state().sessionDefaultColor).toBeNull()
+  })
+})

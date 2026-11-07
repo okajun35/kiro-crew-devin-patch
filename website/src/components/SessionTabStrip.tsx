@@ -1,0 +1,559 @@
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import type { CSSProperties, ReactNode } from 'react'
+import { Pin, X } from 'lucide-react'
+import { Reorder, useReducedMotion } from 'framer-motion'
+import { useAppSelector } from '../store'
+import { useScrollEdges } from '../hooks/useScrollEdges'
+import { useWheelToHorizontal } from '../hooks/useWheelToHorizontal'
+import {
+  TAB_GAP,
+  TAB_MAX_WIDTH,
+  TAB_MIN_WIDTH,
+  TAB_STATUS_COLOR,
+  freezeAfterPointerClose,
+  moveSessionTab,
+  tabStatus,
+  tabStatusPulses,
+  truncateTabTitle,
+  type TabFreeze,
+  type TabStatus,
+} from '../lib/sessionTabs'
+import { offlineProps } from '../utils/offline'
+import { i18nT } from '../i18n/t'
+import { useLongPressReorder } from '../hooks/useLongPressReorder'
+import { isUntitledSession, sessionDisplayTitle } from '../utils/sessionDisplayTitle'
+
+/**
+ * Status → catalog key. A STATIC table, not a computed `status_${s}` key: the
+ * i18n gate resolves key references literally, and a template-literal key is
+ * invisible to it — so a status whose string was never added would ship as the
+ * raw key rather than failing CI.
+ */
+const STATUS_LABEL_KEY: Record<Exclude<TabStatus, 'idle'>, string> = {
+  running: 'components.sessionTabStrip.status_running',
+  unread: 'components.sessionTabStrip.status_unread',
+  permission: 'components.sessionTabStrip.status_permission',
+  question: 'components.sessionTabStrip.status_question',
+}
+
+/** How long the replacement outline is held at full strength, then faded. */
+const FLASH_HOLD_MS = 700
+const FLASH_FADE_MS = 400
+
+/** The neighbours' slide into place during a drag: the same tight spring the
+ *  side-panel and terminal strips use, so a reorder snaps rather than floats. */
+const REORDER_SPRING = { type: 'spring', stiffness: 700, damping: 45 } as const
+const INSTANT = { duration: 0 } as const
+const NO_PINS: readonly string[] = []
+
+interface SessionTabProps {
+  value: string
+  tabRef: (el: HTMLDivElement | null) => void
+  style: CSSProperties
+  className: string
+  /** Skip the layout slide: under reduced motion, and while a close sequence
+   *  is frozen so the next close button is already under the pointer. */
+  instant: boolean
+  children: ReactNode
+  [attr: `data-${string}`]: string | undefined
+  role: 'tab'
+  tabIndex: number
+  title: string
+  'aria-selected': boolean
+  'aria-label': string
+  'aria-disabled'?: boolean | 'true' | 'false'
+  onClick: () => void
+  onMouseDownCapture: (e: React.MouseEvent) => void
+  onAuxClick: (e: React.MouseEvent) => void
+  onKeyDown: (e: React.KeyboardEvent) => void
+}
+
+/**
+ * One reorderable tab. A component rather than inline JSX inside the map:
+ * each tab owns its own long-press drag state, and a hook cannot be called
+ * from a loop. `useLongPressReorder` supplies the input split (a mouse or pen
+ * drags on press, a touch only after a stationary hold, so a swipe still
+ * scrolls the strip) and the touch pan blocker for the armed drag.
+ */
+function ReorderableSessionTab({ value, tabRef, style, className, instant, children, ...rest }: SessionTabProps) {
+  const { itemProps, dragging } = useLongPressReorder()
+  return (
+    <Reorder.Item
+      as="div"
+      value={value}
+      {...itemProps}
+      {...rest}
+      ref={tabRef}
+      // A press on the close button is a close, never the start of a drag.
+      onPointerDown={e => { if (!(e.target as HTMLElement).closest('button')) itemProps.onPointerDown(e) }}
+      // Android fires a native `contextmenu` on a long press, which can cancel
+      // the touch the hold just armed. The strip has no menu of its own, so it
+      // is swallowed only while a drag holds the pointer.
+      onContextMenu={e => { if (dragging) e.preventDefault() }}
+      data-dragging={dragging ? 'true' : undefined}
+      // Position only: closing a tab also changes the others' widths, and a
+      // size layout animation would stretch their labels while it ran.
+      layout="position"
+      transition={instant ? INSTANT : REORDER_SPRING}
+      style={{
+        ...itemProps.style,
+        ...style,
+        // An opaque fill and a shadow on the held tab: an inactive tab is
+        // transparent, and its label would otherwise print over the tab it is
+        // dragged across. The fill is also the cue that a touch hold armed.
+        ...(dragging ? { cursor: 'grabbing', background: 'var(--bg-elevated)', boxShadow: 'var(--shadow-md)' } : {}),
+      }}
+      // While held: stacked above its neighbours, because a later sibling
+      // paints over an earlier one and the fill would otherwise sit under the
+      // tab it crosses. `!important` because Reorder.Item writes its own
+      // inline z-index, `unset` whenever the held tab sits at its slot. The
+      // accent ring tells the held tab from the active one, which has the same
+      // fill; the terminal strip uses the same cue.
+      className={dragging ? `${className} relative !z-1 ring-1 ring-accent` : className}
+    >
+      {children}
+    </Reorder.Item>
+  )
+}
+
+/**
+ * The open-sessions strip above the chat transcript: a working set the user
+ * assembles, one visible at full width, switched in one click or one keystroke.
+ *
+ * WHY IT CAN BE ABSENT. It renders nothing below two tabs, and nothing is what
+ * every user gets until they deliberately open a second session here. That is
+ * the whole compatibility story for the surface: no new bar, no reclaimed
+ * height, no moved transcript for anyone who does not use it — checked in one
+ * place (the early return) rather than at each call site.
+ *
+ * WHY NOT REUSE `EmbedTabStrip`. That strip belongs to the embed shell: it
+ * navigates `/embed/chat/:slug` routes, seeds a slug-less "sessions" tab, and
+ * owns pointer-drag reordering against `sessionStorage`. Here the same visual
+ * affordance has to drive Redux `switchSlot` on the host route and must not
+ * carry the placeholder tab (this surface always has a session). The parts that
+ * are genuinely the same — status precedence, its colour vocabulary, the
+ * close-index arithmetic, title truncation — live in `lib/sessionTabs` and both
+ * strips call them, so the shared behaviour has one owner and the two shells
+ * stay separate.
+ */
+export default function SessionTabStrip({ tabs, pinned = NO_PINS, activeKey, cue, connected = true, onSelect, onClose, onReorder, onTogglePin }: {
+  tabs: readonly string[]
+  /**
+   * Pinned tabs (#22775). A pinned tab keeps its pin shown; its close button
+   * is hidden and disabled, and ×, middle-click or Delete cannot close it
+   * until it is unpinned.
+   */
+  pinned?: readonly string[]
+  activeKey: string | null
+  /** A tab worth looking at — a swap, or a re-request. See `SessionTabsApi.cue`. */
+  cue?: { key: string; at: number } | null
+  /**
+   * Gateway reachability. Offline, activating a tab is withheld (an offline
+   * switch clears the transcript), so the tabs are marked aria-disabled and say
+   * why rather than silently ignoring the click.
+   */
+  connected?: boolean
+  onSelect: (key: string) => void
+  onClose: (key: string) => void
+  /**
+   * The whole new tab order: each step of a drag (a mouse or pen press, or a
+   * touch hold) as the held tab crosses a neighbour, or Ctrl/Cmd+Shift+Arrow
+   * on the focused tab. Works offline, because the order is local view state.
+   */
+  onReorder: (keys: string[]) => void
+  onTogglePin: (key: string) => void
+}) {
+  const slots = useAppSelector(s => s.dashboard.slots)
+  const unreadSlots = useAppSelector(s => s.dashboard.unreadSlots)
+  const [attachEdges, edges, remeasure] = useScrollEdges<HTMLDivElement>()
+  const attachWheel = useWheelToHorizontal<HTMLDivElement>()
+  const attachScroller = useCallback((node: HTMLDivElement | null) => {
+    attachEdges(node)
+    attachWheel(node)
+  }, [attachEdges, attachWheel])
+  const tabRefs = useRef<Record<string, HTMLDivElement | null>>({})
+  const reduceMotion = useReducedMotion() ?? false
+
+  /**
+   * The tab a keyboard move should refocus. Moving a tab right makes React
+   * re-insert that tab's own node, and a focused node that is re-inserted
+   * loses focus to document.body. Restored before paint, so the next
+   * Ctrl/Cmd+Shift+Arrow still lands on the tab.
+   */
+  const pendingFocusRef = useRef<string | null>(null)
+  useLayoutEffect(() => {
+    const key = pendingFocusRef.current
+    if (!key) return
+    pendingFocusRef.current = null
+    const el = tabRefs.current[key]
+    if (!el) return
+    if (document.activeElement !== el) el.focus()
+    // The reveal effect ignores a change of order, so a keyboard move at the
+    // strip's edge would otherwise leave the focused tab scrolled out of view.
+    el.scrollIntoView({ block: 'nearest', inline: 'nearest' })
+  }, [tabs])
+
+  /**
+   * Brief outline on a tab whose session was swapped in place. A plain sidebar
+   * click is the DEFAULT gesture, and the swap keeps the tab's position and
+   * changes only its label — so without a cue the tab the user deliberately
+   * opened is not perceived as consumed, it is discovered missing later.
+   *
+   * Outline + a colour transition to transparent, removed by JS afterwards —
+   * the same treatment (and the same reason) as the sidebar's reveal flash: a
+   * colour transition survives the global reduced-motion animation kill switch,
+   * so the confirmation still lands for a user who suppresses motion.
+   */
+  const [flash, setFlash] = useState<{ key: string; fading: boolean } | null>(null)
+  const cueKey = cue?.key
+  const cueAt = cue?.at
+  useEffect(() => {
+    if (!cueKey) return
+    setFlash({ key: cueKey, fading: false })
+    const fade = setTimeout(() => setFlash(f => (f ? { ...f, fading: true } : f)), FLASH_HOLD_MS)
+    const clear = setTimeout(() => setFlash(null), FLASH_HOLD_MS + FLASH_FADE_MS)
+    return () => { clearTimeout(fade); clearTimeout(clear) }
+  }, [cueKey, cueAt])
+
+  // Opening, closing and auto-titling all change the strip's CONTENT width
+  // while its own box is unchanged, so neither the ResizeObserver nor a scroll
+  // event fires — only an explicit remeasure refreshes the overflow cues.
+  // Same reasoning (and same `slots` dependency) as the embed strip.
+  useEffect(() => { remeasure() }, [tabs, slots, remeasure])
+
+  /**
+   * Chrome's repeated-close behaviour. A pointer close freezes the tab width
+   * and pads the strip's end so the next tab's close button slides under the
+   * pointer; see `freezeAfterPointerClose`. The freeze lasts until the pointer
+   * leaves the strip, the window resizes, a tab is opened, or a keyboard close
+   * happens. A reorderable tab's layout slide is made instant while frozen,
+   * so there is no in-flight layout for a quick second click to land on.
+   */
+  const [freeze, setFreeze] = useState<TabFreeze | null>(null)
+  const releaseFreeze = useCallback(() => setFreeze(null), [])
+  /**
+   * Which kind of pointer pressed last. Only a MOUSE close freezes: a finger
+   * or pen lifting off the screen fires `pointerleave` BEFORE the click, so a
+   * freeze set by that click would have no leave left to release it. Read at
+   * pointerdown because some engines fire `click` as a plain MouseEvent with
+   * no `pointerType`.
+   */
+  const lastPointerTypeRef = useRef<string>('mouse')
+  useEffect(() => {
+    if (!freeze) return
+    window.addEventListener('resize', releaseFreeze)
+    return () => window.removeEventListener('resize', releaseFreeze)
+  }, [freeze, releaseFreeze])
+  // A tab that was not there before is new content the frozen widths were
+  // never computed for, so the strip goes back to its normal layout.
+  const prevTabsRef = useRef(tabs)
+  useEffect(() => {
+    const prev = new Set(prevTabsRef.current)
+    prevTabsRef.current = tabs
+    if (tabs.some(k => !prev.has(k))) setFreeze(null)
+  }, [tabs])
+
+  const closeByPointer = useCallback((key: string) => {
+    if (lastPointerTypeRef.current !== 'mouse') { setFreeze(null); onClose(key); return }
+    const at = tabs.indexOf(key)
+    const closedEl = tabRefs.current[key]
+    const firstEl = tabRefs.current[tabs[0]]
+    if (at !== -1 && closedEl && firstEl) {
+      const closedRect = closedEl.getBoundingClientRect()
+      const next = freezeAfterPointerClose(
+        freeze,
+        { width: closedRect.width, isLast: at === tabs.length - 1 },
+        { firstLeft: firstEl.getBoundingClientRect().left, closedRight: closedRect.right, count: tabs.length },
+      )
+      if (next.width > 0) setFreeze(next)
+    }
+    onClose(key)
+  }, [tabs, freeze, onClose])
+
+  // Keep the active tab on screen: it can be scrolled out by opening tabs, and
+  // a keyboard switch would otherwise move the selection somewhere invisible.
+  // Not while frozen: closing the active tab moves the selection, and
+  // scrolling then would pull the next close button out from under the
+  // pointer. Releasing the freeze re-runs this. Keyed on which tabs are open,
+  // not their order: a drag commits a new order at every step, and scrolling
+  // to the active tab then would pull the strip away from the held tab.
+  const tabSet = useMemo(() => [...tabs].sort().join('\n'), [tabs])
+  useEffect(() => {
+    if (!activeKey || freeze) return
+    tabRefs.current[activeKey]?.scrollIntoView({ block: 'nearest', inline: 'nearest' })
+  }, [activeKey, tabSet, freeze])
+
+  /**
+   * Roving arrow navigation, WAI-ARIA "tabs with automatic activation": the
+   * arrows both move focus and switch session, so a keyboard user needs no
+   * separate commit keystroke. Delete/Backspace closes the focused tab — the
+   * pattern's answer to a close control that is a nested button, which a
+   * screen-reader user reaches only by stepping into the tab.
+   */
+  const onKeyDown = useCallback((e: React.KeyboardEvent, key: string) => {
+    // A move that changed nothing leaves no pending refocus to fire on a
+    // later, unrelated change to the set.
+    pendingFocusRef.current = null
+    const at = tabs.indexOf(key)
+    if (at === -1) return
+    // The keyboard twin of the drag: Ctrl/Cmd+Shift+Arrow moves the focused
+    // tab one slot and keeps focus on it. Checked before plain arrows, which
+    // would otherwise switch sessions instead.
+    if ((e.ctrlKey || e.metaKey) && e.shiftKey && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')) {
+      e.preventDefault()
+      const to = at + (e.key === 'ArrowLeft' ? -1 : 1)
+      if (to >= 0 && to < tabs.length) {
+        pendingFocusRef.current = key
+        onReorder(moveSessionTab(tabs, key, to))
+        // The refocus belongs to the commit this move produces. A rejected
+        // move commits nothing, and a pending key left behind would pull focus
+        // back on some later, unrelated change to the set.
+        requestAnimationFrame(() => { if (pendingFocusRef.current === key) pendingFocusRef.current = null })
+      }
+      return
+    }
+    let target: string | undefined
+    if (e.key === 'ArrowLeft') target = tabs[at - 1]
+    else if (e.key === 'ArrowRight') target = tabs[at + 1]
+    else if (e.key === 'Home') target = tabs[0]
+    else if (e.key === 'End') target = tabs[tabs.length - 1]
+    else if (e.key === 'Delete' || e.key === 'Backspace') {
+      e.preventDefault()
+      if (pinned.includes(key)) return
+      // Hand focus on BEFORE unmounting the tab that holds it. Without this the
+      // closed tab's node goes away with focus on it, focus falls to
+      // document.body, and the keyboard user who just used the strip's own close
+      // key has to Tab through the whole page to get back. Below two remaining
+      // tabs the strip itself unmounts, so there is no tab to land on and the
+      // caller's own post-close focus (the transcript) is the only sane target.
+      const landing = tabs.filter(k => k !== key)
+      if (landing.length >= 2) {
+        const next = landing[Math.min(at, landing.length - 1)]
+        tabRefs.current[next]?.focus()
+      }
+      // The pointer freeze is for a pointer resting on a close button; a
+      // keyboard close reflows the strip at once.
+      setFreeze(null)
+      onClose(key)
+      return
+    } else if (e.key === 'Enter' || e.key === ' ') {
+      // On a nested button (pin, close) the key is that button's own click.
+      if (e.target !== e.currentTarget) return
+      e.preventDefault()
+      onSelect(key)
+      return
+    }
+    if (!target) return
+    e.preventDefault()
+    onSelect(target)
+    tabRefs.current[target]?.focus()
+  }, [tabs, pinned, onSelect, onClose, onReorder])
+
+  if (tabs.length < 2) return null
+
+  const instant = reduceMotion || freeze !== null
+  const items = tabs.map(key => {
+    const slot = slots.find(s => s.key === key)
+    // An untitled tab reads "Untitled session", never its key; the key
+    // stays in the hover title, where it tells untitled tabs apart.
+    const title = sessionDisplayTitle({ key, title: slot?.title })
+    const hoverTitle = isUntitledSession({ key, title: slot?.title }) ? `${title} · ${key}` : title
+    const active = key === activeKey
+    const isPinned = pinned.includes(key)
+    const status = tabStatus(slot, unreadSlots, key)
+    // The dot is decorative (aria-hidden) and colour is its only channel,
+    // so the STATUS WORD has to ride the tab's own accessible name and
+    // tooltip: without it a screen-reader user gets no status at all, and
+    // "needs you" vs "idle" is two greys apart for a colourblind user —
+    // which would defeat the point of ranking a blocked session above a
+    // running one in the first place. 'idle' contributes nothing, so an
+    // ordinary tab is still named by its session and nothing else.
+    const statusWord = status === 'idle' ? '' : i18nT(STATUS_LABEL_KEY[status])
+    const accessibleName = statusWord
+      ? i18nT('components.sessionTabStrip.tab_name_with_status', { name: title, status: statusWord })
+      : title
+    const tooltip = statusWord
+      ? i18nT('components.sessionTabStrip.tab_name_with_status', { name: hoverTitle, status: statusWord })
+      : hoverTitle
+    return (
+      <ReorderableSessionTab
+        key={key}
+        value={key}
+        instant={instant}
+        tabRef={el => { tabRefs.current[key] = el }}
+        role="tab"
+        // Roving tabIndex: one stop for the whole strip, so Tab does not
+        // walk N sessions before reaching the transcript.
+        tabIndex={active ? 0 : -1}
+        aria-selected={active}
+        aria-label={accessibleName}
+        data-testid={`session-tab-${key}`}
+        data-cued={flash?.key === key ? 'true' : undefined}
+        title={tooltip}
+        // Offline, activating a tab is withheld because the switch would
+        // clear the transcript — so the tab says so instead of swallowing
+        // the click. Spread AFTER the online title/aria-label, per this
+        // helper's own contract: last prop wins, so spreading it first
+        // would leave the refused click showing only the session name and
+        // no reason. Closing still works: it is local.
+        {...offlineProps(connected, i18nT('utils.offline.switch_sessions'), tooltip)}
+        onClick={() => onSelect(key)}
+        // Middle-click closes, the other half of the convention this PR
+        // already imports for OPENING on a sidebar row. A user who learned
+        // the open gesture will try it here, and getting nothing reads as
+        // the strip being broken rather than the gesture being unbound.
+        // Chromium on Windows enters middle-click autoscroll on the
+        // middle-button MOUSEDOWN when the target sits in a scroll
+        // container (this strip is overflow-x-auto), and then `auxclick`
+        // never fires, so the close below never runs. Cancelling the
+        // mousedown is the only place that stops it, the same guard the
+        // sidebar rows carry.
+        onMouseDownCapture={e => { if (e.button === 1) e.preventDefault() }}
+        onAuxClick={e => {
+          if (e.button !== 1) return
+          e.preventDefault()
+          if (!isPinned) closeByPointer(key)
+        }}
+        onKeyDown={e => onKeyDown(e, key)}
+        style={{
+          // Equal widths: one flex basis for every tab, so they all
+          // shrink by the same amount and the title never sizes a tab.
+          // A frozen strip holds every tab at the width from the close.
+          ...(freeze
+            ? { flex: '0 0 auto', width: freeze.width }
+            : { flex: `1 1 ${TAB_MAX_WIDTH}px`, minWidth: TAB_MIN_WIDTH, maxWidth: TAB_MAX_WIDTH }),
+          ...(flash?.key === key ? {
+            outline: '2px solid var(--accent)',
+            outlineOffset: '-2px',
+            transition: `outline-color ${FLASH_FADE_MS}ms`,
+            ...(flash.fading ? { outlineColor: 'transparent' } : {}),
+          } : {}),
+        }}
+        className={`group/tab flex items-center gap-2 px-2 py-1.5 rounded-md select-none overflow-hidden text-xs border ${connected ? 'cursor-pointer' : 'cursor-not-allowed'} ${
+          active
+            ? 'bg-bg-elevated text-text border-border'
+            : 'text-muted hover:text-text hover:bg-bg-elevated/50 border-transparent'
+        }`}
+      >
+        <span
+          aria-hidden="true"
+          data-testid={`session-tab-status-${status}`}
+          className={`shrink-0 w-1.5 h-1.5 rounded-full ${tabStatusPulses(status) ? 'animate-pulse' : ''}`}
+          style={{ background: TAB_STATUS_COLOR[status] }}
+        />
+        {/* flex-1 pins the close button to the tab's right edge, so it
+            sits at the same offset in every tab. */}
+        <span className="flex-1 min-w-0 truncate whitespace-nowrap">{truncateTabTitle(title)}</span>
+        {/* On the active tab (shown on hover) and on every pinned one (always,
+            filled), so an inactive tab keeps its title width. */}
+        {(active || isPinned) && (
+          <button
+            type="button"
+            aria-label={i18nT('components.sessionTabStrip.pin_tab_name', { name: title })}
+            aria-pressed={isPinned}
+            title={isPinned ? i18nT('components.sessionTabStrip.unpin_tab_hint') : i18nT('components.sessionTabStrip.pin_tab_hint')}
+            onClick={e => { e.stopPropagation(); onTogglePin(key) }}
+            className={`shrink-0 bg-transparent border-none p-0 leading-none cursor-pointer transition-opacity ${
+              isPinned
+                ? 'opacity-60 hover:opacity-100 hover:text-text'
+                : 'opacity-0 group-hover/tab:opacity-60 [@media(hover:none)]:opacity-60 group-focus-within/tab:opacity-60 hover:!opacity-100 hover:text-text'
+            }`}
+          >
+            <Pin size={11} fill={isPinned ? 'currentColor' : 'none'} />
+          </button>
+        )}
+        <button
+          type="button"
+          // Closing a TAB is not closing the session — the session stays
+          // in the sidebar, so the label says so rather than reusing the
+          // sidebar's own destructive "Close session".
+          aria-label={i18nT('components.sessionTabStrip.close_tab_name', { name: title })}
+          title={i18nT('components.sessionTabStrip.close_tab_hint')}
+          // A pinned tab cannot be closed. Hidden rather than removed, so the
+          // pin beside it stays where the pointer found it.
+          disabled={isPinned}
+          onClick={e => {
+            e.stopPropagation()
+            // detail 0 is a click synthesized from Enter or Space on the
+            // focused button: a keyboard close, which must not freeze.
+            if (e.detail === 0) { setFreeze(null); onClose(key) } else closeByPointer(key)
+          }}
+          className={`shrink-0 bg-transparent border-none p-0 leading-none cursor-pointer transition-opacity ${isPinned ? 'invisible' : ''} ${
+            active
+              ? 'opacity-60 hover:opacity-100 hover:text-text'
+              : 'opacity-0 group-hover/tab:opacity-60 [@media(hover:none)]:opacity-60 group-focus-within/tab:opacity-60 hover:!opacity-100 hover:text-text'
+          }`}
+        >
+          <X size={11} />
+        </button>
+      </ReorderableSessionTab>
+    )
+  })
+  // The group no longer scrolls, so it must be as wide as its tabs need:
+  // the full strip while every tab fits at TAB_MIN_WIDTH or wider (tabs then
+  // share it between their min and max width, as before), and the sum of the
+  // minimums once they do not, which the wrapper then scrolls. `minWidth: 100%`
+  // over a pixel `width` gives the larger of the two. A frozen strip holds
+  // every tab at a fixed width and lets the wrapper scroll whatever overflows.
+  const STRIP_PADDING_PX = 12
+  const minContent = tabs.length * TAB_MIN_WIDTH + (tabs.length - 1) * TAB_GAP + STRIP_PADDING_PX
+  const stripProps = {
+    role: 'tablist',
+    'aria-label': i18nT('components.sessionTabStrip.open_sessions'),
+    'aria-orientation': 'horizontal',
+    'data-testid': 'session-tab-strip',
+    'data-frozen': freeze ? 'true' : undefined,
+    // Leaving the strip ends a close sequence, and the tabs reflow to
+    // fill the room the closed tabs left.
+    onPointerLeave: releaseFreeze,
+    onPointerDownCapture: (e: React.PointerEvent) => { lastPointerTypeRef.current = e.pointerType || 'mouse' },
+    className: 'flex items-center px-1.5 py-1.5',
+    style: { columnGap: TAB_GAP, minWidth: '100%', width: freeze ? undefined : minContent },
+  } as const
+  const content = (
+    <>
+      {items}
+      {/* Holds the strip's content width during a close sequence, so a
+          scrolled strip does not jump and the next tab slides in by
+          exactly one slot. */}
+      {freeze && freeze.spacer > TAB_GAP && (
+        <div aria-hidden="true" data-testid="session-tab-spacer" style={{ flex: 'none', width: freeze.spacer - TAB_GAP, height: 1 }} />
+      )}
+    </>
+  )
+
+  return (
+    // The bottom divider belongs to the shell that mounts the strip (ChatPaneChrome):
+    // while the desktop sidebar is collapsed the shell insets the strip past
+    // the stationary toggle, and a border on this root would stop short of
+    // the gutter and leave a notch. Drawing it once, on the shell, keeps the
+    // hairline continuous across the full width.
+    <div
+      className="relative shrink-0 min-w-0"
+      style={{ background: 'var(--bg)' }}
+      // The shell drawer sees this touch before a long-press can arm, so the
+      // strip claims both horizontal directions from touchstart.
+      data-owns-swipe="left right"
+    >
+      {/* The scroller is a wrapper, not the group. Framer's drag auto-scroll
+          looks for a scrollable ANCESTOR of the Reorder.Group, so a group
+          that scrolls itself never scrolls while a tab is held at its edge,
+          and a tab could not be dragged past the visible ones. */}
+      {/* scroll-px-6: a tab revealed with scrollIntoView stops clear of the w-6 edge fades. */}
+      <div ref={attachScroller} data-testid="session-tab-scroller" className="overflow-x-auto scroll-px-6 min-w-0" style={{ scrollbarWidth: 'none' }}>
+        <Reorder.Group as="div" axis="x" values={[...tabs]} onReorder={onReorder} {...stripProps}>
+          {content}
+        </Reorder.Group>
+      </div>
+      {/* The scroller hides its scrollbar, so a gradient is the only signal
+          that tabs continue past the clipped edge. Same treatment as the
+          sibling strips. */}
+      {edges.left && (
+        <div aria-hidden="true" data-testid="session-tab-cue-left" className="pointer-events-none absolute left-0 top-0 bottom-0 w-6 z-10 bg-gradient-to-r from-bg to-transparent" />
+      )}
+      {edges.right && (
+        <div aria-hidden="true" data-testid="session-tab-cue-right" className="pointer-events-none absolute right-0 top-0 bottom-0 w-6 z-10 bg-gradient-to-l from-bg to-transparent" />
+      )}
+    </div>
+  )
+}

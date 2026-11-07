@@ -1,0 +1,184 @@
+/* ── Search highlights ── */
+/* `.search-match` / `.search-current` style the <mark> elements React renders
+   itself (highlightText). The transcript find bar paints matched text through
+   the CSS Custom Highlight API instead (utils/domHighlight): the bubbles are
+   react-markdown output, and wrapping a match there would split text nodes
+   React owns. `::highlight()` honors background-color and color everywhere the
+   API exists, while text-decoration is not painted by every engine, so the
+   current match is told apart by its stronger fill alone rather than the
+   outline the <mark> variant carries. */
+.search-match {
+  background-color: var(--search-highlight);
+  border-radius: 2px;
+  padding: 0 1px;
+}
+.search-current {
+  background-color: var(--search-highlight-current);
+  border-radius: 2px;
+  padding: 0 1px;
+  outline: 2px solid var(--search-highlight-current-border);
+  outline-offset: 1px;
+}
+::highlight(mc-chat-match) {
+  background-color: var(--search-highlight);
+}
+::highlight(mc-chat-current) {
+  background-color: var(--search-highlight-current);
+}
+
+/* Preview find (MarkdownPanel) uses the CSS Custom Highlight API — paints over
+   Range objects without mutating the react-markdown DOM. Only color and
+   background-color are used; box properties such as border-radius are ignored. */
+::highlight(mc-find) {
+  background-color: var(--search-highlight);
+}
+::highlight(mc-find-current) {
+  background-color: var(--search-highlight-current);
+}
+/* Pierre colours each syntax token inline, so the current match in a code or
+   diff block would keep token colours the orange fill swallows. That match
+   gets one dark text colour; prose matches keep the page's text colour. */
+.code-block::highlight(mc-find-current),
+.diff-block::highlight(mc-find-current) {
+  color: #000;
+}
+
+/* The passage a comment composer is open over (MarkdownPanel annotation). */
+::highlight(mc-annotate) {
+  background-color: var(--accent-subtle, rgba(99, 102, 241, 0.15));
+}
+
+/* The comment shown beside the pointer over a highlighted passage or a box on
+   an image (MarkdownPanel). It follows the pointer, so it takes no events. */
+.mc-comment-tooltip {
+  position: fixed;
+  z-index: 9999;
+  background: var(--bg-elevated, #1e1e2e);
+  color: var(--text, #e0e0e0);
+  border: 1px solid var(--border, #333);
+  border-radius: 6px;
+  padding: 6px 10px;
+  font-size: 12px;
+  line-height: 1.4;
+  max-width: 300px;
+  overflow-wrap: break-word;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.25);
+  pointer-events: none;
+}
+
+/* Anchored-comment highlights on the markdown / text artifact body are drawn
+   as a real overlay layer (InlineCommentOverlay), NOT the CSS Custom Highlight
+   API — real elements always paint and support box-shadow + a persistent active
+   state. Translucent marker over the text; the drop shadow gives contrast with
+   the page; the active comment stays lit.
+
+   Without these rules the overlay still mounts its rects and gutter bubbles
+   into the DOM, but they paint as zero-styled transparent divs — anchors look
+   like they are "not rendering" at all. */
+.mc-cmt-overlay { contain: layout style; }
+.mc-cmt-rect {
+  background-color: var(--warn-subtle);
+  border-bottom: 2px solid var(--warn);
+  border-radius: 2px;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.38);
+  cursor: pointer;
+  transition: background-color 0.15s ease, box-shadow 0.15s ease, border-color 0.15s ease;
+}
+.mc-cmt-rect:hover { box-shadow: 0 3px 9px rgba(0, 0, 0, 0.45); }
+.mc-cmt-rect.active {
+  background-color: var(--accent-subtle);
+  border-bottom-color: var(--accent);
+  box-shadow: 0 3px 12px rgba(0, 0, 0, 0.45), 0 0 0 1px var(--accent);
+}
+/* Gutter bubble, one per anchored thread: OUTLINE = read, FILLED = unread. */
+.mc-cmt-bubble {
+  width: 19px; height: 19px;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 10px; font-weight: 700; line-height: 1;
+  color: var(--warn); background-color: var(--card);
+  border: 1.5px solid var(--warn); border-radius: 10px 10px 10px 2px;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
+  cursor: pointer; padding: 0;
+  transition: background-color 0.12s ease, color 0.12s ease, box-shadow 0.12s ease;
+}
+/* Hover PAINTS (deepens the drop shadow), matching the sibling .mc-cmt-rect:hover
+   idiom, since the removed scale(1.1) was the bubble's only hover cue. Shadow-only:
+   no size or position change, and distinct from .active (which recolours to accent
+   with an accent ring). */
+.mc-cmt-bubble:hover { box-shadow: 0 2px 6px rgba(0, 0, 0, 0.45); }
+.mc-cmt-bubble.unread { background-color: var(--warn); color: var(--warn-fg, #1a1a1a); }
+.mc-cmt-bubble.active { background-color: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
+
+/* Artifact toolbar: every button the same height. Icon-only buttons become
+   squares (the min-width matches the height); labeled buttons keep their
+   padding-driven width. The version select is a Radix trigger inside a
+   wrapper div, so this selector cannot reach it -- it takes the same 32px
+   through its own className (TOOLBAR_SELECT_CLASS in ArtifactDetailPageHeader). A
+   button wrapped in HoverTip (`[data-hover-tip]`) is one level deeper and is
+   matched explicitly. */
+.mc-art-toolbar > button,
+.mc-art-toolbar > [data-hover-tip] > button,
+.mc-art-toolbar > select {
+  height: 32px;
+  min-width: 32px;
+  box-sizing: border-box;
+}
+.mc-art-toolbar > button,
+.mc-art-toolbar > [data-hover-tip] > button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* Phone form: force ChatSidebar to fill overlay drawer width. Keyed on the
+   drawer's class, which only the phone form renders, not on width: a touch-first
+   phone in mobile mode keeps the phone form past 767px (useIsMobile). */
+.mobile-sessions-overlay .sidebar-inner { width: 100% !important; }
+.mobile-sessions-overlay .sidebar-resize-handle { display: none !important; }
+
+/* ── No touch font floor, for the composer or any field ──
+   WebKit zooms the viewport when a field below 16px takes focus, by
+   clampTo(16 / fontSize, minimumScale, maximumScale). The `maximum-scale=1` in
+   index.html clamps that scale to 1, so a 14px field does not zoom on an iPhone
+   (the Settings search is 14px and stays put on a device). Fields therefore keep
+   their authored size on touch, and the composer uses the message font setting
+   (`--mc-message-font-size`, 14px where unset) on every device.
+
+   That is also what keeps an empty composer one line tall. Its auto-size measures
+   the PLACEHOLDER at the field's font size (chat-input/sizing.ts), so the hint and
+   the typed text must share one size: a field held at 16px over a 14px hint
+   measures the hint a line too tall on a narrow phone.
+
+   An app-wide 16px rule would not be safe to add either: CSS can only SET a size,
+   never floor one, so a rule broad enough to reach every field SHRINKS the ones
+   deliberately larger (measured: the artifact rename field's `text-2xl`).
+   `noPageZoom.test.ts` pins the viewport keys and fails if a blanket element rule
+   reappears; the page-zoom section of website/docs/narrow-viewport.md has the full
+   reasoning. */
+
+/* ── The shell is not a zoomable document ──
+   `pan-x pan-y` allows exactly the two behaviours the app needs from the browser
+   on touch -- scrolling either axis -- and withholds the two it does not:
+   pinch page zoom and double-tap zoom. Both magnify a `position: fixed` /
+   `h-dvh` shell, which has no scroll axis to reach whatever the magnification
+   pushed off the visual viewport, so the topbar, composer and drawer all leave
+   at once with no gesture but a second pinch to bring them back.
+
+   `touch-action` is declared on the ROOT because the browser intersects the
+   values from the hit-test target up to the root before deciding which native
+   gesture to run: putting it here restricts every descendant with one rule and
+   cannot be undone lower down -- which is why the image viewer, the one surface
+   that must magnify, owns its pinch as a transform of its own rather than
+   asking for `pinch-zoom` back (see Lightbox in MarkdownRenderer.tsx).
+
+   Existing `touch-action: none` handles (resize separators, drag rows) are
+   unaffected: `none` is strictly narrower, so the intersection is still `none`.
+
+   Pointer-fine devices keep the browser's full gesture set -- ctrl+wheel and
+   the trackpad pinch are a desktop convention this has no business changing.
+   The viewport meta in index.html and the `gesturestart` suppression in
+   utils/pageZoom.ts cover the engines this rule does not reach. */
+@media (pointer: coarse) {
+  html { touch-action: pan-x pan-y; }
+}
+

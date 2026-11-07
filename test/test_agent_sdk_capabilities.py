@@ -1,0 +1,815 @@
+"""The capability mechanism lives inside the boundary, and answers what main answers.
+
+Three things this file is responsible for, and they fail for different reasons:
+
+1. **Nothing outside the boundary asks a backend's IDENTITY any more.** RFC PR 3's
+   exit condition. An identity branch hands each new harness whichever arm the old
+   comparison happened to leave behind, so the six that moved must not come back
+   and no seventh may appear in the files they lived in.
+2. **Every answer is the answer ``origin/main`` gave.** The move is a refactor, so
+   each routing verdict, permission config, membership and capability field is
+   pinned to a literal copied from a clean main checkout -- ``codex`` and an
+   unknown id included, because a fail-closed answer that quietly became
+   fail-open is the failure this class of change actually risks.
+3. **Every capability set has a recorded disposition.** A set with no row in
+   ``agent_sdk/backends``'s docstring is a set nobody decided about, and the next
+   reader exposes a driver-internal membership as a consumer-facing question.
+
+The scans are AST-based, so a set name inside a docstring or a comment is not a
+read. That matters here: several of these files keep prose explaining why they ask
+a capability rather than an identity, and a text scan would either fail on that
+prose or force it to be deleted -- and deleting the reason is how the next change
+re-introduces the branch.
+"""
+
+from __future__ import annotations
+
+import ast
+import re
+from pathlib import Path
+
+import pytest
+from source_corpus import parsed_candidates, src_root
+
+from kiro_crew.acp_backends import ACP_BACKEND_CODEX, permission_config_for, routing_for
+from kiro_crew.agent_sdk import backends as sdk_backends
+from kiro_crew.agent_sdk.capabilities import (
+    MODEL_NAMESPACE_ACP,
+    UNKNOWN_BACKEND_CAPABILITIES,
+    SessionCapabilities,
+    capabilities_for,
+    capabilities_of,
+    capture_prompt_timeout,
+)
+from kiro_crew.agent_sdk.provider_identity import PROVIDER_ACP, PROVIDER_CLAUDE_CODE
+
+SRC = Path(__file__).resolve().parent.parent / "src" / "kiro_crew"
+
+#: The six sites RFC PR 3 names, and the identity spelling each one used.
+#:
+#: Keyed by file so a regression names the file it landed in. The spellings are
+#: what a consumer must never write again: ``is_claude_backend`` (the provider
+#: predicate and the property), ``_is_claude`` (the ACP client's private
+#: attribute), and a bare comparison against ``ACP_BACKEND_CLAUDE``.
+MIGRATED_CONSUMERS = (
+    "config/loader.py",
+    # config/loader.py's code, in the owner modules its facade serves.
+    "config/loader_agents.py",
+    "config/loader_builders.py",
+    "config/loader_config.py",
+    "config/loader_credentials.py",
+    "config/loader_document.py",
+    "config/loader_locations.py",
+    "config/loader_pipeline.py",
+    "config/loader_snapshots.py",
+    "config/loader_writeback.py",
+    "dashboard/chat_handlers.py",
+    "dashboard/handlers/agents.py",
+    "dashboard/chat_runner.py",
+    "knowledge/llm_pool.py",
+    "subagent.py",
+)
+
+#: One field per question a consumer outside the boundary asks.
+CAPABILITY_FIELDS = (
+    "provider_seam",
+    "model_id_namespace",
+    "resolves_model_from_advertised_list",
+    "effort_via_config_option",
+    "effort_via_slash_command",
+    "compacts_inline",
+    "crew_fires_spec_hooks",
+    "crew_fires_spec_observer_hooks",
+    "supports_native_todos",
+    "runs_own_slash_commands",
+    "honors_zero_tool_ban",
+    "acp_client_spawnable",
+    "honors_remote_mcp_oauth",
+    "native_workflows",
+)
+
+
+def _tree(rel: str) -> ast.Module:
+    return ast.parse((SRC / rel).read_text(encoding="utf-8"))
+
+
+#: A migrated consumer whose functions live in owner modules it composes: the
+#: dashboard agents handlers run the functions ``dashboard/agent_admin`` defines on
+#: ``handlers/agents.py``'s globals, the chat handlers those ``dashboard/chat_api``
+#: defines on ``chat_handlers.py``'s, and the chat runner those ``dashboard/chat_turn``
+#: defines on its own, and ``subagent.py`` runs those of ``subagent_parts`` on its own,
+#: so the identity ratchet reads those owners as
+#: part of that file.
+_COMPOSED_OWNERS = {
+    "dashboard/handlers/agents.py": "dashboard/agent_admin",
+    "dashboard/chat_handlers.py": "dashboard/chat_api",
+    "dashboard/chat_runner.py": "dashboard/chat_turn",
+    "subagent.py": "subagent_parts",
+}
+
+
+def _composed_owner_rels(rel: str) -> list[str]:
+    """The owner modules *rel* composes, relative to ``SRC``; ``[]`` if none."""
+    owner_dir = _COMPOSED_OWNERS.get(rel)
+    if owner_dir is None:
+        return []
+    owners = sorted((SRC / owner_dir).glob("[!_]*.py"))
+    assert len(owners) >= 13, f"{owner_dir}: the composed owners were not found"
+    return [owner.relative_to(SRC).as_posix() for owner in owners]
+
+
+# ── 1. the identity checks are gone, and stay gone ──────────────────────────
+
+
+#: The identity reads still standing, keyed by file and by the function they are in.
+#:
+#: ``api_models`` asks whether a backend has a ``--list-models`` catalog, a
+#: pre-session question; a capability for it would change KAS and codex behaviour.
+#: Pinned by enclosing function, not line number.
+KNOWN_REMAINING_IDENTITY_READS = {
+    "dashboard/handlers/agents.py": {"api_models"},
+}
+
+
+def _enclosing_functions(tree: ast.Module) -> dict[int, str]:
+    """Map every line inside a function body to that function's name."""
+    owner: dict[int, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            end = getattr(node, "end_lineno", node.lineno) or node.lineno
+            for line in range(node.lineno, end + 1):
+                owner.setdefault(line, node.name)
+    return owner
+
+
+@pytest.mark.parametrize("rel", MIGRATED_CONSUMERS)
+def test_no_migrated_consumer_reads_a_backend_identity(rel: str) -> None:
+    """No attribute read, call or comparison in these files names the harness.
+
+    AST walk for ``is_claude_backend``/``_is_claude`` (also via ``getattr``) and
+    ``ACP_BACKEND_CLAUDE``; only :data:`KNOWN_REMAINING_IDENTITY_READS` is allowed.
+    """
+    banned_attrs = {"is_claude_backend", "_is_claude"}
+    tree = _tree(rel)
+    owner = _enclosing_functions(tree)
+    allowed = KNOWN_REMAINING_IDENTITY_READS.get(rel, set())
+    offenders = []
+
+    def record(node: ast.AST, what: str) -> None:
+        line = getattr(node, "lineno", 0)
+        if owner.get(line) in allowed:
+            return
+        offenders.append(f"line {line} (in {owner.get(line, '<module>')}): {what}")
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and node.attr in banned_attrs:
+            record(node, f".{node.attr}")
+        elif isinstance(node, ast.Name) and node.id in banned_attrs | {"ACP_BACKEND_CLAUDE"}:
+            record(node, node.id)
+        elif isinstance(node, ast.Constant) and node.value in banned_attrs:
+            # ``getattr(client, "is_claude_backend", False)`` -- a string literal
+            # naming the attribute is the same read with the check hidden.
+            record(node, f"{node.value!r} as a literal")
+    # A composed owner's functions are this consumer's code, and no allowance
+    # reaches into them: every identity read there is an offender.
+    for owner_rel in _composed_owner_rels(rel):
+        for node in ast.walk(_tree(owner_rel)):
+            if isinstance(node, ast.Attribute) and node.attr in banned_attrs:
+                offenders.append(f"{owner_rel} line {node.lineno}: .{node.attr}")
+            elif isinstance(node, ast.Name) and node.id in banned_attrs | {"ACP_BACKEND_CLAUDE"}:
+                offenders.append(f"{owner_rel} line {node.lineno}: {node.id}")
+            elif isinstance(node, ast.Constant) and node.value in banned_attrs:
+                offenders.append(f"{owner_rel} line {node.lineno}: {node.value!r} as a literal")
+    assert not offenders, (
+        f"{rel} asks which backend it is: {offenders}. Ask a capability instead "
+        f"(SessionCapabilities has one field per question these branches make); "
+        f"see docs/request-for-change/rfc-crew-agent-sdk-boundary.md PR 3."
+    )
+
+
+def test_the_allowance_list_is_not_stale() -> None:
+    """An allowed function that stops reading an identity must leave the list.
+
+    Otherwise the list quietly becomes a blanket exemption for a whole function,
+    and the next identity read added inside it goes unnoticed.
+    """
+    banned = {"is_claude_backend", "_is_claude", "ACP_BACKEND_CLAUDE"}
+    for rel, functions in KNOWN_REMAINING_IDENTITY_READS.items():
+        tree = _tree(rel)
+        owner = _enclosing_functions(tree)
+        still_reading = set()
+        for node in ast.walk(tree):
+            name = ""
+            if isinstance(node, ast.Attribute):
+                name = node.attr
+            elif isinstance(node, ast.Name):
+                name = node.id
+            elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+                name = node.value
+            if name in banned:
+                fn = owner.get(getattr(node, "lineno", 0))
+                if fn:
+                    still_reading.add(fn)
+        stale = sorted(functions - still_reading)
+        assert not stale, (
+            f"{rel}: {stale} no longer reads a backend identity; drop it from "
+            f"KNOWN_REMAINING_IDENTITY_READS so the ratchet tightens"
+        )
+
+
+def test_each_capability_question_has_one_consumer_spelling() -> None:
+    """A field is read off a capability record, never off anything else.
+
+    One spelling keeps every consumer findable by ``grep``. All fields go in one pass
+    over ``source_corpus``: a full-tree parse per field costs about 24s each.
+    """
+    fields = set(CAPABILITY_FIELDS)
+    allowed_roots = {"capabilities_for", "capabilities_of"}
+    offenders = []
+    for path, _text, tree in parsed_candidates(require_any=tuple(CAPABILITY_FIELDS)):
+        rel = path.relative_to(src_root()).as_posix()
+        if rel.startswith("agent_sdk/"):
+            continue  # the definition side; it may name its own fields freely
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Attribute) and node.attr in fields):
+                continue
+            base = node.value
+            ok = (isinstance(base, ast.Call) and getattr(base.func, "id", "") in allowed_roots) or (
+                isinstance(base, ast.Attribute) and base.attr == "capabilities"
+            )
+            if not ok:
+                offenders.append(f"{rel}:{node.lineno} reads .{node.attr}")
+    assert not offenders, (
+        f"a capability field is read off something other than a capability record "
+        f"at {offenders}; reach it through capabilities_for(...), "
+        f"capabilities_of(...) or provider.capabilities so one grep finds every "
+        f"consumer"
+    )
+
+
+def test_every_capability_field_has_a_consumer() -> None:
+    """A field nobody reads is a question nobody asks -- delete it or wire it up.
+
+    The record exists to move seven branches off an identity check, so a field with
+    no consumer means one of those branches was missed or the field was invented.
+    """
+    fields = set(CAPABILITY_FIELDS)
+    seen = set()
+    for path, _text, tree in parsed_candidates(require_any=tuple(CAPABILITY_FIELDS)):
+        if path.relative_to(src_root()).as_posix().startswith("agent_sdk/"):
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Attribute) and node.attr in fields:
+                seen.add(node.attr)
+    assert fields == seen, f"capability fields with no consumer: {sorted(fields - seen)}"
+
+
+def test_the_field_list_matches_the_dataclass() -> None:
+    """``CAPABILITY_FIELDS`` must not drift from ``SessionCapabilities``.
+
+    ``backend`` is excluded because it is the identity, and nothing above the
+    boundary may branch on it -- every other field is a question, so a new one
+    must join the gates above rather than arrive unchecked.
+    """
+    declared = {f.name for f in SessionCapabilities.__dataclass_fields__.values()}
+    assert declared - {"backend"} == set(CAPABILITY_FIELDS)
+
+
+def test_the_shims_define_nothing() -> None:
+    """``acp_backends`` and ``acp_tool_gate`` must stay pure re-export shims.
+
+    A definition left in a shim is a definition reachable without crossing the
+    boundary, which is the state the move exists to end. Assignments are the thing
+    to catch; ``__all__`` is the one allowed statement.
+    """
+    for rel in ("acp_backends.py", "acp_tool_gate.py"):
+        tree = _tree(rel)
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                pytest.fail(f"{rel} defines {node.name}; it must only re-export")
+            if isinstance(node, ast.Assign):
+                names = [t.id for t in node.targets if isinstance(t, ast.Name)]
+                assert names == ["__all__"], (
+                    f"{rel} assigns {names}; a shim re-exports and defines nothing, "
+                    f"or the boundary has a second front door"
+                )
+
+
+# ── 2. the answers are byte-for-byte what main gave ────────────────────────
+
+#: Copied from a clean ``origin/main`` checkout (see the PR body for the probe).
+#:
+#: ``"kiro"`` is in the table on purpose and is NOT a backend id: it is the
+#: POLICY wire spelling of the kiro backend, whose code spelling is ``""``. It
+#: must read as an unknown id, because a rule author naming it must not
+#: accidentally select a harness.
+MAIN_ROUTING = {
+    "": ("agent_spec", ("", ""), False),
+    "kas": ("agent_spec", ("", ""), False),
+    "claude": ("seeded_settings", ("", ""), False),
+    "codex": ("session_config", ("mode", "read-only"), True),
+    "nope": ("unverified", ("", ""), False),
+    "kiro": ("unverified", ("", ""), False),
+}
+
+
+@pytest.mark.parametrize("backend", sorted(MAIN_ROUTING))
+def test_routing_and_permission_config_are_unchanged_by_the_move(backend: str) -> None:
+    """The tool-gate answers survive the move to ``agent_sdk``, fail-closed included."""
+    from kiro_crew import acp_tool_gate
+
+    expected_routing, expected_config, expected_enforced = MAIN_ROUTING[backend]
+    assert routing_for(backend).value == expected_routing
+    assert permission_config_for(backend) == expected_config
+    assert acp_tool_gate.is_enforced(backend) is expected_enforced
+
+
+def test_codex_still_needs_its_read_only_mode() -> None:
+    """The one enforced harness, named rather than only parametrized.
+
+    ``codex`` is the backend whose whole security argument is the session-config
+    route plus the credential mask, so its two answers get an assertion a reader
+    finds by name.
+    """
+    assert routing_for(ACP_BACKEND_CODEX) is sdk_backends.Routing.SESSION_CONFIG
+    assert permission_config_for(ACP_BACKEND_CODEX) == ("mode", "read-only")
+
+
+def test_known_membership_is_unchanged_by_the_move() -> None:
+    """``ACP_BACKENDS_KNOWN`` gained and lost nothing.
+
+    Membership is the gate on the ``acp_backend`` kwarg, so a widened set means
+    provider construction accepts a value it must reject.
+    """
+    assert sorted(sdk_backends.ACP_BACKENDS_KNOWN) == [
+        "",
+        "claude",
+        "codex",
+        "copilot",
+        "deepseek",
+        "goose",
+        "kas",
+        "opencode",
+        "pi",
+        "strands",
+    ]
+
+
+#: Every capability field for every known id, plus an unknown one.
+#:
+#: Each row is a translation of a table that already existed, so each row is also
+#: the answer the branch it replaced already computed. Written out per backend
+#: rather than derived from the sets, so a change to a set fails HERE with the
+#: backend named instead of passing tautologically.
+EXPECTED_CAPABILITIES = {
+    "": (PROVIDER_ACP, MODEL_NAMESPACE_ACP, False, False, False, False),
+    "kas": (PROVIDER_ACP, MODEL_NAMESPACE_ACP, False, True, False, False),
+    "claude": (PROVIDER_CLAUDE_CODE, "claude_code", True, True, True, True),
+    "codex": (PROVIDER_ACP, "codex", True, True, True, False),
+    "nope": (PROVIDER_ACP, MODEL_NAMESPACE_ACP, False, False, False, False),
+}
+
+
+@pytest.mark.parametrize("backend", sorted(EXPECTED_CAPABILITIES))
+def test_capabilities_are_pinned_per_backend(backend: str) -> None:
+    """One row per backend, so a silently granted capability names its harness."""
+    caps = capabilities_for(backend)
+    assert caps.backend == backend
+    actual = (
+        caps.provider_seam,
+        caps.model_id_namespace,
+        caps.resolves_model_from_advertised_list,
+        caps.effort_via_config_option,
+        caps.compacts_inline,
+        caps.supports_native_todos,
+    )
+    assert actual == EXPECTED_CAPABILITIES[backend]
+
+
+def test_an_unknown_backend_is_withheld_every_capability() -> None:
+    """Fail closed, and the shared default says the same thing.
+
+    False means "has not demonstrated the capability", so a stranger takes the
+    conservative arm rather than whatever the previous member left behind.
+    """
+    stranger = capabilities_for("some-harness-nobody-registered")
+    for field in CAPABILITY_FIELDS:
+        expected = getattr(UNKNOWN_BACKEND_CAPABILITIES, field)
+        assert getattr(stranger, field) == expected, f"{field} drifted from the default"
+    assert stranger.provider_seam == PROVIDER_ACP
+    assert stranger.model_id_namespace == MODEL_NAMESPACE_ACP
+
+
+def test_inline_compaction_is_a_subset_of_manual_compaction() -> None:
+    """You cannot finish a ``/compact`` inline on a harness that serves none.
+
+    The new set answers "how does the result arrive"; the older
+    ``ACP_BACKENDS_COMPACT`` answers "is a manual /compact offered at all". A
+    member of the first that is not a member of the second would be unreachable
+    logic pretending to be a capability.
+    """
+    assert sdk_backends.ACP_BACKENDS_INLINE_COMPACTION <= sdk_backends.ACP_BACKENDS_COMPACT
+    assert sdk_backends.ACP_BACKENDS_INLINE_COMPACTION <= sdk_backends.ACP_BACKENDS_KNOWN
+
+
+# ── 3. every capability set has a recorded disposition ─────────────────────
+
+
+def test_every_capability_set_has_a_disposition_row() -> None:
+    """A set with no row in the docstring is a set nobody decided about.
+
+    Three dispositions exist -- semantic question, pre-session registry query,
+    driver-internal -- and which one a set is decides whether a consumer above the
+    boundary may read it. Leaving that unrecorded is how a driver-internal
+    membership becomes a consumer-facing question by accident.
+    """
+    doc = sdk_backends.__doc__ or ""
+    documented = set(re.findall(r"``(ACP_BACKENDS_\w+)``", doc))
+    defined = {name for name in vars(sdk_backends) if name.startswith("ACP_BACKENDS_")}
+
+    missing = sorted(defined - documented)
+    assert not missing, (
+        f"these capability sets have no disposition row in agent_sdk/backends.py's "
+        f"docstring: {missing}. Say whether each is a semantic question (a consumer "
+        f"asks it, so SessionCapabilities carries a field), a pre-session registry "
+        f"query, or driver-internal."
+    )
+
+    stale = sorted(documented - defined)
+    assert not stale, (
+        f"the disposition table names sets that no longer exist: {stale}; "
+        f"remove the rows with the sets"
+    )
+
+
+def test_a_markdown_dispatching_host_must_reach_the_overlay_format_rule() -> None:
+    """``overlay_project_scope`` computes its format half from ``has_mirror`` ALONE.
+
+    The markdown set is not OR-ed in because its only member reads the user level
+    alone. If one got a project scope, the user-level stub would outrank the project.
+    """
+    markdown = sdk_backends.ACP_BACKENDS_MARKDOWN_AGENT_SPECS
+    user_level_only = sdk_backends.ACP_BACKENDS_USER_LEVEL_AGENT_SPECS_ONLY
+    assert markdown, "the markdown-spec set is empty; this pin no longer measures anything"
+    escaped = sorted(markdown - user_level_only)
+    assert not escaped, (
+        f"these backends read markdown agent specs from a checkout themselves but DO "
+        f"receive a project scope: {escaped}. agent_sdk/backends.overlay_project_scope "
+        f"computes markdown_specs from has_mirror alone, so such a host is told "
+        f"markdown_specs=False and keeps the user-level overlay's stub for a spec it "
+        f"actually dispatches -- the stub's command and credentials then run under the "
+        f"checkout's agent. OR this set into that decider before adding the host."
+    )
+
+
+def test_every_semantic_disposition_names_a_real_capability_field() -> None:
+    """A row claiming ``SessionCapabilities.<field>`` must name a field that exists."""
+    doc = sdk_backends.__doc__ or ""
+    claimed = set(re.findall(r"``SessionCapabilities\.(\w+)``", doc))
+    fields = {f.name for f in SessionCapabilities.__dataclass_fields__.values()}
+    assert claimed, "the disposition table records no semantic question at all"
+    assert claimed <= fields, f"disposition table names missing fields: {sorted(claimed - fields)}"
+
+
+# ── capabilities_of: the calling convention the predicates had ─────────────
+
+
+class _FakeProvider:
+    def __init__(self, caps: object) -> None:
+        self.capabilities = caps
+
+
+def test_capabilities_of_reads_a_real_record() -> None:
+    claude = capabilities_for("claude")
+    assert capabilities_of(_FakeProvider(claude)) is claude
+
+
+class _PromptTimeoutProvider:
+    def prompt_timeout_for_deadline(self, deadline: float) -> float:
+        return deadline + 60.0
+
+
+def test_capture_prompt_timeout_reads_a_type_declared_capability() -> None:
+    assert capture_prompt_timeout(_PromptTimeoutProvider(), 21600.0) == 21660.0
+
+
+def test_capture_prompt_timeout_preserves_legacy_duck_providers() -> None:
+    provider = _FakeProvider(None)
+    provider.prompt_timeout_for_deadline = lambda deadline: deadline + 60.0
+
+    assert capture_prompt_timeout(provider, 21600.0) is None
+
+
+@pytest.mark.parametrize(
+    "provider",
+    [
+        object(),
+        None,
+        "a string",
+        _FakeProvider("not a capabilities record"),
+        _FakeProvider(None),
+    ],
+    ids=["plain-object", "none", "string", "wrong-type", "explicit-none"],
+)
+def test_capabilities_of_fails_closed_on_a_foreign_shape(provider: object) -> None:
+    """The convention the seven predicates had: not a provider means False everywhere.
+
+    They were ``isinstance(provider, AcpProvider) and provider.is_claude_backend``,
+    so a wrapper, an unstarted provider or a test double answered False. Requiring
+    a real record keeps that, which a bare ``getattr`` would not.
+    """
+    assert capabilities_of(provider) is UNKNOWN_BACKEND_CAPABILITIES
+
+
+def test_a_spec_mock_does_not_read_as_a_member_of_everything() -> None:
+    """A ``MagicMock(spec=...)``'s every attribute is truthy -- including a fake record.
+
+    This is the exact trap ``capabilities_of``'s isinstance check exists for: a
+    ``getattr``-based lookup would let a spec'd double claim every capability at
+    once, and a double that asserts an attribute flag rather than carrying a real
+    record is how that goes unnoticed.
+    """
+    from unittest.mock import MagicMock
+
+    from kiro_crew.providers.acp import AcpProvider
+
+    assert capabilities_of(MagicMock(spec=AcpProvider)) is UNKNOWN_BACKEND_CAPABILITIES
+
+
+def test_the_provider_property_answers_for_its_own_client_backend() -> None:
+    """``AcpProvider.capabilities`` is the record for the backend it is talking to."""
+    from types import SimpleNamespace
+
+    from kiro_crew.providers.acp import AcpProvider
+
+    provider = object.__new__(AcpProvider)
+    for backend in ("", "kas", "claude", "codex"):
+        provider._client = SimpleNamespace(backend=backend)  # type: ignore[attr-defined]
+        assert provider.capabilities == capabilities_for(backend)
+
+
+class TestTheKiroConstructionPathIsUnconditional:
+    """harness-parity H13: no capability lookup may change what Kiro does.
+
+    ``acp_effective_model`` branches via ``_MODEL_REGISTRY_NAMESPACE_BY_BACKEND``, so
+    every kiro-family backend (and any stranger) must reach ``to_acp_id``, never
+    ``to_provider_id``. codex, like claude, takes the other arm.
+    """
+
+    @staticmethod
+    def _translations(monkeypatch, backend: str) -> list[tuple]:
+        """Record which registry translator ``acp_effective_model`` calls."""
+        from kiro_crew.config import loader as loader_mod
+
+        calls: list[tuple] = []
+
+        def _acp_id(model: str) -> str:
+            calls.append(("to_acp_id", model))
+            return f"acp::{model}"
+
+        def _provider_id(model: str, provider: str) -> str:
+            calls.append(("to_provider_id", model, provider))
+            return f"{provider}::{model}"
+
+        monkeypatch.setattr(loader_mod.model_registry, "to_acp_id", _acp_id)
+        monkeypatch.setattr(loader_mod.model_registry, "to_provider_id", _provider_id)
+
+        cfg = loader_mod.KiroCrewConfig()
+        cfg.agent.acp_backend = backend
+        cfg.acp_effective_model(None, "opus-4.8-1m")
+        return calls
+
+    @pytest.mark.parametrize("backend", ["", "kas", "some-future-harness"])
+    def test_a_kiro_family_backend_never_reaches_the_provider_namespace(
+        self, monkeypatch, backend: str
+    ) -> None:
+        calls = self._translations(monkeypatch, backend)
+        assert [c[0] for c in calls] == ["to_acp_id"], (
+            f"backend {backend!r} left the acp translation path; the capability "
+            f"lookup must not move a kiro-family backend off to_acp_id"
+        )
+
+    @pytest.mark.parametrize(
+        ("backend", "namespace"),
+        [
+            # The other half: the one backend that DID take the other arm still does.
+            pytest.param(
+                "claude",
+                "claude_code",
+                id="test_the_claude_backend_still_reaches_its_own_namespace",
+            ),
+            # codex ids are the adapter's own vocabulary: translated into the
+            # ``codex`` namespace (a passthrough, the registry has no such
+            # provider), never folded onto a kiro id codex would refuse.
+            pytest.param("codex", "codex", id="test_the_codex_backend_reaches_its_own_namespace"),
+        ],
+    )
+    def test_a_non_kiro_backend_reaches_its_own_namespace(
+        self, monkeypatch, backend: str, namespace: str
+    ) -> None:
+        calls = self._translations(monkeypatch, backend)
+        assert calls == [("to_provider_id", "opus-4.8-1m", namespace)]
+
+    def test_the_namespace_table_cannot_move_kiro_off_the_acp_arm(self) -> None:
+        """The drift the reviewer named, pinned at the table rather than the branch.
+
+        The branch tests above would also catch this, but they catch it as a
+        translator call; this names the table entry, so the failure message points
+        at the line an editor would have changed.
+        """
+        for backend in ("", "kas"):
+            assert sdk_backends.model_registry_namespace(backend) == MODEL_NAMESPACE_ACP
+
+
+class TestAForeignProviderIsClassifiedThePreviousWay:
+    """harness-parity H14: a provider outside ``AcpProvider`` must not be guessed at.
+
+    The ``LLMProvider`` ABC declares no ``capabilities``, so it falls through to the
+    unknown record. Pinned with a real ``LLMProvider`` subclass, not a bare object.
+    """
+
+    @staticmethod
+    def _foreign_provider() -> object:
+        from kiro_crew.providers.base import LLMProvider
+
+        class _Foreign(LLMProvider):
+            """A complete LLMProvider that is not an AcpProvider."""
+
+            async def start(self) -> None:  # pragma: no cover - never run
+                return None
+
+            async def shutdown(self) -> None:  # pragma: no cover - never run
+                return None
+
+            async def stream(self, message: str):  # pragma: no cover - never run
+                raise NotImplementedError
+
+            async def approve_tool(self, request_id, *, always: bool = False) -> None:
+                raise NotImplementedError  # pragma: no cover - never run
+
+            async def reject_tool(self, request_id) -> None:
+                raise NotImplementedError  # pragma: no cover - never run
+
+            def context_usage_pct(self) -> float:  # pragma: no cover - never run
+                return 0.0
+
+        return _Foreign()
+
+    def test_it_gets_the_fail_closed_record(self) -> None:
+        assert capabilities_of(self._foreign_provider()) is UNKNOWN_BACKEND_CAPABILITIES
+
+    def test_every_capability_reads_the_same_as_the_old_isinstance_gate(self) -> None:
+        """The old gate answered False for a foreign provider. So does every field."""
+        caps = capabilities_of(self._foreign_provider())
+        for field in CAPABILITY_FIELDS:
+            value = getattr(caps, field)
+            if isinstance(value, bool):
+                assert value is False, f"{field} is granted to a foreign provider"
+        assert caps.provider_seam == PROVIDER_ACP
+        assert caps.model_id_namespace == MODEL_NAMESPACE_ACP
+
+    def test_the_subagent_home_routing_still_answers_acp(self) -> None:
+        """The one consumer where a wrong answer picks the wrong home tree.
+
+        ``_is_cc_provider`` decides whether session-file cleanup targets
+        ``~/.claude`` or ``~/.kiro``. A foreign provider answered False before and
+        must answer False now, or cleanup walks the wrong tree.
+        """
+        from kiro_crew.subagent import SubagentManager
+
+        assert SubagentManager._is_cc_provider(self._foreign_provider()) is False
+
+
+def test_honor_zero_tool_ban_membership_matches_the_rule() -> None:
+    """``ACP_BACKENDS_HONOR_ZERO_TOOL_BAN`` is recomputed from the rule's own inputs.
+
+    Rule: routing is ``Routing.AGENT_SPEC``, or it is in ``tool_gate.ENFORCED_ROUTINGS``
+    with a mirror or ``ProjectionKind.BROKER_ONLY`` mounts (pi), and the backend is
+    not in ``ACP_BACKENDS_ACP_RUNTIME`` (the refusal lives only on ``AcpClient``).
+    """
+    from kiro_crew.agent_sdk.tool_gate import ENFORCED_ROUTINGS
+    from kiro_crew.providers.mirrors.registry import MIRRORS, ProjectionKind, projection_for
+
+    # A fourth fact the three above assume: the harness asks about EVERY call, so
+    # ``_deny_zero_tools`` sees each one. Copilot CLI 1.0.100 reads a file inside the
+    # session's own directory without asking (measured, see the set's comment), so a
+    # total ban cannot be honoured there even though the three facts hold.
+    reads_unasked = {sdk_backends.ACP_BACKEND_COPILOT}
+    # A second ground, beside the refusal: a zero-tool session that MOUNTS NO TOOL,
+    # so no call exists for a pre-approval to run. claude's session options carry an
+    # empty ``tools`` with ``strictMcpConfig`` and an empty wire array, measured on
+    # ``claude/zero-tools-refused-live.jsonl`` (``test_claude_zero_tools.py``).
+    mounts_nothing = {sdk_backends.ACP_BACKEND_CLAUDE}
+    for backend in sorted(sdk_backends.ACP_BACKENDS_KNOWN):
+        routing = routing_for(backend)
+        expected = (
+            routing is sdk_backends.Routing.AGENT_SPEC
+            or backend in mounts_nothing
+            or (
+                routing in ENFORCED_ROUTINGS
+                and (
+                    backend in MIRRORS or projection_for(backend).kind is ProjectionKind.BROKER_ONLY
+                )
+                and backend not in sdk_backends.ACP_BACKENDS_ACP_RUNTIME
+                and backend not in reads_unasked
+            )
+        )
+        actual = backend in sdk_backends.ACP_BACKENDS_HONOR_ZERO_TOOL_BAN
+        assert actual == expected, (
+            f"{backend!r}: honors_zero_tool_ban membership is {actual}, the rule "
+            f"says {expected} (routing={routing}, enforced={routing in ENFORCED_ROUTINGS}, "
+            f"mirrored={backend in MIRRORS}, "
+            f"projection={projection_for(backend).kind.value}, "
+            f"acp_runtime={backend in sdk_backends.ACP_BACKENDS_ACP_RUNTIME})"
+        )
+    assert sdk_backends.ACP_BACKENDS_HONOR_ZERO_TOOL_BAN == {
+        sdk_backends.ACP_BACKEND_KIRO,
+        sdk_backends.ACP_BACKEND_KAS,
+        sdk_backends.ACP_BACKEND_CLAUDE,
+        sdk_backends.ACP_BACKEND_OPENCODE,
+        sdk_backends.ACP_BACKEND_GOOSE,
+        sdk_backends.ACP_BACKEND_DEEPSEEK,
+        sdk_backends.ACP_BACKEND_PI,
+        sdk_backends.ACP_BACKEND_STRANDS,
+    }
+
+
+def test_the_knowledge_pool_client_takes_the_default_backend() -> None:
+    """Each pool-eligible backend's effort capability answers are checked, not assumed.
+
+    ``llm_pool._get_acp_backend`` allows only backends with both ``honors_zero_tool_ban``
+    and ``acp_client_spawnable``. claude qualifies because its zero-tool session mounts
+    no tool, so an inherited ``~/.claude`` pre-approval has nothing to run.
+    """
+    from kiro_crew.agent_sdk.backends import (
+        ACP_BACKEND_CLAUDE,
+        ACP_BACKEND_DEEPSEEK,
+        ACP_BACKEND_GOOSE,
+        ACP_BACKEND_KIRO,
+        ACP_BACKEND_OPENCODE,
+        ACP_BACKEND_PI,
+        ACP_BACKEND_STRANDS,
+        ACP_BACKENDS_ACP_CLIENT_SPAWNABLE,
+        ACP_BACKENDS_HONOR_ZERO_TOOL_BAN,
+    )
+
+    tree = _tree("knowledge/llm_pool.py")
+    constructions = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and getattr(node.func, "id", "") == "AcpClient"
+    ]
+    assert constructions, "llm_pool no longer constructs an AcpClient; re-check this pin"
+    for call in constructions:
+        passed = {kw.arg for kw in call.keywords}
+        assert (
+            "acp_backend" in passed
+        ), f"llm_pool.py:{call.lineno} no longer selects a backend; re-check this pin"
+    pool_safe_backends = ACP_BACKENDS_HONOR_ZERO_TOOL_BAN & ACP_BACKENDS_ACP_CLIENT_SPAWNABLE
+    assert pool_safe_backends == {
+        ACP_BACKEND_KIRO,
+        ACP_BACKEND_CLAUDE,
+        ACP_BACKEND_OPENCODE,
+        ACP_BACKEND_GOOSE,
+        ACP_BACKEND_DEEPSEEK,
+        ACP_BACKEND_PI,
+        ACP_BACKEND_STRANDS,
+    }, (
+        "the set of backends this pool trusts changed -- decide the effort "
+        "channel for whichever member is new or missing deliberately, then "
+        "update this pin"
+    )
+    assert capabilities_for(ACP_BACKEND_KIRO).effort_via_config_option is False
+    # claude carries effort as its ``effort`` config option.
+    assert capabilities_for(ACP_BACKEND_CLAUDE).effort_via_config_option is True
+    assert capabilities_for(ACP_BACKEND_CLAUDE).effort_via_slash_command is False
+    assert capabilities_for(ACP_BACKEND_OPENCODE).effort_via_config_option is True
+    assert capabilities_for(ACP_BACKEND_GOOSE).effort_via_config_option is True
+    assert capabilities_for(ACP_BACKEND_KIRO).effort_via_slash_command is True
+    assert capabilities_for(ACP_BACKEND_OPENCODE).effort_via_slash_command is False
+    assert capabilities_for(ACP_BACKEND_GOOSE).effort_via_slash_command is False
+    assert capabilities_for(ACP_BACKEND_DEEPSEEK).effort_via_config_option is True
+    assert capabilities_for(ACP_BACKEND_DEEPSEEK).effort_via_slash_command is False
+    # pi carries effort as its ``thought_level`` config option.
+    assert capabilities_for(ACP_BACKEND_PI).effort_via_config_option is True
+    assert capabilities_for(ACP_BACKEND_PI).effort_via_slash_command is False
+    # Strands takes its model at launch and carries no effort channel at all, so the
+    # pool sends it none: neither the config option nor a slash command.
+    assert capabilities_for(ACP_BACKEND_STRANDS).effort_via_config_option is False
+    assert capabilities_for(ACP_BACKEND_STRANDS).effort_via_slash_command is False
+
+
+def test_effort_via_slash_command_membership_is_the_command_verb_set() -> None:
+    """``effort_via_slash_command`` translates ``ACP_BACKENDS_KIRO_SLASH_COMMANDS``
+    for every known backend, and no backend carries effort down both channels: a
+    change sent down the one the harness does not implement is refused. KAS is
+    kiro-family but outside that set, because it answers
+    ``_kiro.dev/commands/execute`` with -32603 (``kas/commands-refused-live.jsonl``)."""
+    for backend in sorted(sdk_backends.ACP_BACKENDS_KNOWN):
+        caps = capabilities_for(backend)
+        assert caps.effort_via_slash_command == (
+            backend in sdk_backends.ACP_BACKENDS_KIRO_SLASH_COMMANDS
+        ), backend
+        assert not (caps.effort_via_slash_command and caps.effort_via_config_option), backend
+    assert capabilities_for(sdk_backends.ACP_BACKEND_KAS).effort_via_slash_command is False
+    assert capabilities_for("some-harness-nobody-registered").effort_via_slash_command is False

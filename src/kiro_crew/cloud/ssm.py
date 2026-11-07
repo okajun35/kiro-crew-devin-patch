@@ -1,0 +1,1181 @@
+"""SSM Session Manager primitives for the cloud launcher.
+
+Two kinds of SSM interaction:
+
+1. **Run a command on the instance and read its output** — ``send-command`` +
+   poll ``get-command-invocation``. Goes through the :mod:`cloud.aws` chokepoint
+   (captured output), so it is unit-testable by mocking ``run_aws``.
+2. **Open a long-lived port-forward tunnel** — ``start-session`` with the
+   ``AWS-StartPortForwardingSession`` document. This is a streaming child
+   process, so it is spawned directly with ``subprocess.Popen`` (not through the
+   capture-only chokepoint). The argv builders are testable (the CLI head is
+   resolved via the deploy engine's shared resolver).
+
+Requires the ``session-manager-plugin`` on the client for #2 (bundled by the
+launcher prerequisites); #1 needs only the ``aws`` CLI.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import logging
+import os
+import platform
+import re
+import shutil
+import subprocess
+import threading
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Callable, Optional
+
+from kiro_crew import platform_compat
+from kiro_crew.cloud import aws
+from kiro_crew.deploy.engine import (
+    aws_spawn_env,
+    resolve_aws_bin,
+    resolve_aws_tool_bin,
+    resolve_aws_tool_bin_with_refusals,
+)
+
+logger = logging.getLogger(__name__)
+
+# How long to wait for a send-command invocation to finish, and the poll gap.
+_CMD_TOTAL_WAIT = 180
+_CMD_POLL_INTERVAL = 3
+
+#: Bound on the captured port-forward stdout (see :func:`open_port_forward`).
+#: Only a short close notice is ever read back; the cap keeps a chatty plugin
+#: from growing the buffer without bound over a long-lived tunnel.
+_MAX_FORWARD_STDOUT = 8192
+#: Read chunk for the stdout drain — small enough that a close notice written
+#: just before exit is observed promptly.
+_FORWARD_STDOUT_READ_CHUNK = 4096
+#: How long kill_port_forward waits for the forward's process group to empty
+#: after the SIGTERM it sends to members that outlived the wrapper, and after
+#: the SIGKILL that follows when they do not exit.
+_GROUP_TERM_GRACE_SECS = 2.0
+_GROUP_KILL_WAIT_SECS = 5.0
+#: Poll cadence of that wait.
+_GROUP_EMPTY_POLL_SECS = 0.05
+
+# Indirection so tests can patch out the poll sleep.
+_sleep = time.sleep
+
+_PORT_FORWARD_DOC = "AWS-StartPortForwardingSession"
+_SESSION_MANAGER_PLUGIN = "session-manager-plugin"
+_SESSION_MANAGER_PLUGIN_DOC_URL = (
+    "https://docs.aws.amazon.com/systems-manager/latest/userguide/"
+    "session-manager-working-with-install-plugin.html"
+)
+
+# Valid Unix username shape for the `sudo -u <run_as>` target. Anchored with
+# ``\Z``, not ``$``: ``$`` also matches just before a trailing newline, so the
+# ``$`` form accepted ``"ec2-user\n"`` — and ``run_as`` IS interpolated into the
+# command string :func:`_wrap_remote_command` builds, where a newline begins a
+# second shell line. No caller threads user input into ``run_as`` today (each
+# passes the default, or a registry value already bounded with ``\Z`` by
+# ``validation.validate_ssm_run_as``), so this was latent, not exploitable. It is
+# fixed here because :func:`run_command`'s docstring promises the injection
+# surface stays closed "if a caller ever threads user input through", and under
+# ``$`` that promise did not hold.
+_USERNAME_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}\Z")
+
+
+@dataclass
+class CommandResult:
+    """Outcome of an SSM send-command run."""
+
+    status: str  # Success | Failed | TimedOut | ...
+    stdout: str
+    stderr: str
+    exit_code: int
+
+    @property
+    def ok(self) -> bool:
+        return self.status == "Success" and self.exit_code == 0
+
+
+@dataclass
+class PluginInstallResult:
+    """Outcome of installing the local AWS Session Manager plugin."""
+
+    ok: bool
+    message: str = ""
+
+
+def run_command(
+    instance_id: str,
+    command: str,
+    profile: str = "",
+    region: str = "",
+    *,
+    run_as: str = "ec2-user",
+    total_wait: int = _CMD_TOTAL_WAIT,
+) -> CommandResult:
+    """Run a shell ``command`` on the instance via SSM and return its output.
+
+    Uses ``AWS-RunShellScript``; wraps the command in ``sudo -u <run_as> -i`` so
+    it runs as the KiroCrew user with a login shell (PATH, home). Blocks until
+    the invocation completes or ``total_wait`` elapses.
+
+    ``run_as`` is charset-validated (Unix username shape) even though every
+    caller uses the default today — this is the SSM command chokepoint, so the
+    injection surface stays closed if a caller ever threads user input through.
+    """
+    if not _USERNAME_RE.match(run_as):
+        raise aws.AWSError(f"invalid run_as user: {run_as!r}", action="ssm:SendCommand")
+    wrapped = _wrap_remote_command(command, run_as)
+    send = aws.checked_json(
+        [
+            "ssm",
+            "send-command",
+            "--instance-ids",
+            instance_id,
+            "--document-name",
+            "AWS-RunShellScript",
+            "--parameters",
+            f"commands={_json_str_list([wrapped])}",
+        ],
+        profile,
+        region,
+        action="ssm:SendCommand",
+    )
+    command_id = ""
+    if isinstance(send, dict):
+        command_id = send.get("Command", {}).get("CommandId", "")
+    if not command_id:
+        raise aws.AWSError("ssm send-command returned no CommandId", action="ssm:SendCommand")
+
+    deadline = total_wait
+    waited = 0
+    while True:
+        rc, out, err = aws.run_aws(
+            [
+                "ssm",
+                "get-command-invocation",
+                "--command-id",
+                command_id,
+                "--instance-id",
+                instance_id,
+                "--output",
+                "json",
+            ],
+            profile,
+            region,
+        )
+        if rc == 0:
+            import json
+
+            try:
+                inv = json.loads(out or "{}")
+            except json.JSONDecodeError:
+                inv = {}
+            status = inv.get("Status", "")
+            if status in ("Success", "Failed", "Cancelled", "TimedOut"):
+                raw_code = inv.get("ResponseCode", -1)
+                try:
+                    exit_code = int(raw_code)
+                except (TypeError, ValueError):
+                    exit_code = -1
+                return CommandResult(
+                    status=status,
+                    stdout=inv.get("StandardOutputContent", ""),
+                    stderr=inv.get("StandardErrorContent", ""),
+                    exit_code=exit_code,
+                )
+        # "InvocationDoesNotExist" briefly after send — keep polling.
+        if waited >= deadline:
+            return CommandResult(status="TimedOut", stdout="", stderr=err, exit_code=-1)
+        _sleep(_CMD_POLL_INTERVAL)
+        waited += _CMD_POLL_INTERVAL
+
+
+def build_port_forward_argv(
+    target: str,
+    remote_port: int,
+    local_port: int,
+    profile: str = "",
+    region: str = "",
+    document: str = "",
+) -> list[str]:
+    """Build the ``aws ssm start-session`` port-forward argv (testable).
+
+    *target* is an EC2/SSM-managed instance id (``i-…``/``mi-…``) or an ECS task
+    target (``ecs:<cluster>_<taskId>_<runtimeId>``) for the Fargate lane — hence
+    "target" rather than "instance id". Both lanes use the SAME argv and the SAME
+    ``AWS-StartPortForwardingSession`` document, which forwards to a port on the
+    target itself; only the ``--target`` value differs. There is deliberately no
+    branch here, so the EC2 argv cannot drift while the Fargate one is changed.
+
+    Note this document takes no ``host`` parameter: the destination is the target,
+    never a host the caller names, so the tunnel cannot be pointed at a third
+    machine the target happens to be able to reach.
+
+    *document* names a custom Session document whose ``portNumber`` is fixed (a
+    Shared Crew owner scoping IAM to one port); it then takes ``localPortNumber``
+    alone. Empty is the AWS-managed document above.
+
+    The CLI head is resolved absolutely through the deploy engine's shared
+    resolver so a GUI-launched gateway's minimal PATH still finds it.
+    """
+    argv = [
+        resolve_aws_bin(),
+        "ssm",
+        "start-session",
+        "--target",
+        target,
+        "--document-name",
+        document or _PORT_FORWARD_DOC,
+        "--parameters",
+        (
+            f"localPortNumber={local_port}"
+            if document
+            else f"portNumber={remote_port},localPortNumber={local_port}"
+        ),
+    ]
+    if region:
+        argv += ["--region", region]
+    if profile:
+        argv += ["--profile", profile]
+    return argv
+
+
+def session_manager_plugin_installed() -> bool:
+    """True when the local AWS Session Manager plugin is available.
+
+    Resolved through the deploy engine's shared resolver, not a bare
+    ``shutil.which``: the plugin's own installers target ``/usr/local/bin`` (and
+    the Homebrew cask the brew prefix), neither of which is on the minimal
+    launchd ``PATH`` a Finder/Dock-launched gateway inherits — so a bare probe
+    reports "not installed" for a plugin that IS installed, and
+    :func:`require_session_manager_plugin` would refuse every SSM tunnel before
+    one is attempted. Same resolution the ``start-session`` argv head already
+    uses, so probe and spawn agree.
+    """
+    return shutil.which(resolve_aws_tool_bin(_SESSION_MANAGER_PLUGIN)) is not None
+
+
+@dataclass(frozen=True)
+class PluginRefusal:
+    """A Session Manager plugin (or ``aws`` CLI) that is installed but failed the provenance check.
+
+    ``path`` is the candidate the resolver found and ``reason`` the check's own
+    words. ``remedy_command`` is a copy-pasteable fix when one is known for this
+    install, else "".
+
+    ``code`` names the kind of refusal so a caller can say it in its own words
+    (see :data:`_REFUSAL_CODES`), "" for a reason no code covers. For an
+    ``other_owner`` refusal, ``owner_uid`` is the owning account's uid and
+    ``owner`` its login name on this host, "" when it has none.
+    """
+
+    path: str
+    reason: str
+    remedy_command: str
+    code: str = ""
+    owner: str = ""
+    owner_uid: Optional[int] = None
+
+
+def session_manager_plugin_refusal() -> Optional[PluginRefusal]:
+    """Why an installed plugin is not used, or None when there is nothing to explain.
+
+    None when the resolver accepted a plugin, and None when it found none at all
+    (the "not installed" case, whose remedy is the install command). Otherwise the
+    first refused candidate with a known fix, else the first refused candidate:
+    reporting that as "not installed" would send the user
+    to an install command that reinstalls the same refused file.
+
+    Reads the same walk :func:`session_manager_plugin_installed` performs and
+    changes nothing about what is accepted.
+    """
+    return _tool_refusal(_SESSION_MANAGER_PLUGIN, _plugin_ownership_remedy)
+
+
+def aws_cli_refusal() -> Optional[PluginRefusal]:
+    """Why an installed ``aws`` CLI is not used, or None when there is nothing to explain.
+
+    The same reading as :func:`session_manager_plugin_refusal`, for the CLI, so a
+    found but refused ``aws`` is not reported as missing with an install link that
+    puts the same refused file back. ``remedy_command`` is always "": the ownership
+    command is known to clear a refusal only inside AWS's plugin install tree.
+    """
+    return _tool_refusal("aws", lambda _candidate, _reason: "")
+
+
+def _tool_refusal(name: str, remedy_for: Callable[[str, str], str]) -> Optional[PluginRefusal]:
+    """The candidate for *name* to report, or None (accepted or absent): the first
+    refused one *remedy_for* has a fix for, else the first refused one."""
+    resolved, refusals = resolve_aws_tool_bin_with_refusals(name)
+    if os.path.isabs(resolved) or not refusals:
+        return None
+    # Prefer a candidate with a known fix: with a refused copy in an earlier
+    # install dir (a second account's Homebrew), reporting that one would hide
+    # the command that clears the copy AWS's installer put in a later dir.
+    remedies = [(r, remedy_for(r.path, r.reason)) for r in refusals]
+    first, remedy = next(((r, m) for r, m in remedies if m), remedies[0])
+    code, owner_uid = _classify_refusal(first.reason)
+    # With a remedy, name the resolved file: the candidate is often a link from a
+    # bin directory, and the command targets the folder the real file sits in.
+    return PluginRefusal(
+        path=os.path.realpath(first.path) if remedy else first.path,
+        reason=first.reason,
+        remedy_command=remedy,
+        code=code,
+        owner=_account_name(owner_uid) if owner_uid is not None else "",
+        owner_uid=owner_uid,
+    )
+
+
+#: The provenance check's POSIX refusals, each matched against its whole wording
+#: and named by a stable code the dashboard renders in the reader's language.
+#: ``other_owner``: a component belongs to an account that is neither root nor
+#: the gateway user. ``world_writable``: any account can change a component.
+#: ``root_gateway``: the gateway runs as root, which runs no provider program.
+#: ``strict_policy``: the strict policy's own refusals (not root-owned, writable
+#: by the gateway user, reached through a link). Any other reason, Windows ACL
+#: refusals included, has no code and is shown as written.
+_REFUSAL_CODES: tuple[tuple[str, re.Pattern[str]], ...] = (
+    (
+        "other_owner",
+        re.compile(
+            r"\A(?:executable|executable parent) is owned by another user \(uid (?P<uid>\d+)\)\Z"
+        ),
+    ),
+    ("world_writable", re.compile(r"\A(?:executable|executable parent) is world-writable\Z")),
+    ("root_gateway", re.compile(r"\Aprovider execution is disabled for a root gateway\Z")),
+    (
+        "strict_policy",
+        re.compile(
+            r"\A(?:(?:executable|executable parent) is (?:not root-owned|writable by the gateway user)"
+            r"|path must be canonical and contain no symlinks)\Z"
+        ),
+    ),
+)
+
+
+def _classify_refusal(reason: str) -> tuple[str, Optional[int]]:
+    """``(code, owner uid)`` for a provenance-check *reason*; ``("", None)`` when no
+    code covers it. The uid is set only for ``other_owner``."""
+    for code, pattern in _REFUSAL_CODES:
+        match = pattern.match(reason)
+        if match is not None:
+            uid = match.groupdict().get("uid")
+            return code, int(uid) if uid is not None else None
+    return "", None
+
+
+def _account_name(uid: int) -> str:
+    """The login name of *uid* on this host, or "" when it has none.
+
+    AWS's macOS package stamps its tree with the packager's uid, which usually
+    names no account here; the caller then shows the uid instead.
+    """
+    try:
+        import pwd
+    except ImportError:
+        return ""
+    try:
+        return pwd.getpwuid(uid).pw_name
+    except (KeyError, OverflowError):
+        return ""
+
+
+#: Where AWS's own macOS and Linux packages install the plugin. The macOS ``.pkg``
+#: stamps this tree with the packager's uid rather than root, which the
+#: provenance check refuses as "owned by another user". Only meaningful on POSIX:
+#: :func:`_plugin_ownership_remedy` returns "" where there is no ``geteuid``.
+_AWS_PKG_PLUGIN_PREFIX = os.path.join(os.sep, "usr", "local", "sessionmanagerplugin")
+
+
+def _plugin_ownership_remedy(candidate: str, reason: str) -> str:
+    """``sudo chown -R root:<group> <prefix>`` when a third account owns AWS's install tree.
+
+    Offered only when *reason* is the provenance check's third-account ownership
+    refusal (code ``other_owner`` in :data:`_REFUSAL_CODES`, the only refusal a
+    root-owned tree clears: a root gateway, the strict policy and a world-writable
+    component are refused for reasons ``chown`` does not touch), the candidate
+    resolves inside :data:`_AWS_PKG_PLUGIN_PREFIX`, and some
+    directory or file on the way from that prefix to the binary is owned by an
+    account that is neither root nor the gateway user: exactly the state a stock
+    AWS ``.pkg`` install leaves, and one that making the tree root-owned clears.
+    Anything else returns "" and the caller shows only the reason, rather than a
+    command that would not fix it.
+    """
+    if _classify_refusal(reason)[0] != "other_owner":
+        return ""
+    geteuid = getattr(os, "geteuid", None)
+    if geteuid is None:
+        return ""
+    try:
+        prefix = Path(os.path.realpath(_AWS_PKG_PLUGIN_PREFIX))
+        real = Path(os.path.realpath(candidate))
+    except OSError:
+        return ""
+    if prefix not in real.parents:
+        return ""
+    allowed = {0, geteuid()}
+    chain = [prefix, *[p for p in reversed(real.parents) if prefix in p.parents], real]
+    for component in chain:
+        try:
+            owner = component.stat().st_uid
+        except OSError:
+            return ""
+        if owner not in allowed:
+            group = "wheel" if platform.system() == "Darwin" else "root"
+            return f"sudo chown -R root:{group} {_AWS_PKG_PLUGIN_PREFIX}"
+    return ""
+
+
+def session_manager_plugin_install_hint() -> str:
+    """Human-readable install hint for the local SSM plugin prerequisite."""
+    return (
+        "session-manager-plugin is not installed locally. Install the AWS "
+        f"Session Manager plugin, then rerun `kirocrew cloud connect`: "
+        f"{_SESSION_MANAGER_PLUGIN_DOC_URL}"
+    )
+
+
+#: The next step for a refused ``aws`` CLI or plugin with no fix command, by
+#: refusal code. A root gateway and the strict policy are not cleared by an
+#: ownership change, and another account's file must not be made trusted: the
+#: step for it is a copy from AWS, in folders only root or this account own.
+REFUSAL_NEXT_STEP = {
+    "other_owner": (
+        "Install a copy with AWS's own installer, then rerun. That copy runs only if "
+        "it and every folder above it belong to root or to the account the gateway "
+        "runs as. If a folder such as /usr/local/bin belongs to the other account, an "
+        "administrator must make root its owner first (see the Remote Crew on EC2 guide)."
+    ),
+    "root_gateway": "Start the gateway from a regular account instead of root, then rerun.",
+    "strict_policy": (
+        "Install it where only root can change the file and its folders, at a path "
+        "with no symbolic links, then rerun."
+    ),
+    "": "Fix the file's ownership or permissions so the check passes, then rerun.",
+}
+
+
+def session_manager_plugin_unavailable_message() -> str:
+    """Why the plugin cannot be used: the refusal when one was found, else the install hint.
+
+    A plugin that is installed but refused by the provenance check is not "not
+    installed", and the install hint would hide the reason. The message then
+    names the file, the check's reason and, when one is known, the command that
+    clears it. Changes nothing about what is accepted.
+    """
+    refusal = session_manager_plugin_refusal()
+    if refusal is None:
+        return session_manager_plugin_install_hint()
+    message = (
+        f"session-manager-plugin is installed at {refusal.path} but was refused: "
+        f"{refusal.reason}."
+    )
+    if refusal.remedy_command:
+        # Making the tree root-owned turns whatever binary is in it into an
+        # accepted credential receiver, so the user confirms it is AWS's first.
+        return (
+            f"{message} Reinstalling does not change its ownership. "
+            "If you did not install it from AWS yourself, or are not sure, "
+            "reinstall it from AWS first. Then make its install directory root-owned "
+            f"and rerun: {refusal.remedy_command}"
+        )
+    return f"{message} {REFUSAL_NEXT_STEP.get(refusal.code, REFUSAL_NEXT_STEP[''])}"
+
+
+def reinstall_cannot_clear_refusal() -> bool:
+    """True when the refused plugin sits in AWS's own install tree with a known fix.
+
+    That is the one refusal reinstalling cannot clear: the installer rewrites the
+    same file and leaves its ownership as it was. A refused copy elsewhere (a
+    second account's Homebrew) can still be shadowed by a fresh AWS install, so
+    the install offer stays for it.
+    """
+    refusal = session_manager_plugin_refusal()
+    return refusal is not None and bool(refusal.remedy_command)
+
+
+def session_manager_plugin_install_command() -> str:
+    """A copy-pasteable install command for THIS host, or "" if none fits.
+
+    The plugin has to exist on the machine running the gateway, and only this
+    process knows what that machine is — a browser showing the dashboard cannot
+    tell (it may be a remote gateway on Linux while the user is on a Mac). So the
+    remedy is resolved here and handed to callers rather than hardcoded in the UI,
+    where a single macOS/Homebrew line would be wrong for every Linux host.
+
+    Packages come from AWS's public distribution bucket, the same source
+    :func:`install_session_manager_plugin` uses. Returns "" when the platform has
+    no one-liner (callers should fall back to the doc URL); in practice the cloud
+    surfaces are POSIX-only, so Darwin and Linux are the reachable cases.
+    """
+    system = platform.system()
+    arch = _normalized_arch()
+    base = "https://s3.amazonaws.com/session-manager-downloads/plugin/latest"
+
+    if system == "Darwin":
+        # Homebrew's cask is the public homebrew/cask one and installs AWS's own
+        # package, so prefer it when brew is actually present — it is shorter and
+        # keeps the plugin upgradable. Otherwise fall back to AWS's pkg directly,
+        # which needs no package manager at all.
+        if shutil.which("brew"):
+            return "brew install --cask session-manager-plugin"
+        url = f"{base}/{'mac_arm64' if arch == 'arm64' else 'mac'}/session-manager-plugin.pkg"
+        # Download into a private mktemp dir (0700, owner-only) rather than a
+        # predictable /tmp path. On a shared host a local user could preplant or
+        # swap `/tmp/session-manager-plugin.pkg` and have the trailing
+        # `sudo installer` run attacker scripts as root; mktemp -d removes both the
+        # predictable name and the sticky-/tmp race. Clean it up afterward.
+        return (
+            'd="$(mktemp -d)"; '
+            f'curl -fsSL -o "$d/session-manager-plugin.pkg" "{url}" '
+            '&& sudo installer -pkg "$d/session-manager-plugin.pkg" -target /; '
+            'rm -rf "$d"'
+        )
+
+    if system == "Linux":
+        if shutil.which("dpkg"):
+            deb = f"{base}/{'ubuntu_arm64' if arch == 'arm64' else 'ubuntu_64bit'}/session-manager-plugin.deb"
+            # Private mktemp dir, not a predictable /tmp path — same root-substitution
+            # concern as the macOS pkg above (`sudo dpkg -i` on an attacker-swappable
+            # file in sticky /tmp). Clean it up afterward.
+            return (
+                'd="$(mktemp -d)"; '
+                f'curl -fsSL -o "$d/session-manager-plugin.deb" "{deb}" '
+                '&& sudo dpkg -i "$d/session-manager-plugin.deb"; '
+                'rm -rf "$d"'
+            )
+        installer = shutil.which("dnf") or shutil.which("yum")
+        if installer:
+            rpm = f"{base}/{'linux_arm64' if arch == 'arm64' else 'linux_64bit'}/session-manager-plugin.rpm"
+            return f'sudo {Path(installer).name} install -y "{rpm}"'
+
+    return ""
+
+
+def install_session_manager_plugin() -> PluginInstallResult:
+    """Install the local AWS Session Manager plugin for SSM port-forwarding."""
+    if session_manager_plugin_installed():
+        return PluginInstallResult(ok=True, message="session-manager-plugin already installed")
+    if reinstall_cannot_clear_refusal():
+        # Refused inside AWS's own install tree: the installer rewrites that same
+        # file without fixing its ownership.
+        return PluginInstallResult(ok=False, message=session_manager_plugin_unavailable_message())
+
+    import tempfile
+
+    with tempfile.TemporaryDirectory(prefix="kirocrew-ssm-plugin-") as tmp:
+        tmpdir = Path(tmp)
+        plan = _session_manager_plugin_install_plan(tmpdir)
+        if plan is None:
+            return PluginInstallResult(ok=False, message=session_manager_plugin_install_hint())
+        url, package_path, commands = plan
+        try:
+            _download_file(url, package_path)
+        except Exception as exc:
+            return PluginInstallResult(
+                ok=False,
+                message=f"Could not download session-manager-plugin package: {exc}",
+            )
+
+        for argv in commands:
+            rc, _out, err = _run_install_command(argv)
+            if rc != 0:
+                return PluginInstallResult(ok=False, message=_install_error(argv, err))
+
+    if session_manager_plugin_installed():
+        return PluginInstallResult(ok=True, message="session-manager-plugin installed")
+    if session_manager_plugin_refusal() is not None:
+        # The install ran, but what the resolver finds is still refused.
+        return PluginInstallResult(ok=False, message=session_manager_plugin_unavailable_message())
+    return PluginInstallResult(
+        ok=False,
+        message=(
+            "session-manager-plugin installer completed, but the binary was not found on PATH. "
+            f"See {_SESSION_MANAGER_PLUGIN_DOC_URL}"
+        ),
+    )
+
+
+def require_session_manager_plugin() -> None:
+    """Fail fast before starting an SSM port-forward without the local plugin."""
+    if not session_manager_plugin_installed():
+        raise aws.AWSError(session_manager_plugin_unavailable_message(), action="ssm:StartSession")
+
+
+def open_port_forward(
+    target: str,
+    remote_port: int,
+    local_port: int,
+    profile: str = "",
+    region: str = "",
+    *,
+    capture_stdout: bool = False,
+) -> subprocess.Popen:
+    """Spawn a background SSM port-forward. Returns the live child process.
+
+    *target* is an EC2/SSM-managed instance id, which is what both callers here
+    pass: the dashboard tunnel and the device-code callback tunnel. The Fargate
+    lane shares :func:`build_port_forward_argv` but not this function -- the
+    instances layer spawns and supervises its own child, whose stdio and teardown
+    are documented where that child lives rather than described from here. Only
+    one thing is claimed about the pair, and a test pins it: the human-action gate
+    below is reached from this function alone, so it covers these two tunnels and
+    no Fargate forward.
+
+    The caller owns the process (terminate it to close the tunnel). Not routed
+    through :func:`cloud.aws.run_aws` because the session streams for its whole
+    lifetime rather than returning captured output.
+
+    stderr goes to DEVNULL. stdout goes to DEVNULL too UNLESS *capture_stdout*,
+    in which case it is piped AND drained concurrently from spawn by a daemon
+    thread into a bounded buffer on the returned process (``stdout_buf``). The
+    bare PIPE alone would deadlock the tunnel — the plugin logs a line per
+    connection and a pipe nobody reads blocks the writer once the OS buffer fills
+    — so the capture is only safe BECAUSE the drain runs for the child's whole
+    life, exactly as the instances-layer forward does. The notice the plugin
+    prints when a forward is closed goes to stdout, so capturing it lets a caller
+    name the cause instead of reporting a bare exit code. Tunnel liveness is
+    still verified via :func:`wait_for_local_port`, never by parsing output.
+
+    The child gets :func:`~kiro_crew.deploy.engine.aws_spawn_env` rather than a
+    bare inherited env: the ``aws`` head is resolved absolutely, but the CLI then
+    looks ``session-manager-plugin`` up by name on its OWN ``PATH``, which under a
+    GUI-launched gateway is the minimal launchd one. The resolved head is
+    handed over so the widening is withheld when it is a bare name — a bare name
+    means provenance REFUSED the candidate in those dirs, and widening would put
+    it back within ``execvp``'s reach.
+    """
+    # Streaming child — bypasses the run_aws chokepoint, so carry the same
+    # human-action guard here (opening a tunnel to the box is a sensitive,
+    # human-only action, not something an agent session may do).
+    aws.assert_human_action("ssm:StartSession")
+    require_session_manager_plugin()
+    argv = build_port_forward_argv(target, remote_port, local_port, profile, region)
+    logger.info(
+        "opening SSM port-forward %s: local %d -> remote %d", target, local_port, remote_port
+    )
+    proc = subprocess.Popen(  # noqa: S603 — fixed argv, no shell
+        argv,
+        stdout=subprocess.PIPE if capture_stdout else subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        env=aws_spawn_env(argv[0]),
+    )
+    # Read while the wrapper is un-reaped, so the id names its group and no one
+    # else's: kill_port_forward needs it after the wrapper exits, when
+    # ``os.getpgid`` of the reaped pid names nothing.
+    with contextlib.suppress(AttributeError):  # a Popen stand-in without a __dict__
+        proc.ssm_pgid = _spawned_group(proc)  # type: ignore[attr-defined]
+    if capture_stdout:
+        _start_stdout_drain(proc)
+    return proc
+
+
+def _spawned_group(proc: subprocess.Popen) -> Optional[int]:
+    """The process group a just-spawned forward leads, or ``None``.
+
+    Kept only when the wrapper leads its own group (``pgid == pid``, which
+    ``start_new_session=True`` makes it), so the id names a group this forward
+    owns. POSIX only: Windows has no process groups and reaps the tree through
+    ``taskkill /T`` instead.
+    """
+    pid = getattr(proc, "pid", None)
+    if not platform_compat.IS_POSIX or type(pid) is not int or pid <= 1:
+        return None
+    # No poll() here: nothing has waited on the child yet, so even a wrapper
+    # that already exited is an un-reaped zombie whose pid still names it.
+    return pid if platform_compat.pgroup_of(pid) == pid else None
+
+
+def _start_stdout_drain(proc: subprocess.Popen) -> None:
+    """Drain *proc*'s piped stdout for its whole life into a bounded buffer.
+
+    Attaches a ``stdout_buf`` attribute (``list[str]`` holding at most one entry,
+    the most recent ``_MAX_FORWARD_STDOUT`` characters) that a close-reason reader
+    can inspect after the child exits, and a ``stdout_drain`` attribute holding
+    the daemon thread so a reader can join it once the child has exited (the pipe
+    reaches EOF and the drain returns) rather than guess at a wait. A daemon
+    thread reads so the OS pipe buffer never fills — the deadlock the DEVNULL
+    default avoids — and because it is a daemon it never keeps the interpreter
+    alive. Decoding is lossy-by-design (``"replace"``): a split multi-byte
+    sequence must not raise in a thread whose failure nobody observes.
+    """
+    stdout = proc.stdout
+    if stdout is None:  # pragma: no cover - PIPE was requested
+        return
+    buf: list[str] = [""]
+    # Expose the shared buffer on the process so a later reader (see
+    # cloud.connect._port_forward_error) can pull the captured notice out.
+    proc.stdout_buf = buf  # type: ignore[attr-defined]
+
+    def _drain() -> None:
+        try:
+            while True:
+                chunk = stdout.read(_FORWARD_STDOUT_READ_CHUNK)
+                if not chunk:
+                    return
+                buf[0] = (buf[0] + chunk.decode("utf-8", "replace"))[-_MAX_FORWARD_STDOUT:]
+        except Exception:  # noqa: BLE001 - a background drain must never raise
+            return
+        finally:
+            with contextlib.suppress(Exception):
+                stdout.close()
+
+    thread = threading.Thread(target=_drain, name="ssm-forward-stdout-drain", daemon=True)
+    # Expose the thread so a reader can join it once the child has exited (EOF on
+    # the pipe ends the drain), rather than guessing at how long it needs.
+    proc.stdout_drain = thread  # type: ignore[attr-defined]
+    thread.start()
+
+
+def kill_port_forward(proc: Optional[subprocess.Popen]) -> None:
+    """Tear down a port-forward child AND its ``session-manager-plugin`` child.
+
+    :func:`open_port_forward` uses ``start_new_session=True``, so the ``aws``
+    wrapper is a process-group leader and the plugin (which actually holds the
+    forwarded local port) is in the same group. ``proc.terminate()`` signals ONLY
+    the wrapper — the plugin would survive and keep the port bound. On POSIX we
+    therefore signal the whole group (``killpg``); if that's unavailable (or the
+    group is already gone) fall back to the single-process kill. Both the
+    dashboard tunnel (``connect``) and the login callback tunnel (``login``) go
+    through this so neither leaves an orphaned plugin/port behind.
+
+    WINDOWS has no ``os.killpg``/``os.getpgid`` (and silently ignores
+    ``start_new_session``), so the group signal is not merely unavailable there --
+    it can never succeed, and the fallback ``proc.terminate()`` kills ONLY the
+    wrapper, leaving the plugin holding the forwarded port exactly as this
+    function exists to prevent. Windows therefore gets its own tree kill via
+    ``taskkill /T``, which walks the child chain the way a process group does on
+    POSIX.
+
+    The wrapper's exit is not the forward's end: ``session-manager-plugin`` can
+    outlive it -- exiting on its own first, or dying on SIGTERM while the plugin
+    does not -- still in the group and still holding the port. ``os.getpgid`` of
+    the reaped wrapper names nothing, so on POSIX the group recorded at spawn
+    (``ssm_pgid``, see :func:`open_port_forward`) is what gets signalled, and
+    any member it still has after the wrapper is gone is sent SIGTERM, then
+    SIGKILL, each followed by a bounded wait for the group to empty. Only that
+    one group is signalled, so another forward's plugin is never touched.
+    """
+    if proc is None:
+        return
+    pgid = _recorded_group(proc)
+    if proc.poll() is not None:
+        _reap_group_survivors(pgid, term_sent=False)
+        return
+    group_term_sent = False
+
+    def _signal_group(sig: int) -> bool:
+        nonlocal group_term_sent
+        if pgid is not None:
+            try:
+                platform_compat.kill_process_group(pgid, sig)
+            except (OSError, ValueError):
+                return False
+            group_term_sent = group_term_sent or sig == platform_compat.SIGTERM
+            return True
+        try:
+            os.killpg(os.getpgid(proc.pid), sig)
+            return True
+        except (ProcessLookupError, PermissionError, OSError, AttributeError):
+            return False
+
+    def _kill_tree_windows() -> bool:
+        """``taskkill /T /F`` the wrapper and every process below it.
+
+        /T includes the child tree, /F is forceful (the plugin does not handle a
+        graceful console event). Returns False so the caller can still fall back
+        if taskkill is missing or refuses.
+        """
+        # getattr, not proc.pid: this helper accepts any Popen-LIKE object, and the
+        # POSIX branch already tolerates one without a pid (its `_signal_group`
+        # catches AttributeError and falls back to terminate()). Without the same
+        # tolerance here, a caller passing a lightweight stand-in works on Linux
+        # and raises on Windows.
+        pid = getattr(proc, "pid", None)
+        if pid is None:
+            return False
+        # Resolved from the fixed system directories, never a bare argv name:
+        # CreateProcess searches the calling image's directory and the CWD before
+        # PATH, and a gateway PATH can legitimately lead with agent-writable
+        # directories -- so `["taskkill", ...]` lets a planted shim run with this
+        # process's privileges on the teardown path. `platform_compat` already
+        # resolves the SAME binary this way at both of its own taskkill sites.
+        # ``None`` means unavailable, which is the case this helper already
+        # returns False for so the caller escalates.
+        taskkill_bin = platform_compat.trusted_system_bin("taskkill")
+        if taskkill_bin is None:
+            return False
+        try:
+            subprocess.run(
+                [taskkill_bin, "/T", "/F", "/PID", str(pid)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False
+        # taskkill returns non-zero when the pid already exited, which is the
+        # desired end state, so success is judged by the process being gone.
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            return False
+        return True
+
+    if os.name == "nt":
+        if _kill_tree_windows():
+            return
+        # Fall through: better a parent-only kill than nothing.
+
+    try:
+        if not _signal_group(platform_compat.SIGTERM):
+            proc.terminate()
+        proc.wait(timeout=5)
+    except Exception:
+        # Signal numbers come from platform_compat, not `signal`: Windows has no
+        # `signal.SIGKILL`, so naming it here raises AttributeError while
+        # evaluating the call argument — inside this handler's own try, which
+        # swallows it — and `proc.kill()` would never run. That silently turns
+        # the escalation into a no-op on the one platform that reaches it via
+        # the taskkill fall-through, leaving the plugin holding the port.
+        try:
+            if not _signal_group(platform_compat.SIGKILL):
+                proc.kill()
+        except Exception:
+            pass
+        # Reap the killed wrapper: an un-reaped zombie stays a member of its
+        # group, so the survivor check below would read the group as populated.
+        with contextlib.suppress(Exception):
+            proc.wait(timeout=5)
+    _reap_group_survivors(pgid, term_sent=group_term_sent)
+
+
+def _recorded_group(proc: subprocess.Popen) -> Optional[int]:
+    """The group :func:`open_port_forward` recorded on *proc*, if it is usable.
+
+    A Popen-like object that did not come from :func:`open_port_forward` has no
+    record and gets ``None``, which leaves it the pid-resolved group signal.
+    """
+    pgid = getattr(proc, "ssm_pgid", None)
+    return pgid if type(pgid) is int and pgid > 1 else None
+
+
+def _wait_group_empty(pgid: int, timeout: float) -> bool:
+    """Poll until process group *pgid* has no member, for at most *timeout* s."""
+    deadline = time.monotonic() + timeout
+    while platform_compat.pgroup_exists(pgid):
+        if time.monotonic() >= deadline:
+            return False
+        _sleep(_GROUP_EMPTY_POLL_SECS)
+    return True
+
+
+def _reap_group_survivors(pgid: Optional[int], *, term_sent: bool) -> None:
+    """Signal what is left of the forward's recorded group once the wrapper is gone.
+
+    Reached after the wrapper has exited. A member still in the group is the
+    plugin (or its own child) holding the forwarded port, so the group gets
+    SIGTERM unless this teardown already sent it one, then SIGKILL, each followed
+    by a bounded wait for the group to empty. The id was read at spawn while the
+    wrapper was un-reaped, and a group id is not reused while any member lives,
+    so a non-empty group with this id is still this forward's.
+    """
+    if pgid is None or not platform_compat.pgroup_exists(pgid):
+        return
+    signals = [(platform_compat.SIGKILL, _GROUP_KILL_WAIT_SECS)]
+    if not term_sent:
+        signals.insert(0, (platform_compat.SIGTERM, _GROUP_TERM_GRACE_SECS))
+    for sig, wait_secs in signals:
+        try:
+            platform_compat.kill_process_group(pgid, sig)
+        except (OSError, ValueError):  # the group emptied, or a member is unsignalable
+            return
+        if _wait_group_empty(pgid, wait_secs):
+            return
+    logger.warning(
+        "session-manager-plugin group %d survived SIGKILL; its forwarded port may still be held",
+        pgid,
+    )
+
+
+def port_is_free(port: int, host: str = "127.0.0.1") -> bool:
+    """True if nothing is already listening on ``host:port``.
+
+    Pre-tunnel guard: if a port is already occupied by an unrelated process,
+    the SSM child will fail to bind, but a probe against the port would still
+    succeed against that foreign listener — so we must refuse before minting a
+    token or spawning, rather than send the dashboard JWT to a stranger.
+    """
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(1.0)
+        # connect_ex == 0 means something already accepted -> port is occupied.
+        return sock.connect_ex((host, port)) != 0
+
+
+def wait_for_local_port(
+    port: int,
+    host: str = "127.0.0.1",
+    timeout: float = 30.0,
+    proc: Optional[subprocess.Popen] = None,
+) -> bool:
+    """Poll until ``host:port`` accepts a TCP connection (tunnel is up).
+
+    When ``proc`` is given, stop early if the child has exited: a listener that
+    only appears after the SSM port-forward died is not our tunnel, and
+    returning true for it would expose the dashboard token to that process.
+    """
+    import socket
+
+    deadline_iters = int(timeout / 0.5)
+    for _ in range(max(1, deadline_iters)):
+        if proc is not None and proc.poll() is not None:
+            return False  # the SSM child exited — any listener here is not ours
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(1.0)
+            if sock.connect_ex((host, port)) == 0:
+                return True
+        _sleep(0.5)
+    return False
+
+
+def instance_is_managed(instance_id: str, profile: str = "", region: str = "") -> bool:
+    """True if SSM reports the instance as a managed, online node (Agent up)."""
+    rc, out, _err = aws.run_aws(
+        [
+            "ssm",
+            "describe-instance-information",
+            "--filters",
+            f"Key=InstanceIds,Values={instance_id}",
+            "--query",
+            "InstanceInformationList[0].PingStatus",
+            "--output",
+            "text",
+        ],
+        profile,
+        region,
+    )
+    return rc == 0 and out.strip() == "Online"
+
+
+@dataclass
+class TaskExecReadiness:
+    """Whether an ECS task can accept an SSM session, and why not when it cannot."""
+
+    ready: bool
+    reason: str = ""
+
+
+#: Cap on how much AWS stderr is quoted into a readiness reason. The tail is
+#: operator-facing diagnostics rather than anything parsed, and an unbounded one
+#: pastes a page of CLI output into a single error line.
+_MAX_AWS_ERROR_CHARS = 200
+
+
+def task_exec_readiness(
+    cluster: str, task_id: str, profile: str = "", region: str = ""
+) -> TaskExecReadiness:
+    """Whether *task_id* in *cluster* is ready for an SSM port-forward.
+
+    The Fargate sibling of :func:`instance_is_managed`, and it exists for the same
+    reason: without it the tunnel simply fails to open and the message says
+    nothing about which prerequisite is missing. AWS exposes exactly the two
+    observables that distinguish the causes, so this reads both.
+
+    ``enableExecuteCommand`` false is TERMINAL for that task's life. ECS cannot
+    turn the channel on for a running task, so the remedy is teardown and relaunch,
+    and the message says exactly that instead of inviting a retry that would repeat
+    forever. The distinction lives in the MESSAGE because that is the only place
+    anything acts on it: this module's Fargate consumer surfaces a reason string,
+    and a structured ``recoverable`` flag was removed rather than kept unread,
+    because a field whose presence implies a caller branches on it asserts a
+    guarantee no code delivers.
+
+    The execute-command managed agent not ``RUNNING`` invites a retry instead,
+    because it is usually still starting -- but it is also what a
+    PrivateLink-only VPC looks like, where the subnets can reach the container
+    registry (so the task pulls its image and reaches RUNNING) and cannot reach
+    ``ssmmessages`` (so the agent never comes up). The message names that
+    possibility, because it is otherwise invisible: nothing else in a healthy
+    task's state points at it.
+    """
+    rc, out, err = aws.run_aws(
+        [
+            "ecs",
+            "describe-tasks",
+            "--cluster",
+            cluster,
+            "--tasks",
+            task_id,
+            "--query",
+            "tasks[0].[enableExecuteCommand,containers[0].managedAgents[?name=="
+            "`ExecuteCommandAgent`].lastStatus|[0]]",
+            "--output",
+            "text",
+        ],
+        profile,
+        region,
+    )
+    if rc != 0:
+        # !r-quoted and capped, unlike instance_is_managed, which discards stderr
+        # entirely. AWS names the full caller ARN on an AccessDenied, and the repr
+        # turns an ESC or a newline in the tail into a literal rather than
+        # something a terminal acts on.
+        return TaskExecReadiness(
+            ready=False,
+            reason=(
+                f"could not describe task {task_id} in cluster {cluster}: "
+                f"{err.strip()[:_MAX_AWS_ERROR_CHARS]!r}"
+            ),
+        )
+    fields = out.split()
+    if len(fields) < 2:
+        return TaskExecReadiness(
+            ready=False,
+            reason=(
+                f"task {task_id} was not found in cluster {cluster}, or it has stopped. "
+                f"Check `kirocrew cloud status`."
+            ),
+        )
+    exec_enabled, agent_status = fields[0], fields[1]
+    if exec_enabled.lower() != "true":
+        return TaskExecReadiness(
+            ready=False,
+            reason=(
+                f"task {task_id} was launched without the execute-command channel, so no "
+                f"SSM session can reach it. ECS cannot enable it on a running task: tear "
+                f"this crew down and launch it again."
+            ),
+        )
+    if agent_status != "RUNNING":
+        return TaskExecReadiness(
+            ready=False,
+            reason=(
+                f"the execute-command agent in task {task_id} is {agent_status or 'absent'}, "
+                f"not RUNNING. It may still be starting -- retry shortly. If it stays this "
+                f"way, the task's subnets probably cannot reach the `ssmmessages` endpoint: "
+                f"a VPC with registry endpoints but no `ssmmessages` endpoint (and no NAT "
+                f"route) pulls the image and runs the task, but never brings this agent up."
+            ),
+        )
+    return TaskExecReadiness(ready=True)
+
+
+# --- small helpers ---------------------------------------------------------
+
+
+def _wrap_remote_command(command: str, run_as: str) -> str:
+    """Wrap a (possibly multi-line) script for reliable execution over SSM.
+
+    SSM's ``AWS-RunShellScript`` mangles multi-line command strings (it strips
+    the newlines, gluing statements together — ``set +eKIRO=...`` — which breaks
+    any real script). To be newline- and quoting-proof we base64-encode the
+    whole script and decode+run it on the box under ``sudo -u <run_as> -i bash``.
+    """
+    import base64
+
+    b64 = base64.b64encode(command.encode("utf-8")).decode("ascii")
+    # Single-line, no embedded newlines: SSM can't mangle it.
+    return f"echo {b64} | base64 -d | sudo -u {run_as} -i bash"
+
+
+def _session_manager_plugin_install_plan(
+    tmpdir: Path,
+) -> tuple[str, Path, list[list[str]]] | None:
+    """Return (download_url, package_path, install_commands) for this platform."""
+    system = platform.system()
+    arch = _normalized_arch()
+    if system == "Darwin":
+        url_arch = "mac_arm64" if arch == "arm64" else "mac"
+        package_path = tmpdir / "session-manager-plugin.pkg"
+        return (
+            f"https://s3.amazonaws.com/session-manager-downloads/plugin/latest/{url_arch}/"
+            "session-manager-plugin.pkg",
+            package_path,
+            [
+                ["sudo", "installer", "-pkg", str(package_path), "-target", "/"],
+                ["sudo", "mkdir", "-p", "/usr/local/bin"],
+                [
+                    "sudo",
+                    "ln",
+                    "-sf",
+                    "/usr/local/sessionmanagerplugin/bin/session-manager-plugin",
+                    "/usr/local/bin/session-manager-plugin",
+                ],
+            ],
+        )
+
+    if system != "Linux":
+        return None
+
+    if shutil.which("dpkg"):
+        url_arch = "ubuntu_arm64" if arch == "arm64" else "ubuntu_64bit"
+        package_path = tmpdir / "session-manager-plugin.deb"
+        return (
+            f"https://s3.amazonaws.com/session-manager-downloads/plugin/latest/{url_arch}/"
+            "session-manager-plugin.deb",
+            package_path,
+            [["sudo", "dpkg", "-i", str(package_path)]],
+        )
+
+    if shutil.which("rpm"):
+        url_arch = "linux_arm64" if arch == "arm64" else "linux_64bit"
+        package_path = tmpdir / "session-manager-plugin.rpm"
+        installer = shutil.which("dnf") or shutil.which("yum")
+        if installer:
+            commands = [["sudo", installer, "install", "-y", str(package_path)]]
+        else:
+            commands = [["sudo", "rpm", "-Uvh", str(package_path)]]
+        return (
+            f"https://s3.amazonaws.com/session-manager-downloads/plugin/latest/{url_arch}/"
+            "session-manager-plugin.rpm",
+            package_path,
+            commands,
+        )
+
+    return None
+
+
+def _normalized_arch() -> str:
+    machine = platform.machine().lower()
+    return "arm64" if machine in ("arm64", "aarch64") else "x86_64"
+
+
+def _download_file(url: str, dest: Path) -> None:
+    """Download a package file using stdlib HTTPS."""
+    import urllib.request
+
+    # URLs come only from the fixed per-platform install plan (hardcoded
+    # https://s3.amazonaws.com/session-manager-downloads/...), never from user
+    # input; the scheme check keeps file:// et al. out even if that changes.
+    if not url.startswith("https://"):
+        raise ValueError(f"refusing non-HTTPS download URL: {url}")
+    with urllib.request.urlopen(url, timeout=120) as response, dest.open("wb") as fh:  # nosemgrep
+        shutil.copyfileobj(response, fh)
+
+
+def _run_install_command(argv: list[str]) -> tuple[int, str, str]:
+    try:
+        proc = subprocess.run(argv, check=False)  # noqa: S603 — fixed platform plan
+    except FileNotFoundError as exc:
+        return 127, "", str(exc)
+    return proc.returncode, "", ""
+
+
+def _install_error(argv: list[str], err: str) -> str:
+    command = " ".join(argv)
+    detail = err.strip().splitlines()[-1] if err.strip() else "installer returned non-zero"
+    return f"`{command}` failed: {detail}"
+
+
+def _json_str_list(items: list[str]) -> str:
+    """Render a JSON array of strings for the --parameters commands=[...] form."""
+    import json
+
+    return json.dumps(items)

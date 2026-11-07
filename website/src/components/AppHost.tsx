@@ -1,0 +1,371 @@
+/**
+ * AppHost — dynamically loads and renders a KiroCrew app via ESM import.
+ *
+ * A single component that:
+ * 1. Reads the app manifest to get permissions
+ * 2. Creates the app's identity + a permission-scoped API context via AppApiProvider
+ * 3. Dynamically imports the app's ESM bundle
+ * 4. Renders it inside an ErrorBoundary + Suspense
+ *
+ * The app is a normal React component in the same tree — no iframes,
+ * no Web Components, no Shadow DOM.
+ */
+import { Suspense, lazy, useMemo, useState, useCallback, useEffect } from 'react'
+import React from 'react'
+import { useNavigate } from 'react-router-dom'
+import { ArrowLeft, RefreshCw, PowerOff, AlertTriangle, Package, Bot } from 'lucide-react'
+import { AppApiProvider, type AppUpdate } from '../app-sdk'
+import { Btn, PageHeader } from './ui'
+import AppLoadingFallback from './AppLoadingFallback'
+import { importAppBundle } from './appBundleImport'
+import ErrorNotice from './ErrorNotice'
+import { errMessage } from '../utils/thunkError'
+
+import { i18nT } from '../i18n/t'
+import { appDisplayName, appDescription } from './appstore/appManifest'
+import { withBase } from '@/lib/basePath'
+import { useAppSlotPush } from '../utils/appSlotPush'
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+export interface AppHostProps {
+  /** Installed app metadata (from /api/apps). */
+  app: {
+    name: string
+    version?: string
+    displayName?: string
+    enabled?: boolean
+    origin?: string
+    /** Set when the gateway skipped this built-in at boot; its routes were never registered. */
+    unavailable?: { reason: string }
+    /** Cached update state, carried by both `GET /api/apps` and
+     *  `GET /api/apps/{name}` so a routed page and a side-panel tab publish the
+     *  same answer. Absent whenever no cache has seen this app, so the SDK
+     *  publishes nothing rather than an unfounded "up to date". */
+    update?: AppUpdate
+    manifest?: {
+      name?: string
+      version?: string
+      displayName?: string
+      description?: string
+      ui?: {
+        entry?: string
+        pages?: { route: string; label: string; icon?: string }[]
+        /** Placeholder shape while the bundle loads, e.g. `{ layout: 'rail' }`.
+         *  Typed `unknown` on purpose: it is read straight from `app.json` and
+         *  `AppLoadingFallback` validates it against a closed set. */
+        loading?: unknown
+      }
+      permissions?: {
+        api?: string[]
+        events?: string[]
+      }
+      /** The app's own listing copy per locale, read by the title helpers. */
+      l10n?: unknown
+    }
+  }
+  /** Bundle to mount, overriding `manifest.ui.entry`. Resolved against the app's
+   *  `ui/` directory (`/apps/<name>/ui/<entry>`), the same base that override
+   *  uses. A side-panel tab (`contributes.panelTabs[].entry`) mounts its own
+   *  entry through this host rather than the app's default page bundle. */
+  entry?: string
+  /** Whether this host is the visible surface. A body-owning host (a side-panel
+   *  tab) stays mounted while hidden, so it is handed `active` to pause polling
+   *  or release global keys; defaults to visible for the routed-page case. */
+  active?: boolean
+  /** The chat identity this host's requests act under, sent as `X-Session-Key` on
+   *  every scoped call the app makes. Without it the backend's restricted-session
+   *  guard fails open, so an app mounted inside an incognito chat would be allowed
+   *  the persistent writes incognito exists to deny -- the same reason
+   *  `SessionControlHost` passes it. The routed `/apps/<name>` page uses the
+   *  core API client's `dashboard:ui` page identity rather than a chat key. */
+  sessionKey?: string
+  /** The name the route asked for, shown when `app` is absent. The not-found
+   *  title is "<name> isn't installed", so it needs the requested name. */
+  requestedName?: string
+}
+
+// ---------------------------------------------------------------------------
+// Error boundary (class component — React requirement)
+// ---------------------------------------------------------------------------
+
+interface EBProps { appName: string; onReset: () => void; children: React.ReactNode }
+interface EBState { error: Error | null }
+
+class AppErrorBoundary extends React.Component<EBProps, EBState> {
+  state: EBState = { error: null }
+
+  static getDerivedStateFromError(error: Error): EBState {
+    return { error }
+  }
+
+  componentDidCatch(error: Error, info: React.ErrorInfo) {
+    // eslint-disable-next-line no-console -- surface app crashes for debugging
+    console.error(`[AppHost] ${this.props.appName} crashed:`, error, info.componentStack)
+  }
+
+  render() {
+    if (this.state.error) {
+      return (
+        <AppCrashFallback
+          appName={this.props.appName}
+          error={this.state.error}
+          onRetry={() => { this.setState({ error: null }); this.props.onReset() }}
+        />
+      )
+    }
+    return this.props.children
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Crash fallback
+// ---------------------------------------------------------------------------
+
+function AppCrashFallback({
+  appName,
+  error,
+  onRetry,
+}: {
+  appName: string
+  error: Error
+  onRetry: () => void
+}) {
+  const navigate = useNavigate()
+  return (
+    <>
+      <PageHeader title={appName} subtitle={i18nT('components.appHost.app_crashed')} />
+      <div className="flex-1 flex items-center justify-center p-8">
+        <div className="text-center max-w-md">
+          <AlertTriangle size={48} className="text-danger mx-auto mb-4" />
+          <h3 className="text-text font-medium mb-2">{appName} {i18nT('components.appHost.encountered_an_error')}</h3>
+          {/* Crash fallback: the app tree is already gone, so the hand-off loses
+              nothing. The message is the whole visible error — the stack stays
+              in the console and in the journal the hand-off carries; a second,
+              hand-written `<p>` of error text would bypass the shared surface. */}
+          <ErrorNotice
+            askAgent
+            testId="app-host-crash-error"
+            className="mb-6 text-left"
+            message={error.message || error.name}
+          />
+          <div className="flex gap-2 justify-center">
+            <Btn onClick={onRetry}><RefreshCw size={14} /> {i18nT('components.appHost.retry')}</Btn>
+            <Btn onClick={() => navigate('/apps')}><ArrowLeft size={14} /> {i18nT('components.appHost.apps')}</Btn>
+          </div>
+        </div>
+      </div>
+    </>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Not found / not enabled
+// ---------------------------------------------------------------------------
+
+function AppNotFound({ name }: { name: string }) {
+  const navigate = useNavigate()
+  return (
+    <>
+      <PageHeader title={i18nT('components.appHost.not_installed', { name })} />
+      <div className="flex-1 flex items-center justify-center p-8">
+        <div className="text-center">
+          <div className="text-[48px] mb-4 opacity-20"><Package size={48} /></div>
+          <p className="text-muted mb-4">{i18nT('components.appHost.install_it_from_apps_or_via_cli')}</p>
+          <Btn onClick={() => navigate('/apps')}><ArrowLeft size={14} /> {i18nT('components.appHost.apps')}</Btn>
+        </div>
+      </div>
+    </>
+  )
+}
+
+function AppDisabled({ app }: { app: AppHostProps['app'] }) {
+  const navigate = useNavigate()
+  return (
+    <>
+      <PageHeader title={appDisplayName(app)} />
+      <div className="flex-1 flex items-center justify-center p-8">
+        <div className="text-center max-w-md">
+          <PowerOff size={48} className="text-muted mx-auto mb-4 opacity-30" />
+          <p className="text-sm text-muted mb-4">{i18nT('components.appHost.enable_this_app_from_apps_to_use_it')}</p>
+          <Btn onClick={() => navigate('/apps')}><ArrowLeft size={14} /> {i18nT('components.appHost.apps')}</Btn>
+        </div>
+      </div>
+    </>
+  )
+}
+
+function AppUnavailable({ app }: { app: AppHostProps['app'] & { unavailable: { reason: string } } }) {
+  const navigate = useNavigate()
+  return (
+    <>
+      <PageHeader title={appDisplayName(app)} />
+      <div className="flex-1 flex items-center justify-center p-8">
+        <div className="max-w-md grid gap-4 justify-items-center">
+          {/* A caught import error, so it renders through ErrorNotice; leaving this
+              page loses nothing, so the agent hand-off is on. */}
+          <ErrorNotice
+            message={i18nT('pages.appDetailPage.unavailable_notice', { reason: app.unavailable.reason })}
+            askAgent
+          />
+          <Btn onClick={() => navigate('/apps')}><ArrowLeft size={14} /> {i18nT('components.appHost.apps')}</Btn>
+        </div>
+      </div>
+    </>
+  )
+}
+
+function AppNoUI({ app }: { app: AppHostProps['app'] }) {
+  const navigate = useNavigate()
+  return (
+    <>
+      <PageHeader
+        title={appDisplayName(app)}
+        subtitle={appDescription({ name: app.name, description: app.manifest?.description, origin: app.origin, l10n: app.manifest?.l10n })}
+      />
+      <div className="flex-1 flex items-center justify-center p-8">
+        <div className="text-center max-w-md">
+          <div className="text-[48px] mb-4 opacity-20"><Bot size={48} /></div>
+          <h3 className="text-text font-medium mb-2">{i18nT('components.appHost.agent_only_app')}</h3>
+          <p className="text-sm text-muted mb-4">
+            {i18nT('components.appHost.this_app_provides_agents_and_skills_but_no_visua')}
+          </p>
+          <Btn onClick={() => navigate('/apps')}><ArrowLeft size={14} /> {i18nT('components.appHost.apps')}</Btn>
+        </div>
+      </div>
+    </>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// AppHost
+// ---------------------------------------------------------------------------
+
+function AppHostInner({ app, entry: entryOverride, active = true, sessionKey }: AppHostProps) {
+  const navigate = useNavigate()
+  const [resetKey, setResetKey] = useState(0)
+
+  // App dev-mode live reload: the gateway broadcasts app_reload when a
+  // dev-flagged app's ui/ files change (useWebSocket re-dispatches it as a
+  // window CustomEvent). We do a FULL PAGE RELOAD rather than only bumping the
+  // entry-module import URL: cache-busting just the entry leaves its statically
+  // imported dependency chunks pinned to their original URLs, and the browser's
+  // ESM module map is keyed by URL — so edits confined to a chunk would stay
+  // stale. A page reload re-fetches every module (the app's assets are served
+  // no-store in dev mode), guaranteeing the latest bytes across the whole graph.
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const detail = (e as CustomEvent).detail as { app?: string } | undefined
+      if (detail?.app === app.name) window.location.reload()
+    }
+    window.addEventListener('mc:app-reload', handler)
+    return () => window.removeEventListener('mc:app-reload', handler)
+  }, [app.name])
+
+  const entry = entryOverride || app.manifest?.ui?.entry
+  const permissions = app.manifest?.permissions || {}
+  const allowedApi = permissions.api || []
+  const allowedEvents = permissions.events || []
+  const bundlePath = withBase(`/apps/${app.name}/ui/${entry}`)
+
+  // Dynamically import the app bundle. Keyed on resetKey so retry works.
+  const LazyApp = useMemo(
+    () => lazy(() =>
+      importAppBundle(bundlePath).catch(err => {
+        // eslint-disable-next-line no-console -- surface bundle load failures for debugging
+        console.error(`[AppHost] Failed to load ${app.name} from ${bundlePath}:`, err)
+        // Return a module with a default export that shows the error
+        return {
+          default: () => (
+            <div className="flex-1 flex items-center justify-center p-8">
+              <div className="text-center max-w-md">
+                <AlertTriangle size={48} className="text-danger mx-auto mb-4" />
+                <h3 className="text-text font-medium mb-2">{i18nT('components.appHost.failed_to_load')} {appDisplayName(app)}</h3>
+                {/* Bundle load failure: nothing rendered yet, so the hand-off loses nothing. */}
+                <ErrorNotice
+                  askAgent
+                  testId="app-host-load-error"
+                  className="mb-4 text-left"
+                  message={errMessage(err) || String(err)}
+                />
+                <Btn onClick={() => navigate('/apps')}><ArrowLeft size={14} /> {i18nT('components.appHost.apps')}</Btn>
+              </div>
+            </div>
+          ),
+        }
+      })
+    ),
+    [bundlePath, resetKey] // eslint-disable-line react-hooks/exhaustive-deps
+  )
+
+  // WebSocket event subscription bridge
+  // TODO: Apps currently only receive CustomEvents; integrate WebSocket subscription when app event forwarding is implemented.
+  const subscribeFn = useCallback((event: string, cb: (data: unknown) => void) => {
+    // For now, use a simple CustomEvent bridge.
+    // Apps subscribe to events, and the host's WebSocket handler dispatches them.
+    const handler = (e: Event) => cb((e as CustomEvent).detail)
+    window.addEventListener(`mc:app:${event}`, handler)
+    return () => window.removeEventListener(`mc:app:${event}`, handler)
+  }, [])
+
+  const navigateFn = useCallback((path: string) => navigate(path), [navigate])
+  // Own-slot change signals from the dashboard socket (appSlotPush.ts).
+  const slotPush = useAppSlotPush(app.name)
+
+  // Kept explicit rather than relying on the SDK's default, which is byte-identical:
+  // `AppHostCoverage` asserts this bridge's behaviour at the surface that owns it,
+  // and moving the assertion elsewhere to delete three lines is a bad trade.
+  const notifyFn = useCallback((message: string, opts?: { type?: 'info' | 'success' | 'error' }) => {
+    // Dispatch to host notification system
+    window.dispatchEvent(new CustomEvent('mc:notify', { detail: { message, ...opts } }))
+  }, [])
+
+  return (
+    <AppErrorBoundary appName={app.name} onReset={() => setResetKey(k => k + 1)}>
+      <AppApiProvider
+        appName={app.name}
+        appDisplayName={appDisplayName(app)}
+        appVersion={app.manifest?.version || app.version}
+        appUpdate={app.update}
+        // Provenance verbatim from `GET /api/apps`, which is the one claim an app
+        // cannot forge: `builtin` is assigned only by register_builtin_apps() and
+        // is refused on the self-registration path. Anything else is external, and
+        // `useTrustedAppId()` refuses it a host-owned state namespace — an app
+        // that self-registers under a builtin's NAME must not inherit its keys.
+        origin={app.origin === 'builtin' ? 'builtin' : 'external'}
+        allowedApiPaths={allowedApi}
+        allowedEvents={allowedEvents}
+        active={active}
+        subscribeFn={subscribeFn}
+        navigateFn={navigateFn}
+        notifyFn={notifyFn}
+        sessionKey={sessionKey}
+        slotPush={slotPush}
+      >
+        {/* Delayed and shaped: nothing for the first 300 ms, then the layout the
+            manifest declares in `ui.loading` (default "page"). See AppLoadingFallback. */}
+        {/* `ui.loading` describes the app's routed page. A side-panel tab mounts
+            its own bundle (`entry` override) in a narrow panel, so it keeps the
+            default shape rather than borrowing the page's rail or split. */}
+        <Suspense fallback={<AppLoadingFallback appName={appDisplayName(app)} loading={entryOverride ? undefined : app.manifest?.ui?.loading} />}>
+          <LazyApp />
+        </Suspense>
+      </AppApiProvider>
+    </AppErrorBoundary>
+  )
+}
+
+export default function AppHost({ app, entry, active, sessionKey, requestedName }: AppHostProps) {
+  // Guard: not installed
+  if (!app) return <AppNotFound name={requestedName || 'unknown'} />
+  // Guard: disabled
+  if (app.enabled === false) return <AppDisabled app={app} />
+  // Guard: skipped at boot. Its bundle may load, but every route behind it is missing.
+  if (app.unavailable) return <AppUnavailable app={{ ...app, unavailable: app.unavailable }} />
+  // Guard: no UI bundle. An explicit `entry` (a panel-tab body) is its own
+  // bundle, so it does not require the app to also declare a routed `ui.entry`.
+  if (!entry && !app.manifest?.ui?.entry) return <AppNoUI app={app} />
+
+  return <AppHostInner app={app} entry={entry} active={active} sessionKey={sessionKey} />
+}

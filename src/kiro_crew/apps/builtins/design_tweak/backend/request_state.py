@@ -1,0 +1,632 @@
+"""Durable request and project state for the Design Tweak backend.
+
+``server`` is the composition root and security-policy owner.  Functions that
+depend on its mutable state or compatibility seams receive that module as
+``runtime`` and resolve collaborators through it at call time, making the
+server namespace the authoritative runtime boundary.
+
+Queue mutations are whole-record read-modify-write transactions.  Their caller
+must hold ``runtime._QUEUE_LOCK`` from the first read through the final write or
+rename.  Socket I/O, subprocess work, and response writes must remain outside
+that critical section.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import re
+import time
+import uuid
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any
+
+from kiro_crew.atomic_write import replace_with_retry
+from kiro_crew.platform_compat import strip_extended_length_prefix
+
+logger = logging.getLogger(__name__)
+
+JsonObject = dict[str, Any]
+
+COMMENT_STATUSES = ("new", "sent", "done")
+REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+class PathEscape(ValueError):
+    """A candidate path escaped the directory that must contain it."""
+
+
+class RecordTooLarge(ValueError):
+    """A queue record would serialize past the reader's byte ceiling."""
+
+
+def config_file(runtime: Any) -> Path:
+    """The project registry path, derived from the CURRENT ``runtime.DATA_DIR``."""
+
+    return runtime.DATA_DIR / "config.json"
+
+
+def _is_project_id(value: Any) -> bool:
+    """True for an id the routes can compare and use as a dict key: a string or an int."""
+
+    return isinstance(value, (str, int)) and not isinstance(value, bool)
+
+
+def _usable_project(project: Any) -> bool:
+    """True for a project row every route can read: a dict with an id and a string ``path``."""
+
+    return (
+        isinstance(project, dict)
+        and _is_project_id(project.get("id"))
+        and isinstance(project.get("path"), str)
+    )
+
+
+def _coerce_config(config: JsonObject) -> JsonObject:
+    """Give each registry field the type the routes index it as, in place.
+
+    A field of the wrong type takes its default and a project row that is not
+    usable is left out, so one bad value cannot crash every route that reads
+    the registry. Valid values pass through unchanged, extra keys included.
+    """
+
+    projects = config.get("projects")
+    if not isinstance(projects, list):
+        if projects is not None:
+            logger.warning("design-tweak config: projects is not a list; using []")
+        projects = []
+    usable = [project for project in projects if _usable_project(project)]
+    if len(usable) != len(projects):
+        logger.warning(
+            "design-tweak config: skipped %d project row(s) without an id and a string path",
+            len(projects) - len(usable),
+        )
+    config["projects"] = usable
+
+    if not _is_project_id(config.get("activeId")):
+        config["activeId"] = ""
+
+    counter = config.get("counter", 0)
+    try:
+        # ``int()`` is the conversion the legacy numbering applies, so every value
+        # it accepts ("5", 4.0, true) keeps its number; only what it refuses resets.
+        config["counter"] = int(counter)
+    except (TypeError, ValueError, OverflowError):
+        logger.warning("design-tweak config: counter %r is not a number; using 0", counter)
+        config["counter"] = 0
+    return config
+
+
+def load_config(runtime: Any) -> JsonObject:
+    """Load the registry from :func:`config_file`, tolerating bad state."""
+
+    try:
+        config = runtime.json.loads(config_file(runtime).read_text("utf-8"))
+        if isinstance(config, dict):
+            return _coerce_config(config)
+    except (OSError, ValueError):
+        pass
+    return {"projects": [], "activeId": "", "counter": 0}
+
+
+def save_config(runtime: Any, config: JsonObject) -> None:
+    """Atomically persist the project registry without the queue-record cap."""
+
+    runtime._atomic_write_json(config_file(runtime), config)
+
+
+def active_project(runtime: Any) -> JsonObject | None:
+    """Return the configured active project, if it still exists."""
+
+    for project in runtime._CFG["projects"]:
+        if project["id"] == runtime._CFG["activeId"]:
+            return project
+    return None
+
+
+def next_request_number(runtime: Any, project_id: str = "") -> int:
+    """Return the next project-local request number.
+
+    Scoped numbering is derived from queue and history files so there is only
+    one source of truth.  Unscoped legacy callers retain the global counter.
+    The caller must hold ``runtime._QUEUE_LOCK`` while using this value to create
+    and publish a request.
+    """
+
+    if not project_id:
+        # The stored counter can lag the records (``_coerce_config`` resets one it
+        # cannot read), so the next number also clears every unscoped record.
+        highest = _highest_number(runtime, lambda request: not request.get("projectId"))
+        runtime._CFG["counter"] = max(int(runtime._CFG.get("counter", 0)), highest) + 1
+        runtime._save_cfg(runtime._CFG)
+        return runtime._CFG["counter"]
+
+    return _highest_number(runtime, lambda request: request.get("projectId") == project_id) + 1
+
+
+def _highest_number(runtime: Any, matches: Callable[[JsonObject], bool]) -> int:
+    """The largest request ``number`` in the queue and history among records ``matches`` accepts."""
+
+    highest = 0
+    for directory in (runtime.QUEUE_DIR, runtime.HANDLED_DIR):
+        for path in directory.glob("*.json"):
+            request = runtime._read_request(path)
+            if not request or not matches(request):
+                continue
+            try:
+                highest = max(highest, int(request.get("number") or 0))
+            except (TypeError, ValueError, OverflowError):
+                continue
+    return highest
+
+
+def new_request_id() -> str:
+    """Mint a filesystem-safe, time-sortable request or comment id."""
+
+    return f"{int(time.time() * 1000)}-{uuid.uuid4().hex[:6]}"
+
+
+def utc_now_iso() -> str:
+    """Return the persisted timestamp format used by request records."""
+
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def pending_files(runtime: Any) -> list[Path]:
+    """Return pending request paths in stable filename order."""
+
+    return sorted(runtime.QUEUE_DIR.glob("*.json"))
+
+
+def contain_path(base: Path | str, candidate: str = "") -> Path:
+    """Resolve ``candidate`` and return it only when it remains under ``base``.
+
+    Both sides are realpath-normalized so traversal and symlink escapes collapse
+    before the comparison.  The separator check rejects sibling-prefix paths.
+    Callers must use the returned path rather than reopening the input path.
+
+    The comparison additionally runs through ``os.path.normcase``, which is a
+    no-op on POSIX and folds case plus the separator on Windows.  Only the
+    PREFIX that already exists gets canonicalized by ``realpath``, so a record
+    path whose file has not been created yet could otherwise disagree with its
+    own base on drive-letter case alone and read as an escape — a spurious 403
+    on a legitimate write.  The raised message keeps the un-folded paths so the
+    text still names what the caller actually passed.
+    """
+
+    base_real = os.path.realpath(base)
+    candidate_real = os.path.realpath(os.path.join(base_real, candidate))
+    # Windows' ``\\?\`` prefix is folded off both sides before ``normcase``,
+    # which neither adds nor strips it: one ``realpath`` can keep it while the
+    # other does not, and the lone prefix would read as an escape.
+    base_cmp = os.path.normcase(strip_extended_length_prefix(base_real))
+    candidate_cmp = os.path.normcase(strip_extended_length_prefix(candidate_real))
+    if not candidate_cmp.startswith(base_cmp):
+        raise PathEscape(f"{candidate_real!r} is outside {base_real!r}")
+    if candidate_cmp != base_cmp and not candidate_cmp[len(base_cmp) :].startswith(
+        os.path.normcase(os.sep)
+    ):
+        raise PathEscape(f"{candidate_real!r} is a sibling of {base_real!r}, not inside it")
+    return Path(candidate_real)
+
+
+def request_file(runtime: Any, base: Path, request_id: str) -> Path:
+    """Return the contained JSON path for a syntactically safe request id."""
+
+    if not request_id or not runtime._ID_RE.match(request_id):
+        raise runtime._PathEscape(f"invalid request id: {request_id!r}")
+    return runtime._contained(base, f"{request_id}.json")
+
+
+def is_kirocrew_internal(runtime: Any, target: Path) -> bool:
+    """Return whether ``target`` resolves within a private Kiro Crew tree."""
+
+    # Folded on both sides so a ``\\?\``-prefixed resolve of an internal path
+    # is still recognised as internal.
+    real = strip_extended_length_prefix(runtime.os.path.realpath(target))
+    for base in runtime._KIROCREW_INTERNAL_DIRS:
+        base = strip_extended_length_prefix(base)
+        if real == base or real.startswith(base + runtime.os.sep):
+            return True
+    return False
+
+
+def valid_target(runtime: Any, url: str) -> bool:
+    """Accept only an HTTP URL targeting a dialable loopback port."""
+
+    try:
+        parsed = runtime.urlparse(url)
+        if parsed.scheme != "http":
+            return False
+        if (parsed.hostname or "").lower() not in runtime._LOOPBACK_HOSTS:
+            return False
+        port = parsed.port
+    except ValueError:
+        return False
+    return port is None or 1 <= port <= 65535
+
+
+def valid_root(runtime: Any, path: str) -> Path | None:
+    """Resolve an existing project root after server-owned policy checks."""
+
+    try:
+        real = runtime.os.path.realpath(runtime.os.path.expanduser(path))
+    except (ValueError, OSError):
+        return None
+    if set(runtime.Path(real).parts) & runtime._DENIED_ROOT_PARTS:
+        return None
+    if runtime.is_sensitive_path(real):
+        return None
+    if runtime.path_contains_sensitive(real):
+        return None
+    resolved = runtime.Path(real)
+    if not resolved.is_dir():
+        return None
+    return resolved
+
+
+def request_status(request: JsonObject) -> str:
+    """Derive request status from authoritative per-comment statuses."""
+
+    comments = request.get("comments") or []
+    if not comments:
+        # Only a draft is ever written with no comments (the last delete unlinks
+        # it), so an empty record that says it was sent stays sealed.
+        return "draft" if request.get("state", "draft") == "draft" else "sent"
+    if all(comment.get("status") == "done" for comment in comments):
+        return "done"
+    if request.get("state") != "draft" or any(
+        comment.get("status") != "new" for comment in comments
+    ):
+        return "sent"
+    return "draft"
+
+
+def is_draft(runtime: Any, request: JsonObject) -> bool:
+    """Return whether a request remains open for new comments."""
+
+    return runtime._request_status(request) == "draft"
+
+
+def element_name(element: JsonObject) -> str:
+    """Build a tolerant human-readable label for a captured element."""
+
+    name = str(element.get("tag") or "")
+    element_id = element.get("id")
+    classes = element.get("classes")
+    if element_id:
+        name += f"#{element_id}"
+    elif isinstance(classes, (list, tuple)):
+        names = [value for value in classes[:2] if isinstance(value, str)]
+        if names:
+            name += "." + ".".join(names)
+    return name
+
+
+def redact_thread(runtime: Any, thread: object) -> list[JsonObject]:
+    """Return a read-tolerant thread, redacted as a floor under the ingest pass.
+
+    ``/thread`` already redacts before writing, so nothing new should reach disk
+    unredacted — but ingest is not the only writer. The delivery model hands the
+    agent the queue JSON directly (that is how a request reaches it), so an entry
+    written into the file rather than posted to ``/thread``, or one persisted
+    before the ingest pass existed, would otherwise render verbatim in the panel.
+    Redaction is an always-on floor in this repo, so it belongs on both edges.
+    """
+
+    if not isinstance(thread, list):
+        return []
+    result: list[JsonObject] = []
+    for entry in thread:
+        if not isinstance(entry, dict):
+            # Tolerate a malformed file rather than 500 the read path: a 500 here
+            # is unrecoverable without deleting the queue file by hand.
+            continue
+        result.append({**entry, "text": runtime._redact_text(entry.get("text", ""))})
+    return result
+
+
+def summarize_comment(runtime: Any, comment: JsonObject) -> JsonObject:
+    """Return the panel-facing shape of one comment."""
+
+    selection = comment.get("selection") or {}
+    # Keep only dict elements. ``/submit`` rejects a malformed selection at the
+    # boundary, but a queue file written before that guard existed would still
+    # crash ``element_name`` here, and this read path must stay recoverable.
+    raw_elements = selection.get("elements") or []
+    elements = [element for element in raw_elements if isinstance(element, dict)]
+    element = elements[0] if elements else {}
+    return {
+        "cid": comment.get("cid", ""),
+        "index": comment.get("index", 0),
+        "status": comment.get("status", "new"),
+        # Redacted on the way OUT for the same reason as ``thread`` below: the
+        # delivery model hands the agent the queue JSON directly, so a comment
+        # rewritten in the FILE rather than posted through ``/submit`` (which
+        # redacts on ingest) would otherwise render verbatim in the panel.
+        "comment": runtime._redact_text(comment.get("comment", "")),
+        "createdAt": comment.get("createdAt", ""),
+        "element": runtime._el_name(element),
+        "locator": element.get("locator", ""),
+        # Fallback anchors, so a pin survives its element being deleted (parent) or
+        # not existing yet (point). The overlay tries them in that order.
+        "parentLocator": element.get("parentLocator", ""),
+        "point": element.get("point") or {},
+        "count": len(elements),
+        "mode": selection.get("mode", "single"),
+        "previewUrl": comment.get("previewUrl", ""),
+        "projectId": comment.get("projectId", ""),
+        "sourceFile": comment.get("sourceFile", ""),
+        # Where the agent should edit, and how much to trust it:
+        # data-kiro-source → "high", React Fiber → "medium", neither → "low".
+        # Independent of how the page was served, so a dev-server project gets
+        # BETTER targeting than a proxied static folder, not worse.
+        "source": element.get("source") or {},
+        "followUpTo": comment.get("followUpTo", ""),
+        "thread": runtime._redact_thread(comment.get("thread")),
+    }
+
+
+def summarize_request(runtime: Any, request: JsonObject) -> JsonObject:
+    """Return request metadata and its panel-facing comment summaries."""
+
+    comments = request.get("comments") or []
+    return {
+        "id": request.get("id", ""),
+        "number": request.get("number", 0),
+        "state": request.get("state", "draft"),
+        "status": runtime._request_status(request),
+        "createdAt": request.get("createdAt", ""),
+        "sentAt": request.get("sentAt", ""),
+        # Set only once the panel confirms the prompt actually reached the agent.
+        # Sealed-but-not-acknowledged is the stranded state the retry bar exists for.
+        "deliveredAt": request.get("deliveredAt", ""),
+        "projectId": request.get("projectId", ""),
+        "projectRoot": request.get("projectRoot", ""),
+        "thread": runtime._redact_thread(request.get("thread")),
+        "doneCount": sum(1 for comment in comments if comment.get("status") == "done"),
+        "comments": [runtime._summarize_comment(comment) for comment in comments],
+    }
+
+
+def project_for_preview(runtime: Any, preview_url: str) -> tuple[JsonObject | None, str]:
+    """Resolve a project and relative file from an owned static preview URL."""
+
+    url = str(preview_url)
+    relative = ""
+    matched = False
+    for project_id, record in runtime._STATIC_SRV.items():
+        base = record.get("url") or ""
+        if base and url.startswith(f"{base}{project_id}/"):
+            relative = url[len(base) :]
+            matched = True
+            break
+    if not matched:
+        marker = "/api/proxy/"
+        marker_at = url.find(marker)
+        if marker_at == -1:
+            return None, ""
+        relative = url[marker_at + len(marker) :]
+
+    relative = relative.split("?")[0].split("#")[0]
+    project_id = relative.split("/", 1)[0] if relative else ""
+    rest = relative.split("/", 1)[1] if "/" in relative else ""
+    project = next(
+        (item for item in runtime._CFG["projects"] if item["id"] == project_id),
+        None,
+    )
+    return project, rest
+
+
+def project_by_id(runtime: Any, project_id: str) -> JsonObject | None:
+    """Look up a registered project by id."""
+
+    if not project_id:
+        return None
+    return next(
+        (project for project in runtime._CFG["projects"] if project["id"] == project_id),
+        None,
+    )
+
+
+def resolve_project(runtime: Any, payload: JsonObject) -> tuple[str, str, str]:
+    """Resolve ``(project id, project root, contained source file)`` for a capture."""
+
+    preview_url = str(payload.get("previewUrl", ""))
+    explicit_id = str(payload.get("projectId", "") or "")
+    project = runtime._project_by_id(explicit_id)
+    served_relative = ""
+
+    if project is not None:
+        url_project, served_relative = runtime._proj_for_preview(preview_url)
+        if url_project is not None and url_project["id"] != project["id"]:
+            served_relative = ""
+    else:
+        project, served_relative = runtime._proj_for_preview(preview_url)
+
+    if project is not None:
+        root = project["path"]
+        return project["id"], root, runtime._contained_source(root, served_relative)
+    if runtime._ROOT:
+        return (
+            explicit_id,
+            runtime._ROOT,
+            runtime._contained_source(runtime._ROOT, served_relative),
+        )
+    return explicit_id, "", ""
+
+
+def contained_source(runtime: Any, root: str, relative: str) -> str:
+    """Return a contained source path, or an empty string on escape/route input."""
+
+    if not relative:
+        return ""
+    try:
+        return str(runtime._contained(root, relative))
+    except runtime._PathEscape:
+        return ""
+
+
+def sanitize_selection_sources(runtime: Any, selection: Any, root: str) -> None:
+    """Contain preview-controlled element source paths in place, failing closed."""
+
+    if not isinstance(selection, dict):
+        return
+    for element in selection.get("elements") or []:
+        if not isinstance(element, dict):
+            continue
+        source = element.get("source")
+        if not isinstance(source, dict) or not source.get("file"):
+            continue
+        safe = runtime._contained_source(root, str(source["file"])) if root else ""
+        if safe:
+            source["file"] = safe
+        else:
+            source["file"] = ""
+            source["confidence"] = "low"
+
+
+def read_request(runtime: Any, path: Path) -> JsonObject | None:
+    """Read one contained, size-bounded queue record.
+
+    The size check must precede ``read_text``.  Queue files are writable outside
+    this process, and a single oversized file must not poison queue listing.
+    """
+
+    try:
+        contained = runtime._contained(runtime.DATA_DIR, runtime.os.fspath(path))
+        if contained.stat().st_size > runtime.MAX_RECORD_BYTES:
+            return None
+        request = runtime.json.loads(contained.read_text("utf-8"))
+    except (runtime._PathEscape, OSError, ValueError):
+        return None
+    return _coerce_request(request) if isinstance(request, dict) else None
+
+
+def _coerce_request(request: JsonObject) -> JsonObject:
+    """Give a queue record's ``comments`` the list-of-objects shape its readers index, in place.
+
+    Every route walks ``comments`` and calls ``.get`` on each entry, so a stored
+    value that is not a list, or an entry that is not an object, holds no comment
+    any route can read. Those take the empty default. A missing key stays missing,
+    and a well-formed record passes through unchanged.
+    """
+
+    if "comments" in request:
+        comments = request["comments"]
+        if not isinstance(comments, list):
+            request["comments"] = []
+        elif not all(isinstance(comment, dict) for comment in comments):
+            kept = [comment for comment in comments if isinstance(comment, dict)]
+            # Renumber like a comment delete does, so the next comment's
+            # ``len + 1`` index never repeats one a kept comment holds.
+            for index, comment in enumerate(kept, start=1):
+                comment["index"] = index
+            request["comments"] = kept
+    return request
+
+
+def atomic_write_json(
+    runtime: Any,
+    path: Path,
+    payload: JsonObject,
+    *,
+    max_bytes: int | None = None,
+) -> None:
+    """Publish complete durable JSON with a same-directory atomic replacement."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = runtime.json.dumps(payload, indent=2).encode("utf-8")
+    if max_bytes is not None and len(data) > max_bytes:
+        raise runtime._RecordTooLarge(
+            f"record would be {len(data)} bytes, over the {max_bytes}-byte limit"
+        )
+
+    descriptor, temporary = runtime.tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+    try:
+        try:
+            written = 0
+            while written < len(data):
+                count = runtime.os.write(descriptor, data[written:])
+                if count <= 0:  # pragma: no cover - os.write normally raises
+                    raise OSError(f"short write to {temporary}: {written}/{len(data)} bytes")
+                written += count
+            runtime.os.fsync(descriptor)
+        finally:
+            runtime.os.close(descriptor)
+        replace_with_retry(temporary, path)
+    finally:
+        if runtime.os.path.exists(temporary):
+            runtime.os.unlink(temporary)
+
+
+def write_request(runtime: Any, path: Path, request: JsonObject) -> None:
+    """Atomically write a contained request using the shared read/write ceiling."""
+
+    contained = runtime._contained(runtime.DATA_DIR, runtime.os.fspath(path))
+    runtime._atomic_write_json(
+        contained,
+        request,
+        max_bytes=runtime.MAX_RECORD_BYTES,
+    )
+
+
+def find_request(runtime: Any, request_id: str) -> Path | None:
+    """Locate a request in queue first, then handled history."""
+
+    for directory in (runtime.QUEUE_DIR, runtime.HANDLED_DIR):
+        try:
+            path = runtime._request_file(directory, request_id)
+        except runtime._PathEscape:
+            return None
+        if path.is_file():
+            return path
+    return None
+
+
+def open_draft_file(runtime: Any, project_id: str) -> Path | None:
+    """Return the project's single open draft, based on derived status."""
+
+    for path in runtime._pending_files():
+        request = runtime._read_request(path)
+        if request and request.get("projectId") == project_id and runtime._is_draft(request):
+            return path
+    return None
+
+
+__all__ = [
+    "COMMENT_STATUSES",
+    "JsonObject",
+    "PathEscape",
+    "RecordTooLarge",
+    "REQUEST_ID_RE",
+    "active_project",
+    "atomic_write_json",
+    "contain_path",
+    "contained_source",
+    "element_name",
+    "find_request",
+    "is_draft",
+    "is_kirocrew_internal",
+    "load_config",
+    "new_request_id",
+    "next_request_number",
+    "open_draft_file",
+    "pending_files",
+    "project_by_id",
+    "project_for_preview",
+    "read_request",
+    "redact_thread",
+    "request_file",
+    "request_status",
+    "resolve_project",
+    "sanitize_selection_sources",
+    "save_config",
+    "summarize_comment",
+    "summarize_request",
+    "utc_now_iso",
+    "valid_root",
+    "valid_target",
+    "write_request",
+]

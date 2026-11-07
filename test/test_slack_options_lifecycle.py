@@ -1,0 +1,1084 @@
+"""OPTIONS lifecycle on the Slack surface.
+
+Every outbound path renders a trailing ``[OPTIONS: …]`` tag as a control, and a control
+stops being answerable once the conversation moves past its question. The ``_expiry``
+and ``_link`` siblings cover the expiry primitives and the link-time backfill.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+from aiohttp import web
+from aiohttp.test_utils import TestClient, TestServer
+from chat_test_helpers import _make_state
+from slack_options_lifecycle_helpers import (
+    _recs,
+    _set_recs,
+)
+from test_handler_turn import SLACK_TURN_FUNCTIONS
+from turn_harness import SlotSpec, TurnContext, TurnScript, run_turn
+
+from kiro_crew.acp.types import EVENT_COMPLETE, EVENT_TEXT_CHUNK, AcpEvent
+from kiro_crew.dashboard.chat_utils import remember_slack_options
+from kiro_crew.slack.format import build_options_blocks
+from kiro_crew.slack.outbound import PostedOptions
+
+AWS_KEY = "AKIAIOSFODNN7EXAMPLE"
+
+
+def _mirror_slack() -> MagicMock:
+    """A Slack client a dashboard turn can mirror its streamed reply through."""
+    slack = MagicMock()
+    slack.post_message = AsyncMock(return_value="body-ts")
+    slack.start_stream = AsyncMock(return_value="stream-ts")
+    slack.append_stream = AsyncMock()
+    slack.stop_stream = AsyncMock()
+    slack.update_message = AsyncMock()
+    return slack
+
+
+_OPTIONS_REPLY = [
+    AcpEvent(kind=EVENT_TEXT_CHUNK, text="Pick one.\n\n[OPTIONS: A | B]"),
+    AcpEvent(kind=EVENT_COMPLETE, stop_reason="end_turn"),
+]
+
+
+async def _mirror_turn(*, relink_to: str | None = None, newer: PostedOptions | None = None):
+    """One Slack-linked dashboard turn whose reply ends in an OPTIONS tag.
+
+    With *relink_to*, the thread is relinked to that session while the mirror's
+    ``post_blocks`` is in flight, and *newer* is the control it records meanwhile.
+    """
+    slack = _mirror_slack()
+    owner: dict = {"key": None}
+    held: dict = {}
+
+    async def _post_blocks(_channel, _blocks, _text, _thread, *_a, **_k):
+        if relink_to is not None:
+            owner["key"] = relink_to
+            _set_recs(held["state"], relink_to, (newer,))
+        return "opt-mirror"
+
+    slack.post_blocks = AsyncMock(side_effect=_post_blocks)
+
+    def _arrange(ctx: TurnContext) -> None:
+        held["state"] = ctx.state
+        ctx.state.slack_client = slack
+        ctx.state.sessions.set_slack_link("dashboard:s1", "thread-1", "C-1")
+        ctx.state.sessions.get_session_for_thread = lambda _ts: owner["key"]
+
+    record = await run_turn(
+        TurnScript(events=_OPTIONS_REPLY, setup=_arrange), slot=SlotSpec(key="s1")
+    )
+    return slack, record, held["state"]
+
+
+async def _live_control_turn(message: str):
+    """A dashboard turn on a slot whose previous answer left a live OPTIONS control.
+
+    ``seen["at_acquisition"]`` is the slot's control store and the edit count at
+    the moment the turn asks for its session, if it gets that far.
+    """
+    slack = _mirror_slack()
+    seen: dict = {}
+
+    def _arrange(ctx: TurnContext) -> None:
+        seen["state"] = ctx.state
+        ctx.state.slack_client = slack
+        remember_slack_options(
+            ctx.state,
+            "dashboard:s1",
+            PostedOptions(channel="C-1", ts="opt-live", choices=("A", "B"), blocks=()),
+        )
+        acquire = ctx.state.sessions.get_or_create
+
+        async def _acquire(*args, **kwargs):
+            seen["at_acquisition"] = (
+                _recs(ctx.state, "dashboard:s1"),
+                slack.update_message.await_count,
+            )
+            return await acquire(*args, **kwargs)
+
+        ctx.state.sessions.get_or_create = _acquire
+
+    events = [
+        AcpEvent(kind=EVENT_TEXT_CHUNK, text="ok"),
+        AcpEvent(kind=EVENT_COMPLETE, stop_reason="end_turn"),
+    ]
+    record = await run_turn(
+        TurnScript(events=events, message=message, setup=_arrange), slot=SlotSpec(key="s1")
+    )
+    return slack, record, seen["state"], seen
+
+
+def _posted_texts(slack: MagicMock) -> list[str]:
+    return [c.args[1] for c in slack.post_message.await_args_list]
+
+
+class TestControlPostedAfterTheWindowIsSpent:
+    """A control recorded after its expiry window closed must be spent on the spot.
+
+    The native footer and the link backfill both post after a concurrent turn's expiry
+    pass may have run, so each re-checks after recording and expires at once if the
+    conversation moved on.
+    """
+
+    def test_options_are_recorded_under_the_threads_live_owner(self):
+        """Structural: the record and the expiry must key off the SAME owner.
+
+        A thread linked mid-turn changes owner, so recording under the starting key hides
+        the control from the next expiry. The footer path resolves the owner ONCE so a
+        link between its record and its cleanup cannot split them.
+        """
+        import inspect
+
+        from kiro_crew.slack import handler, transport_dispatch
+
+        dispatch = inspect.getsource(transport_dispatch.handle_message_transport)
+        owner_expr = "get_session_for_thread(reply_ts) or session_key"
+        d_owner = dispatch.find("_options_owner =")
+        assert d_owner != -1, "transport_dispatch must resolve the owner into a variable"
+        assert owner_expr in dispatch[d_owner : d_owner + 200], (
+            "transport_dispatch must resolve the thread's LIVE owner, not the key "
+            "the turn started under"
+        )
+        rec = dispatch.find("remember_slack_options(")
+        assert rec != -1
+        assert (
+            "_options_owner" in dispatch[rec : rec + 300]
+        ), "the record must consume the resolved owner, not a re-derived key"
+
+        footer = "".join(inspect.getsource(getattr(handler, n)) for n in SLACK_TURN_FUNCTIONS)
+        owner = footer.find("_options_owner =")
+        assert owner != -1, "the footer path must resolve the owner once, into a variable"
+        assert "get_session_for_thread(reply_ts) or session_key" in footer[owner : owner + 200]
+        # Both the record and the cleanup must consume that one resolution.
+        assert footer.count("_options_owner") >= 3, (
+            "the footer's record AND its superseded-cleanup must both use the "
+            "single resolved owner, or a mid-turn relink can split them"
+        )
+
+    def test_a_non_conversational_command_does_not_spend_a_live_control(self):
+        """`ping`/`status`/denial must not expire a still-pending question.
+
+        Asserted on source order: in both entry points the expiry sits BELOW every
+        short-circuit that answers without a turn, so a shortcut added later inherits it.
+        """
+        import inspect
+
+        from kiro_crew.slack import handler, transport_dispatch
+
+        for name, src, shortcuts in (
+            (
+                "transport_dispatch",
+                inspect.getsource(transport_dispatch.handle_message_transport),
+                ('_lower == "ping"', '_lower == "status"', "if _only_modifier:"),
+            ),
+            (
+                "handler",
+                "".join(inspect.getsource(getattr(handler, n)) for n in SLACK_TURN_FUNCTIONS),
+                ('.lower() == "status"', "if _only_modifier:", "_Permission denied._"),
+            ),
+        ):
+            expiry = src.find("await expire_slack_options(")
+            assert expiry != -1, f"{name} must still expire on a real turn"
+            for shortcut in shortcuts:
+                at = src.find(shortcut)
+                assert at != -1, f"{name}: shortcut {shortcut!r} not found -- test is stale"
+                assert at < expiry, (
+                    f"{name}: the OPTIONS expiry must come AFTER {shortcut!r}; a path "
+                    "that answers without running the agent has not superseded the "
+                    "pending question and must not spend its control"
+                )
+            # ...and it must still precede the turn itself.
+            keyword = src.find("maybe_handle_keyword_command")
+            assert (
+                keyword != -1 and keyword < expiry
+            ), f"{name}: keyword commands dispatch elsewhere and must not expire either"
+
+    @pytest.mark.asyncio
+    async def test_backfill_expires_when_the_transcript_advanced_mid_drain(
+        self, tmp_path, monkeypatch
+    ):
+        """The seeding drain is backgrounded, so a reply can land while it runs.
+
+        Every post awaits Slack (roughly one message per second), so the newest
+        reply's control can be recorded AFTER a new turn already ran its expiry
+        pass — leaving live buttons for a superseded question. The drain re-checks
+        and spends it itself.
+        """
+        from kiro_crew.dashboard import chat_slack
+        from kiro_crew.dashboard.chat_backfill import BackfillSelection
+
+        expired: list[str] = []
+
+        async def _record_expire(_state, session_key, ts=None):
+            expired.append(session_key)
+
+        monkeypatch.setattr(chat_slack, "expire_slack_options", _record_expire)
+
+        state = _make_state(tmp_path)
+        slot = state.get_or_create_slot("s1")
+        reply = {"role": "assistant", "content": "pick one [OPTIONS: A | B]"}
+        slot.messages.extend([{"role": "user", "content": "hi"}, reply])
+
+        monkeypatch.setattr(
+            chat_slack,
+            "select_backfill_messages",
+            lambda _s, _sl: BackfillSelection(first_turn=[], recent=[[reply]], skipped_turns=0),
+        )
+
+        slack = MagicMock()
+        slack.post_blocks = AsyncMock(return_value="opt-1")
+        state.slack_client = slack
+
+        # A reply lands mid-drain: the transcript grows while we are posting.
+        # Bump total_messages too — that is what state.add_message does, and it is
+        # the signal the drain compares.
+        async def _grow(*_a, **_k):
+            slot.messages.append({"role": "user", "content": "actually, neither"})
+            slot.total_messages += 1
+            return "p1"
+
+        slack.post_message = _grow
+
+        # Production links BEFORE spawning the drain (link_slack is the canonical
+        # writer), so a faithful drain test starts from a linked slot.
+        state.link_slack(slot.key, "thread-1", "C-1")
+        await chat_slack.drain_slack_backfill(state, slot, "C-1", "thread-1")
+
+        assert expired, "a transcript that advanced during the drain must spend the control"
+
+    @pytest.mark.asyncio
+    async def test_mid_drain_expiry_spends_only_the_control_the_drain_posted(
+        self, tmp_path, monkeypatch
+    ):
+        """The drain's own cleanup must not spend a control a newer turn recorded.
+
+        A turn can finish DURING the drain and record its own control in the same slot,
+        so the drain expires only the ts it posted itself.
+        """
+        from kiro_crew.dashboard import chat_slack
+        from kiro_crew.dashboard.chat_backfill import BackfillSelection
+        from kiro_crew.slack.outbound import PostedOptions
+
+        state = _make_state(tmp_path)
+        slot = state.get_or_create_slot("s1")
+        reply = {"role": "assistant", "content": "pick one [OPTIONS: A | B]"}
+        slot.messages.extend([{"role": "user", "content": "hi"}, reply])
+
+        monkeypatch.setattr(
+            chat_slack,
+            "select_backfill_messages",
+            lambda _s, _sl: BackfillSelection(first_turn=[], recent=[[reply]], skipped_turns=0),
+        )
+
+        newer = PostedOptions(channel="C-1", ts="opt-NEWER", choices=("X",), blocks=())
+
+        slack = MagicMock()
+        slack.post_blocks = AsyncMock(return_value="opt-REPLAYED")
+        edited: list[str] = []
+
+        async def _update(channel, ts, **_kw):
+            edited.append(ts)
+
+        slack.update_message = _update
+        state.slack_client = slack
+
+        # A brand-new turn completes mid-drain: the transcript grows AND it
+        # records its own live control in the same slot.
+        async def _grow(*_a, **_k):
+            slot.messages.append({"role": "assistant", "content": "new q [OPTIONS: X]"})
+            slot.total_messages += 1
+            _set_recs(state, slot, (*_recs(state, slot), newer))
+            return "p1"
+
+        slack.post_message = _grow
+
+        # Production links BEFORE spawning the drain (link_slack is the canonical
+        # writer), so a faithful drain test starts from a linked slot.
+        state.link_slack(slot.key, "thread-1", "C-1")
+        await chat_slack.drain_slack_backfill(state, slot, "C-1", "thread-1")
+
+        assert "opt-REPLAYED" in edited, "the drain must spend the control it posted"
+        assert "opt-NEWER" not in edited, "a newer turn's live control must NOT be struck through"
+        assert newer in _recs(state, slot), "the newer control must stay tracked"
+
+    @pytest.mark.asyncio
+    async def test_backfill_renders_the_newest_reply_as_a_live_control(self, tmp_path, monkeypatch):
+        """An OPTIONS tag in replayed history must be a control, not literal text.
+
+        Guards the headline defect of this PR against the seeding rewrite: the
+        drain posts bodies as plain text, so without lifting the tag out the
+        choices would arrive as the characters `[OPTIONS: A | B]`. Only the newest
+        reply is answerable; an earlier one renders struck through.
+        """
+        from kiro_crew.dashboard import chat_slack
+        from kiro_crew.dashboard.chat_backfill import BackfillSelection
+
+        state = _make_state(tmp_path)
+        slot = state.get_or_create_slot("s1")
+        older = {"role": "assistant", "content": "an old question [OPTIONS: X | Y]"}
+        newest = {"role": "assistant", "content": "pick one [OPTIONS: A | B]"}
+        typed = {"role": "user", "content": "I typed [OPTIONS: not | mine] myself"}
+
+        monkeypatch.setattr(
+            chat_slack,
+            "select_backfill_messages",
+            lambda _s, _sl: BackfillSelection(
+                first_turn=[], recent=[[older], [typed], [newest]], skipped_turns=0
+            ),
+        )
+
+        slack = MagicMock()
+        slack.post_message = AsyncMock(return_value="p1")
+        slack.post_blocks = AsyncMock(return_value="opt-1")
+        state.slack_client = slack
+
+        # Production links BEFORE spawning the drain (link_slack is the canonical
+        # writer), so a faithful drain test starts from a linked slot.
+        state.link_slack(slot.key, "thread-1", "C-1")
+        await chat_slack.drain_slack_backfill(state, slot, "C-1", "thread-1")
+
+        # Two agent tags become two control messages; the user's typed tag does not.
+        assert slack.post_blocks.await_count == 2, slack.post_blocks.await_args_list
+        # Only the newest is recorded, so only it can be expired later — the older
+        # one was posted already spent and there is nothing to strike through.
+        assert [p.ts for p in _recs(state, slot)] == ["opt-1"]
+        # The user's own words survive verbatim, tag included.
+        posted_text = " ".join(str(c.args[1]) for c in slack.post_message.await_args_list)
+        assert "[OPTIONS: not | mine]" in posted_text
+
+    @pytest.mark.asyncio
+    async def test_backfill_redacts_credentials_inside_options_choices(self, tmp_path, monkeypatch):
+        """Choices bypass the body pipeline, so they need their own redaction.
+
+        The body goes through _format_backfill_parts, which redacts. The choices
+        go out as Block Kit label/value instead, so extracting them from raw
+        history would put a credential into Slack with no redaction anywhere on
+        that path.
+        """
+        from kiro_crew.dashboard import chat_slack
+        from kiro_crew.dashboard.chat_backfill import BackfillSelection
+
+        secret = "AKIAIOSFODNN7EXAMPLE"
+        reply = {"role": "assistant", "content": f"which key? [OPTIONS: {secret} | cancel]"}
+
+        state = _make_state(tmp_path)
+        slot = state.get_or_create_slot("s1")
+        monkeypatch.setattr(
+            chat_slack,
+            "select_backfill_messages",
+            lambda _s, _sl: BackfillSelection(first_turn=[], recent=[[reply]], skipped_turns=0),
+        )
+
+        slack = MagicMock()
+        slack.post_message = AsyncMock(return_value="p1")
+        slack.post_blocks = AsyncMock(return_value="opt-1")
+        state.slack_client = slack
+
+        # Production links BEFORE spawning the drain (link_slack is the canonical
+        # writer), so a faithful drain test starts from a linked slot.
+        state.link_slack(slot.key, "thread-1", "C-1")
+        await chat_slack.drain_slack_backfill(state, slot, "C-1", "thread-1")
+
+        blocks_text = json.dumps(slack.post_blocks.await_args_list[0].args[1])
+        assert secret not in blocks_text, "a credential must never reach an OPTIONS control"
+
+    @pytest.mark.asyncio
+    async def test_backfill_expiry_survives_a_slot_at_the_trim_cap(self, tmp_path, monkeypatch):
+        """At the message cap, a new turn does not change len(slot.messages).
+
+        add_message trims from the front past _MAX_SLOT_MESSAGES, so the length stays the
+        same; total_messages is a lifetime counter and still moves.
+        """
+        from kiro_crew.dashboard import chat_slack
+        from kiro_crew.dashboard.chat_backfill import BackfillSelection
+
+        expired: list[str] = []
+
+        async def _record_expire(_state, session_key, ts=None):
+            expired.append(session_key)
+
+        monkeypatch.setattr(chat_slack, "expire_slack_options", _record_expire)
+
+        state = _make_state(tmp_path)
+        slot = state.get_or_create_slot("s1")
+        reply = {"role": "assistant", "content": "pick one [OPTIONS: A | B]"}
+        monkeypatch.setattr(
+            chat_slack,
+            "select_backfill_messages",
+            lambda _s, _sl: BackfillSelection(first_turn=[], recent=[[reply]], skipped_turns=0),
+        )
+
+        slack = MagicMock()
+        slack.post_blocks = AsyncMock(return_value="opt-1")
+        state.slack_client = slack
+
+        # A turn lands mid-drain on a slot AT the cap: one row in, one row out, so
+        # the list length is unchanged while total_messages advances.
+        async def _grow_at_cap(*_a, **_k):
+            slot.messages.append({"role": "user", "content": "actually, neither"})
+            del slot.messages[:1]
+            slot.total_messages += 1
+            return "p1"
+
+        slack.post_message = _grow_at_cap
+        before = len(slot.messages)
+
+        # Production links BEFORE spawning the drain (link_slack is the canonical
+        # writer), so a faithful drain test starts from a linked slot.
+        state.link_slack(slot.key, "thread-1", "C-1")
+        await chat_slack.drain_slack_backfill(state, slot, "C-1", "thread-1")
+
+        assert len(slot.messages) == before, "the length must be unchanged for this test to bite"
+        assert expired, "advancement must be detected via total_messages, not list length"
+
+    @pytest.mark.asyncio
+    async def test_backfill_spends_the_control_when_a_turn_runs_throughout(
+        self, tmp_path, monkeypatch
+    ):
+        """A turn in flight for the WHOLE drain moves neither baseline.
+
+        slot.running is the same at both ends and no row may be appended yet, but the
+        agent is mid-reply, so the replayed question is stale and must still be spent.
+        """
+        from kiro_crew.dashboard import chat_slack
+        from kiro_crew.dashboard.chat_backfill import BackfillSelection
+
+        expired: list[str] = []
+
+        async def _record_expire(_state, session_key, ts=None):
+            expired.append(session_key)
+
+        monkeypatch.setattr(chat_slack, "expire_slack_options", _record_expire)
+
+        state = _make_state(tmp_path)
+        slot = state.get_or_create_slot("s1")
+        reply = {"role": "assistant", "content": "pick one [OPTIONS: A | B]"}
+        # Running before, during and after — and no new row lands. `running` is a
+        # derived property (task is not None and not task.done()), so an in-flight
+        # turn is simulated with a pending future rather than by assignment.
+        slot.task = asyncio.get_running_loop().create_future()
+        assert slot.running, "the test must actually present an in-flight turn"
+        before_total = slot.total_messages
+
+        monkeypatch.setattr(
+            chat_slack,
+            "select_backfill_messages",
+            lambda _s, _sl: BackfillSelection(first_turn=[], recent=[[reply]], skipped_turns=0),
+        )
+
+        slack = MagicMock()
+        slack.post_message = AsyncMock(return_value="p1")
+        slack.post_blocks = AsyncMock(return_value="opt-1")
+        state.slack_client = slack
+
+        # Production links BEFORE spawning the drain (link_slack is the canonical
+        # writer), so a faithful drain test starts from a linked slot.
+        state.link_slack(slot.key, "thread-1", "C-1")
+        await chat_slack.drain_slack_backfill(state, slot, "C-1", "thread-1")
+
+        assert slot.total_messages == before_total, "no row may land for this test to bite"
+        assert expired, "a turn running throughout the drain must spend the control"
+        slot.task.cancel()
+
+    def test_an_ansi_split_credential_in_a_choice_does_not_reach_slack(self):
+        """A credential broken up by escapes must not survive into a choice.
+
+        `slack.format.build_options_blocks` redacts every choice through
+        `redact_for_display`, which scans the form Slack DISPLAYS (ANSI, emphasis,
+        backticks, link markup).
+        """
+        from kiro_crew.slack.format import strip_ansi
+
+        # An AWS key broken up by a colour escape mid-token.
+        secret = "AKIA\x1b[0mIOSFODNN7EXAMPLE"
+        blocks = build_options_blocks([secret, "cancel"])
+
+        rendered = strip_ansi(json.dumps(blocks))
+        # Assert on the ANSI-STRIPPED render: leaving the escape in is not a
+        # defence, because whatever shows the choice strips it and the reader
+        # sees the key whole. Asserting on the raw bytes would pass vacuously --
+        # the escape splits the token, so the contiguous secret is absent either
+        # way.
+        assert AWS_KEY not in rendered
+
+    @pytest.mark.asyncio
+    async def test_expiry_marks_the_control_terminal(self, tmp_path):
+        """A click queued behind a successful expiry must not dispatch.
+
+        The once-only claim stops only a second click; a Send queued behind the expiry
+        would find it unheld. So the expiry marks the control terminal under the edit
+        lock, and the queued click hits the same check a duplicate click does.
+        """
+        from kiro_crew.dashboard.chat_utils import (
+            expire_slack_options,
+            remember_slack_options,
+        )
+        from kiro_crew.slack.outbound import claim_options_answer
+
+        state = _make_state(tmp_path)
+        slot = state.get_or_create_slot("s1")
+        posted = PostedOptions(channel="C-1", ts="opt-1", choices=("A",), blocks=())
+        remember_slack_options(state, slot.key, posted)
+
+        slack = MagicMock()
+        slack.update_message = AsyncMock()
+        state.slack_client = slack
+
+        await expire_slack_options(state, slot.key)
+
+        assert claim_options_answer("C-1", "opt-1") is False, (
+            "a click queued behind a settled expiry must be refused -- otherwise it "
+            "answers the question the expiry just retired"
+        )
+        assert _recs(state, slot) == ()
+
+    def test_a_submission_that_rendered_nothing_gives_the_claim_back(self):
+        """A wholly failed submit must not consume the answer forever.
+
+        If neither the edit nor the replacement post lands, the buttons are still on
+        screen and a held claim would refuse every retry. Once rendered, the claim stays.
+        """
+        import inspect
+
+        from kiro_crew.slack import interactions
+
+        src = inspect.getsource(interactions._answer_options)
+        assert (
+            "release_options_answer(channel, msg_ts)" in src
+        ), "a submit that rendered nothing must give the claim back"
+        rel = src.find("release_options_answer(channel, msg_ts)")
+        guard = src[max(0, rel - 200) : rel]
+        assert "not edited and new_ts == msg_ts" in guard, (
+            "the rollback must be gated on NOTHING having been rendered -- releasing "
+            "after a successful edit would re-admit a duplicate click"
+        )
+        assert (
+            "finally:" in src[max(0, rel - 600) : rel]
+        ), "the rollback must run on the abort path too, which returns early"
+
+    @pytest.mark.asyncio
+    async def test_the_dashboard_mirror_files_its_control_under_the_live_owner(self):
+        """The dashboard mirror files its control under the live owner, as the others do.
+
+        The thread is relinked WHILE the mirror's ``post_blocks`` is in flight and the
+        new owner records its own control. Ours is filed under the new owner and struck
+        at once; the new owner's survives.
+        """
+        newer = PostedOptions(channel="C-1", ts="opt-newer", choices=("X",), blocks=())
+        slack, record, state = await _mirror_turn(relink_to="dashboard:other", newer=newer)
+        assert record.stop_reason == "end_turn"
+        assert slack.post_blocks.await_count == 1
+        assert [c.args for c in slack.update_message.await_args_list] == [("C-1", "opt-mirror")]
+        assert _recs(state, "dashboard:other") == (newer,)
+        assert _recs(state, "dashboard:s1") == ()
+
+    @pytest.mark.asyncio
+    async def test_an_unraced_mirror_control_stays_live_under_the_turns_own_key(self):
+        """No relink: the control is the turn's own, recorded and left clickable."""
+        slack, _record, state = await _mirror_turn()
+        assert slack.post_blocks.await_count == 1
+        assert slack.update_message.await_count == 0
+        [mine] = _recs(state, "dashboard:s1")
+        assert (mine.ts, mine.choices) == ("opt-mirror", ("A", "B"))
+
+    def test_the_forget_uses_owner_keys_snapshotted_before_the_edit(self):
+        """A relink during the submit's edit must not orphan the old owner's record.
+
+        ``forget_slack_options_for_thread`` resolved its key list when called --
+        after the edit. A relink landing during that edit moves the thread, so the
+        recomputed list names the NEW owner, the previous owner's record survives
+        the click, and that session's next turn edits over the selection.
+        """
+        import inspect
+
+        from kiro_crew.dashboard.chat_utils import (
+            slack_options_owner_keys_snapshot,
+        )
+        from kiro_crew.slack import interactions
+
+        state = MagicMock()
+        state._slots = {}
+        state.get_linked_slot = MagicMock(return_value=None)
+        state.sessions.get_session_for_thread = MagicMock(return_value="dashboard:chat-A")
+        before = slack_options_owner_keys_snapshot(state, "thread-1")
+        assert "dashboard:chat-A" in before
+
+        # The thread moves to B. The snapshot must still name A.
+        state.sessions.get_session_for_thread = MagicMock(return_value="dashboard:chat-B")
+        after = slack_options_owner_keys_snapshot(state, "thread-1")
+        assert (
+            "dashboard:chat-B" in after and "dashboard:chat-A" not in after
+        ), "coherence check: resolving after the relink names only the new owner"
+
+        src = inspect.getsource(interactions._answer_options)
+        snap = src.find("slack_options_owner_keys_snapshot(")
+        edit = src.find("update_message(")
+        forget = src.find("_forget_options_control(")
+        assert snap != -1 and snap < edit, "the snapshot must be taken BEFORE the edit"
+        assert (
+            "keys=_owner_keys" in src[forget : forget + 120]
+        ), "the forget must consume the pre-edit snapshot, not re-resolve"
+
+    @pytest.mark.asyncio
+    async def test_eviction_never_splits_one_message_lock(self):
+        """A released lock with a scheduled waiter reads as UNLOCKED.
+
+        Evicting it there hands the next caller a brand-new lock for the same
+        message while the waiter proceeds on the old one, so two coroutines edit
+        one Slack message at once and every guarantee built on this lock is off.
+        """
+        from kiro_crew.slack import outbound
+
+        key = ("CH-split", "msg-split")
+        inside: list[str] = []
+        overlap: list[str] = []
+
+        async def _worker(name: str, hold: asyncio.Event) -> None:
+            async with outbound.options_edit_lock(*key):
+                if inside:
+                    overlap.append(name)
+                inside.append(name)
+                await hold.wait()
+                inside.remove(name)
+
+        a_hold, b_hold = asyncio.Event(), asyncio.Event()
+        a = asyncio.create_task(_worker("A", a_hold))
+        await asyncio.sleep(0)
+        # B is now a WAITER on the same lock.
+        b = asyncio.create_task(_worker("B", b_hold))
+        await asyncio.sleep(0)
+
+        # Flood the registry past its cap while B waits, then let A go so the lock
+        # is released with B still only scheduled -- the exact split window.
+        for i in range(outbound._MAX_EDIT_LOCKS + 20):
+            outbound.options_edit_lock("CH-bulk", f"t{i}")
+        a_hold.set()
+        await asyncio.sleep(0)
+        for i in range(outbound._MAX_EDIT_LOCKS + 20):
+            outbound.options_edit_lock("CH-bulk", f"u{i}")
+
+        assert key in outbound._EDIT_LOCKS, "a lock with a pending waiter must never be evicted"
+        b_hold.set()
+        await asyncio.gather(a, b)
+        assert overlap == [], f"two coroutines held one message lock at once: {overlap}"
+        # And once nobody wants it the entry is reclaimable again.
+        assert not outbound._LOCK_USERS.get(key)
+
+    def test_send_message_options_use_the_safe_fallback_stub(self):
+        """The `send_message` control must not carry the agent's body as fallback.
+
+        Slack parses entities in top-level ``text``, so a body with `<!channel>` would
+        ping the channel, again on each expiry edit. The body is already posted above.
+        """
+        import inspect
+        from pathlib import Path
+
+        from kiro_crew.dashboard.handlers import messaging
+
+        # The send route's Slack leg runs from a messaging_api owner the facade
+        # composes, so the scan reads the facade and every owner, and fails if the
+        # leg lives in a file it does not read.
+        owners = sorted((Path(messaging.__file__).parents[1] / "messaging_api").glob("[!_]*.py"))
+        assert owners, "the messaging_api owners were not found"
+        held = Path(inspect.getsourcefile(messaging._post_send_message_to_slack) or "")
+        assert held.parts[-2:] in {path.parts[-2:] for path in owners}, held
+        src = "\n".join(
+            [inspect.getsource(messaging)] + [path.read_text(encoding="utf-8") for path in owners]
+        )
+        at = src.find("option_blocks = build_options_blocks(")
+        assert at != -1, "the send_message OPTIONS post should be findable"
+        # Radius, not a behaviour bound: it only has to reach past the comment
+        # block below the call. Widened when the call became multi-line.
+        window = src[at : at + 1600]
+        assert (
+            "OPTIONS_FALLBACK_TEXT," in window
+        ), "the control's post-time fallback must be the safe stub"
+        assert "text=text," not in window, (
+            "and the stored record must not carry the raw body -- the expiry "
+            "replays it as top-level text on every edit"
+        )
+        # The body itself still reaches Slack, as its own message.
+        assert "post_message(" in src, "the message body is still posted normally"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("command", ["/goal status", "/prompts"])
+    async def test_a_local_dashboard_command_does_not_spend_the_control(self, command):
+        """`/goal` and `/prompts` answer without an agent turn.
+
+        The expiry in ``_run_chat`` runs below these short-circuits, as in each Slack
+        entry point, so a command that starts no turn leaves the question answerable.
+        """
+        slack, record, state, _seen = await _live_control_turn(command)
+        assert record.allocations == [], "a local command acquires no session"
+        assert slack.update_message.await_count == 0
+        assert [p.ts for p in _recs(state, "dashboard:s1")] == ["opt-live"]
+
+    @pytest.mark.asyncio
+    async def test_a_turn_spends_the_control_before_it_acquires_its_session(self):
+        """A real turn does spend it -- before it waits on the session lease or
+        spawn, so a slow (or failed) acquisition never leaves the superseded
+        question clickable."""
+        slack, record, state, seen = await _live_control_turn("hello")
+        assert seen["at_acquisition"] == ((), 1), "spent when the session is acquired"
+        assert [c.args for c in slack.update_message.await_args_list] == [("C-1", "opt-live")]
+        assert record.stop_reason == "end_turn"
+
+    @pytest.mark.asyncio
+    async def test_linking_an_existing_thread_retires_its_prior_control(self, tmp_path):
+        """Reassigning a thread must not strand the previous owner's buttons.
+
+        A live control is recorded under the thread's own conversation key. Linking
+        a dashboard session to that existing thread moves the thread -> slot index,
+        so no dashboard turn would ever expire that record and a click on those
+        buttons would answer into the dashboard session instead.
+        """
+        from kiro_crew.dashboard.chat_slack import api_chat_slot_slack_link
+
+        state = _make_state(tmp_path)
+        slack = MagicMock()
+        slack.update_message = AsyncMock(return_value=True)
+        slack.post_message = AsyncMock(return_value="thread-1")
+        state.slack_client = slack
+        state.owner_id = "U-owner"
+
+        prior = state.get_or_create_slot("slack-prior")
+        state.link_slack(prior.key, "thread-1", "C-1")
+        _set_recs(
+            state,
+            prior,
+            (PostedOptions(channel="C-1", ts="opt-1", choices=("A", "B"), blocks=()),),
+        )
+
+        dash = state.get_or_create_slot("s1")
+        app = web.Application()
+        app["state"] = state
+        app.router.add_post("/api/chat/slots/{slot}/slack-link", api_chat_slot_slack_link)
+        async with TestClient(TestServer(app)) as client:
+            await client.post(
+                f"/api/chat/slots/{dash.key}/slack-link",
+                json={"channel": "C-1", "thread_ts": "thread-1"},
+            )
+
+        assert (
+            slack.update_message.await_count >= 1
+        ), "the previous owner's control must be struck through on reassign"
+        assert (
+            _recs(state, prior) == ()
+        ), "and it must not stay tracked under a key nothing will ever expire"
+
+    def test_link_captures_the_prior_owner_before_reassigning(self):
+        """The keys must be read BEFORE link_slack moves the index."""
+        import inspect
+
+        from kiro_crew.dashboard import chat_slack
+
+        src = inspect.getsource(chat_slack.link_slot_to_slack)
+        snap = src.find("_prior_owner_keys = slack_options_owner_keys_snapshot(")
+        link = src.find("state.link_slack(slot.key, thread_ts, target_channel)")
+        assert snap != -1 and link != -1, "both the snapshot and the link must be present"
+        assert snap < link, (
+            "resolving after link_slack names the NEW owner, so the previous "
+            "conversation's record would never be found"
+        )
+        assert "_own_keys" in src, (
+            "re-linking a thread to the slot that already holds it must not spend "
+            "that slot's own live control"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_different_thread_relink_during_the_expiry_survives(
+        self, tmp_path, monkeypatch
+    ):
+        """A relink to a DIFFERENT thread during the expiry must not be torn down.
+
+        Here the slot's in-memory fields moved too. The replacement is protected by
+        comparing the slot's live fields with those captured before the await, not by
+        any check inside the clear.
+        """
+        from kiro_crew.dashboard import chat_slack
+        from kiro_crew.dashboard.chat_slack import api_chat_slot_slack_unlink
+        from kiro_crew.dashboard.chat_utils import effective_session_key
+
+        state = _make_state(tmp_path)
+        slot = state.get_or_create_slot("s1")
+        slack = MagicMock()
+        slack.update_message = AsyncMock(return_value=True)
+        state.slack_client = slack
+        state.link_slack(slot.key, "thread-1", "C-1")
+        key = effective_session_key(slot)
+
+        async def _relink_mid_expiry(*_a, **_k):
+            state.link_slack(slot.key, "thread-2", "C-2")
+
+        monkeypatch.setattr(chat_slack, "expire_slack_options", _relink_mid_expiry)
+
+        app = web.Application()
+        app["state"] = state
+        app.router.add_post("/api/chat/slots/{slot}/slack-unlink", api_chat_slot_slack_unlink)
+        async with TestClient(TestServer(app)) as client:
+            await client.post(f"/api/chat/slots/{slot.key}/slack-unlink")
+
+        assert (
+            state.sessions.get_slack_link(key)[0] == "thread-2"
+        ), "the replacement written during the expiry await must survive"
+
+    def test_a_one_click_answer_takes_the_shared_guarded_path(self):
+        """A choice button answers through ``_answer_options``, like the modal does.
+
+        That path holds the edit lock, the once-only claim, the pre-edit owner snapshot
+        and the escaped fallback text; a branch of its own would have none of them.
+        """
+        import inspect
+
+        from kiro_crew.slack import interactions
+
+        src = inspect.getsource(interactions._handle_options)
+        tail = src[src.find("Standard OPTIONS choice") :]
+        assert "await _answer_options(" in tail
+        for own_side_effect in ("update_message(", "post_blocks(", "handle_message(", "claim_"):
+            assert own_side_effect not in tail, own_side_effect
+
+    def test_an_unsettled_answer_claim_is_never_evicted(self):
+        """The claim map's bound must not re-admit a click on live buttons.
+
+        Eviction is by insertion order across the WHOLE workspace, so busy channels could
+        drop the claim on buttons still on screen in a quiet thread.
+        """
+        from kiro_crew.slack import outbound
+
+        cap = outbound._MAX_EDIT_LOCKS
+        # One claim whose buttons may still be live -- never settled.
+        assert outbound.claim_options_answer("C-live", "live-1") is True
+        # Then flood well past the cap with controls that DID settle.
+        for i in range(cap + 50):
+            assert outbound.claim_options_answer("C-bulk", f"t{i}") is True
+            outbound.settle_options_answer("C-bulk", f"t{i}")
+
+        assert ("C-live", "live-1") in outbound._ANSWERED, (
+            "the unsettled claim must survive the flood -- evicting it re-admits "
+            "a click on a control still showing buttons"
+        )
+        assert (
+            outbound.claim_options_answer("C-live", "live-1") is False
+        ), "and the surviving claim must still refuse a second click"
+        assert (
+            len(outbound._ANSWERED) <= cap + 1
+        ), "settled entries must still be reclaimed, or the cap means nothing"
+
+    def test_a_settled_claim_is_reclaimable(self):
+        """Settling is what makes the bound work at all.
+
+        A claim settles once the buttons are provably gone -- the in-place edit
+        landed, the original was deleted, or the expiry's strike-through
+        succeeded. Only then may memory pressure reclaim it.
+        """
+        from kiro_crew.slack import outbound
+
+        assert outbound.claim_options_answer("C1", "s1") is True
+        assert outbound._ANSWERED[("C1", "s1")] is False
+        outbound.settle_options_answer("C1", "s1")
+        assert outbound._ANSWERED[("C1", "s1")] is True
+        # mark_options_terminal only runs after a confirmed strike-through, so it
+        # records a settled entry directly.
+        outbound.mark_options_terminal("C2", "s2")
+        assert outbound._ANSWERED[("C2", "s2")] is True
+
+    def test_a_live_control_is_never_evicted_to_bound_the_store(self):
+        """No cap may drop a record for a control that is still clickable.
+
+        An evicted live record can never be retired. The only bound is the lifecycle: a
+        key exists while its question is unanswered and is pruned once it is not.
+        """
+        import inspect
+
+        from kiro_crew.dashboard import chat_utils
+        from kiro_crew.dashboard.chat_utils import options_records, set_options_records
+
+        src = inspect.getsource(chat_utils.set_options_records)
+        assert (
+            "_MAX_OPTION_KEYS" not in src and "del store[" not in src
+        ), "the store must not evict live records to stay small"
+
+        state = MagicMock()
+        state._slack_options_by_key = {}
+        posted = PostedOptions(channel="C-1", ts="opt-1", choices=("A",), blocks=())
+        for i in range(1200):
+            set_options_records(state, f"slack:{i}", (posted,))
+        assert options_records(state, "slack:0") == (
+            posted,
+        ), "the oldest live control must still be tracked after 1200 sessions"
+        # ...and an emptied key is still pruned, so the store is not a leak.
+        set_options_records(state, "slack:0", ())
+        assert options_records(state, "slack:0") == ()
+        assert "slack:0" not in state._slack_options_by_key
+
+    def test_the_store_is_not_held_on_the_slot(self):
+        """Structural: one store, keyed by session key, on DashboardState.
+
+        A plain Slack thread has no slot. A slot field plus a keyed fallback fails too:
+        a slot can appear at any moment (the channel-surface reconciler), and two stores
+        let a record be filed under one and cleared under the other.
+        """
+        import inspect
+        import sys
+
+        from kiro_crew.dashboard import chat_utils
+        from kiro_crew.dashboard import state as state_mod
+
+        assert "_slack_options_posted" not in inspect.getsource(
+            state_mod
+        ), "the slot-held OPTIONS field must be gone, not shadowed by a fallback"
+        # The facade and the owner modules it serves the moved code from.
+        family = (chat_utils.__name__, *chat_utils._OWNERS)
+        utils_src = "\n".join(inspect.getsource(sys.modules[name]) for name in family)
+        assert "_slack_options_by_key" in utils_src
+        assert (
+            "_slack_options_posted" not in utils_src
+        ), "every accessor must go through the keyed store"
+
+    @pytest.mark.asyncio
+    async def test_a_slotless_thread_gets_the_whole_lifecycle(self, tmp_path):
+        """End to end for the slotless-thread case.
+
+        Record, expire and forget must all work for a session that has no dashboard
+        slot at any point -- which is the normal state of a plain Slack thread.
+        """
+        from kiro_crew.dashboard.chat_utils import (
+            expire_slack_options,
+            forget_slack_options,
+            options_records,
+            remember_slack_options,
+        )
+
+        state = _make_state(tmp_path)
+        state._slots = {}
+        state.get_linked_slot = MagicMock(return_value=None)
+        slack = MagicMock()
+        slack.update_message = AsyncMock()
+        state.slack_client = slack
+
+        key = "slack:1785370133.085469"
+        first = PostedOptions(channel="C-1", ts="opt-1", choices=("A",), blocks=())
+        second = PostedOptions(channel="C-1", ts="opt-2", choices=("B",), blocks=())
+
+        remember_slack_options(state, key, first)
+        remember_slack_options(state, key, second)
+        assert options_records(state, key) == (
+            first,
+            second,
+        ), "a slotless session must accumulate every outstanding control"
+
+        forget_slack_options(state, key, "opt-1")
+        assert options_records(state, key) == (second,), "the forget must be ts-scoped"
+
+        await expire_slack_options(state, key)
+        assert (
+            slack.update_message.await_count == 1
+        ), "the remaining control must actually be struck through"
+        assert options_records(state, key) == ()
+
+    def test_only_the_first_click_on_a_control_is_answered(self):
+        """A second Send on the same message must dispatch nothing.
+
+        Both clicks serialize on ``options_edit_lock``, so the lock alone would dispatch
+        twice. The claim is not "is a record tracked": ``remember_slack_options`` no-ops
+        without a dashboard slot, the normal state of a plain Slack conversation.
+        """
+        from kiro_crew.slack.outbound import claim_options_answer
+
+        assert claim_options_answer("C-1", "opt-1") is True
+        assert (
+            claim_options_answer("C-1", "opt-1") is False
+        ), "a second click on the same control must not be answered again"
+        # A different control in the same channel is unaffected.
+        assert claim_options_answer("C-1", "opt-2") is True
+        # ...and so is the same ts in a different channel.
+        assert claim_options_answer("C-2", "opt-1") is True
+
+    def test_the_duplicate_click_is_dropped_before_any_side_effect(self):
+        """Structural: the claim gates the edit, the forget AND the dispatch.
+
+        Claiming after the edit would still leave two messages rewritten and two
+        turns dispatched; claiming outside the lock would let both clicks pass the
+        check before either set it.
+        """
+        import inspect
+
+        from kiro_crew.slack import interactions
+
+        src = inspect.getsource(interactions._answer_options)
+        lock_at = src.find("async with options_edit_lock(")
+        claim_at = src.find("if not claim_options_answer(")
+        edit_at = src.find("update_message(")
+        assert lock_at != -1 and claim_at != -1 and edit_at != -1
+        assert lock_at < claim_at < edit_at, (
+            "the claim must sit INSIDE the lock and BEFORE the first edit, so a "
+            "duplicate click touches nothing"
+        )
+
+    def test_the_slack_fallback_text_is_escaped_but_the_answer_is_not(self):
+        """A mention must not survive into the message's top-level `text`.
+
+        Slack parses entities in `text` too, which notifications show. The copy echoed
+        into the session stays raw: it is the answer the user picked.
+        """
+        import inspect
+
+        from kiro_crew.slack import interactions
+
+        src = inspect.getsource(interactions._answer_options)
+
+        assert (
+            "combined_fallback = escape_mrkdwn(combined)" in src
+        ), "the Slack-facing fallback text must be escaped"
+        assert "text=combined_fallback" in src, "update_message must use the escaped text"
+        assert (
+            "answered_blocks, combined_fallback" in src
+        ), "the post_blocks fallback must use the escaped text"
+        assert "text=combined," not in src, "no raw selection may reach Slack as text"
+        # ...and the agent-facing answer stays verbatim.
+        assert "[OPTIONS multi-select: {combined}]" in src, (
+            "the answer echoed into the session must stay raw -- escaping it would "
+            "change what the user picked"
+        )
+
+    def test_a_channel_mention_in_a_choice_is_inert_in_the_mrkdwn_summary(self):
+        """A choice cannot notify a channel just by being rendered.
+
+        Choice text is LLM-authored, so it can carry Slack's own entity syntax.
+        The summary that backfill, submit and expiry all render is a ``mrkdwn``
+        field, where ``<!channel>`` is INTERPRETED -- so an OPTIONS tag reading
+        ``[OPTIONS: <!channel> | Skip]`` would page a whole channel on render.
+        """
+        from kiro_crew.slack.format import build_options_selected_blocks
+
+        blocks = build_options_selected_blocks(["<!channel>", "Skip & go <b>"], [0])
+        text = blocks[0]["elements"][0]["text"]
+
+        assert "<!channel>" not in text, "a raw channel mention must never reach mrkdwn"
+        assert "&lt;!channel&gt;" in text
+        # `&` first, or the earlier substitutions get re-escaped into `&amp;lt;`.
+        assert "&amp;lt;" not in text
+        assert "Skip &amp; go &lt;b&gt;" in text
+
+    def test_escaping_does_not_leak_into_the_label_or_the_submit_value(self):
+        """The escape belongs to the mrkdwn sink only.
+
+        ``plain_text`` is not interpreted by Slack, so escaping there would show
+        a literal ``&lt;``; and the button ``value`` is echoed back into the
+        session on submit, so escaping it would change the answer the user
+        picked. Guards against "fixing" this in the shared `_redact_choices`.
+        """
+        choice = "Skip & go <b>"
+        blocks = build_options_blocks([choice])
+        opt = blocks[0]["elements"][0]
+
+        assert opt["text"]["text"] == choice, "plain_text labels must stay unescaped"
+        assert opt["value"] == choice, "the click value must round-trip verbatim"

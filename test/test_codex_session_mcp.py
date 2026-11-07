@@ -1,0 +1,1625 @@
+"""Codex's spec projection: the agent spec -> a codex ``session/new`` array.
+
+``providers/mirrors/codex.py`` adds two rules to claude's translation, both facts of the
+adapter, measured here against a real ``codex-acp``:
+
+* an ``sse`` element is dropped: codex-acp would accept it silently and never wire it;
+* Crew's own servers carry ``KIROCREW_SESSION_KEY`` on the element, because ``codex-rs``
+  starts a stdio server with ``env_clear()``. Which servers are Crew's is decided by the
+  resolved invocation, never the name, since that key authenticates a session claim.
+
+The Real Adapter Contract Tests lane collects this file. Unit behaviour is in
+``test_codex_session_mcp_projection.py`` and ``test_codex_session_mcp_tool_refusal.py``.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+import pytest
+from real_adapter_gate import MEASURED_CODEX_ACP_VERSION, require_real_adapter
+
+from kiro_crew.acp import runtime as acp_runtime
+from kiro_crew.acp import session_mcp
+from kiro_crew.acp.harness.codex import CodexHarness
+from kiro_crew.providers.mirrors.codex import (
+    codex_name,
+    drop_unadvertised_transports,
+)
+from kiro_crew.testing.wait import wait_until
+
+# ── the real adapter ────────────────────────────────────────────────────────
+
+# The driver runs OUT OF PROCESS on purpose: it spawns a real Node adapter, and a
+# stalled readline in the test process would surface as a pytest timeout kill
+# rather than the clean assertion failures below.
+_DRIVER = r"""
+import json, os, queue, subprocess, sys, threading, time
+
+root, entry, stub, node = sys.argv[1:5]
+report = os.path.join(root, "report.json")
+env = dict(os.environ)
+env["CODEX_HOME"] = os.path.join(root, "codex_home")
+env["NO_BROWSER"] = "1"
+
+
+def reap(p):
+    # Every exit from drive() runs this, including an exception and the outer
+    # timeout's SIGTERM: a bare readline() on an adapter that has stopped writing
+    # blocks forever, and an adapter left running keeps its own MCP child alive
+    # after this driver is gone. Nothing else on the machine knows to kill them.
+    for step in (p.terminate, p.kill):
+        try:
+            step()
+            p.communicate(timeout=15)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+        except Exception:
+            return
+
+
+def pump(stream, q):
+    for line in stream:
+        q.put(line)
+    q.put(None)
+
+
+def drive(element):
+    p = subprocess.Popen(
+        [node, entry], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL, cwd=os.path.join(root, "work"), env=env,
+        text=True, bufsize=1,
+    )
+    try:
+        # Read on a daemon thread so the deadline below is real. The main loop
+        # never blocks on the adapter, so a stalled one costs 90s, not the turn.
+        q = queue.Queue()
+        threading.Thread(target=pump, args=(p.stdout, q), daemon=True).start()
+
+        def send(o):
+            p.stdin.write(json.dumps(o) + "\n")
+            p.stdin.flush()
+
+        send({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+              "params": {"protocolVersion": 1, "clientCapabilities": {"fs": {}}}})
+        send({"jsonrpc": "2.0", "id": 2, "method": "session/new",
+              "params": {"cwd": os.path.join(root, "work"), "mcpServers": [element]}})
+        got, deadline = {}, time.time() + 90
+        while 2 not in got:
+            budget = deadline - time.time()
+            if budget <= 0:
+                break
+            try:
+                line = q.get(timeout=budget)
+            except queue.Empty:
+                break
+            if line is None:
+                break
+            try:
+                msg = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(msg.get("id"), int):
+                got[msg["id"]] = msg
+        if 2 in got and "result" in got[2]:
+            # The child MCP server is launched and tools/list is queried after session/new answers.
+            for _ in range(120):
+                try:
+                    with open(report) as f:
+                        if "tools/list" in json.load(f).get("methods", []):
+                            break
+                except (OSError, ValueError):
+                    pass
+                time.sleep(0.25)
+        return got.get(1) or {}, got.get(2) or {}
+    finally:
+        reap(p)
+
+
+stdio_el = {
+    "name": "kirocrew-core", "type": "stdio", "command": sys.executable,
+    "args": [stub],
+    "env": [{"name": "STUB_MCP_REPORT", "value": report},
+            {"name": "KIROCREW_SESSION_KEY", "value": "probe-session-key"}],
+}
+init, new = drive(stdio_el)
+out = {
+    "mcp_capabilities": (init.get("result") or {}).get("agentCapabilities", {}).get(
+        "mcpCapabilities"),
+    "stdio_error": new.get("error"),
+    "stdio_ok": bool(new.get("result")),
+    "child": json.load(open(report)) if os.path.exists(report) else None,
+}
+if os.path.exists(report):
+    os.unlink(report)
+_, sse = drive({"name": "remote", "type": "sse", "url": "http://127.0.0.1:1/sse",
+                "headers": []})
+out["sse_error"] = sse.get("error")
+out["sse_ok"] = bool(sse.get("result"))
+# The same transport WITHOUT the schema-required `headers` array. The adapter's
+# answer to an unadvertised transport depends on whether the element parses as
+# that transport at all: a complete sse element is named and refused, an
+# incomplete one falls to the untagged variant and is accepted unwired.
+_, sse_bare = drive({"name": "remote-bare", "type": "sse", "url": "http://127.0.0.1:1/sse"})
+out["sse_bare_error"] = sse_bare.get("error")
+out["sse_bare_ok"] = bool(sse_bare.get("result"))
+# The CONTROL for the line above: a type no schema can name. If the adapter answers
+# this one normally too, it is validating the transport tag not at all, which is what
+# makes client-side narrowing the only guard rather than a second opinion.
+_, junk = drive({"name": "junk", "type": "nonsense-type", "url": "http://127.0.0.1:1/j"})
+out["unknown_type_error"] = junk.get("error")
+out["unknown_type_ok"] = bool(junk.get("result"))
+_, bad = drive({"name": "no-command", "args": [], "env": []})
+out["malformed_error"] = bad.get("error")
+out["malformed_ok"] = bool(bad.get("result"))
+
+# FOLD MEASUREMENT. codex registers by name with `insert`, so a collision is
+# observable as a child that never launches. "probe  one" (TWO spaces) folds to
+# "probe__one" under codex's per-character rule and to "probe_one" under a
+# collapsing one -- so pairing it with a literal "probe__one" discriminates them:
+# per-character means one slot and ONE report file, collapsing means two.
+fold_a = os.path.join(root, "fold-a.json")
+fold_b = os.path.join(root, "fold-b.json")
+for path in (fold_a, fold_b):
+    if os.path.exists(path):
+        os.unlink(path)
+
+
+def stub_named(name, report):
+    return {
+        "name": name, "type": "stdio", "command": sys.executable, "args": [stub],
+        "env": [{"name": "STUB_MCP_REPORT", "value": report}],
+    }
+
+
+p_fold = subprocess.Popen(
+    [node, entry], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+    stderr=subprocess.DEVNULL, cwd=os.path.join(root, "work"), env=env, text=True, bufsize=1,
+)
+try:
+    def send_fold(o):
+        p_fold.stdin.write(json.dumps(o) + "\n")
+        p_fold.stdin.flush()
+
+    send_fold({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+               "params": {"protocolVersion": 1, "clientCapabilities": {"fs": {}}}})
+    send_fold({"jsonrpc": "2.0", "id": 2, "method": "session/new",
+               "params": {"cwd": os.path.join(root, "work"), "mcpServers": [
+                   stub_named("probe  one", fold_a), stub_named("probe__one", fold_b)]}})
+    got_fold, deadline = {}, time.time() + 90
+    q_fold = queue.Queue()
+    threading.Thread(target=pump, args=(p_fold.stdout, q_fold), daemon=True).start()
+    while 2 not in got_fold:
+        budget = deadline - time.time()
+        if budget <= 0:
+            break
+        try:
+            line = q_fold.get(timeout=budget)
+        except queue.Empty:
+            break
+        if line is None:
+            break
+        try:
+            msg = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(msg.get("id"), int):
+            got_fold[msg["id"]] = msg
+    for _ in range(60):
+        if os.path.exists(fold_a) or os.path.exists(fold_b):
+            break
+        time.sleep(0.25)
+    time.sleep(4)
+finally:
+    reap(p_fold)
+out["fold_session_ok"] = bool((got_fold.get(2) or {}).get("result"))
+out["fold_children"] = sorted(
+    n for n, pth in (("probe  one", fold_a), ("probe__one", fold_b)) if os.path.exists(pth)
+)
+print(json.dumps(out))
+"""
+
+# A stdio MCP server small enough to read: it records the environment it was
+# LAUNCHED with (which is the measurement) and answers the two methods codex sends.
+_STUB_MCP = r"""
+import json, os, sys
+
+REPORT = os.environ["STUB_MCP_REPORT"]
+seen = []
+
+
+def dump():
+    tmp = REPORT + ".part"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump({"methods": seen, "env": dict(os.environ)}, fh)
+    os.replace(tmp, REPORT)
+
+
+def send(o):
+    sys.stdout.write(json.dumps(o) + "\n")
+    sys.stdout.flush()
+
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        msg = json.loads(line)
+    except ValueError:
+        continue
+    seen.append(msg.get("method") or "")
+    dump()
+    if "id" not in msg:
+        continue
+    if msg.get("method") == "initialize":
+        send({"jsonrpc": "2.0", "id": msg["id"], "result": {
+            "protocolVersion": "2025-06-18", "capabilities": {"tools": {}},
+            "serverInfo": {"name": "stub", "version": "0"}}})
+    elif msg.get("method") == "tools/list":
+        send({"jsonrpc": "2.0", "id": msg["id"], "result": {"tools": [
+            {"name": "stub_echo", "description": "echo",
+             "inputSchema": {"type": "object", "properties": {}}}]}})
+    else:
+        send({"jsonrpc": "2.0", "id": msg["id"], "result": {}})
+"""
+
+
+def _run_driver_reaping_group(
+    argv: list[str], *, timeout: float, cwd: "str | os.PathLike[str]"
+) -> "subprocess.CompletedProcess[str]":
+    """Run the out-of-process driver in its OWN process group and reap the group.
+
+    ``subprocess.run(timeout=...)`` kills only the driver, leaking codex-acp and its MCP
+    child. One tree kill on every exit reaches the whole group (a no-op after a clean
+    exit), through ``platform_compat.kill_process_tree`` for Windows and the broadcast
+    guard. ``cwd`` is required so the tree does not run in the checkout.
+    """
+    from kiro_crew import platform_compat
+
+    proc = subprocess.Popen(
+        argv,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        encoding="utf-8",
+        errors="replace",
+        cwd=cwd,
+        start_new_session=platform_compat.IS_POSIX,
+        creationflags=platform_compat.CREATE_NEW_PROCESS_GROUP,
+    )
+
+    def reap() -> None:
+        try:
+            platform_compat.kill_process_tree(proc.pid, platform_compat.SIGKILL)
+        except Exception:
+            # Already gone is the expected case on the happy path.
+            pass
+
+    try:
+        try:
+            out, err = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            reap()
+            # Bounded: the group is SIGKILLed, so the only thing left to do is
+            # drain pipes no live writer holds. A second stall would be a kernel
+            # problem, and swallowing the output beats hanging the suite.
+            try:
+                out, err = proc.communicate(timeout=60)
+            except subprocess.TimeoutExpired:
+                out, err = "", ""
+    finally:
+        reap()
+    return subprocess.CompletedProcess(argv, proc.returncode, out, err)
+
+
+def _codex_acp_entry() -> Path | None:
+    """The installed adapter's entry script, through the SPAWN's own resolver.
+
+    Asking ``_resolve_codex_acp_bin`` rather than ``shutil.which`` is deliberate:
+    what this test must exercise is the adapter a real session would spawn, on the
+    same ladder (``CODEX_ACP_BIN``, project ``node_modules``, mise, PATH).
+    """
+    from kiro_crew.acp.client import _resolve_codex_acp_bin
+
+    argv, _search = _resolve_codex_acp_bin()
+    if not argv:
+        return None
+    return Path(argv[-1])
+
+
+_ENTRY = _codex_acp_entry()
+
+
+def _require_codex_acp(*, with_node: bool = False) -> None:
+    """Gate a live measurement on the adapter, without a skip a lane can hide behind.
+
+    Absent locally, the test skips. Under ``KIROCREW_E2E_REQUIRE=1`` it fails, since a lane
+    that only skipped would report success having measured nothing. The pinned version comes
+    from ``real_adapter_gate``.
+    """
+    require_real_adapter(
+        _ENTRY,
+        what="codex-acp",
+        install=f"npm i -g @agentclientprotocol/codex-acp@{MEASURED_CODEX_ACP_VERSION}",
+    )
+    if with_node:
+        require_real_adapter(
+            shutil.which("node"), what="node", install="install Node 24 and put it on PATH"
+        )
+
+
+@pytest.mark.skipif(not hasattr(os, "getpgid"), reason="POSIX process groups only")
+def test_the_driver_runner_reaps_descendants_on_the_timeout_path():
+    """The leak the outer bound exists to prevent, driven end to end.
+
+    A parent that spawns a sleeping grandchild and hangs stands in for driver, codex-acp and
+    MCP child. Asserted on the grandchild, since the parent dies either way.
+
+    By the time the pid is read the group is dead and the pid may be reissued, so the driver
+    also prints the start-time identity, and both "gone" and the failure-path kill use it.
+    """
+    from kiro_crew import platform_compat
+
+    src_root = Path(platform_compat.__file__).resolve().parents[1]
+    parent = (
+        "import subprocess, sys, time\n"
+        f"sys.path.insert(0, {str(src_root)!r})\n"
+        "from kiro_crew.platform_compat import get_process_start_id\n"
+        'g = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(300)"])\n'
+        "print(g.pid, get_process_start_id(g.pid) or '', flush=True)\n"
+        "time.sleep(300)\n"
+    )
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as w:
+        script = Path(w) / "parent.py"
+        script.write_text(parent, encoding="utf-8")
+        started = time.monotonic()
+        result = _run_driver_reaping_group([sys.executable, str(script)], timeout=5, cwd=w)
+        # The bound is the control here, and the reap must not add a long second wait.
+        assert time.monotonic() - started < 90
+        reported = (result.stdout or "").strip().splitlines()[0].split()
+        grandchild = int(reported[0])
+        assert len(reported) == 2, (
+            f"the driver could not read the start-time identity of grandchild "
+            f"{grandchild}, so neither the liveness check nor the failure-path kill "
+            "below could be pinned to the process it spawned"
+        )
+        grandchild_identity = reported[1]
+
+    # Liveness through the identity helper: ``os.kill(pid, 0)`` terminates the target on
+    # Windows and cannot tell a reissued pid from the grandchild.
+    try:
+        wait_until(
+            lambda: platform_compat.get_process_start_id(grandchild) != grandchild_identity,
+            timeout=10,
+        )
+    except AssertionError:  # pragma: no cover - the failure this test exists to catch
+        try:
+            platform_compat.kill_pid_pinned(
+                grandchild, grandchild_identity, platform_compat.SIGKILL
+            )
+        except OSError:
+            pass
+        pytest.fail(
+            f"pid {grandchild} outlived the driver's timeout: the runner killed the "
+            "driver but not its process group, so a real run leaks codex-acp and "
+            "the MCP child codex-acp itself spawned"
+        )
+
+
+@pytest.mark.real_adapter
+def test_real_codex_acp_accepts_the_crew_stdio_element():
+    """Anti-drift guard: four undocumented adapter facts the projection depends on.
+
+    1. Crew's stdio element (the claude shape) is accepted, though ACP v1 makes stdio the
+       untagged fallback of ``serde(tag = "type")``.
+    2. The server is launched: the child answers ``initialize`` and ``tools/list``.
+    3. ``codex-rs`` runs ``env_clear()``, so ``KIROCREW_SESSION_KEY`` arrives only on the
+       element, which is why ``codex_elements`` carries it.
+    4. One bad element fails the whole ``session/new``: a complete ``sse`` element gets
+       ``-32600``; on 2.3.0+ a nonsense type, a headerless ``sse`` and a stdio element with
+       no ``command`` get ``-32602`` (2.2.2 accepted them unwired). So every element Crew
+       lets through must be one the adapter takes. An answer wiring a transport its own
+       ``mcpCapabilities`` denies is never admitted.
+
+    A fake API key in a temp ``CODEX_HOME`` passes the auth check, which runs before
+    ``mcpServers`` is read (else every shape answers ``-32000``). ``session/new`` makes no
+    model call, so the key never leaves the temp directory.
+    """
+    _require_codex_acp(with_node=True)
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as w:
+        root = Path(w)
+        (root / "work").mkdir()
+        (root / "codex_home").mkdir()
+        (root / "codex_home" / "auth.json").write_text(
+            json.dumps({"OPENAI_API_KEY": "sk-not-a-real-key-" + "0" * 24}), encoding="utf-8"
+        )
+        stub = root / "stub_mcp.py"
+        stub.write_text(_STUB_MCP, encoding="utf-8")
+        driver = root / "drive.py"
+        driver.write_text(_DRIVER, encoding="utf-8")
+        result = _run_driver_reaping_group(
+            [
+                sys.executable,
+                str(driver),
+                str(root),
+                str(_ENTRY),
+                str(stub),
+                shutil.which("node") or "node",
+            ],
+            # A backstop: the driver bounds each adapter run itself. Reaching it means the
+            # driver died before it could reap, hence the process-group kill.
+            timeout=540,
+            cwd=root / "work",
+        )
+        context = (
+            f"driver exit: {result.returncode}\n"
+            f"stdout: {result.stdout[-3000:]}\nstderr: {result.stderr[-3000:]}"
+        )
+        try:
+            measured = json.loads(result.stdout.strip().splitlines()[-1])
+        except (ValueError, IndexError):
+            pytest.fail("the codex-acp driver produced no measurement\n" + context)
+
+        if (measured.get("stdio_error") or {}).get("code") == -32000:
+            pytest.skip("codex-acp refused the fabricated credential; nothing to measure")
+
+        # 1 + 2: the shape is accepted and the server really runs.
+        assert measured["stdio_ok"], (
+            "codex-acp rejected the mcpServers element Crew emits, so the codex "
+            "projection cannot be delivered in this shape at all\n" + context
+        )
+        child = measured.get("child")
+        assert child, "the stdio MCP server was never launched\n" + context
+        assert "tools/list" in child["methods"], (
+            "codex-acp launched the server but never listed its tools, so the "
+            "session would hold a mounted server with no usable tool\n" + context
+        )
+
+        # 3: the env allowlist, which is the whole reason for the carriage rule.
+        assert child["env"].get("KIROCREW_SESSION_KEY") == "probe-session-key"
+        assert "PATH" in child["env"]
+        assert "STUB_MCP_REPORT" in child["env"]
+
+        # 4: an element the adapter will not take fails the whole session/new, with
+        # -32600 or -32602 per shape, each pinned exactly so the contract cannot drift.
+        # A complete sse element (with `headers`, as Crew emits) is named and refused.
+        assert not measured["sse_ok"] and measured["sse_error"], (
+            "codex-acp accepted a schema-complete sse element it advertises it does not "
+            f"support: ok={measured['sse_ok']!r} error={measured['sse_error']!r}. "
+            "Re-measure before changing this assertion.\n" + context
+        )
+        assert "sse" in json.dumps(measured["sse_error"]).lower(), (
+            "codex-acp failed session/new over an sse element for a reason that does "
+            "not name the transport, so this measures something other than the "
+            f"transport check: {measured['sse_error']!r}\n" + context
+        )
+        # On 2.3.0+ the array is schema-validated, so an element that parses as no
+        # variant (headerless sse, unknown tag, stdio with no `command`) gets -32602.
+        for shape in ("sse_bare", "unknown_type", "malformed"):
+            assert not measured[f"{shape}_ok"] and (
+                (measured[f"{shape}_error"] or {}).get("code") == -32602
+            ), (
+                f"codex-acp no longer refuses the {shape} element with -32602: "
+                f"ok={measured[f'{shape}_ok']!r} error={measured[f'{shape}_error']!r}. "
+                "Re-measure before changing this assertion.\n" + context
+            )
+        # So Crew must never send those shapes. The translator skips an entry with
+        # no command and no url, and the filter drops a tag nobody advertised.
+        assert session_mcp.acp_server_element("no-command", {"args": []}) is None
+        assert (
+            drop_unadvertised_transports(
+                [{"name": "junk", "type": "nonsense-type", "url": "http://x/j"}],
+                measured["mcp_capabilities"],
+            )
+            == []
+        )
+        # The advertisement the client captures and the filter consumes, so this is
+        # also the assertion that the two agree on a real adapter.
+        assert measured["mcp_capabilities"]["sse"] is False
+        assert measured["mcp_capabilities"]["http"] is True
+
+        # 5: the per-character fold `codex_name` reproduces. `"probe  one"` and
+        # `"probe__one"` both register as `probe__one`, so exactly one child launches;
+        # a collapsing fold would launch two.
+        assert measured["fold_session_ok"], "the fold probe's session/new failed\n" + context
+        assert len(measured["fold_children"]) == 1, (
+            "codex-acp no longer folds whitespace per character: two names that this "
+            "rule maps together launched separately, so `codex_name` and the "
+            "control-plane collision argument both need re-deriving.\n"
+            f"children launched: {measured['fold_children']}\n" + context
+        )
+        assert codex_name("probe  one") == codex_name("probe__one") == "probe__one"
+        assert (
+            drop_unadvertised_transports(
+                [{"name": "remote", "type": "sse", "url": "http://x/sse", "headers": []}],
+                measured["mcp_capabilities"],
+            )
+            == []
+        )
+
+
+_CLOSE_DRIVER = r"""
+import json, os, queue, subprocess, sys, threading, time
+
+root, entry, node = sys.argv[1:4]
+work = os.path.join(root, "work")
+env = dict(os.environ)
+env["CODEX_HOME"] = os.path.join(root, "codex_home")
+env["NO_BROWSER"] = "1"
+
+
+def reap(p):
+    for step in (p.terminate, p.kill):
+        try:
+            step()
+            p.communicate(timeout=15)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+        except Exception:
+            return
+
+
+def pump(stream, q):
+    for line in stream:
+        q.put(line)
+    q.put(None)
+
+
+p = subprocess.Popen(
+    [node, entry], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+    stderr=subprocess.DEVNULL, cwd=work, env=env, text=True, bufsize=1,
+)
+q = queue.Queue()
+threading.Thread(target=pump, args=(p.stdout, q), daemon=True).start()
+next_id = [0]
+
+
+def send(method, params, notification=False):
+    msg = {"jsonrpc": "2.0", "method": method, "params": params}
+    if not notification:
+        next_id[0] += 1
+        msg["id"] = next_id[0]
+    p.stdin.write(json.dumps(msg) + "\n")
+    p.stdin.flush()
+    return None if notification else next_id[0]
+
+
+def wait(rid, timeout=60):
+    deadline = time.time() + timeout
+    while True:
+        budget = deadline - time.time()
+        if budget <= 0:
+            return {"_timeout": True}
+        try:
+            line = q.get(timeout=budget)
+        except queue.Empty:
+            return {"_timeout": True}
+        if line is None:
+            return {"_eof": True}
+        try:
+            msg = json.loads(line)
+        except ValueError:
+            continue
+        if msg.get("id") == rid:
+            return msg
+
+
+def call(method, params):
+    return wait(send(method, params))
+
+
+def alive(sid):
+    # The liveness oracle: a live session answers with its refreshed configOptions;
+    # an evicted one answers an error frame.
+    r = call("session/set_config_option",
+             {"sessionId": sid, "configId": "mode", "value": "read-only"})
+    return {"ok": "result" in r, "error": r.get("error")}
+
+
+out = {}
+try:
+    call("initialize", {"protocolVersion": 1, "clientCapabilities": {"fs": {}}})
+    new1 = call("session/new", {"cwd": work, "mcpServers": []})
+    out["new_error"] = new1.get("error")
+    s1 = (new1.get("result") or {}).get("sessionId")
+    if s1:
+        out["before_close"] = alive(s1)
+        close = call("session/close", {"sessionId": s1})
+        out["close_reply"] = {"result": close.get("result"), "error": close.get("error")}
+        out["after_close"] = alive(s1)
+        out["close_again"] = {"result": call("session/close", {"sessionId": s1}).get("result")}
+        # The notification form, on a fresh session: must NOT evict, or the
+        # TeardownPolicy's notification=False stops being load-bearing.
+        s2 = (call("session/new", {"cwd": work, "mcpServers": []}).get("result") or {}).get("sessionId")
+        send("session/close", {"sessionId": s2}, notification=True)
+        time.sleep(1.0)
+        out["after_close_notification"] = alive(s2)
+        # The process is unharmed by the closes.
+        out["fresh_after"] = "result" in call("session/new", {"cwd": work, "mcpServers": []})
+finally:
+    reap(p)
+print(json.dumps(out))
+"""
+
+
+@pytest.mark.real_adapter
+def test_real_codex_acp_session_close_evicts():
+    """ANTI-DRIFT GUARD for ``CodexHarness.teardown`` and codex's membership in
+    ``ACP_BACKENDS_SESSION_EVICTION``.
+
+    Without eviction on ``session/close`` every codex session on the shared runtime would
+    leak silently.
+
+    1. After close as a request the session is gone. The oracle is
+       ``session/set_config_option``: ``configOptions`` when live, an error when evicted.
+    2. Close as a notification does not evict, so ``notification=False`` is load-bearing.
+    3. Close is idempotent and the process still opens fresh sessions.
+
+    A fake key in a temp ``CODEX_HOME`` passes auth; no model call is made.
+    """
+    _require_codex_acp(with_node=True)
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as w:
+        root = Path(w)
+        (root / "work").mkdir()
+        (root / "codex_home").mkdir()
+        (root / "codex_home" / "auth.json").write_text(
+            json.dumps({"OPENAI_API_KEY": "sk-not-a-real-key-" + "0" * 24}), encoding="utf-8"
+        )
+        driver = root / "drive_close.py"
+        driver.write_text(_CLOSE_DRIVER, encoding="utf-8")
+        result = _run_driver_reaping_group(
+            [sys.executable, str(driver), str(root), str(_ENTRY), shutil.which("node") or "node"],
+            timeout=300,
+            cwd=root / "work",
+        )
+        context = (
+            f"driver exit: {result.returncode}\n"
+            f"stdout: {result.stdout[-3000:]}\nstderr: {result.stderr[-3000:]}"
+        )
+        try:
+            m = json.loads(result.stdout.strip().splitlines()[-1])
+        except (ValueError, IndexError):
+            pytest.fail("the codex-acp close driver produced no measurement\n" + context)
+
+        if (m.get("new_error") or {}).get("code") == -32000:
+            pytest.skip("codex-acp refused the fabricated credential; nothing to measure")
+        assert "before_close" in m, "session/new failed, so nothing was measured\n" + context
+
+        # 1. eviction.
+        assert m["before_close"]["ok"], "baseline session was not live\n" + context
+        assert m["close_reply"]["error"] is None, (
+            "session/close was refused; the harness's teardown verb is wrong for this "
+            f"adapter: {m['close_reply']['error']!r}\n" + context
+        )
+        assert not m["after_close"]["ok"], (
+            "session/close did NOT evict: the sessionId still answers, so codex must "
+            "leave ACP_BACKENDS_SESSION_EVICTION until a verb that evicts is found\n" + context
+        )
+
+        # 2. the notification form is the leak.
+        assert m["after_close_notification"]["ok"], (
+            "close as a notification now evicts too; TeardownPolicy.notification=False "
+            "is no longer what makes eviction happen -- re-measure before changing it\n" + context
+        )
+
+        # 3. idempotent, and the process survives.
+        assert m["close_again"]["result"] == {}, (
+            "a second close on the same id errored; a double-terminate would fault\n" + context
+        )
+        assert m["fresh_after"], "session/new failed after the closes\n" + context
+
+
+_DEPTH_DRIVER = r"""
+import json, os, queue, subprocess, sys, threading, time
+
+root, entry, node, src_root, max_depth = sys.argv[1:6]
+max_depth = int(max_depth)
+sys.path.insert(0, src_root)
+from kiro_crew.acp.runtime import _iter_descendant_pids
+
+work = os.path.join(root, "work")
+env = dict(os.environ)
+env["CODEX_HOME"] = os.path.join(root, "codex_home")
+env["NO_BROWSER"] = "1"
+
+
+def reap(p):
+    for step in (p.terminate, p.kill):
+        try:
+            step()
+            p.communicate(timeout=15)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+        except Exception:
+            return
+
+
+def pump(stream, q):
+    for line in stream:
+        q.put(line)
+    q.put(None)
+
+
+def cmdline(pid):
+    try:
+        with open("/proc/%d/cmdline" % pid, "rb") as fh:
+            raw = fh.read()
+    except OSError:
+        return None
+    return [tok.decode("utf-8", "replace") for tok in raw.split(b"\0") if tok]
+
+
+p = subprocess.Popen(
+    [node, entry], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+    stderr=subprocess.DEVNULL, cwd=work, env=env, text=True, bufsize=1,
+)
+q = queue.Queue()
+threading.Thread(target=pump, args=(p.stdout, q), daemon=True).start()
+next_id = [0]
+
+
+def call(method, params):
+    next_id[0] += 1
+    rid = next_id[0]
+    p.stdin.write(json.dumps({"jsonrpc": "2.0", "id": rid, "method": method, "params": params}) + "\n")
+    p.stdin.flush()
+    deadline = time.time() + 60
+    while True:
+        budget = deadline - time.time()
+        if budget <= 0:
+            return {"_timeout": True}
+        try:
+            line = q.get(timeout=budget)
+        except queue.Empty:
+            return {"_timeout": True}
+        if line is None:
+            return {"_eof": True}
+        try:
+            msg = json.loads(line)
+        except ValueError:
+            continue
+        if msg.get("id") == rid:
+            return msg
+
+
+out = {}
+try:
+    call("initialize", {"protocolVersion": 1, "clientCapabilities": {"fs": {}}})
+    new = call("session/new", {"cwd": work, "mcpServers": []})
+    out["new_error"] = new.get("error")
+    # The runtime's own bounded walk, one generation at a time: a pid's depth is the
+    # first bound it appears under, so the generation the constant names is measured
+    # by the same reader the recycle guard uses, not by a second tree walker.
+    depth_of = {}
+    for depth in range(max_depth + 1):
+        for pid in _iter_descendant_pids(p.pid, depth):
+            depth_of.setdefault(pid, depth)
+    cmdlines = {str(pid): cmdline(pid) for pid in depth_of}
+    hits = [pid for pid, argv in ((int(k), v) for k, v in cmdlines.items()) if argv and "app-server" in argv]
+    out["depth_pids"] = sorted(depth_of, key=depth_of.get)
+    out["app_server_found"] = bool(hits)
+    out["app_server_depth"] = depth_of[hits[0]] if hits else None
+    out["cmdlines"] = cmdlines
+finally:
+    reap(p)
+print(json.dumps(out))
+"""
+
+
+@pytest.mark.real_adapter
+def test_real_codex_acp_app_server_sits_at_core_rss_depth():
+    """ANTI-DRIFT GUARD for ``CodexHarness.CORE_RSS_DEPTH``.
+
+    The recycle guard sums RSS over ``CORE_RSS_DEPTH`` generations below the adapter. If a
+    release inserted a launcher generation, app-server would leave the measured scope and a
+    real leak would never trip ``CORE_RSS_CEILING_MB``; every other pin is static.
+
+    1. ``codex app-server`` is within ``CORE_RSS_DEPTH``, walked by the guard's own
+       ``_iter_descendant_pids``. That reads ``/proc``, so it is gated on Linux through
+       ``require_real_adapter`` (a ``skipif`` would hide a lane that must run it).
+    2. It sits at exactly ``CORE_RSS_DEPTH`` (a plain spawn has ``wrapper_generations=0``).
+
+    The constant is asserted, not read from the live tree. ``session/new`` is sent so
+    app-server has answered a request; a refused one fails rather than skips.
+    """
+    _require_codex_acp(with_node=True)
+    require_real_adapter(
+        sys.platform == "linux",
+        what="the Linux /proc process tree the recycle guard's reader walks",
+        install="run the real-adapter lane on a Linux host",
+    )
+    src_root = Path(acp_runtime.__file__).resolve().parents[2]
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as w:
+        root = Path(w)
+        (root / "work").mkdir()
+        (root / "codex_home").mkdir()
+        (root / "codex_home" / "auth.json").write_text(
+            json.dumps({"OPENAI_API_KEY": "sk-not-a-real-key-" + "0" * 24}), encoding="utf-8"
+        )
+        driver = root / "drive_depth.py"
+        driver.write_text(_DEPTH_DRIVER, encoding="utf-8")
+        result = _run_driver_reaping_group(
+            [
+                sys.executable,
+                str(driver),
+                str(root),
+                str(_ENTRY),
+                shutil.which("node") or "node",
+                str(src_root),
+                str(CodexHarness.CORE_RSS_DEPTH),
+            ],
+            timeout=300,
+            cwd=root / "work",
+        )
+        context = (
+            f"driver exit: {result.returncode}\n"
+            f"stdout: {result.stdout[-3000:]}\nstderr: {result.stderr[-3000:]}"
+        )
+        try:
+            m = json.loads(result.stdout.strip().splitlines()[-1])
+        except (ValueError, IndexError):
+            pytest.fail("the codex-acp depth driver produced no measurement\n" + context)
+
+        # A refused credential is adapter drift: skipping would go quiet on exactly the
+        # release this guard is for.
+        assert m.get("new_error") is None, (
+            f"session/new was refused ({m.get('new_error')!r}); the fabricated-credential "
+            "arrangement no longer reaches app-server -- re-measure before trusting the "
+            "depth pin\n" + context
+        )
+        assert "depth_pids" in m, "the process tree was not walked\n" + context
+
+        # 1. within scope.
+        assert m["app_server_found"] is True, (
+            f"no `codex app-server` within CORE_RSS_DEPTH={CodexHarness.CORE_RSS_DEPTH} of "
+            "the adapter; the core-scope recycle guard is measuring the wrong processes\n" + context
+        )
+        # 2. exactly the generation the constant names.
+        assert m["app_server_depth"] == CodexHarness.CORE_RSS_DEPTH, (
+            f"`codex app-server` sits at depth {m['app_server_depth']}, not "
+            f"CORE_RSS_DEPTH={CodexHarness.CORE_RSS_DEPTH}; re-measure the constant against "
+            "this adapter release\n" + context
+        )
+
+
+@pytest.mark.real_adapter
+def test_the_installed_adapter_still_builds_the_frames_the_refusal_reads():
+    """The frame VOCABULARY the deny channel keys on, pinned against the adapter.
+
+    Three things identify a codex MCP call to Crew: the ``tool_call`` frame's
+    ``rawInput = {server, tool, arguments}`` (``mcpInput``), its
+    ``_meta.is_mcp_tool_call`` marker, and the approval request's
+    ``_meta.is_mcp_tool_approval`` marker with ``cancel`` as its reject option
+    (``buildMcpPermissionRequest`` / ``McpApprovalOptionId``). One builder makes all three,
+    so a reshape blinds every refusal at once. Read from the shipped source the spawn
+    resolves, since seeing them on the wire needs a model call.
+    """
+    _require_codex_acp()
+    assert _ENTRY is not None
+    source = _ENTRY.read_text(encoding="utf-8", errors="replace")
+    for needle in (
+        "return { server: item.server, tool: item.tool, arguments: item.arguments };",
+        "is_mcp_tool_call: true",
+        "is_mcp_tool_approval: true",
+        'Cancel: "cancel"',
+    ):
+        assert needle in source, (
+            f"codex-acp at {_ENTRY} no longer contains {needle!r}: the frame shape the "
+            "spec-restriction refusal identifies an MCP call by has drifted"
+        )
+
+
+def test_the_real_adapter_guard_is_reachable_at_all(monkeypatch):
+    """A skip-only guard is a guard nobody notices has stopped running.
+
+    It asserts the resolver the guard reads is the spawn's own, so a rename there cannot
+    turn the guard green unseen; presence is enforced by ``KIROCREW_E2E_REQUIRE``.
+
+    ``_mise_which`` is a recording fake because a real ``mise`` may fetch toolchains; that
+    the ladder asked mise for this adapter is the fact pinned.
+    """
+    from kiro_crew.acp import client as client_mod
+    from kiro_crew.acp.client import CODEX_ACP_BIN, _resolve_codex_acp_bin
+
+    asked: list[str] = []
+
+    def fake_mise_which(tool: str) -> str | None:
+        asked.append(tool)
+        return None
+
+    monkeypatch.setattr(client_mod, "_mise_which", fake_mise_which)
+
+    argv, search = _resolve_codex_acp_bin()
+    assert argv is None or isinstance(argv, list)
+    assert isinstance(search, str)
+    assert asked == [CODEX_ACP_BIN]
+    assert os.environ.get("CODEX_ACP_BIN") is None or _ENTRY is not None
+
+
+_LOAD_DRIVER = r"""
+import json, os, queue, subprocess, sys, threading, time
+
+root, entry, node = sys.argv[1:4]
+work = os.path.join(root, "work")
+env = dict(os.environ)
+env["CODEX_HOME"] = os.path.join(root, "codex_home")
+env["AWS_CONFIG_FILE"] = os.path.join(root, "aws", "config")
+env["AWS_SHARED_CREDENTIALS_FILE"] = os.path.join(root, "aws", "creds")
+env["NO_BROWSER"] = "1"
+# A wrapped codex build writes telemetry into TMPDIR. Point it inside the temp
+# root so the measurement leaves nothing behind for the residue reporter to find.
+env["TMPDIR"] = os.path.join(root, "tmp")
+os.makedirs(env["TMPDIR"], exist_ok=True)
+SECRET = "quibbleflum"
+
+
+def reap(p):
+    for step in (p.terminate, p.kill):
+        try:
+            step()
+            p.communicate(timeout=15)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+        except Exception:
+            return
+
+
+class Conn:
+    def __init__(self):
+        self.p = subprocess.Popen(
+            [node, entry], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, cwd=work, env=env, text=True, bufsize=1,
+        )
+        self.q = queue.Queue()
+        self.notes = []
+        self.n = 0
+        threading.Thread(target=self._pump, daemon=True).start()
+
+    def _pump(self):
+        for line in self.p.stdout:
+            self.q.put(line)
+        self.q.put(None)
+
+    def send(self, method, params):
+        self.n += 1
+        self.p.stdin.write(json.dumps(
+            {"jsonrpc": "2.0", "id": self.n, "method": method, "params": params}) + "\n")
+        self.p.stdin.flush()
+        return self.n
+
+    def wait(self, rid, timeout=180):
+        deadline = time.time() + timeout
+        while True:
+            budget = deadline - time.time()
+            if budget <= 0:
+                return {"_timeout": True}
+            try:
+                line = self.q.get(timeout=budget)
+            except queue.Empty:
+                return {"_timeout": True}
+            if line is None:
+                return {"_eof": True}
+            try:
+                msg = json.loads(line)
+            except ValueError:
+                continue
+            if msg.get("id") == rid:
+                return msg
+            if msg.get("method"):
+                if "id" in msg:
+                    # A request from the agent: answer fail-closed so nothing hangs.
+                    self.p.stdin.write(json.dumps({
+                        "jsonrpc": "2.0", "id": msg["id"],
+                        "result": {"outcome": {"outcome": "cancelled"}}}) + "\n")
+                    self.p.stdin.flush()
+                else:
+                    self.notes.append(msg)
+
+    def call(self, method, params, timeout=180):
+        return self.wait(self.send(method, params), timeout=timeout)
+
+    def alive(self, sid):
+        r = self.call("session/set_config_option",
+                      {"sessionId": sid, "configId": "mode", "value": "read-only"}, 60)
+        return "result" in r
+
+    def replay(self):
+        out = []
+        for note in self.notes:
+            upd = (note.get("params") or {}).get("update") or {}
+            if upd.get("sessionUpdate") in ("agent_message_chunk", "user_message_chunk"):
+                c = upd.get("content") or {}
+                if isinstance(c, dict) and c.get("type") == "text":
+                    out.append(c.get("text") or "")
+        return "".join(out)
+
+    def prompt(self, sid, text):
+        self.notes = []
+        r = self.call("session/prompt",
+                      {"sessionId": sid, "prompt": [{"type": "text", "text": text}]}, 300)
+        res = r.get("result") or {}
+        return {"stop": res.get("stopReason"), "error": r.get("error"),
+                "usage": res.get("usage"), "text": self.replay()[:200]}
+
+
+out = {}
+sid = None
+c1 = Conn()
+try:
+    c1.call("initialize", {"protocolVersion": 1, "clientCapabilities": {"fs": {}}}, 120)
+    new = c1.call("session/new", {"cwd": work, "mcpServers": []})
+    out["new_error"] = new.get("error")
+    sid = (new.get("result") or {}).get("sessionId")
+    if sid:
+        out["plant"] = c1.prompt(
+            sid, "Remember this word for later: %s. Reply with exactly OK." % SECRET)
+        out["close_error"] = c1.call("session/close", {"sessionId": sid}, 60).get("error")
+        out["alive_after_close"] = c1.alive(sid)
+        c1.notes = []
+        load = c1.call("session/load", {"sessionId": sid, "cwd": work, "mcpServers": []})
+        out["same_load_ok"] = "result" in load
+        out["same_load_error"] = load.get("error")
+        if "result" in load:
+            out["same_recall"] = c1.prompt(
+                sid, "What word did I ask you to remember? Reply with only that word.")
+finally:
+    reap(c1.p)
+
+if sid:
+    c2 = Conn()
+    try:
+        c2.call("initialize", {"protocolVersion": 1, "clientCapabilities": {"fs": {}}}, 120)
+        c2.notes = []
+        load = c2.call("session/load", {"sessionId": sid, "cwd": work, "mcpServers": []})
+        out["fresh_load_ok"] = "result" in load
+        out["fresh_load_error"] = load.get("error")
+        if "result" in load:
+            out["fresh_recall"] = c2.prompt(
+                sid, "What word did I ask you to remember? Reply with only that word.")
+        out["delete_error"] = c2.call("session/delete", {"sessionId": sid}, 120).get("error")
+        after = c2.call("session/load", {"sessionId": sid, "cwd": work, "mcpServers": []})
+        out["load_after_delete_ok"] = "result" in after
+        out["load_after_delete_error"] = after.get("error")
+    finally:
+        reap(c2.p)
+
+print(json.dumps(out))
+"""
+
+
+def _provider_config_only(config_toml: str) -> str:
+    """Keep only provider settings needed by the live Codex test.
+
+    The allowlist keeps selected top-level scalar keys and whole
+    ``[model_providers...]`` tables. A denylist has an open spelling axis: each new
+    TOML spelling can reopen it and let an operator-configured process start.
+    """
+    allowed_top_level_keys = {
+        "model_provider",
+        "forced_login_method",
+        "model",
+        "model_reasoning_effort",
+        "chatgpt_base_url",
+        "check_for_update_on_startup",
+    }
+    out: list[str] = []
+    at_top_level = True
+    in_provider_table = False
+    for line in config_toml.splitlines(keepends=True):
+        stripped = line.lstrip()
+        if stripped.startswith("["):
+            at_top_level = False
+            if stripped.startswith("[["):
+                header = None
+            else:
+                end = stripped.find("]", 1)
+                header = stripped[1:end].strip() if end != -1 else None
+            in_provider_table = header == "model_providers" or (
+                header is not None and header.startswith("model_providers.")
+            )
+            if in_provider_table:
+                out.append(line)
+            continue
+        if in_provider_table:
+            out.append(line)
+            continue
+        if at_top_level:
+            key, separator, _value = stripped.partition("=")
+            if separator and key.strip() in allowed_top_level_keys:
+                out.append(line)
+    return "".join(out)
+
+
+def test_provider_config_only_excludes_process_configuration():
+    config = """\
+model_provider = "custom"
+forced_login_method = "chatgpt"
+model = "example-model"
+model_reasoning_effort = "low"
+chatgpt_base_url = "https://example.invalid"
+check_for_update_on_startup = false
+mcp_servers = { evil = { command = "/bin/sh" } }
+mcp_servers.evil2 = { command = "/bin/sh" }
+notify = ["/bin/sh"]
+
+[model_providers.custom]
+name = "Custom"
+wire_api = "responses"
+
+[mcp_servers.builder]
+command = "/bin/sh"
+
+[hooks]
+command = "/bin/sh"
+"""
+
+    filtered = _provider_config_only(config)
+
+    assert "mcp_servers" not in filtered
+    assert "hooks" not in filtered
+    assert "notify" not in filtered
+    for provider_setting in (
+        'model_provider = "custom"',
+        'forced_login_method = "chatgpt"',
+        'model = "example-model"',
+        'model_reasoning_effort = "low"',
+        'chatgpt_base_url = "https://example.invalid"',
+        "check_for_update_on_startup = false",
+        "[model_providers.custom]",
+        'name = "Custom"',
+        'wire_api = "responses"',
+    ):
+        assert provider_setting in filtered
+
+
+@pytest.mark.skipif(
+    os.environ.get("KIROCREW_LIVE_CODEX_PROMPT_TESTS") != "1",
+    reason=("spends real model tokens; set KIROCREW_LIVE_CODEX_PROMPT_TESTS=1 to opt in"),
+)
+def test_real_codex_acp_load_after_close_restores():
+    """ANTI-DRIFT GUARD for codex's membership in ``ACP_BACKENDS_SESSION_SHARING``.
+
+    ``session/close`` evicts the id, but the thread's record survives, so ``session/load``
+    restores it and a shared subagent stays continuable.
+
+    1. After a close, ``session/load`` on the same id answers what only turn one taught it.
+    2. The load also works from a restarted adapter over the same ``CODEX_HOME``, the shape
+       ``spawn_continue`` takes; a same-process load could come from adapter memory.
+    3. ``session/delete`` archives the thread and a later load refuses.
+
+    This test prompts, so the spend opt-in is the one gate; past it every missing
+    precondition fails, because ``test_real_adapter_gate.py`` forbids a ``skipif`` on
+    ``_ENTRY``. It carries no ``@pytest.mark.real_adapter``: that lane has no credential and
+    refuses a selected case that skips. ``CODEX_PATH`` alone is not consent to spend tokens.
+    """
+    if _ENTRY is None:
+        pytest.fail(
+            "codex-acp is not installed, and KIROCREW_LIVE_CODEX_PROMPT_TESTS=1: the "
+            "opt-in declares this host can prompt a real codex. Install it with: "
+            f"npm i -g @agentclientprotocol/codex-acp@{MEASURED_CODEX_ACP_VERSION}"
+        )
+    if shutil.which("node") is None:
+        pytest.fail("node is not on PATH, so the codex-acp entrypoint cannot run")
+    if not os.environ.get("CODEX_PATH"):
+        pytest.fail(
+            "CODEX_PATH is unset, so there is no codex build to prompt; unset "
+            "KIROCREW_LIVE_CODEX_PROMPT_TESTS on a host that cannot prompt one"
+        )
+
+    ambient = Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex")) / "config.toml"
+    if not ambient.is_file():
+        pytest.fail(
+            f"no codex config.toml at {ambient} to resolve a provider from, so this "
+            "opt-in test cannot prompt; unset KIROCREW_LIVE_CODEX_PROMPT_TESTS on a "
+            "host without a configured codex"
+        )
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as w:
+        root = Path(w)
+        (root / "work").mkdir()
+        (root / "codex_home").mkdir()
+        (root / "aws").mkdir()
+        (root / "codex_home" / "config.toml").write_text(
+            _provider_config_only(ambient.read_text(encoding="utf-8")), encoding="utf-8"
+        )
+        driver = root / "drive_load.py"
+        driver.write_text(_LOAD_DRIVER, encoding="utf-8")
+        result = _run_driver_reaping_group(
+            [sys.executable, str(driver), str(root), str(_ENTRY), shutil.which("node") or "node"],
+            timeout=900,
+            cwd=root / "work",
+        )
+        context = (
+            f"driver exit: {result.returncode}\n"
+            f"stdout: {result.stdout[-3000:]}\nstderr: {result.stderr[-3000:]}"
+        )
+        try:
+            m = json.loads(result.stdout.strip().splitlines()[-1])
+        except (ValueError, IndexError):
+            pytest.fail("the codex-acp load driver produced no measurement\n" + context)
+
+        # ``KIROCREW_LIVE_CODEX_PROMPT_TESTS=1`` is a DECLARATION that this host has
+        # a working credentialled codex, the way ``KIROCREW_E2E_REQUIRE=1`` is used in
+        # ``real_adapter_gate``. Under a declaration an absent precondition is a
+        # failure rather than a skip: a host that cannot meet it unsets the opt-in,
+        # and a run that reports success having measured nothing is what the
+        # no-silent-skip rule exists to refuse.
+        if m.get("new_error"):
+            pytest.fail(
+                f"codex-acp refused session/new on this host: {m['new_error']!r}\n{context}"
+            )
+        plant = m.get("plant") or {}
+        if plant.get("error") or plant.get("stop") != "end_turn":
+            pytest.fail(f"the planting prompt did not complete on this host: {plant!r}\n{context}")
+
+        # The close still evicts -- restated here so this test fails rather than
+        # silently measuring a load on a session that never left.
+        assert m["close_error"] is None, f"session/close was refused\n{context}"
+        assert not m["alive_after_close"], (
+            "session/close no longer evicts, so this test is measuring a live session "
+            "rather than a restored one\n" + context
+        )
+
+        # 1. the record survived the close, on the same process.
+        assert m["same_load_ok"], (
+            "session/load on a CLOSED sessionId failed, so codex's close disposes the "
+            "record as well as the session -- codex must leave "
+            f"ACP_BACKENDS_SESSION_SHARING: {m.get('same_load_error')!r}\n" + context
+        )
+        same = m.get("same_recall") or {}
+        assert "quibbleflum" in (same.get("text") or "").lower(), (
+            "the restored session could not recall the first turn, so the load "
+            f"returned a session without its context: {same!r}\n" + context
+        )
+
+        # 2. and across an adapter RESTART, which is the continuation's real shape.
+        assert m["fresh_load_ok"], (
+            "session/load from a FRESH adapter process failed, so a codex subagent "
+            "stops being continuable once its runtime is recycled -- which is the "
+            f"ordinary case: {m.get('fresh_load_error')!r}\n" + context
+        )
+        fresh = m.get("fresh_recall") or {}
+        assert "quibbleflum" in (fresh.get("text") or "").lower(), (
+            f"the reopened thread lost its context across the restart: {fresh!r}\n" + context
+        )
+
+        # 3. delete is the disposing verb, so release has one and close is not it.
+        assert m["delete_error"] is None, f"session/delete was refused\n{context}"
+        assert not m["load_after_delete_ok"], (
+            "session/load succeeded after session/delete, so delete no longer disposes "
+            "the thread and release has no verb that does\n" + context
+        )
+
+
+# ── turn-level memberships, measured against a loopback model ───────────────
+
+# The lane's credential is fabricated, so codex cannot reach a real model. Every
+# membership below needs a TURN, so the driver serves codex's Responses API itself:
+# a stdlib HTTP server on 127.0.0.1 (ephemeral port, test process only) that answers
+# each request with one assistant message. The first turn's request is HELD open so a
+# steer can land while the turn is in flight. Every request body is logged, which is
+# how the test sees what codex actually sent its model.
+_TURN_DRIVER = r"""
+import json, os, queue, subprocess, sys, threading, time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+root, entry, node = sys.argv[1:4]
+work = os.path.join(root, "work")
+log, lock, held = [], threading.Lock(), []
+first_seen, release = threading.Event(), threading.Event()
+USAGE = {"input_tokens": 100, "input_tokens_details": None, "output_tokens": 5,
+         "output_tokens_details": None, "total_tokens": 105}
+
+
+class Model(BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def _json(self, obj):
+        body = json.dumps(obj).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        with lock:
+            log.append({"method": "GET", "path": self.path})
+        self._json({"data": [], "models": []})
+
+    def do_POST(self):
+        text = self.rfile.read(int(self.headers.get("Content-Length") or 0)).decode("utf-8", "replace")
+        with lock:
+            n = len(log)
+            log.append({"method": "POST", "path": self.path,
+                        "encoding": self.headers.get("Content-Encoding"), "body": text})
+            hold = not held and "TURN-ONE-PELICAN" in text
+            if hold:
+                held.append(n)
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.end_headers()
+
+        def emit(ev):
+            self.wfile.write(("event: %s\ndata: %s\n\n" % (ev["type"], json.dumps(ev))).encode())
+            self.wfile.flush()
+
+        emit({"type": "response.created", "response": {"id": "resp_%d" % n}})
+        if hold:
+            first_seen.set()
+            release.wait(60)
+        emit({"type": "response.output_item.done", "item": {
+            "type": "message", "role": "assistant", "id": "msg_%d" % n,
+            "content": [{"type": "output_text", "text": "STUB-REPLY-%d" % n}]}})
+        emit({"type": "response.completed", "response": {"id": "resp_%d" % n, "usage": USAGE}})
+
+
+server = ThreadingHTTPServer(("127.0.0.1", 0), Model)
+threading.Thread(target=server.serve_forever, daemon=True).start()
+with open(os.path.join(root, "codex_home", "config.toml"), "w") as fh:
+    fh.write('model = "gpt-5-codex"\nmodel_provider = "stub"\n'
+             '[model_providers.stub]\nname = "stub"\n'
+             'base_url = "http://127.0.0.1:%d/v1"\nwire_api = "responses"\n'
+             'env_key = "KIROCREW_STUB_MODEL_KEY"\n'
+             'request_max_retries = 0\nstream_max_retries = 0\n' % server.server_address[1])
+env = dict(os.environ, CODEX_HOME=os.path.join(root, "codex_home"), NO_BROWSER="1",
+           KIROCREW_STUB_MODEL_KEY="stub-key")
+
+
+class Agent:
+    def __init__(self):
+        self.p = subprocess.Popen([node, entry], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                  stderr=subprocess.DEVNULL, cwd=work, env=env, text=True, bufsize=1)
+        self.q, self.frames, self.next = queue.Queue(), [], 0
+        threading.Thread(target=self._pump, daemon=True).start()
+
+    def _pump(self):
+        for line in self.p.stdout:
+            self.q.put(line)
+        self.q.put(None)
+
+    def send(self, method, params, notify=False):
+        msg = {"jsonrpc": "2.0", "method": method, "params": params}
+        if not notify:
+            self.next += 1
+            msg["id"] = self.next
+        self.p.stdin.write(json.dumps(msg) + "\n")
+        self.p.stdin.flush()
+        return msg.get("id")
+
+    def until(self, done, timeout):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if done(None):
+                return None
+            try:
+                line = self.q.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            if line is None:
+                return {"_eof": True}
+            try:
+                msg = json.loads(line)
+            except ValueError:
+                continue
+            self.frames.append(msg)
+            if "method" in msg and "id" in msg:  # an agent->client request: refuse it
+                if msg["method"] == "session/request_permission":
+                    answer = {"result": {"outcome": {"outcome": "cancelled"}}}
+                else:
+                    answer = {"error": {"code": -32601, "message": "n/a"}}
+                self.p.stdin.write(json.dumps(dict(answer, jsonrpc="2.0", id=msg["id"])) + "\n")
+                self.p.stdin.flush()
+            elif done(msg):
+                return msg
+        return {"_timeout": True}
+
+    def reply(self, rid, timeout=30):
+        return self.until(lambda m: m is not None and m.get("id") == rid and "method" not in m, timeout)
+
+    def call(self, method, params, timeout=30):
+        return self.reply(self.send(method, params), timeout)
+
+    def reap(self):
+        for step in (self.p.terminate, self.p.kill):
+            try:
+                step()
+                self.p.communicate(timeout=15)
+                return
+            except subprocess.TimeoutExpired:
+                continue
+            except Exception:
+                return
+
+
+def text(s):
+    return [{"type": "text", "text": s}]
+
+
+def since(agent, mark, sid):
+    return [f for f in agent.frames[mark:] if (f.get("params") or {}).get("sessionId") == sid]
+
+
+def is_idle(msg, sid):
+    params = msg.get("params") or {}
+    update = params.get("update") or {}
+    status = ((update.get("_meta") or {}).get("codex") or {}).get("threadStatus") or {}
+    return params.get("sessionId") == sid and status.get("type") == "idle"
+
+
+def recalled(tag):
+    # The proof a loaded thread kept its context: the next turn's MODEL REQUEST
+    # carries the first turn. Replay frames are recorded but not relied on.
+    return any(tag in e.get("body", "") and "TURN-ONE-PELICAN" in e["body"] for e in log)
+
+
+out = {}
+a = Agent()
+try:
+    out["init"] = (a.call("initialize", {"protocolVersion": 1, "clientCapabilities": {"fs": {}}}) or {}).get("result")
+    new = a.call("session/new", {"cwd": work, "mcpServers": []})
+    out["new_error"] = new.get("error")
+    sid = (new.get("result") or {}).get("sessionId")
+    out["sid"] = sid
+    if sid:
+        p1 = a.send("session/prompt", {"sessionId": sid, "prompt": text("TURN-ONE-PELICAN: remember it.")})
+        a.until(lambda m: first_seen.is_set(), 60)
+        out["held_turn_seen"] = first_seen.is_set()
+        out["steer"] = a.call("_session/steering", {"sessionId": sid, "prompt": text("STEER-MID-TURN")}, 20)
+        release.set()
+        out["p1"] = a.reply(p1)
+        out["steer_reached_model"] = any("STEER-MID-TURN" in e.get("body", "") for e in log[(held or [0])[0] + 1:])
+        out["close"] = a.call("session/close", {"sessionId": sid})
+        mark = len(a.frames)
+        out["load_same"] = a.call("session/load", {"sessionId": sid, "cwd": work, "mcpServers": []})
+        a.until(lambda m: False, 3)
+        out["load_same_replay"] = "TURN-ONE-PELICAN" in json.dumps(since(a, mark, sid))
+        out["recall_same"] = a.call("session/prompt", {"sessionId": sid, "prompt": text("RECALL-SAME: which word?")})
+        out["recall_same_had_context"] = recalled("RECALL-SAME")
+finally:
+    a.reap()
+out["frames_a"] = a.frames
+
+if out.get("sid"):
+    b = Agent()
+    try:
+        b.call("initialize", {"protocolVersion": 1, "clientCapabilities": {"fs": {}}})
+        mark = len(b.frames)
+        out["load_fresh"] = b.call("session/load", {"sessionId": sid, "cwd": work, "mcpServers": []})
+        b.until(lambda m: False, 3)
+        out["load_fresh_replay"] = "TURN-ONE-PELICAN" in json.dumps(since(b, mark, sid))
+        out["recall_fresh"] = b.call("session/prompt", {"sessionId": sid, "prompt": text("RECALL-FRESH: which word?")})
+        out["recall_fresh_had_context"] = recalled("RECALL-FRESH")
+        mark, before = len(b.frames), len(log)
+        out["compact"] = b.call("session/prompt", {"sessionId": sid, "prompt": text("/compact")}, 60)
+        out["compact_frames"] = since(b, mark, sid)
+        out["compact_requests"] = len(log) - before
+        # Last, so the turn startedNewTurn launches cannot race anything measured above.
+        # The prompt answer can precede the thread going idle, and a steer in that gap
+        # is answered "failed" (seen once in the lane), so wait for codex to say idle.
+        b.until(lambda m: m is not None and is_idle(m, sid), 15)
+        out["idle_steer"] = b.call("_session/steering", {"sessionId": sid, "prompt": text("STEER-IDLE")}, 20)
+        b.send("session/cancel", {"sessionId": sid}, notify=True)
+    finally:
+        b.reap()
+    out["frames_b"] = b.frames
+out["requests"] = [{k: (v[:300] if k == "body" else v) for k, v in e.items()} for e in log]
+server.shutdown()
+print(json.dumps(out))
+"""
+
+
+@pytest.fixture(scope="module")
+def codex_turns() -> dict:
+    """One driven run of the real adapter, shared by the four measurements below."""
+    _require_codex_acp(with_node=True)
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as w:
+        root = Path(w)
+        (root / "work").mkdir()
+        (root / "codex_home").mkdir()
+        (root / "codex_home" / "auth.json").write_text(
+            json.dumps({"OPENAI_API_KEY": "sk-not-a-real-key-" + "0" * 24}), encoding="utf-8"
+        )
+        driver = root / "drive_turns.py"
+        driver.write_text(_TURN_DRIVER, encoding="utf-8")
+        result = _run_driver_reaping_group(
+            [sys.executable, str(driver), str(root), str(_ENTRY), shutil.which("node") or "node"],
+            timeout=600,
+            cwd=root / "work",
+        )
+    try:
+        m = json.loads(result.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        pytest.fail(f"the turn driver produced no measurement\nstderr: {result.stderr[-3000:]}")
+    # session/new makes no model call, so a refusal here is a contract break, never a skip.
+    assert m.get(
+        "sid"
+    ), f"session/new failed: {m.get('new_error')!r}\nstderr: {result.stderr[-3000:]}"
+    m["_context"] = json.dumps({k: v for k, v in m.items() if k != "frames_a"})[-6000:]
+    return m
+
+
+@pytest.mark.real_adapter
+def test_real_codex_acp_advertises_image_prompts(codex_turns):
+    """``AcpClient`` sends image blocks only on a literal ``promptCapabilities.image: true``."""
+    agent = (codex_turns.get("init") or {}).get("agentCapabilities") or {}
+    caps = agent.get("promptCapabilities")
+    assert isinstance(caps, dict) and caps.get("image") is True, codex_turns["_context"]
+
+
+@pytest.mark.real_adapter
+def test_real_codex_acp_steer_is_injected_into_the_running_turn(codex_turns):
+    """Codex's membership in ``ACP_BACKENDS_STEERING_REQUEST`` (see ``backends_turns``)."""
+    from kiro_crew.acp.types import (
+        STEERING_INJECTED,
+        STEERING_STARTED_NEW_TURN,
+        steering_advertised,
+    )
+
+    m, ctx = codex_turns, codex_turns["_context"]
+    assert steering_advertised(m.get("init")), ctx
+    assert m.get("held_turn_seen"), "the first turn never reached the model stub\n" + ctx
+    assert (m.get("steer") or {}).get("result", {}).get("outcome") == STEERING_INJECTED, ctx
+    assert m.get("steer_reached_model"), "the injected steer never reached a model request\n" + ctx
+    assert (m.get("p1") or {}).get("result", {}).get("stopReason") == "end_turn", ctx
+    idle = (m.get("idle_steer") or {}).get("result", {}).get("outcome")
+    assert idle == STEERING_STARTED_NEW_TURN, ctx
+
+
+@pytest.mark.real_adapter
+def test_real_codex_acp_compact_runs_inside_the_turn(codex_turns):
+    """Codex's membership in ``ACP_BACKENDS_COMPACT`` and ``INLINE_COMPACTION``."""
+    m, ctx = codex_turns, codex_turns["_context"]
+    commands = [
+        c.get("name")
+        for f in m.get("frames_a", []) + m.get("frames_b", [])
+        for c in ((f.get("params") or {}).get("update") or {}).get("availableCommands") or []
+    ]
+    assert "compact" in commands, ctx
+    assert m.get("compact_requests"), "/compact made no model request\n" + ctx
+    assert (m.get("compact") or {}).get("result", {}).get("stopReason") == "end_turn", ctx
+
+
+@pytest.mark.real_adapter
+def test_real_codex_acp_compact_pair_reads_as_started_then_completed(codex_turns):
+    """``_dispatch.parse_codex_compaction_update`` reads the pair the adapter sends.
+
+    Threaded the way both consumers thread it: the start's ``toolCallId`` is what
+    lets an unmarked (2.2.2) terminal be matched, so the marker is not required.
+    """
+    from kiro_crew.acp._dispatch import parse_codex_compaction_update
+
+    m, ctx = codex_turns, codex_turns["_context"]
+    pending: object = False
+    statuses = []
+    for f in m.get("compact_frames", []):
+        update = (f.get("params") or {}).get("update") or {}
+        status = parse_codex_compaction_update(update, pending, allow_unmarked=True)
+        if status:
+            statuses.append(status)
+            pending = (update.get("toolCallId") or True) if status == "started" else False
+    assert statuses == ["started", "completed"], ctx
+
+
+@pytest.mark.real_adapter
+def test_real_codex_acp_closed_session_loads_again(codex_turns):
+    """Codex's membership in ``ACP_BACKENDS_SESSION_SHARING``: close, then load restores."""
+    m, ctx = codex_turns, codex_turns["_context"]
+    close = m.get("close") or {}
+    assert "result" in close and not close.get("error"), ctx
+    assert "result" in (m.get("load_same") or {}), ctx
+    assert m.get("recall_same_had_context"), "the same-process reload lost the first turn\n" + ctx
+    assert "result" in (m.get("load_fresh") or {}), ctx
+    assert m.get("recall_fresh_had_context"), "the restarted reload lost the first turn\n" + ctx

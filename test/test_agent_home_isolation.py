@@ -1,0 +1,853 @@
+"""Agent-spec home isolation — the KIRO_HOME seam, the worktree guard, and the
+anti-regression guard that keeps ``~/.kiro/agents`` from being hard-coded again.
+
+A worktree gateway that rewrites the machine-wide ``~/.kiro/agents/*.json`` stamps its
+own ``.venv`` and data home into every managed server, so the real install's MCP calls
+get HTTP 403. Siblings: ``test_agent_home_isolation_override_home.py``,
+``test_agent_home_isolation_derived_specs.py`` and ``agent_home_isolation_helpers.py``.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+from agent_home_isolation_helpers import _durable_checkout  # noqa: F401
+from agent_home_isolation_helpers import _isolate_default_home_fixture  # noqa: F401
+from agent_home_isolation_helpers import _pin_default_home_and_breadcrumb  # noqa: F401
+from agent_home_isolation_helpers import _capture_sel, _pretend_target_is_shared
+
+from conftest import make_dir_link
+from kiro_crew.config.paths import kiro_agents_dir, kiro_home
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SRC = REPO_ROOT / "src" / "kiro_crew"
+
+
+# The KIRO_HOME seam
+def _no_overrides(monkeypatch) -> None:
+    """No KIRO_HOME and no KIROCREW_HOME — the plain-install baseline.
+
+    Both must be cleared: with a KIROCREW_HOME override active AND the code
+    running from a worktree (which is how this repo is developed), the derived
+    isolated home legitimately kicks in.
+    """
+    monkeypatch.delenv("KIRO_HOME", raising=False)
+    monkeypatch.delenv("KIROCREW_HOME", raising=False)
+    monkeypatch.delenv("KIROCREW_POD", raising=False)
+
+
+def test_kiro_home_defaults_to_dot_kiro(monkeypatch, unpinned_agent_spec_home):
+    """The shipped default, with the suite's agents-dir pin lifted.
+
+    ``kiro_agents_dir()`` honours ``config.paths._agents_dir_override``, which the
+    host-mutation floor installs for every test, so this assertion is about the
+    resolver's own default rather than what a test run resolves.
+    """
+    _no_overrides(monkeypatch)
+    assert kiro_home() == Path.home() / ".kiro"
+    assert kiro_agents_dir() == Path.home() / ".kiro" / "agents"
+
+
+def test_kiro_home_honors_override(monkeypatch, tmp_path):
+    monkeypatch.setenv("KIRO_HOME", str(tmp_path / "pod-kiro"))
+    assert kiro_home() == (tmp_path / "pod-kiro").resolve()
+    assert kiro_agents_dir() == (tmp_path / "pod-kiro").resolve() / "agents"
+
+
+def test_kiro_home_expands_user(monkeypatch):
+    monkeypatch.delenv("KIROCREW_HOME", raising=False)
+    monkeypatch.setenv("KIRO_HOME", "~/some-kiro-home")
+    assert kiro_home() == (Path.home() / "some-kiro-home").resolve()
+
+
+def test_kiro_home_refuses_a_root(monkeypatch):
+    """The root check is portable: a root is its own parent on every OS.
+
+    On Windows a bare "/" resolves to the current DRIVE root (``C:\\``), which is
+    still its own parent, so the same assertion holds without special-casing.
+    """
+    _no_overrides(monkeypatch)
+    monkeypatch.setenv("KIRO_HOME", "/")
+    assert kiro_home() == Path.home() / ".kiro"
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="/usr, /etc, /System are POSIX system dirs; on Windows they resolve to "
+    "ordinary per-drive folders (D:/usr) and are not privileged",
+)
+@pytest.mark.parametrize("bad", ["/usr", "/etc", "/System"])
+def test_kiro_home_refuses_posix_system_dirs(monkeypatch, bad):
+    """A POSIX system dir must degrade to the default, never be written into."""
+    _no_overrides(monkeypatch)
+    monkeypatch.setenv("KIRO_HOME", bad)
+    assert kiro_home() == Path.home() / ".kiro"
+
+
+def test_kiro_home_matches_kirocrew_home_safety_rules():
+    """Both overrides share one predicate, so they refuse the same targets."""
+    from kiro_crew.config.paths import _is_unsafe_home
+
+    # Portable on every OS: a root is its own parent.
+    assert _is_unsafe_home(Path(Path("/").resolve().anchor))
+    if sys.platform != "win32":
+        assert _is_unsafe_home(Path("/usr"))
+    assert not _is_unsafe_home(Path.home() / ".kiro")
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="/etc -> /private/etc is a macOS symlink")
+def test_macos_private_etc_is_refused():
+    """The RESOLVED spelling of /etc must be refused, not just the literal one.
+
+    Callers resolve() the override first, and on macOS ``/etc`` resolves to
+    ``/private/etc``, which a guard knowing only ``("/", "etc")`` would accept.
+    """
+    from kiro_crew.config.paths import _is_unsafe_home
+
+    assert _is_unsafe_home(Path("/etc").resolve())
+    assert _is_unsafe_home(Path("/private/etc"))
+    # The whole TREE, not just the bare directory: ("/", "etc") is already a
+    # prefix match on Linux, so refusing only the exact resolved path would let
+    # KIROCREW_HOME=/etc/kirocrew through on macOS alone — the two platforms
+    # would disagree about the same override.
+    assert _is_unsafe_home(Path("/etc/kirocrew").resolve())
+    assert _is_unsafe_home(Path("/private/etc/kirocrew"))
+    assert _is_unsafe_home(Path("/private/etc/foo/bar"))
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX tempdir layout")
+def test_temp_dir_home_is_still_allowed():
+    """The /etc fix must not refuse a temp-dir home.
+
+    On macOS ``tempfile.gettempdir()`` resolves under ``/private/var/folders/...``,
+    so refusing the whole ``/private`` tree would reject every temp-dir data home
+    — which tests, pods and worktree previews all rely on.
+    """
+    import tempfile
+
+    from kiro_crew.config.paths import _is_unsafe_home
+
+    assert not _is_unsafe_home(Path(tempfile.gettempdir()).resolve())
+
+
+def test_under_system_tmp_answers_on_the_call_time_root():
+    """``_under_system_tmp`` covers the temp root and its subtrees, nothing else.
+
+    The DATA-home predicate above deliberately allows a temp-dir home; this
+    CHECKOUT predicate deliberately condemns a temp-dir checkout. Both answer
+    against ``tempfile.gettempdir()`` as configured at call time.
+    """
+    import tempfile
+
+    from kiro_crew.config.paths import _under_system_tmp
+
+    root = Path(tempfile.gettempdir()).resolve()
+    assert _under_system_tmp(root)
+    assert _under_system_tmp(root / "kc-task-1234" / "repo" / "src")
+    assert not _under_system_tmp(Path("/durable-install/KiroCrew").resolve())
+
+
+# The worktree decline guard
+def _make_linked_worktree(tmp_path: Path) -> Path:
+    """A directory whose ``.git`` is a linked-worktree gitdir pointer file."""
+    wt = tmp_path / "kirocrew-wt-example"
+    (wt / "src" / "kiro_crew").mkdir(parents=True)
+    (wt / ".git").write_text(
+        "gitdir: /somewhere/KiroCrew/.git/worktrees/kirocrew-wt-example\n",
+        encoding="utf-8",
+    )
+    return wt
+
+
+def test_private_target_is_never_declined(monkeypatch, tmp_path):
+    """A pod/test target is private, so a worktree may write it freely.
+
+    This keeps the guard from breaking Kiro Crew's own suite, which runs in worktrees
+    and writes to ``tmp_path``.
+    """
+    from kiro_crew import agent
+
+    monkeypatch.delenv("KIRO_HOME", raising=False)
+    wt = _make_linked_worktree(tmp_path)
+    monkeypatch.setattr(agent, "__file__", str(wt / "src" / "kiro_crew" / "agent.py"))
+    # Target the ambient environment would never produce -> private by definition.
+    monkeypatch.setattr(agent, "KIRO_AGENTS_DIR", tmp_path / "private" / "agents")
+    monkeypatch.setattr(agent, "kiro_agents_dir", lambda: tmp_path / "elsewhere")
+
+    assert agent._decline_shared_agent_home() is None
+
+
+def test_symlinked_shared_home_still_declines(monkeypatch, tmp_path):
+    """A symlinked shared home must NOT be mistaken for a private target.
+
+    A lexical comparison would read a symlinked ``~/.kiro`` as a different directory.
+    ``make_dir_link`` makes a junction on Windows, so the case runs there too.
+    """
+    from kiro_crew import agent
+
+    real = tmp_path / "real-kiro" / "agents"
+    real.mkdir(parents=True)
+    link = tmp_path / "linked-kiro"
+    make_dir_link(link, tmp_path / "real-kiro")
+
+    wt = _make_linked_worktree(tmp_path)
+    monkeypatch.setattr(agent, "__file__", str(wt / "src" / "kiro_crew" / "agent.py"))
+    # Same directory, two spellings: the target is reached through the symlink,
+    # the machine-wide default through the real path.
+    monkeypatch.setattr(agent, "KIRO_AGENTS_DIR", link / "agents")
+    monkeypatch.setattr(agent, "ambient_agents_dir", lambda: real)
+
+    assert (
+        agent._decline_shared_agent_home() is not None
+    ), "symlinked shared home was treated as private — guard bypassed"
+
+
+def test_declines_when_running_from_worktree_without_kiro_home(monkeypatch, tmp_path):
+    from kiro_crew import agent
+
+    monkeypatch.delenv("KIRO_HOME", raising=False)
+    wt = _make_linked_worktree(tmp_path)
+    monkeypatch.setattr(agent, "__file__", str(wt / "src" / "kiro_crew" / "agent.py"))
+    _pretend_target_is_shared(monkeypatch, agent, tmp_path / "agents")
+
+    declined = agent._decline_shared_agent_home()
+    assert declined is not None
+    assert declined.name == agent.AGENT_FILENAME
+
+
+def test_agent_home_inside_own_data_home_is_private(monkeypatch, tmp_path):
+    """The supported opt-in: put the agent home INSIDE this instance's data home.
+
+    That is provable privacy — the instance's own teardown owns the directory — so
+    an ephemeral instance may write it freely.
+    """
+    from kiro_crew import agent
+    from kiro_crew.config.paths import isolated_agents_dir
+
+    own_home = tmp_path / "wt" / ".kirocrew-dev"
+    own_home.mkdir(parents=True)
+    agents = isolated_agents_dir(own_home)
+
+    wt = _make_linked_worktree(tmp_path)
+    monkeypatch.setattr(agent, "__file__", str(wt / "src" / "kiro_crew" / "agent.py"))
+    monkeypatch.setenv("KIROCREW_HOME", str(own_home))
+    monkeypatch.setenv("KIRO_HOME", str(own_home / "kiro"))
+    _pretend_target_is_shared(monkeypatch, agent, agents)
+
+    assert agent._decline_shared_agent_home() is None
+
+
+def test_data_home_that_is_an_ancestor_does_not_make_shared_private(monkeypatch, tmp_path):
+    """An ANCESTOR data home must not make the shared dir private.
+
+    With ``KIROCREW_HOME=$HOME`` the shared ``~/.kiro/agents`` sits beneath the data
+    home, so the exemption is an exact match on ``<data home>/kiro/agents``.
+    """
+    from kiro_crew import agent
+
+    fake_home = tmp_path / "home"
+    shared = fake_home / ".kiro" / "agents"
+    shared.mkdir(parents=True)
+
+    wt = _make_linked_worktree(tmp_path)
+    monkeypatch.setattr(agent, "__file__", str(wt / "src" / "kiro_crew" / "agent.py"))
+    monkeypatch.delenv("KIRO_HOME", raising=False)
+    monkeypatch.delenv("KIROCREW_POD", raising=False)
+    # The data home is an ANCESTOR of the shared agents dir.
+    monkeypatch.setenv("KIROCREW_HOME", str(fake_home))
+    _pretend_target_is_shared(monkeypatch, agent, shared)
+
+    assert (
+        agent._decline_shared_agent_home() is not None
+    ), "an ancestor data home made the shared agent home look private"
+
+
+def test_global_kiro_home_in_a_worktree_still_declines(monkeypatch, tmp_path):
+    """A globally exported KIRO_HOME moves the SHARED directory.
+
+    The comparison is against what the ambient environment resolves, not a
+    hard-coded ``~/.kiro/agents``.
+    """
+    from kiro_crew import agent
+
+    monkeypatch.delenv("KIROCREW_HOME", raising=False)
+    monkeypatch.setenv("KIRO_HOME", str(tmp_path / "kiro-alt"))
+    wt = _make_linked_worktree(tmp_path)
+    monkeypatch.setattr(agent, "__file__", str(wt / "src" / "kiro_crew" / "agent.py"))
+    _pretend_target_is_shared(monkeypatch, agent, tmp_path / "kiro-alt" / "agents")
+
+    assert (
+        agent._decline_shared_agent_home() is not None
+    ), "a globally exported KIRO_HOME bypassed the guard"
+
+
+def test_cold_sel_decline_keeps_default_home_synthetic(
+    monkeypatch, tmp_path, _isolate_default_home
+):
+    """Exercise key creation through the real writer after the override is removed."""
+    from kiro_crew import agent
+    from kiro_crew.config import paths
+    from kiro_crew.sel import SecurityEventLog
+
+    _no_overrides(monkeypatch)
+    monkeypatch.setattr(SecurityEventLog, "_instance", None)
+    audit_root = tmp_path / "cold-audit"
+    assert not audit_root.exists()
+    assert paths._resolved_home is None
+    # The real synchronous mode avoids leaving a new daemon writer behind.
+    audit = SecurityEventLog(base_dir=audit_root, sync=True)
+    home = _isolate_default_home
+    assert paths._resolved_home == home / ".kiro" / "crew"
+    assert (home / paths.RECOVERY_BREADCRUMB_NAME).is_file()
+
+    wt = _make_linked_worktree(tmp_path)
+    monkeypatch.setattr(agent, "__file__", str(wt / "src" / "kiro_crew" / "agent.py"))
+    shared = tmp_path / "shared-agents"
+    _pretend_target_is_shared(monkeypatch, agent, shared)
+    assert agent._decline_shared_agent_home() == shared / agent.AGENT_FILENAME
+    assert not shared.exists()
+    events = audit.recent()
+    assert len(events) == 1
+    assert events[0]["operation"] == "agent_home_write"
+    assert events[0]["outcome"] == "denied"
+    assert audit.verify_integrity() == (1, 1)
+
+
+def test_declines_from_a_clone_under_the_temp_dir(monkeypatch, tmp_path):
+    """A throwaway clone under the system temp dir must not own the shared home.
+
+    Built under ``tempfile.gettempdir()``, not ``tmp_path``: pytest's basetemp predates
+    the suite's tempfile redirect and would miss the arm. A spec is planted because
+    the harm is an overwrite; the empty-home case is the next test.
+    """
+    import tempfile
+
+    from kiro_crew import agent
+
+    monkeypatch.delenv("KIRO_HOME", raising=False)
+    monkeypatch.delenv("KIROCREW_HOME", raising=False)
+    shared = tmp_path / "agents"
+    shared.mkdir()
+    (shared / agent.AGENT_FILENAME).write_text("{}", encoding="utf-8")
+    with tempfile.TemporaryDirectory(prefix="kc-clone-") as scratch_name:
+        clone = Path(scratch_name) / "repo"
+        (clone / "src" / "kiro_crew").mkdir(parents=True)
+        (clone / ".git").mkdir()  # a DIRECTORY -> ordinary clone, not a worktree
+        monkeypatch.setattr(agent, "__file__", str(clone / "src" / "kiro_crew" / "agent.py"))
+        _pretend_target_is_shared(monkeypatch, agent, shared)
+
+        assert (
+            agent._decline_shared_agent_home() is not None
+        ), "a temp-dir clone was allowed to rewrite the shared agent home"
+
+
+def test_does_not_decline_from_a_temp_clone_when_no_spec_exists(monkeypatch, tmp_path):
+    """With an EMPTY shared home the temp arm must write, not decline.
+
+    Declining is only ever a redirect to "the specs that already worked". When
+    there are none, refusing protects nothing and leaves the install with no
+    spec at all -- every turn then fails with ``Mode 'kirocrew' not found``.
+    """
+    import tempfile
+
+    from kiro_crew import agent
+
+    monkeypatch.delenv("KIRO_HOME", raising=False)
+    monkeypatch.delenv("KIROCREW_HOME", raising=False)
+    with tempfile.TemporaryDirectory(prefix="kc-clone-") as scratch_name:
+        clone = Path(scratch_name) / "repo"
+        (clone / "src" / "kiro_crew").mkdir(parents=True)
+        (clone / ".git").mkdir()
+        monkeypatch.setattr(agent, "__file__", str(clone / "src" / "kiro_crew" / "agent.py"))
+        # Target resolves shared but holds no spec -> nothing to preserve.
+        _pretend_target_is_shared(monkeypatch, agent, tmp_path / "agents")
+
+        assert agent._decline_shared_agent_home(audit=False) is None, (
+            "an empty shared agent home was refused its first spec, so the install "
+            "would have no agent to run"
+        )
+
+
+def test_does_not_decline_from_an_appimage_runtime_mount(monkeypatch, tmp_path):
+    """An AppImage lives under the temp root yet must keep writing its specs.
+
+    Each launch mounts at a new random ``/tmp/.mount_<name>XXXXXX``, so declining would
+    pin every managed server to a stale mount.
+    """
+    import tempfile
+
+    from kiro_crew import agent
+
+    monkeypatch.delenv("KIRO_HOME", raising=False)
+    monkeypatch.delenv("KIROCREW_HOME", raising=False)
+    monkeypatch.delenv("APPDIR", raising=False)  # env-free child: `.mount_` is the signal
+    with tempfile.TemporaryDirectory(prefix="kc-appimage-") as scratch_name:
+        # The temp root may sit inside a linked worktree; this `.git` stops the
+        # worktree arm's walk-up here, so only the temp arm decides.
+        (Path(scratch_name) / ".git").mkdir()
+        mount = Path(scratch_name) / ".mount_KiroXk3Qm9"
+        (mount / "usr" / "lib" / "kiro_crew").mkdir(parents=True)
+        monkeypatch.setattr(
+            agent, "__file__", str(mount / "usr" / "lib" / "kiro_crew" / "agent.py")
+        )
+        _pretend_target_is_shared(monkeypatch, agent, tmp_path / "agents")
+
+        assert agent._decline_shared_agent_home(audit=False) is None, (
+            "an AppImage runtime mount was refused the shared agent home, so its "
+            "managed servers would stay pinned to a stale mount path"
+        )
+
+
+def test_under_system_tmp_covers_posix_tmp_when_tmpdir_points_elsewhere(monkeypatch, tmp_path):
+    """The macOS shape: ``$TMPDIR`` is per-user, so ``/tmp`` needs its own arm.
+
+    launchd sets ``$TMPDIR`` to ``/var/folders/.../T``, simulated here by pointing
+    ``gettempdir()`` away from ``/tmp``. POSIX-only: ``/tmp`` is drive-relative on Windows.
+    """
+    import tempfile as _tempfile
+
+    if sys.platform == "win32":
+        pytest.skip("no POSIX /tmp tree on Windows")
+
+    from kiro_crew.config import paths as paths_mod
+
+    monkeypatch.setattr(_tempfile, "gettempdir", lambda: str(tmp_path / "T"))
+
+    assert paths_mod._under_system_tmp(Path("/tmp/kc-fix-4781/repo/src")) is True
+    # And the configured root still answers, so neither arm shadows the other.
+    assert paths_mod._under_system_tmp(tmp_path / "T" / "scratch") is True
+    assert paths_mod._under_system_tmp(Path("/var/tmp/durable")) is False
+
+
+def test_under_system_tmp_omits_the_posix_literal_off_posix(monkeypatch, tmp_path):
+    """``/tmp`` is drive-relative on Windows, so the literal arm must not apply.
+
+    ``C:\\tmp`` may hold a durable checkout. Asserted natively on Windows: patching
+    ``os.name`` breaks pathlib, which picks its flavour from it.
+    """
+    import tempfile as _tempfile
+
+    from kiro_crew.config import paths as paths_mod
+
+    if sys.platform != "win32":
+        pytest.skip("the drive-relative resolution being pinned is Windows-only")
+
+    monkeypatch.setattr(_tempfile, "gettempdir", lambda: str(tmp_path / "T"))
+    drive_tmp = Path("/tmp").resolve()
+    if drive_tmp == (tmp_path / "T").resolve() or drive_tmp in (tmp_path / "T").resolve().parents:
+        pytest.skip("this host's %TEMP% is itself under the drive-anchored /tmp")
+
+    assert paths_mod._under_system_tmp(drive_tmp / "kc-fix-4781" / "repo") is False
+    # The configured root is still the one root every platform keeps.
+    assert paths_mod._under_system_tmp(tmp_path / "T" / "scratch") is True
+
+
+def test_under_system_tmp_still_answers_yes_for_an_appimage_mount():
+    """The carve-out belongs to the CALLER, not to the predicate.
+
+    The probe is resolved because the predicate resolves only its roots, and on
+    Windows ``gettempdir()`` returns an 8.3 short form (``RUNNER~1``).
+    """
+    import tempfile
+
+    from kiro_crew.config.paths import _in_ephemeral_tree, _under_system_tmp
+
+    mount = (Path(tempfile.gettempdir()) / ".mount_KiroXk3Qm9" / "usr" / "lib").resolve()
+    assert _under_system_tmp(mount) is True
+    assert _in_ephemeral_tree(mount, env={}) is True
+
+
+def test_does_not_decline_from_a_durable_clone(monkeypatch, tmp_path):
+    """An ordinary install outside the temp dir still owns its shared specs.
+
+    The path is fabricated: any path a test can create is under the temp root, and
+    the predicates are lexical, so it need not exist.
+    """
+    from kiro_crew import agent
+
+    monkeypatch.delenv("KIRO_HOME", raising=False)
+    monkeypatch.delenv("KIROCREW_HOME", raising=False)
+    durable = Path("/durable-install/KiroCrew/src/kiro_crew/agent.py")
+    monkeypatch.setattr(agent, "__file__", str(durable))
+    _pretend_target_is_shared(monkeypatch, agent, tmp_path / "agents")
+
+    assert agent._decline_shared_agent_home() is None
+
+
+def test_rebuild_agent_config_writes_nothing_when_declined(monkeypatch, tmp_path):
+    """The guard must stop the write, not merely warn after it."""
+    from kiro_crew import agent
+
+    monkeypatch.delenv("KIRO_HOME", raising=False)
+    agents_dir = tmp_path / "agents"
+    _pretend_target_is_shared(monkeypatch, agent, agents_dir)
+    wt = _make_linked_worktree(tmp_path)
+    monkeypatch.setattr(agent, "__file__", str(wt / "src" / "kiro_crew" / "agent.py"))
+
+    returned = agent.rebuild_agent_config()
+
+    assert returned == agents_dir / agent.AGENT_FILENAME
+    assert not agents_dir.exists(), "declined rebuild must not create the agent home"
+
+    # A declined home must report wrote=False, and the guard runs exactly once per
+    # rebuild: a second check reopens a race with a concurrent default-home boot.
+    real_guard = agent._decline_shared_agent_home
+    guard_calls: list[int] = []
+
+    def counting_guard(**kwargs):
+        guard_calls.append(1)
+        return real_guard(**kwargs)
+
+    monkeypatch.setattr(agent, "_decline_shared_agent_home", counting_guard)
+    probe: list[bool] = []
+    reported = agent.rebuild_agent_config(_wrote_out=probe)
+    assert reported == agents_dir / agent.AGENT_FILENAME
+    assert probe == [False], "a refused rebuild must report exactly one False verdict"
+    assert len(guard_calls) == 1, "the guard must be evaluated exactly once per rebuild"
+    reported2, wrote = agent.rebuild_agent_config_reporting()
+    assert reported2 == agents_dir / agent.AGENT_FILENAME
+    assert wrote is False, "a refused rebuild must report wrote=False"
+    assert len(guard_calls) == 2, "reporting adds exactly one more guard evaluation"
+
+
+def test_refusal_is_sel_audited(monkeypatch, tmp_path):
+    """The refusal is a permission decision, so it must reach the audit trail.
+
+    A silent refusal is indistinguishable from "no write was attempted" when
+    reconstructing what an ephemeral instance did to the host, so the log line
+    alone is not enough.
+    """
+    from kiro_crew import agent
+
+    events = _capture_sel(monkeypatch, agent)
+    monkeypatch.delenv("KIRO_HOME", raising=False)
+    monkeypatch.delenv("KIROCREW_HOME", raising=False)
+    monkeypatch.delenv("KIROCREW_POD", raising=False)
+    wt = _make_linked_worktree(tmp_path)
+    monkeypatch.setattr(agent, "__file__", str(wt / "src" / "kiro_crew" / "agent.py"))
+    _pretend_target_is_shared(monkeypatch, agent, tmp_path / "agents")
+
+    assert agent._decline_shared_agent_home() is not None
+
+    denied = [e for e in events if e.get("outcome") == "denied"]
+    assert len(denied) == 1, f"expected exactly one denied event, got {events}"
+    assert denied[0]["operation"] == "agent_home_write"
+    assert denied[0]["source"] == "rebuild_agent_config"
+    assert str(tmp_path / "agents") in denied[0]["resources"]
+
+
+def test_allowed_shared_home_write_is_audited(monkeypatch, tmp_path):
+    """The GRANT is audited too, not just the denial.
+
+    Otherwise "no event" is ambiguous between "permitted" and "never attempted".
+    """
+    from kiro_crew import agent
+
+    events = _capture_sel(monkeypatch, agent)
+    monkeypatch.delenv("KIRO_HOME", raising=False)
+    monkeypatch.delenv("KIROCREW_HOME", raising=False)
+    monkeypatch.delenv("KIROCREW_POD", raising=False)
+    # Fabricated non-temp location: a clone under tmp_path would be declined by the
+    # temp-dir arm. The predicates are lexical, so the file need not exist.
+    durable = Path("/durable-install/KiroCrew/src/kiro_crew/agent.py")
+    monkeypatch.setattr(agent, "__file__", str(durable))
+    _pretend_target_is_shared(monkeypatch, agent, tmp_path / "agents")
+
+    assert agent._decline_shared_agent_home() is None
+
+    allowed = [e for e in events if e.get("outcome") == "allowed"]
+    assert len(allowed) == 1, f"expected exactly one allowed event, got {events}"
+    assert allowed[0]["operation"] == "agent_home_write"
+    assert allowed[0]["source"] == "rebuild_agent_config"
+    assert str(tmp_path / "agents") in allowed[0]["resources"]
+
+
+def test_private_target_emits_no_audit_event(monkeypatch, tmp_path):
+    """A private target is not a decision ABOUT the shared home, so it is silent.
+
+    This bounds the audit to shared-resource decisions: without it every test and
+    every pod boot would add events that carry no traceability.
+    """
+    from kiro_crew import agent
+
+    events = _capture_sel(monkeypatch, agent)
+    monkeypatch.delenv("KIRO_HOME", raising=False)
+    monkeypatch.delenv("KIROCREW_POD", raising=False)
+    wt = _make_linked_worktree(tmp_path)
+    monkeypatch.setattr(agent, "__file__", str(wt / "src" / "kiro_crew" / "agent.py"))
+    monkeypatch.setattr(agent, "KIRO_AGENTS_DIR", tmp_path / "private" / "agents")
+    monkeypatch.setattr(agent, "kiro_agents_dir", lambda: tmp_path / "elsewhere")
+
+    assert agent._decline_shared_agent_home() is None
+    assert events == []
+
+
+def test_derived_spec_write_outside_a_rebuild_records_the_allowed_event(monkeypatch, tmp_path):
+    """A per-dispatch derived-spec write admitted OUTSIDE an admitted rebuild
+    records an ``agent_home_write`` / ``allowed`` SEL event.
+
+    A spawn re-derives a stale worker mirror through ``_declined_foreign_spec_write``
+    per dispatch, outside the boot-time rebuild that audits its own grant.
+    """
+    from kiro_crew import agent
+
+    events = _capture_sel(monkeypatch, agent)
+    monkeypatch.delenv("KIRO_HOME", raising=False)
+    # A NON-DEFAULT data home: the attribution the event buys only matters when
+    # instances coexist, so the audit is scoped to a non-default home.
+    monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / "relocated-home"))
+    monkeypatch.delenv("KIROCREW_POD", raising=False)
+    # A durable owner is admitted; the path need not exist (predicates are lexical).
+    durable = Path("/durable-install/KiroCrew/src/kiro_crew/agent.py")
+    monkeypatch.setattr(agent, "__file__", str(durable))
+    agents_dir = tmp_path / "agents"
+    _pretend_target_is_shared(monkeypatch, agent, agents_dir)
+    # Not inside an admitted rebuild, so the grant is this writer's to record.
+    agent._rebuild_spec_install_admitted.set(False)
+
+    declined = agent._declined_foreign_spec_write(agents_dir / "kirocrew-worker.json")
+
+    assert declined is False  # the write is admitted
+    allowed = [e for e in events if e.get("outcome") == "allowed"]
+    assert len(allowed) == 1, f"expected exactly one allowed event, got {events}"
+    assert allowed[0]["operation"] == "agent_home_write"
+    assert allowed[0]["source"] == "derived-spec"
+    assert str(agents_dir) in allowed[0]["resources"]
+
+
+def test_default_home_derived_spec_write_records_the_allowed_event(monkeypatch, tmp_path):
+    """A default-home admitted write outside a rebuild still records the grant.
+
+    The shared decision runs with ``audit=False``, so nothing else records it. Only a
+    private redirected target stays silent.
+    """
+    from kiro_crew import agent
+
+    events = _capture_sel(monkeypatch, agent)
+    monkeypatch.delenv("KIRO_HOME", raising=False)
+    monkeypatch.delenv("KIROCREW_HOME", raising=False)  # default home
+    monkeypatch.delenv("KIROCREW_POD", raising=False)
+    durable = Path("/durable-install/KiroCrew/src/kiro_crew/agent.py")
+    monkeypatch.setattr(agent, "__file__", str(durable))
+    agents_dir = tmp_path / "agents"
+    _pretend_target_is_shared(monkeypatch, agent, agents_dir)
+    agent._rebuild_spec_install_admitted.set(False)
+
+    declined = agent._declined_foreign_spec_write(agents_dir / "kirocrew-worker.json")
+
+    assert declined is False  # admitted
+    allowed = [e for e in events if e.get("outcome") == "allowed"]
+    assert len(allowed) == 1, f"expected the default-home grant to be audited, got {events}"
+    assert allowed[0]["operation"] == "agent_home_write"
+    assert allowed[0]["source"] == "derived-spec"
+
+
+def test_derived_spec_write_to_a_private_dir_emits_no_event(monkeypatch, tmp_path):
+    """The private-directory exemption through the primitive stays silent.
+
+    A redirected agents dir is not a decision about the shared resource, so the
+    admitted write records nothing.
+    """
+    from kiro_crew import agent
+
+    events = _capture_sel(monkeypatch, agent)
+    monkeypatch.delenv("KIRO_HOME", raising=False)
+    # Non-default home, so the default-home short-circuit does not hide the
+    # private-redirect branch this test is about.
+    monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / "relocated-home"))
+    monkeypatch.delenv("KIROCREW_POD", raising=False)
+    durable = Path("/durable-install/KiroCrew/src/kiro_crew/agent.py")
+    monkeypatch.setattr(agent, "__file__", str(durable))
+    # Target is a private redirect: the configured agents dir is NOT what the
+    # ambient environment resolves, so the write is admitted but silent.
+    private_dir = tmp_path / "private" / "agents"
+    monkeypatch.setattr(agent, "KIRO_AGENTS_DIR", private_dir)
+    monkeypatch.setattr(agent, "ambient_agents_dir", lambda: tmp_path / "elsewhere" / "agents")
+    agent._rebuild_spec_install_admitted.set(False)
+
+    declined = agent._declined_foreign_spec_write(private_dir / "kirocrew-worker.json")
+
+    assert declined is False  # admitted (private target)
+    assert events == []
+
+
+def test_unresolvable_parent_fails_closed(monkeypatch, tmp_path):
+    """An OSError resolving the write's parent is REFUSED, not admitted.
+
+    If ``path.parent.resolve()`` raises, the write cannot be proven to land outside
+    the shared dir, so ``_declined_foreign_spec_write`` refuses it.
+    """
+    from kiro_crew import agent
+
+    agents_dir = tmp_path / "agents"
+    target = agents_dir / "kirocrew-worker.json"
+
+    real_resolve = Path.resolve
+
+    def resolve_raising(self, *args, **kwargs):
+        # Only the write's parent is unresolvable; everything else resolves
+        # normally so the failure under test is the parent-resolve, not a
+        # blanket break of resolve().
+        if self == target.parent:
+            raise OSError("parent is unresolvable")
+        return real_resolve(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", resolve_raising)
+
+    assert (
+        agent._declined_foreign_spec_write(target) is True
+    ), "an unresolvable parent must fail closed (refuse the write), not be admitted"
+
+
+# Pods get their own agent home
+@pytest.mark.skipif(sys.platform != "linux", reason="pods are systemd --user, Linux-only")
+def test_pod_env_gives_the_pod_its_own_homes():
+    """A pod owns its agent specs AND its transcripts, so it shares nothing.
+
+    Own specs alone would lose session resume; neither would fall back to the shared
+    spec, whose env pins the live data home and its lessons.
+    """
+    from kiro_crew.pod.config import PodConfig
+    from kiro_crew.pod.runtime import build_pod_env
+
+    cfg = PodConfig.load()
+    home = Path("/tmp/kirocrew-pods/example")
+    env = build_pod_env(cfg, home, 7811, Path("/workplace/example"))
+
+    assert env["KIRO_HOME"] == str(home / "kiro")
+    assert env["KIROCREW_HOME"] == str(home)
+    # both live inside the pod home, so teardown reclaims them
+    assert Path(env["KIRO_HOME"]).is_relative_to(home)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="pods are systemd --user, Linux-only")
+def test_pod_target_is_private_so_the_guard_stands_aside(monkeypatch, tmp_path):
+    """A pod writes its OWN specs rather than being refused.
+
+    Being refused is not harmless for a pod: it would inherit the shared spec,
+    which pins the live data home.
+    """
+    from kiro_crew import agent
+    from kiro_crew.config.paths import isolated_agents_dir
+
+    pod_home = tmp_path / "pods" / "example"
+    pod_home.mkdir(parents=True)
+    monkeypatch.setenv("KIROCREW_HOME", str(pod_home))
+    monkeypatch.setenv("KIRO_HOME", str(pod_home / "kiro"))
+    wt = _make_linked_worktree(tmp_path)
+    monkeypatch.setattr(agent, "__file__", str(wt / "src" / "kiro_crew" / "agent.py"))
+    _pretend_target_is_shared(monkeypatch, agent, isolated_agents_dir(pod_home))
+
+    assert agent._decline_shared_agent_home() is None
+
+
+# Transcripts follow the same home as the specs
+def test_sessions_dir_follows_kiro_home(monkeypatch, tmp_path, unpinned_kiro_sessions_dir):
+    """The transcripts dir must move WITH the agent dir, or resume breaks.
+
+    kiro-cli writes transcripts under ``KIRO_HOME``; reading the machine-wide path
+    would lose resume and let ``SessionMap`` prune mappings it cannot see.
+    """
+    from kiro_crew.config.paths import kiro_agents_dir, kiro_sessions_dir
+
+    monkeypatch.delenv("KIROCREW_HOME", raising=False)
+    monkeypatch.setenv("KIRO_HOME", str(tmp_path / "pod-kiro"))
+
+    root = (tmp_path / "pod-kiro").resolve()
+    assert kiro_sessions_dir() == root / "sessions" / "cli"
+    assert kiro_agents_dir() == root / "agents"
+
+
+def test_sessions_dir_defaults_to_dot_kiro(monkeypatch, unpinned_kiro_sessions_dir):
+    _no_overrides(monkeypatch)
+    from kiro_crew.config.paths import kiro_sessions_dir
+
+    assert kiro_sessions_dir() == Path.home() / ".kiro" / "sessions" / "cli"
+
+
+def test_no_hardcoded_transcripts_dir():
+    """Every transcripts reader must resolve through ``kiro_sessions_dir()``.
+
+    One hard-coded path here is what makes an instance write transcripts to one
+    place and read them from another.
+    """
+    offenders: list[str] = []
+    pat = re.compile(r'"\.kiro"\s*/\s*"sessions"')
+    for py in SRC.rglob("*.py"):
+        rel = py.relative_to(SRC).as_posix()
+        if rel in _ALLOWED:
+            continue
+        for i, line in enumerate(py.read_text(encoding="utf-8").splitlines(), 1):
+            if line.strip().startswith("#") or not pat.search(line):
+                continue
+            offenders.append(f"{rel}:{i}: {line.strip()}")
+    assert not offenders, "hard-coded transcripts dir -- use kiro_sessions_dir():\n" + "\n".join(
+        offenders
+    )
+
+
+# Anti-regression guard
+# Files allowed to mention the literal default: the resolver that defines it,
+# and prose/comments that describe the mechanism.
+# Both spellings must be caught. The tuple form ``"​.kiro" / "agents"`` and the
+# string form ``".kiro/agents/..."`` (e.g. inside a ``glob()``).
+_LITERAL_RE = re.compile(r'"\.kiro"\s*/\s*"agents"' r"|[\"']\.kiro/agents")
+# ``config/paths.py`` defines the default. ``security/paths_lists.py`` holds the
+# denylist's HOME-relative literals: it only matches path strings, a resolver import
+# would make a config->security cycle, and ``TestKiroAgentsDirWriteProtection`` pins
+# the literal to ``kiro_agents_dir()``.
+_ALLOWED = {
+    "config/paths.py",
+    "security/paths_lists.py",
+    # The AWS Control container cannot import ``kiro_crew``, so ``supervisor/bundle.py``
+    # re-implements the resolver; this is its test, which only uses a tmp_path.
+    "apps/builtins/aws_control/crew/runtime/container_tests/test_supervisor_bundle.py",
+}
+
+
+def test_no_new_hardcoded_global_agents_dir():
+    """Every reader/writer must resolve through ``kiro_agents_dir()``.
+
+    A single hard-coded ``Path.home() / ".kiro" / "agents"`` reintroduces the
+    split brain this module guards: writers honoring KIRO_HOME while a reader
+    still looks at the machine-wide directory (or vice versa).
+    """
+    offenders: list[str] = []
+    for py in SRC.rglob("*.py"):
+        rel = py.relative_to(SRC).as_posix()
+        if rel in _ALLOWED:
+            continue
+        for i, line in enumerate(py.read_text(encoding="utf-8").splitlines(), 1):
+            stripped = line.strip()
+            if stripped.startswith("#") or not _LITERAL_RE.search(line):
+                continue
+            # ``user_home`` is an explicit caller-supplied override, not the
+            # machine-wide default.
+            if "user_home" in line:
+                continue
+            offenders.append(f"{rel}:{i}: {stripped}")
+    assert (
+        not offenders
+    ), "hard-coded global agents dir — use kiro_agents_dir() instead:\n" + "\n".join(offenders)
+
+
+def test_repo_has_no_python_syntax_regression(tmp_path):
+    """Cheap compile-all so a rewrite typo fails here rather than at import.
+
+    Bytecode goes to a tmp cache prefix so the checkout stays clean.
+    """
+    env = {**os.environ, "PYTHONPYCACHEPREFIX": str(tmp_path / "pycache")}
+    proc = subprocess.run(
+        [sys.executable, "-X", "utf8", "-m", "compileall", "-q", str(SRC)],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        env=env,
+        cwd=str(tmp_path),
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr

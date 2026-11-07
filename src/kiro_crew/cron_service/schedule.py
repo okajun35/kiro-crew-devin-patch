@@ -1,0 +1,1042 @@
+"""When a cron job fires: the schedule evaluator.
+
+Pure functions over a :class:`~kiro_crew.cron_service.model.CronJob` and a clock
+reading -- the next-run math the listing shows, the boundary the timer arms on,
+the due decision the timer tick makes, the jitter a run sleeps and the human
+rendering of a schedule. Every timezone read goes through the published config
+default (:func:`published_config_timezone`), never a config load, because the
+timer tick and prompt assembly call these on the event loop.
+
+The service owns the state these read (the job list, which jobs are running);
+nothing here holds any, bar bounded warn-once memos for bad cron expressions
+and unresolvable timezones.
+"""
+
+from __future__ import annotations
+
+import logging
+import math
+import random
+import re
+import time
+from collections.abc import Container, Iterable
+from datetime import datetime, timedelta, timezone, tzinfo
+from typing import TYPE_CHECKING
+from zoneinfo import ZoneInfo
+
+try:
+    from cron_descriptor import Options, get_description  # type: ignore[import-untyped]
+except ImportError:
+    Options = None  # type: ignore[assignment,misc]
+    get_description = None  # type: ignore[assignment]
+from croniter import CroniterBadDateError, croniter  # type: ignore[import-untyped]
+
+from kiro_crew import host_timezone, platform_compat
+from kiro_crew.cron_service.zone_default_migration import LEGACY_ZONE_ATTR
+from kiro_crew.host_timezone import LOCAL_TIMEZONE, is_local_timezone  # noqa: F401 -- re-exported
+
+if TYPE_CHECKING:
+    from kiro_crew.cron_service.model import CronJob, CronSchedule
+
+logger = logging.getLogger("kiro_crew.cron")
+
+_TIMER_POLL_SECS = 30  # check for due cron-expr jobs
+
+# Bound skip_date advancement by a WALL-CLOCK horizon rather than an iteration
+# count. An iteration cap couples the bound to schedule granularity: sized for a
+# weekly cron (old 52) it broke daily crons; re-sized for daily it would then
+# break sub-daily (e.g. a */5 cron does 288 fires/day and would exhaust a
+# daily-sized cap within days). Bounding by wall-clock time removes the coupling
+# entirely — a daily cron and a */5 cron both simply look ~2 years ahead for the
+# next non-skipped fire. A large absolute iteration ceiling remains ONLY as an
+# anti-infinite-loop safety net for a pathological all-skipped sub-minute
+# schedule; realistic skip_dates lists are short (hand-entered) and exit far
+# sooner, so the horizon is the binding constraint in every practical case.
+_MAX_SKIP_DATE_HORIZON_SECS = 2 * 365 * 24 * 3600  # ~2 years of look-ahead
+_MAX_SKIP_DATE_LOOKAHEAD = 500_000  # absolute safety ceiling (anti-infinite-loop)
+
+# Jitter bounds (seconds) to spread job execution and avoid traffic spikes
+_JITTER_HOURLY_MAX = 5 * 60  # 0–5 minutes for hourly jobs
+_JITTER_DAILY_MAX = 59 * 60  # 0–59 minutes for daily jobs
+# Longest single sleep inside the jitter wait. The wait ends on a WALL-CLOCK
+# deadline, but asyncio sleeps on time.monotonic(), which on macOS
+# (mach_absolute_time) does not advance while the host is asleep. Slicing the
+# wait bounds how long a resumed host keeps sleeping past a deadline the wall
+# clock already crossed: at most one slice of awake time.
+_JITTER_WALL_SLICE_SECS = 30
+
+
+def cron_expr_matches(expr: str, dt: datetime) -> bool:
+    """Check if ``dt`` matches a 5-field cron expression (min hour dom month dow)."""
+    try:
+        return croniter.match(expr, dt)
+    except (ValueError, KeyError):
+        return False
+
+
+def validate_cron_expr(expr: str) -> bool:
+    """Return True if ``expr`` is a syntactically valid 5-field cron expression.
+
+    A seconds-bearing six-field expression refuses even though croniter reads
+    one: :func:`is_due` never fires a job twice in the same UTC minute, so such
+    a schedule advertises a next run (:func:`compute_next_run_ts` advances by
+    seconds) that the due check then suppresses forever. Both writers funnel
+    through this predicate (``fields.build_job`` on create,
+    ``fields.apply_job_update`` on update), so the schedule the minute-level
+    execution contract cannot honor refuses before it persists. The one-field
+    ``@`` aliases (``@daily``, ``@yearly``) stay — they carry no seconds field.
+    """
+    # croniter calls ``.lower()`` on its input, so a non-string (a JSON number,
+    # list or object from a PATCH body) raised instead of reading as invalid.
+    if not isinstance(expr, str) or not croniter.is_valid(expr):
+        return False
+    parts = expr.split()
+    if len(parts) == 5:
+        return True
+    # The one-field ``@`` aliases (``@daily``, ``@yearly``) carry no seconds
+    # field; every other width croniter accepts either does (six fields) or
+    # never fires once a minute at all.
+    return len(parts) == 1 and expr.startswith("@")
+
+
+def never_fires_warning(schedule: CronSchedule) -> str:
+    """A one-line caveat for a cron schedule that matches no date, else ``""``.
+
+    :func:`validate_cron_expr` checks syntax only, so ``0 0 31 2 *`` (February
+    31st) saves: it is a valid expression whose next run croniter cannot find.
+    Such a job keeps saving -- a stored job with this schedule must still load,
+    edit and save -- and the add and update surfaces show this caveat beside
+    their success answer, so the caller learns the job never runs.
+    """
+    from kiro_crew import cron as seams  # the facade holds the patched names; it imports us
+
+    if schedule.kind != "cron" or not schedule.cron_expr:
+        return ""
+    try:
+        croniter(schedule.cron_expr, seams.datetime.now(timezone.utc)).get_next(float)
+    except CroniterBadDateError:
+        return (
+            f"cron expression {schedule.cron_expr!r} matches no calendar date, "
+            "so this job never runs; it is saved as given"
+        )
+    except Exception:
+        return ""
+    return ""
+
+
+def _humanize_cron(expr: str, tz_name: str = "") -> str:
+    """Convert a 5-field cron expression to human-readable string with timezone."""
+    from kiro_crew import cron as seams  # the facade holds the patched names; it imports us
+
+    if get_description is None:
+        return expr
+    opts = Options()
+    opts.use_24hour_time_format = False
+    try:
+        desc = get_description(expr, opts)
+    except Exception:
+        return expr
+
+    # Timezone-aware display: evaluate the cron expression in the job's
+    # timezone (matching compute_next_run_ts) and display the local time.
+    parts = expr.split()
+    tz_name = resolve_timezone_name(tz_name) if tz_name else ""
+    if tz_name and len(parts) == 5 and parts[0].isdigit() and parts[1].isdigit():
+        try:
+            tz = ZoneInfo(tz_name)
+            # Step in the job timezone's WALL clock, then attach the zone. Given
+            # an aware zoneinfo start, croniter <6 shifts a next run that lies
+            # past a DST change by the offset change a second time, so a 3 AM
+            # job read "4:00 AM PST" through the day before a fall-back.
+            base = seams.datetime.now(tz).replace(tzinfo=None)
+            next_local = croniter(expr, base).get_next(seams.datetime).replace(tzinfo=tz)
+            local_time = platform_compat.strftime(next_local, "%-I:%M %p %Z")
+            # cron_descriptor produces UTC-based text; replace the time portion
+            utc_base = seams.datetime.now(timezone.utc)
+            next_as_utc = croniter(expr, utc_base).get_next(seams.datetime)
+            utc_time = platform_compat.strftime(next_as_utc, "%-I:%M %p")
+            utc_time_padded = next_as_utc.strftime("%I:%M %p")
+            result = desc.replace(f"At {utc_time}", f"At {local_time}")
+            if result == desc:
+                result = desc.replace(f"At {utc_time_padded}", f"At {local_time}")
+            if result == desc:
+                # Fallback: prepend local time if replacement failed
+                result = f"At {local_time}, {desc.removeprefix('At ')}"
+            return result
+        except Exception:
+            pass
+
+    return desc
+
+
+def format_schedule(schedule: CronSchedule, tz_name: str = "") -> str:
+    """Human-readable schedule description."""
+    from kiro_crew import cron as seams  # the facade holds the patched names; it imports us
+
+    # An empty or "local" name resolves through the published config default and
+    # the published host zone. Reading snapshots rather than loading config.json
+    # or the host's zone is what lets a loop-side caller omit tz_name safely.
+    tz_name = resolve_timezone_name(tz_name)
+    if schedule.kind == "cron" and schedule.cron_expr:
+        return _humanize_cron(schedule.cron_expr, tz_name)
+    if schedule.kind == "every" and schedule.every_secs:
+        secs = schedule.every_secs
+        if secs % 3600 == 0:
+            return f"every {secs // 3600}h"
+        if secs % 60 == 0:
+            return f"every {secs // 60}m"
+        return f"every {secs}s"
+    if schedule.kind == "at" and schedule.at_ts:
+        # Tolerance lives HERE, at the render site, not in the deserializer: a
+        # stored at_ts that datetime.fromtimestamp cannot represent (NaN or
+        # Infinity from bare json.loads, epoch milliseconds, a beyond-year-9999
+        # stamp, a pre-epoch value on Windows) must degrade to a fallback
+        # string instead of raising inside the comprehension that serializes
+        # EVERY job on GET /api/crons -- and the record itself is preserved for
+        # the operator to repair. Same degrade-on-render posture as
+        # CronJob._render_run_stamp.
+        try:
+            tz = ZoneInfo(tz_name) if tz_name else None
+            if tz:
+                now = seams.datetime.now(tz)
+                dt = seams.datetime.fromtimestamp(schedule.at_ts, tz)
+            else:
+                now = seams.datetime.now().astimezone()
+                dt = seams.datetime.fromtimestamp(schedule.at_ts).astimezone()
+            if dt.date() == now.date():
+                return f"at {dt:%I:%M %p %Z}"
+            return f"at {dt:%I:%M %p %Z}, {platform_compat.strftime(dt, '%b %-d')}"
+        except Exception:
+            logger.debug("format_schedule: unrenderable at_ts %r", schedule.at_ts, exc_info=True)
+            return "at an invalid stored time"
+    return schedule.kind
+
+
+def is_valid_timezone(tz_name: str) -> bool:
+    """Return True if ``tz_name`` is a resolvable IANA timezone key.
+
+    Validates via the ``ZoneInfo`` constructor -- a single targeted, cached
+    lookup -- rather than ``available_timezones()``, which recursively walks
+    the entire tzdata tree and opens many files on every call. Because this
+    runs on callers reachable from the async event loop (dashboard cron PATCH
+    -> CronService.update_job), the cheap constructor path avoids blocking the
+    gateway (see ``no-blocking-call-on-event-loop``). ``ZoneInfo`` raises
+    ``ZoneInfoNotFoundError`` for unknown keys and ``ValueError`` for malformed
+    ones (e.g. absolute paths, ``..``); both are treated as invalid.
+
+    ``local`` is valid too: it names no IANA key, and stands for the host's zone
+    (see :func:`resolve_timezone_name`).
+    """
+    if not tz_name:
+        return False
+    if is_local_timezone(tz_name):
+        return True
+    try:
+        ZoneInfo(tz_name)
+    except Exception:
+        return False
+    return True
+
+
+def is_valid_skip_date(value: object) -> bool:
+    """Return True iff ``value`` is a strict, zero-padded ``YYYY-MM-DD`` date.
+
+    ``datetime.strptime(s, "%Y-%m-%d")`` accepts non-padded inputs such as
+    ``"<year>-1-1"``: they parse fine, but fire-time skip matching compares
+    against a zero-padded rendering (``"<year>-01-01"``), so the intended skip
+    silently never matches and the job runs on a date the user told it to
+    skip -- with no error anywhere. Requiring the parsed value to round-trip
+    exactly back to ``%Y-%m-%d`` rejects non-padded (and calendar-invalid)
+    inputs at every persistence path, independent of the running Python
+    version's ``date.fromisoformat`` leniency.
+    """
+    from kiro_crew import cron as seams  # the facade holds the patched names; it imports us
+
+    s = str(value)
+    try:
+        return seams.datetime.strptime(s, "%Y-%m-%d").strftime("%Y-%m-%d") == s
+    except (ValueError, TypeError):
+        return False
+
+
+def resolve_timezone_name(tz_name: str = "") -> str:
+    """The IANA zone *tz_name* stands for right now, or ``""`` for UTC.
+
+    An IANA name stands for itself. An empty name stands for the published config
+    default, and an empty config default stands for ``local``. ``local`` stands
+    for the zone of the machine this process runs on, so a schedule that follows
+    it moves with a laptop that travels. The result is ``""`` when that host zone
+    has never been detected; every caller reads ``""`` as UTC.
+
+    Reads published snapshots only (:func:`published_config_timezone`,
+    :func:`published_host_timezone`), never ``config.json`` or the host's zone
+    files on the event loop.
+    """
+    from kiro_crew import cron as seams  # the facade holds the patched names; it imports us
+
+    name = (tz_name or "").strip()
+    if not name:
+        name = (seams.published_config_timezone() or "").strip()
+    if name and not is_local_timezone(name):
+        return name
+    return host_timezone.published_host_timezone()
+
+
+def default_timezone_name() -> str:
+    """The zone a job with none of its own follows, as a name to store or show.
+
+    The configured zone, or ``local`` when none is configured (or it is
+    ``local``). Unresolved on purpose: a job that stores ``local`` keeps
+    following the host, where the resolved name would pin today's zone. A
+    configured name that cannot load (a typo in a hand-edited config) is
+    ``UTC``, the zone :func:`_job_tz` runs it in: stored as is, every write
+    would refuse it.
+    """
+    from kiro_crew import cron as seams  # the facade holds the patched names; it imports us
+
+    name = (seams.published_config_timezone() or "").strip()
+    if not name or is_local_timezone(name):
+        return LOCAL_TIMEZONE
+    return name if is_valid_timezone(name) else "UTC"
+
+
+def job_zone_name(job: CronJob) -> str:
+    """The zone name *job*'s wall clock follows: its own, else one held in memory only.
+
+    The held one is set by an upgrade waiting for a readable config
+    (``zone_default_migration.hold_jobs_on_utc_in_memory``) on an older job it
+    could not stamp. Every reader that resolves a job's zone reads it here, so
+    such a job runs, and shows, in UTC without a stamp reaching disk.
+    """
+    # Read defensively, as the display callers it replaced did: a caller may hold a
+    # job-like object without the field, and only a string names a zone.
+    own = getattr(job, "timezone", "")
+    held = getattr(job, LEGACY_ZONE_ATTR, "")
+    return (own.strip() if isinstance(own, str) else "") or (held if isinstance(held, str) else "")
+
+
+def _zone_follows_host(tz_name: str) -> bool:
+    """Whether the zone *tz_name* stands for is the host's (``local``, directly or by default)."""
+    from kiro_crew import cron as seams  # the facade holds the patched names; it imports us
+
+    name = (tz_name or "").strip() or (seams.published_config_timezone() or "").strip()
+    return not name or is_local_timezone(name)
+
+
+def job_follows_host(job: CronJob) -> bool:
+    """Whether *job*'s wall clock follows the host's zone (``local``, directly or by default)."""
+    return _zone_follows_host(job_zone_name(job))
+
+
+def get_local_tz() -> tuple[str, tzinfo]:
+    """Return (tz_name, zone) for the default zone: the config default, else the host's, else UTC.
+
+    Reads :func:`published_config_timezone` rather than loading ``config.json``:
+    prompt assembly (``context.py``), the dashboard cron handler and the
+    messaging commands all reach this from the event loop, where a
+    stat/read/validate would be a per-call stall
+    (``no-blocking-call-on-event-loop``). The snapshot is refreshed by every
+    successful config load, so a settings change still reaches a running gateway.
+
+    The fallback is :data:`datetime.timezone.utc`, not ``ZoneInfo("UTC")``: a
+    host with no system zoneinfo tree and no ``tzdata`` package cannot load
+    any zone, UTC included, and prompt assembly calls this on every chat turn.
+    """
+    try:
+        tz_name = resolve_timezone_name() or "UTC"
+        return tz_name, ZoneInfo(tz_name)
+    except Exception:
+        logger.warning(
+            "Failed to load timezone from config, falling back to UTC",
+            exc_info=True,
+        )
+        return "UTC", timezone.utc
+
+
+# Patterns for parse_time_string
+_RE_IN_DURATION = re.compile(
+    r"^in\s+(\d+)\s*(s|sec|secs|second|seconds|m|min|mins|minute|minutes"
+    r"|h|hr|hrs|hour|hours|d|day|days|w|wk|wks|week|weeks)$",
+    re.I,
+)
+_UNIT_SECS = {
+    "s": 1,
+    "sec": 1,
+    "secs": 1,
+    "second": 1,
+    "seconds": 1,
+    "m": 60,
+    "min": 60,
+    "mins": 60,
+    "minute": 60,
+    "minutes": 60,
+    "h": 3600,
+    "hr": 3600,
+    "hrs": 3600,
+    "hour": 3600,
+    "hours": 3600,
+}
+# Day units are calendar days in the job's zone, not 86400-second blocks, so
+# "in 2 days" lands at the same clock time it was asked at even across a DST
+# change, the way "tomorrow" does.
+_UNIT_DAYS = {
+    "d": 1,
+    "day": 1,
+    "days": 1,
+    "w": 7,
+    "wk": 7,
+    "wks": 7,
+    "week": 7,
+    "weeks": 7,
+}
+
+
+def _wall_clock_resolution_error(value: datetime, tz: tzinfo, tz_name: str) -> str | None:
+    """Return an error when a zone cannot resolve the requested wall clock."""
+    clock_format = "%H:%M:%S" if value.second else "%H:%M"
+    clock = value.strftime(clock_format)
+    date = f"{value.year:04d}-{value.month:02d}-{value.day:02d}"
+    try:
+        round_tripped = value.astimezone(timezone.utc).astimezone(tz)
+    except (OverflowError, ValueError):
+        return f"Error: {date} {clock} in {tz_name} is outside the supported date range"
+    wall_clock = (
+        value.year,
+        value.month,
+        value.day,
+        value.hour,
+        value.minute,
+        value.second,
+        value.microsecond,
+    )
+    round_tripped_wall_clock = (
+        round_tripped.year,
+        round_tripped.month,
+        round_tripped.day,
+        round_tripped.hour,
+        round_tripped.minute,
+        round_tripped.second,
+        round_tripped.microsecond,
+    )
+    if round_tripped_wall_clock == wall_clock:
+        return None
+    return (
+        f"Error: {clock} on {date} does not exist in {tz_name} "
+        "(the zone's clocks skip it); pick a time the zone has"
+    )
+
+
+def parse_time_string(s: str, tz_name: str = "") -> float | str:
+    """Parse a human time string into a Unix timestamp. Returns error string on failure.
+
+    Lives here, next to :func:`get_local_tz`, because EVERY one-shot entry point
+    needs it: the ``cron_add`` MCP tool, ``POST /api/crons`` and
+    ``kirocrew cron add --at``. A second copy would let them drift, and "5pm"
+    resolving to different instants depending on which door the request came
+    through is exactly the class of bug a shared parser prevents. Relative forms
+    ("in 30 minutes") are absolute already; a wall clock ("5pm", "tomorrow 9am",
+    an ISO date and time) is read in *tz_name*, the job's own timezone, when the
+    caller has one -- the same zone the job's ``cron_expr`` and ``skip_dates``
+    are evaluated in and its schedule is rendered in. Without one it is read in
+    the default zone (:func:`get_local_tz`): the configured timezone, else the
+    host's. ``local``, directly or by default, is read in the host's zone as it is
+    now: read here off the event loop, and by an on-loop caller beforehand with
+    ``host_timezone.ensure_host_timezone``. The result is an instant, so a one-shot
+    does not move when the host later changes zone.
+    *tz_name* must already have passed
+    :func:`is_valid_timezone`; every caller checks it before parsing so a bad
+    name is refused with that caller's own message.
+    """
+    from kiro_crew import cron as seams  # the facade holds the patched names; it imports us
+
+    s = s.strip()
+    if _zone_follows_host(tz_name):
+        # The instant is stored for good: read the host's zone as it is now.
+        host_timezone.ensure_host_timezone_off_loop()
+    tz: tzinfo
+    if tz_name and not is_local_timezone(tz_name):
+        resolved_tz_name = tz_name
+        tz = ZoneInfo(tz_name)
+    elif tz_name:
+        resolved_tz_name = host_timezone.published_host_timezone() or "UTC"
+        tz = ZoneInfo(resolved_tz_name)
+    else:
+        resolved_tz_name, tz = seams.get_local_tz()
+    now = seams.datetime.now(tz)
+
+    # "in 5 minutes", "in 2 hours", "in 3 days", "in 1 week"
+    m = _RE_IN_DURATION.match(s)
+    if m:
+        unit = m.group(2).lower()
+        if unit in _UNIT_DAYS:
+            try:
+                later = now + timedelta(days=int(m.group(1)) * _UNIT_DAYS[unit])
+            except OverflowError:
+                return f"Error: '{s}' is outside the supported date range"
+            error = _wall_clock_resolution_error(later, tz, resolved_tz_name)
+            return error or later.timestamp()
+        secs = int(m.group(1)) * _UNIT_SECS[unit]
+        return time.time() + secs
+
+    # Try common formats with optional "tomorrow"
+    tomorrow = False
+    text = s
+    if text.lower().startswith("tomorrow"):
+        tomorrow = True
+        text = re.sub(r"^at\b\s*", "", text[8:].strip())
+
+    # "5pm", "5:30pm", "17:00", "9:30am"
+    for fmt in ("%I%p", "%I:%M%p", "%H:%M", "%I %p", "%I:%M %p"):
+        try:
+            parsed = seams.datetime.strptime(text, fmt)
+            result = now.replace(hour=parsed.hour, minute=parsed.minute, second=0, microsecond=0)
+            if tomorrow:
+                result += timedelta(days=1)
+            elif result <= now:
+                result += timedelta(days=1)  # "5pm" when it's already 6pm → tomorrow
+            error = _wall_clock_resolution_error(result, tz, resolved_tz_name)
+            return error or result.timestamp()
+        except ValueError:
+            continue
+
+    # ISO-ish: "YYYY-MM-DD HH:MM", space or "T" separator, seconds optional
+    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            parsed = seams.datetime.strptime(text, fmt).replace(tzinfo=now.tzinfo)
+            error = _wall_clock_resolution_error(parsed, tz, resolved_tz_name)
+            return error or parsed.timestamp()
+        except ValueError:
+            continue
+
+    return f"Error: could not parse time '{s}'. Examples: '5pm', 'in 30 minutes', 'tomorrow 9am'"
+
+
+def _job_tz(job: CronJob) -> tzinfo:
+    """Return the job's timezone, as :func:`resolve_timezone_name` resolves it, else UTC.
+
+    Reads :func:`published_config_timezone` rather than loading ``config.json``,
+    and :func:`published_host_timezone` rather than the host's zone files.
+    Both callers reach this from the event loop: :meth:`CronService._on_timer`
+    scans EVERY cron-expression job through :meth:`_is_due` on every tick, and
+    :meth:`CronJob.set_run_result` renders a completed run's stamp, so a config
+    stat/read/validate here was a recurring gateway stall
+    (``no-blocking-call-on-event-loop``). The snapshot is refreshed by every
+    successful config load, so a timezone change still reaches a running
+    gateway on the following tick; the host zone is refreshed by the tick's
+    worker-thread scan, so a laptop that changes zone does too.
+    """
+    name = ""
+    try:
+        name = resolve_timezone_name(job_zone_name(job)) or "UTC"
+        zone = ZoneInfo(name)
+    except Exception as exc:
+        # Every tick re-resolves every job: warn once per job+zone, with no
+        # traceback; a full memo refuses rows, said once.
+        key, val = hash(job.id), hash(name)
+        if key in _BAD_TZ_WARNED or len(_BAD_TZ_WARNED) < _BAD_TZ_WARNED_MAX:
+            if _BAD_TZ_WARNED.get(key) != val:
+                _BAD_TZ_WARNED[key] = val
+                logger.warning(
+                    "Failed to resolve timezone %r for job %s, using UTC: %r", name, job.id, exc
+                )
+        else:
+            if not _BAD_TZ_REFUSED[0]:
+                logger.warning("Bad timezone warn-once memo is full; further jobs are not logged")
+            _BAD_TZ_REFUSED[0] = min(_BAD_TZ_REFUSED[0] + 1, 2**31)  # saturating count
+        # Fixed UTC needs no tz database, so the Schedule page and the timer
+        # keep working on a host that has none (see get_local_tz).
+        return timezone.utc
+    if _BAD_TZ_WARNED:
+        _BAD_TZ_WARNED.pop(hash(job.id), None)
+    return zone
+
+
+# hash(job id) -> hash(zone name) already warned about by _job_tz. Fixed-size
+# ints, so the count cap below bounds the bytes too.
+_BAD_TZ_WARNED: dict[int, int] = {}
+_BAD_TZ_WARNED_MAX = 1024
+_BAD_TZ_REFUSED = [0]  # resolutions the full memo refused a row
+
+
+def backoff_delaying_next_run(job: CronJob, now: float | None = None) -> float | None:
+    """The failure-backoff end that moved this job's next run later, or ``None``.
+
+    ``None`` for a disabled job, which has no next run to move, and for a job
+    whose next scheduled slot already falls at or after the backoff end (an
+    ``every 1d`` job five failures in), whose next run the backoff leaves
+    where it was. The test is :func:`_backoff_shift`, the one
+    :func:`compute_next_run_ts` shifts by.
+    """
+    if not job.enabled:
+        return None
+    return _backoff_shift(job, _compute_next_run_ts_raw(job, now))
+
+
+def _backoff_shift(job: CronJob, unshifted: float | None) -> float | None:
+    """The backoff end when it falls after ``unshifted``, the job's next slot; else ``None``.
+
+    The one copy of the backoff-shift test, shared by :func:`compute_next_run_ts`
+    (which moves the slot) and :func:`backoff_delaying_next_run` (which reports it).
+    """
+    if unshifted is None:
+        return None
+    backoff_until = job.failure_backoff_until()
+    if backoff_until is None or unshifted >= backoff_until:
+        return None
+    return backoff_until
+
+
+def _cron_due_at_backoff_end(job: CronJob, backoff_until: float) -> bool:
+    """Whether the cron-expression ``job`` is due at its own backoff end.
+
+    The minute the backoff ends in can match the expression; the timer then wakes
+    on the end (:func:`next_wake_secs`) and the preview shows it
+    (:func:`compute_next_run_ts`). An end no datetime can hold (a hand-edited
+    store) is not due.
+    """
+    try:
+        return is_due(job, backoff_until)
+    except (ValueError, OverflowError, OSError):
+        return False
+
+
+def compute_next_run_ts(job: CronJob, now: float | None = None) -> float | None:
+    """Return the next fire time as a UTC epoch, or ``None`` if unknown.
+
+    Never returns a non-finite float: the result feeds ``next_run_ts`` on the
+    ``GET /api/crons`` payload, and ``json.dumps`` (``allow_nan=True`` by
+    default) would emit the bare token ``Infinity`` -- invalid JSON that makes
+    the client reject the WHOLE listing. Finite extremes a hand-edited store
+    can carry still overflow here through arithmetic (``last + every_secs``
+    with ``every_secs=1e308`` sums to ``inf``), so the guard sits on the
+    RESULT, covering every arithmetic route at the serialize site.
+    """
+    result = _compute_next_run_ts_raw(job, now)
+    # A cron job due at a backoff end still ahead runs then: nothing runs before
+    # the end, and next_wake_secs wakes on it. croniter's get_next is strictly
+    # after its base, so the raw lookup alone never names that end.
+    if result is not None and job.schedule.kind == "cron":
+        backoff_end = job.failure_backoff_until()
+        current = now if now is not None else time.time()
+        if (
+            backoff_end is not None
+            and backoff_end > current
+            and _cron_due_at_backoff_end(job, backoff_end)
+        ):
+            return backoff_end
+    # A failing job past the default limit: its next fire is the first slot after its backoff.
+    backoff_until = _backoff_shift(job, result)
+    if backoff_until is not None:
+        if job.schedule.kind == "cron":
+            result = _compute_next_run_ts_raw(job, backoff_until)
+        else:
+            result = _next_unskipped_ts(job, backoff_until)
+    # Float-gated like every non-finite check in this module: a bignum int
+    # result serializes as digits (valid JSON) and math.isfinite(huge_int)
+    # raises OverflowError -- the exact escape this guard exists to prevent.
+    if isinstance(result, float) and not math.isfinite(result):
+        return None
+    return result
+
+
+# hash(job id) -> hash(cron expression) already warned about by _next_cron_boundary_ts.
+# Fixed-size ints, so the count cap below bounds the bytes too.
+_BAD_CRON_WARNED: dict[int, int] = {}
+_BAD_CRON_WARNED_MAX = 1024
+_BAD_CRON_REFUSED = [0]  # evaluations the full memo refused a row
+
+
+def _next_cron_boundary_ts(job: CronJob, now: float) -> float | None:
+    """Return the immediate next cron boundary as a UTC epoch, ignoring skip_dates.
+
+    For TIMER ARMING only. It answers "when is the next minute this expression
+    matches" with a single ``croniter.get_next`` -- O(1), no ``skip_dates``
+    traversal -- so a job with many ``skip_dates`` cannot make the on-loop
+    re-arm walk up to ``_MAX_SKIP_DATE_LOOKAHEAD`` occurrences. ``skip_dates`` is
+    still enforced at fire time by :meth:`CronService._is_due`, so a wake that
+    lands on a skipped boundary is a cheap no-op that re-arms to the following
+    boundary. Returns ``None`` for a non-cron or invalid expression, or when the
+    boundary is non-finite, so the caller falls back to the poll interval.
+    """
+    from kiro_crew import cron as seams  # the facade holds the patched names; it imports us
+
+    sched = job.schedule
+    if sched.kind != "cron" or sched.cron_expr is None:
+        return None
+    try:
+        tz = _job_tz(job)
+        base = seams.datetime.fromtimestamp(now, tz=tz)
+        nxt = croniter(sched.cron_expr, base).get_next(float)
+    except Exception as exc:  # CroniterBadDateError for an unsatisfiable expression
+        # Re-armed every poll: warn once per job+expression; a full memo refuses rows, said once.
+        key, val = hash(job.id), hash(sched.cron_expr)
+        if key in _BAD_CRON_WARNED or len(_BAD_CRON_WARNED) < _BAD_CRON_WARNED_MAX:
+            if _BAD_CRON_WARNED.get(key) != val:
+                _BAD_CRON_WARNED[key] = val
+                logger.warning("Bad cron %r for job %s: %r", sched.cron_expr, job.id, exc)
+        else:
+            if not _BAD_CRON_REFUSED[0]:
+                logger.warning("Bad cron warn-once memo is full; further jobs are not logged")
+            _BAD_CRON_REFUSED[0] = min(_BAD_CRON_REFUSED[0] + 1, 2**31)  # saturating count
+        return None
+    _BAD_CRON_WARNED.pop(hash(job.id), None)
+    if isinstance(nxt, float) and not math.isfinite(nxt):
+        return None
+    return nxt
+
+
+def _next_unskipped_ts(job: CronJob, candidate: float) -> float | None:
+    """First allowed instant at or after an interval or one-shot deadline.
+
+    These schedules stay due until attempted, so an excluded deadline moves to
+    the next allowed local day's start, without advancing the stored schedule.
+    Calendar days, rather than elapsed 24-hour periods, preserve DST boundaries.
+    """
+    if not job.skip_dates:
+        return candidate
+    from kiro_crew import cron as seams
+
+    try:
+        tz = _job_tz(job)
+        skipped = set(job.skip_dates)
+        horizon = candidate + _MAX_SKIP_DATE_HORIZON_SECS
+        for _ in range(len(skipped) + 1):
+            local = seams.datetime.fromtimestamp(candidate, tz=tz)
+            if local.strftime("%Y-%m-%d") not in skipped:
+                return candidate
+            midnight = (local + timedelta(days=1)).replace(
+                hour=0, minute=0, second=0, microsecond=0, fold=0
+            )
+            candidate = midnight.timestamp()
+            if candidate > horizon:
+                return None
+    except Exception:
+        logger.warning("Failed to compute allowed run date for job %s", job.id, exc_info=True)
+    return None
+
+
+def _compute_next_run_ts_raw(job: CronJob, now: float | None = None) -> float | None:
+    """Unchecked next-fire-time computation; see :func:`compute_next_run_ts`."""
+    from kiro_crew import cron as seams  # the facade holds the patched names; it imports us
+
+    try:
+        if not job.enabled:
+            return None
+        sched = job.schedule
+        now = now if now is not None else time.time()
+        if sched.kind == "every" and sched.every_secs is not None:
+            last = job.last_run_ts if job.last_run_ts is not None else job.created_ts
+            if last is None:
+                return None
+            nxt = last + sched.every_secs
+            return _next_unskipped_ts(job, nxt if nxt > now else now)
+        if sched.kind == "at" and sched.at_ts is not None:
+            return _next_unskipped_ts(job, sched.at_ts) if sched.at_ts > now else None
+        if sched.kind == "cron" and sched.cron_expr is not None:
+            # croniter interprets cron_expr in base's timezone; get_next(float) returns UTC epoch
+            tz = _job_tz(job)
+            base = seams.datetime.fromtimestamp(now, tz=tz)
+            cron = croniter(sched.cron_expr, base)
+            # Advance past any skip_dates, bounded by a wall-clock horizon so the
+            # bound does not depend on schedule granularity (a daily and a */5
+            # cron both look ~2 years ahead). The iteration count is only a hard
+            # safety ceiling against a pathological all-skipped sub-minute config.
+            horizon = now + _MAX_SKIP_DATE_HORIZON_SECS
+            for _ in range(_MAX_SKIP_DATE_LOOKAHEAD):
+                nxt = cron.get_next(float)
+                # The slot that repeats the last run's occurrence in a new host zone
+                # is not its next run (see _already_ran_by_wall_clock).
+                if _already_ran_by_wall_clock(job, seams.datetime.fromtimestamp(nxt, tz=tz)):
+                    continue
+                if not job.skip_dates:
+                    return nxt
+                if nxt > horizon:
+                    logger.warning(
+                        "No valid next run within ~2y horizon for job %s (all dates skipped)",
+                        job.id,
+                    )
+                    return None
+                local_date = seams.datetime.fromtimestamp(nxt, tz=tz).strftime("%Y-%m-%d")
+                if local_date not in job.skip_dates:
+                    return nxt
+            logger.warning(
+                "No valid next run within %d-iteration safety cap for job %s (all dates skipped)",
+                _MAX_SKIP_DATE_LOOKAHEAD,
+                job.id,
+            )
+            return None
+    except CroniterBadDateError:
+        # An expression that matches no date (``0 0 31 2 *``): one plain line,
+        # since the traceback names croniter's internals and not the job's fault.
+        logger.warning(
+            "No next run for job %s: cron %r matches no calendar date",
+            job.id,
+            job.schedule.cron_expr,
+        )
+        return None
+    except Exception:
+        logger.warning("Failed to compute next run for job %s", job.id, exc_info=True)
+        return None
+    return None
+
+
+def jitter_bound(job: CronJob) -> float:
+    """The longest jitter wait *job* can get, in seconds: the band :func:`compute_jitter` draws from.
+
+    - strict_schedule=True or one-shot 'at' jobs: no jitter
+    - Sub-hourly (every < 3600s or cron whose parsed minute field fires
+      more than once per hour): no jitter
+    - Hourly (every 3600–86399s or cron firing hourly): 0–5 min
+    - Daily (every >= 86400s or cron firing daily): 0–59 min
+    - Unrecognized cron patterns (fallback): 0–5 min
+    """
+    if job.strict_schedule:
+        return 0.0
+    sched = job.schedule
+    if sched.kind == "at":
+        return 0.0  # one-shot jobs fire at exact time
+    if sched.kind == "every" and sched.every_secs:
+        if sched.every_secs >= 86400:
+            return _JITTER_DAILY_MAX
+        elif sched.every_secs >= 3600:
+            return _JITTER_HOURLY_MAX
+        else:
+            return 0.0  # sub-hourly jobs shouldn't be jittered
+    if sched.kind == "cron" and sched.cron_expr:
+        # Ask croniter for the normalized minute set. Wildcard collapses
+        # to ["*"]; lists, ranges, steps, and their combinations expand
+        # and deduplicate, so cardinality reflects actual fires per hour.
+        try:
+            expanded, _ = croniter.expand(sched.cron_expr)
+            minute_values = expanded[0]
+        except (KeyError, TypeError, ValueError):
+            minute_values = []
+        if minute_values == ["*"] or len(minute_values) > 1:
+            return 0.0
+
+        parts = sched.cron_expr.split()
+        if len(parts) == 5:
+            # Single literal hour (e.g., "0 3 * * *") = truly daily/weekly
+            if parts[1].isdigit():
+                return _JITTER_DAILY_MAX
+            # Multi-hour patterns (*/2, 1,13) or wildcard = hourly jitter
+            if parts[1] != "*":
+                return _JITTER_HOURLY_MAX
+        return _JITTER_HOURLY_MAX
+    return 0.0
+
+
+def compute_jitter(job: CronJob) -> float:
+    """Return random jitter seconds based on schedule frequency, within :func:`jitter_bound`."""
+    bound = jitter_bound(job)
+    return random.uniform(0, bound) if bound else 0.0
+
+
+# Two runs of a cron job this close together that belong to one occurrence are
+# one run fired twice (see ``is_due``); adjacent minutes are at most 120 s apart.
+_SAME_OCCURRENCE_SECS = 120
+
+
+#: How long after a run's time limit its end may be stamped: a reaped run ends
+#: once its deadline has passed, not exactly at it.
+_RUN_STAMP_SLACK_SECS = 300
+
+
+def _already_ran_by_wall_clock(job: CronJob, slot: datetime) -> bool:
+    """Whether *slot* repeats, in a new host zone, the occurrence the job last ran.
+
+    For a job that follows the host. *slot* is an aware datetime in the zone the
+    job resolves to now. Moving west (Shanghai to San Francisco) brings a local
+    date and time round again; the slot whose date and time equal the occurrence
+    the last run belonged to, read in the zone the host was in then, does not
+    run a second time. Every other slot runs, so a frequent job keeps running
+    through the trip. Moving east skips the slots the clock jumped over; nothing
+    catches them up, as nothing catches up a slot the gateway slept through.
+
+    ``last_run_ts`` is stamped when a run ENDS, so from its dispatch the run spans
+    up to the job's own longest jitter wait (:func:`jitter_bound`) plus its time
+    limit before it, and the zone
+    may have changed inside that span (during the jitter wait, or a lid closed
+    mid-run on a flight): each zone other than the slot's over that span
+    is compared, and only for an occurrence the scheduler could have dispatched
+    there, one the host was in that zone for at its instant. In an unchanged zone this is never true, so the repeated hour of
+    a DST fall-back still runs as it did. ``False`` when no other zone is known
+    for that span: the zone history starts when this process first detected it.
+    """
+    from kiro_crew import cron as seams  # the facade holds the patched names; it imports us
+
+    last = job.last_run_ts
+    expr = job.schedule.cron_expr
+    if not last or not expr or not job_follows_host(job):
+        return False
+    # Dispatch to end: this job's longest jitter wait before the run, its time limit,
+    # and the slack a reaped run's end stamp may lag its deadline by.
+    span = jitter_bound(job) + (job.timeout_secs or seams._JOB_TIMEOUT_SECS) + _RUN_STAMP_SLACK_SECS
+    zones = host_timezone.host_timezones_between(last - span, last)
+    slot_wall = slot.replace(tzinfo=None, second=0, microsecond=0)
+    for zone in zones - {str(getattr(slot.tzinfo, "key", ""))}:
+        try:
+            then = ZoneInfo(zone)
+        except Exception:
+            continue
+        occurrence = _cron_occurrence_ts(expr, last, then)
+        # Only an occurrence the scheduler could have dispatched in this zone: the
+        # host was in it at that very instant. A zone the host left before the
+        # occurrence came round never ran it. No lower bound on the instant: a run
+        # the host slept through ends long after its occurrence.
+        if occurrence is None or host_timezone.host_timezone_at(occurrence) != zone:
+            continue
+        if seams.datetime.fromtimestamp(occurrence, tz=then).replace(tzinfo=None) == slot_wall:
+            return True
+    return False
+
+
+def _cron_occurrence_ts(expr: str, ts: float, tz: tzinfo) -> float | None:
+    """Return the occurrence of ``expr`` that ``ts`` belongs to, or ``None``.
+
+    That is the latest occurrence at or before the end of ``ts``'s minute in
+    ``tz``, as a UTC epoch. ``None`` when croniter cannot answer, so a caller
+    never treats two unknowns as the same occurrence.
+    """
+    from kiro_crew import cron as seams  # the facade holds the patched names; it imports us
+
+    try:
+        end_of_minute = seams.datetime.fromtimestamp((int(ts) // 60 + 1) * 60, tz=tz)
+        occurrence = croniter(expr, end_of_minute).get_prev(float)
+    except Exception:  # bad expression, or a timestamp out of datetime range
+        return None
+    return occurrence if isinstance(occurrence, float) else None
+
+
+def is_due(job: CronJob, now: float) -> bool:
+    """Whether ``job`` is due at ``now``: its schedule has arrived and ``now`` is not a skip date."""
+    from kiro_crew import cron as seams  # the facade holds the patched names; it imports us
+
+    # A failing job past the default limit waits out its backoff whatever its schedule says.
+    backoff_until = job.failure_backoff_until()
+    if backoff_until is not None and now < backoff_until:
+        return False
+    if job.schedule.kind == "every" and job.schedule.every_secs:
+        last = job.last_run_ts or job.created_ts
+        if now < last + job.schedule.every_secs:
+            return False
+    elif job.schedule.kind == "at" and job.schedule.at_ts:
+        if now < job.schedule.at_ts:
+            return False
+    elif job.schedule.kind == "cron" and job.schedule.cron_expr:
+        tz = _job_tz(job)
+        dt = seams.datetime.fromtimestamp(now, tz=tz)
+        if not seams.cron_expr_matches(job.schedule.cron_expr, dt):
+            return False
+        # Don't re-fire within the same UTC minute (immune to DST ambiguity)
+        if job.last_run_ts and int(job.last_run_ts) // 60 == int(now) // 60:
+            return False
+        # Nor in the next minute when both instants are one occurrence: on a
+        # spring-forward day croniter matches a skipped wall time (02:30) in two
+        # adjacent UTC minutes. The time bound keeps an occurrence that matches
+        # again much later (the repeated fall-back hour) due.
+        if job.last_run_ts and now - job.last_run_ts < _SAME_OCCURRENCE_SECS:
+            occurrence = _cron_occurrence_ts(job.schedule.cron_expr, now, tz)
+            if occurrence is not None and occurrence == _cron_occurrence_ts(
+                job.schedule.cron_expr, job.last_run_ts, tz
+            ):
+                return False
+        if _already_ran_by_wall_clock(job, dt):
+            return False
+    else:
+        return False
+    # Skip dates check (evaluated in job's local timezone, applies to all schedule types)
+    if job.skip_dates:
+        local_date = seams.datetime.fromtimestamp(now, _job_tz(job)).strftime("%Y-%m-%d")
+        if local_date in job.skip_dates:
+            return False
+    return True
+
+
+#: How long an enabled one-shot waits after an attempt whose fire never started.
+#: Such a job stays enabled past its ``at_ts`` so it runs once dispatch opens;
+#: keyed on ``at_ts`` alone its wake would be zero for as long as the refusal
+#: lasts, and the timer would re-fire it on every pass.
+_AT_RETRY_FLOOR_SECS = _TIMER_POLL_SECS
+
+
+def _at_next_attempt_ts(job: CronJob) -> float:
+    """When the timer should next attempt the one-shot ``job``.
+
+    Its ``at_ts``, unless an attempt already ran at or after that time. A
+    one-shot that fires, fails or is denied is parked or removed, so an enabled
+    one with such an attempt is one whose fire never started, and it is next
+    attempted one floor after that attempt. Only the wake moves: ``is_due`` is
+    unchanged, so a tick that runs for another job may still attempt it.
+    """
+    at_ts = job.schedule.at_ts or 0.0
+    last = job.last_run_ts
+    if last is not None and last >= at_ts:
+        return max(at_ts, last + _AT_RETRY_FLOOR_SECS)
+    return at_ts
+
+
+def next_wake_secs(jobs: Iterable[CronJob], claimed: Container[str], now: float) -> float | None:
+    """Seconds from ``now`` until the next of ``jobs`` should fire, or None when none will.
+
+    A disabled job, and a job whose id is in ``claimed`` (a run occupies it), is
+    skipped: the claimed job's next due time is only knowable once its run ends,
+    which re-arms the timer then.
+    """
+    delays: list[float] = []
+    for job in jobs:
+        if not job.enabled or job.id in claimed:
+            continue
+        if job.schedule.kind == "every" and job.schedule.every_secs:
+            last = job.last_run_ts or job.created_ts
+            next_run = last + job.schedule.every_secs
+            # Wake when the backoff ends, not on each skipped interval. A cron
+            # job keeps its boundary wakes: one landing inside the backoff is
+            # the same cheap no-op as a skip date.
+            backoff_until = job.failure_backoff_until()
+            if backoff_until is not None:
+                next_run = max(next_run, backoff_until)
+            delay = max(0.0, next_run - now)
+        elif job.schedule.kind == "at" and job.schedule.at_ts:
+            # Same as `every`: a re-enabled one-shot inside its backoff would
+            # otherwise re-arm at 0 s and spin until the backoff ends.
+            next_attempt = _at_next_attempt_ts(job)
+            backoff_until = job.failure_backoff_until()
+            if backoff_until is not None:
+                next_attempt = max(next_attempt, backoff_until)
+            delay = max(0.0, next_attempt - now)
+        elif job.schedule.kind == "cron":
+            # Wake ON the next cron boundary (as `at`/`every` do), not on a
+            # flat poll whose phase is unrelated to the schedule -- a phase
+            # gap can straddle a cron's single matching minute and drop the
+            # occurrence, most visibly on low-frequency crons. Use the
+            # skip-free boundary helper: it is O(1), so a job with many
+            # skip_dates cannot make this on-loop re-arm traverse up to
+            # _MAX_SKIP_DATE_LOOKAHEAD occurrences. skip_dates is enforced at
+            # fire time by is_due; a wake on a skipped boundary is a no-op
+            # that re-arms to the next one. _effective_delay() still caps the
+            # armed delay at _TIMER_POLL_SECS so an externally-added job is
+            # picked up within one poll.
+            cron_next = _next_cron_boundary_ts(job, now)
+            if cron_next is not None:
+                delay = max(0.0, cron_next - now)
+            else:
+                delay = _TIMER_POLL_SECS
+            # A backoff ending inside a matching minute makes the job due at that
+            # end, which can fall between the boundary wake and the next poll.
+            backoff_until = job.failure_backoff_until()
+            if (
+                backoff_until is not None
+                and backoff_until > now
+                and _cron_due_at_backoff_end(job, backoff_until)
+            ):
+                delays.append(backoff_until - now)
+        else:
+            continue
+        # A skipped date leaves an overdue job enabled without advancing its
+        # last run. Poll instead of immediately repeating the same refused scan;
+        # other jobs still contribute their own earlier deadlines.
+        if delay == 0.0 and job.skip_dates and not is_due(job, now):
+            delay = _TIMER_POLL_SECS
+        delays.append(delay)
+    return min(delays) if delays else None

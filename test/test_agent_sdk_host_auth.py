@@ -1,0 +1,979 @@
+"""One declaration per harness is the only place an auth fact may live.
+
+The read-gate floor, the sandbox mask, the logout-recycle set and the panel's sign-in
+advice are all projections of ``agent_sdk.host_auth``, so they cannot name different
+files. Pinned here: every selectable harness is declared; the table stays a stdlib-only
+leaf (the floor imports it); each projection is read by its consumer; a driver cannot
+unmask itself; an unnamed harness fails closed; sign-in absence is a shape, not a flag;
+and the resolved-root cache key moves with every declared override.
+"""
+
+from __future__ import annotations
+
+import ast
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+from source_corpus import parsed_candidates
+
+from kiro_crew import acp_backends, kiro_cli_bundle, security
+from kiro_crew.acp import types as acp_types
+from kiro_crew.agent_sdk import host_auth, native_allow_stores, tool_gate
+from kiro_crew.agent_sdk.backends import ACP_BACKEND_KAS, ACP_BACKEND_KIRO
+from kiro_crew.doctor_checks import render
+from kiro_crew.security import paths as security_paths
+from kiro_crew.security import paths_targets
+from kiro_crew.subprocess_utf8 import UTF8_TEXT
+
+SRC = Path(__file__).resolve().parent.parent / "src"
+HOST_AUTH_PY = SRC / "kiro_crew" / "agent_sdk" / "host_auth.py"
+
+#: Stdlib modules this table may import, named one by one.
+#:
+#: Enumerated rather than derived from ``sys.stdlib_module_names``: the point of
+#: the gate is that a reviewer sees the whole import surface of a module the
+#: credential floor depends on, and a set the interpreter computes would silently
+#: widen with the interpreter. The list is deliberately larger than what the
+#: module imports today, so an ordinary stdlib addition is not a test edit while
+#: a third-party or heavy in-tree one still is.
+_ALLOWED_STDLIB = frozenset(
+    {
+        "__future__",
+        "abc",
+        "collections",
+        "collections.abc",
+        "dataclasses",
+        "enum",
+        "functools",
+        "os",
+        "os.path",
+        "pathlib",
+        "sys",
+        "types",
+        "typing",
+    }
+)
+
+#: The only in-tree imports allowed here, each itself a stdlib-only leaf: the module
+#: that supplies the backend ids this table is keyed by, and the one that composes
+#: the kiro-cli sign-in command its remedy text names.
+_ALLOWED_IN_TREE = frozenset({"kiro_crew.agent_sdk.backends", "kiro_crew.kiro_cli_bundle"})
+
+#: Stdlib modules the sign-in-command leaf may import. Kept apart from the table's
+#: own list so that list does not widen to cover what only the leaf needs.
+_ALLOWED_BUNDLE_STDLIB = frozenset({"__future__", "collections.abc", "os", "shlex", "sys"})
+KIRO_CLI_BUNDLE_PY = SRC / "kiro_crew" / "kiro_cli_bundle.py"
+
+#: Packages whose arrival would close the cycle the leaf exists to avoid.
+_FORBIDDEN_IN_TREE = (
+    "kiro_crew.security",
+    "kiro_crew.acp",
+    "kiro_crew.config",
+    "kiro_crew.sandbox",
+)
+
+#: The methods :class:`host_auth.AgentInteractiveLogin` requires.
+_LOGIN_PROTOCOL_METHODS = frozenset({"login_flows", "begin_login", "poll_login", "logout"})
+
+
+def _declaration_kwargs(**overrides: object) -> dict:
+    """A minimal VALID declaration, so each validation case varies one field."""
+    base: dict = {
+        "backend": "probe",
+        "credential_leaves": (".probe/token.json",),
+        "home_override_env_vars": (),
+        "adapter_own_leaves": (),
+        "sign_in_remedy": "Sign in to probe.",
+        "signed_out_message": "Probe is not signed in. Sign in to probe.",
+        "host_logout_retires_children": False,
+        "entitlement_source": host_auth.ENTITLEMENT_OWN_CREDENTIAL_FILE,
+    }
+    base.update(overrides)
+    return base
+
+
+# ── 1. Parity: a selectable harness always has an auth answer ────────────────
+
+
+def test_every_known_harness_has_a_declaration() -> None:
+    """A harness becomes selectable by joining the known set, and joining it
+    without an auth answer is how a live OAuth token stayed off the credential
+    floor once already. Names the gap rather than comparing lengths, so a failure
+    says which harness is unanswered."""
+    assert host_auth.missing_declarations() == ()
+
+
+def test_the_parity_gate_fails_for_an_undeclared_harness(monkeypatch) -> None:
+    """The gate above passes today, which proves nothing about whether it CAN
+    fail. A synthetic id in the known set stands in for the next harness someone
+    makes selectable, and the gate has to name it -- otherwise the parity test is
+    a rubber stamp that would have missed the incident it exists for."""
+    synthetic = "harness-that-forgot-to-declare"
+    monkeypatch.setattr(
+        host_auth,
+        "ACP_BACKENDS_KNOWN",
+        frozenset(host_auth.ACP_BACKENDS_KNOWN) | {synthetic},
+    )
+    assert host_auth.missing_declarations() == (synthetic,)
+
+
+# ── 2. The table stays a stdlib-only leaf ────────────────────────────────────
+
+
+def _module_scope_imports(tree: ast.Module) -> list[str]:
+    """Every import reachable at module scope, including inside a top-level guard.
+
+    A guarded import still executes at import time on the branch that is taken,
+    so a ``TYPE_CHECKING``-shaped block is not an escape hatch from the gate.
+    """
+    found: list[str] = []
+
+    def visit(body: list[ast.stmt]) -> None:
+        for node in body:
+            if isinstance(node, ast.Import):
+                found.extend(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                prefix = "." * node.level
+                found.append(f"{prefix}{node.module or ''}")
+            elif isinstance(node, ast.If):
+                visit(node.body)
+                visit(node.orelse)
+            elif isinstance(node, ast.Try):
+                visit(node.body)
+                visit(node.orelse)
+                visit(node.finalbody)
+                for handler in node.handlers:
+                    visit(handler.body)
+
+    visit(tree.body)
+    return found
+
+
+def test_module_scope_imports_are_stdlib_or_the_backend_leaf() -> None:
+    """The floor reads this table while building itself, so a heavier import here
+    is a cycle rather than a slow start. Read from the SOURCE, not from the loaded
+    module, so an import added and shadowed by a later rebinding is still caught."""
+    tree = ast.parse(HOST_AUTH_PY.read_text(encoding="utf-8"))
+    imports = _module_scope_imports(tree)
+    assert imports, "parsed no module-scope imports; the gate would pass vacuously"
+    stray = sorted(
+        name for name in imports if name not in _ALLOWED_STDLIB and name not in _ALLOWED_IN_TREE
+    )
+    assert not stray, (
+        f"host_auth imports {stray} at module scope; the credential floor reads this "
+        "table during its own construction, so anything heavier than stdlib (or the "
+        "stdlib-only backend-id leaf) closes an import cycle on a security path"
+    )
+
+
+def test_importing_the_table_pulls_in_nothing_heavy() -> None:
+    """The gate that keeps the credential floor able to read this table.
+
+    ``security.paths`` imports ``host_auth`` while building the floor, so a cycle would
+    leave a half-initialised security module with a short floor, not an ImportError.
+    Runs in a cold interpreter, since the suite has already imported most modules.
+    """
+    probe = "\n".join(
+        (
+            "import sys",
+            f"sys.path.insert(0, {str(SRC)!r})",
+            "before = set(sys.modules)",
+            "import kiro_crew.agent_sdk.host_auth as m",
+            "assert m.credential_leaves(), 'table did not load'",
+            "added = sorted(set(sys.modules) - before)",
+            f"forbidden_roots = {_FORBIDDEN_IN_TREE!r}",
+            "forbidden = sorted(",
+            "    name for name in sys.modules",
+            "    if any(name == root or name.startswith(root + '.') for root in forbidden_roots)",
+            ")",
+            "def _file(name):",
+            "    return getattr(sys.modules.get(name), '__file__', None) or ''",
+            "vendored = sorted(",
+            "    name for name in added",
+            "    if '.' not in name",
+            "    and ('site-packages' in _file(name) or 'dist-packages' in _file(name))",
+            ")",
+            "print(repr({'forbidden': forbidden, 'vendored': vendored, 'added': added}))",
+        )
+    )
+    # ``-B``: the probe imports the package from the checkout, and without it the
+    # interpreter writes ``__pycache__`` into the repository as a side effect of a
+    # test run.
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", probe],
+        capture_output=True,
+        cwd=str(SRC.parent),
+        **UTF8_TEXT,
+    )
+    assert result.returncode == 0, f"probe failed: {result.stderr[-2000:]}"
+    loaded = ast.literal_eval(result.stdout.strip().splitlines()[-1])
+
+    assert loaded["forbidden"] == [], (
+        f"importing host_auth loaded {loaded['forbidden']}; the credential floor "
+        "imports this table while building itself, so any of these closes a cycle"
+    )
+    assert loaded["vendored"] == [], (
+        f"importing host_auth loaded third-party module(s) {loaded['vendored']}; the "
+        "table must be readable before any dependency is available"
+    )
+    assert "kiro_crew.agent_sdk.backends" in loaded["added"], (
+        "the probe did not observe the backend-id leaf loading, so it was measuring "
+        "an already-warm interpreter rather than a cold import"
+    )
+
+
+# ── 3. Each projection equals the table it replaced, at its real consumer ────
+
+
+def test_every_declared_leaf_is_on_the_read_gate_floor() -> None:
+    """A declared credential leaf that never reaches the floor is a harness whose
+    token an agent ``fs_read`` can still lift. Asserted on the PUBLIC view, which
+    is the same list ``is_sensitive_path`` consults, so the projection is proven at
+    the consumer rather than at the splice site."""
+    floor = set(security.sensitive_home_dirs())
+    missing = sorted(leaf for leaf in host_auth.credential_leaves() if leaf not in floor)
+    assert not missing, f"declared but unfenced: {missing}"
+
+
+def test_the_mask_exclusion_is_the_declaration_projection() -> None:
+    """The mask exclusion and the fence must name the same file, or a harness is
+    either masked out of its own auth or excluded from a mask that never covered
+    it. Compares against the projection rather than a literal, so the day a
+    harness declares a second leaf the table is the only edit."""
+    expected = {
+        declaration.backend: declaration.adapter_own_leaves
+        for declaration in host_auth.AGENT_AUTH_DECLARATIONS
+        if declaration.adapter_own_leaves
+    }
+    assert tool_gate.ADAPTER_OWN_CREDENTIAL_LEAVES == expected
+    assert expected, "no harness declares an own-leaf, so this gate would pass vacuously"
+
+
+def test_every_excluded_own_leaf_is_also_on_the_floor() -> None:
+    """An exclusion from a mask that never covered the leaf is a no-op at best and
+    a widening at worst. The declaration refuses the local half of this (an
+    own-leaf must be one of the declaration's own credential leaves); this pins the
+    other half, that the leaf really did land on the floor the mask is derived
+    from."""
+    floor = set(security.sensitive_home_dirs())
+    for backend, leaves in tool_gate.ADAPTER_OWN_CREDENTIAL_LEAVES.items():
+        for leaf in leaves:
+            assert leaf in floor, (
+                f"{backend!r} asks the mask to spare {leaf!r}, which is not on the "
+                "read-gate floor; sparing a leaf the floor never covered opens it"
+            )
+
+
+def test_the_logout_recycle_set_is_projected_not_copied() -> None:
+    """Membership authorizes ENDING a live turn, so the two spellings consumers
+    import must be one object. A copy would keep passing an equality test while
+    drifting from the declarations the floor and the mask read."""
+    assert host_auth.backends_retired_by_host_logout() == frozenset(
+        {ACP_BACKEND_KIRO, ACP_BACKEND_KAS}
+    )
+    assert acp_types.backends_retired_by_host_logout() == frozenset({"", "kas"})
+    assert (
+        acp_types.backends_retired_by_host_logout
+        is acp_backends.backends_retired_by_host_logout
+        is host_auth.backends_retired_by_host_logout
+    )
+    # Published as a FUNCTION and nowhere as an ``ACP_BACKENDS_*`` set. That naming is
+    # harness vocabulary, whose home is the backends module, and a derived answer is
+    # not vocabulary -- ``scripts/check_harness_parity.py`` fails on a set defined
+    # outside that module and its owners, and the set could not be defined inside it either (it
+    # supplies the ids this table is keyed by). Asserted so the alias does not come
+    # back as a convenience.
+    for module in (host_auth, acp_types, acp_backends):
+        assert not hasattr(module, "ACP_BACKENDS_KIRO_IDENTITY_STORE"), module.__name__
+
+
+def test_only_a_host_store_harness_is_retired_by_a_host_logout() -> None:
+    """Derived from a declared fact rather than from "not claude": a harness
+    authenticated some other way must never be recycled on a store it never reads,
+    and a negative list grows wrong silently as harnesses are added."""
+    retired = host_auth.backends_retired_by_host_logout()
+    for declaration in host_auth.AGENT_AUTH_DECLARATIONS:
+        on_host_store = declaration.entitlement_source == host_auth.ENTITLEMENT_HOST_IDENTITY_STORE
+        assert (declaration.backend in retired) is on_host_store
+
+
+def test_the_override_pairing_is_the_declaration_projection() -> None:
+    """The floor re-anchors every declared leaf under each override variable, so a
+    relocated token is still fenced. The pairing has to name the same leaf the
+    floor fences and the same variable the resolver reads -- it was a third
+    hand-maintained copy of both."""
+    assert security_paths._OVERRIDE_ANCHORED_LEAVES == (
+        host_auth.override_anchored_leaves() + native_allow_stores.override_anchored_leaves()
+    )
+    assert security._OVERRIDE_ANCHORED_LEAVES is security_paths._OVERRIDE_ANCHORED_LEAVES
+    assert security_paths._OVERRIDE_ANCHORED_LEAVES, "no leaf is override-anchored; vacuous"
+
+
+def test_every_anchored_variable_is_a_declared_override() -> None:
+    """The resolver only resolves variables the declarations name, so a variable
+    that appears in the pairing but not in that list anchors on a root nobody ever
+    resolved -- an entry describing protection that does not exist."""
+    resolved = set(paths_targets._ADAPTER_ROOT_ENVS)
+    for leaf, env_vars, _under_root in security_paths._OVERRIDE_ANCHORED_LEAVES:
+        for env_var in env_vars:
+            assert env_var in resolved, (
+                f"{leaf!r} is anchored on {env_var!r}, which no declaration names, so "
+                "the resolver never resolves it and the anchor is dead"
+            )
+
+
+# ── 4. The declaration refuses what the host cannot honour ───────────────────
+
+
+def test_the_override_spelling_defaults_to_the_leafs_last_segment() -> None:
+    """A harness whose override replaces the token's PARENT declares nothing extra.
+
+    The default keeps every existing declaration correct without an edit: a root
+    that stands in for the parent leaves exactly one segment behind it.
+    """
+    pairing = {leaf: under_root for leaf, _envs, under_root in host_auth.override_anchored_leaves()}
+    assert pairing[".codex/auth.json"] == "auth.json"
+    assert pairing[".claude/.credentials.json"] == ".credentials.json"
+
+
+def test_a_multi_segment_override_keeps_the_segments_below_the_root() -> None:
+    """An override standing in for a PREFIX leaves more than the final segment.
+
+    ``XDG_DATA_HOME`` replaces ``.local/share``, so the relocated token is
+    ``$XDG_DATA_HOME/opencode/auth.json``. Anchoring the final segment alone would
+    fence a path the harness never writes and leave the real one readable, which is
+    why the spelling is declared rather than derived.
+    """
+    pairing = {leaf: under_root for leaf, _envs, under_root in host_auth.override_anchored_leaves()}
+    assert pairing[".local/share/opencode/auth.json"] == "opencode/auth.json"
+
+
+def test_an_override_spelling_that_is_not_part_of_the_leaf_is_refused() -> None:
+    """A declaration may re-spell where its own file lands, never name another file.
+
+    Without the trailing-slice rule a driver could anchor an unrelated path under
+    an override root it controls, which is the mask-editing power this class exists
+    to withhold.
+    """
+    with pytest.raises(ValueError, match="not a trailing slice"):
+        host_auth.AgentAuthDeclaration(
+            backend="probe",
+            credential_leaves=(".local/share/probe/auth.json",),
+            home_override_env_vars=("XDG_DATA_HOME",),
+            adapter_own_leaves=(),
+            sign_in_remedy="Run the probe sign-in.",
+            signed_out_message="The probe is not signed in.",
+            host_logout_retires_children=False,
+            entitlement_source=host_auth.ENTITLEMENT_OWN_CREDENTIAL_FILE,
+            override_relative_leaves=("elsewhere/id_rsa",),
+        )
+
+
+def test_a_partial_list_of_override_spellings_is_refused() -> None:
+    """The two tuples are positional, so a short list would anchor the wrong file."""
+    with pytest.raises(ValueError, match="override spelling"):
+        host_auth.AgentAuthDeclaration(
+            backend="probe",
+            credential_leaves=(".probe/a.json", ".probe/b.json"),
+            home_override_env_vars=("PROBE_HOME",),
+            adapter_own_leaves=(),
+            sign_in_remedy="Run the probe sign-in.",
+            signed_out_message="The probe is not signed in.",
+            host_logout_retires_children=False,
+            entitlement_source=host_auth.ENTITLEMENT_OWN_CREDENTIAL_FILE,
+            override_relative_leaves=("a.json",),
+        )
+
+
+def test_an_unknown_entitlement_source_is_refused() -> None:
+    """The doctor row, the panel and the logout policy all branch on this field, so
+    a typo'd fourth spelling would read as a harness nobody has an answer for --
+    silently, at every one of those branches."""
+    with pytest.raises(ValueError, match="unknown entitlement source"):
+        host_auth.AgentAuthDeclaration(**_declaration_kwargs(entitlement_source="vibes"))
+
+
+@pytest.mark.parametrize("remedy", ["", "   ", "\n\t"])
+def test_an_empty_remedy_is_refused(remedy: str) -> None:
+    """The remedy is rendered VERBATIM wherever a harness is unauthenticated, so a
+    blank one is an operator staring at an auth failure with no next step."""
+    with pytest.raises(ValueError, match="no sign-in remedy"):
+        host_auth.AgentAuthDeclaration(**_declaration_kwargs(sign_in_remedy=remedy))
+
+
+def test_a_driver_cannot_unmask_a_leaf_it_did_not_declare() -> None:
+    """A driver must not be able to unmask itself.
+
+    ``adapter_own_leaves`` is the one field that asks the host to OPEN something,
+    so it may only name a leaf this same declaration already put ON the floor. Were
+    it free-form, a driver could name any fenced path -- another harness's token,
+    ``.ssh`` -- and the sandbox mask would spare it.
+    """
+    with pytest.raises(ValueError, match="may only ask the mask to spare"):
+        host_auth.AgentAuthDeclaration(
+            **_declaration_kwargs(
+                credential_leaves=(".probe/token.json",),
+                adapter_own_leaves=(".ssh/id_rsa",),
+            )
+        )
+
+
+def test_an_own_leaf_from_its_own_declaration_is_accepted() -> None:
+    """The refusal above must not be a blanket ban: a harness that authenticates
+    ITSELF has to keep reading its own token, which is the whole reason the
+    exclusion exists."""
+    declaration = host_auth.AgentAuthDeclaration(
+        **_declaration_kwargs(
+            credential_leaves=(".probe/token.json",),
+            adapter_own_leaves=(".probe/token.json",),
+        )
+    )
+    assert declaration.adapter_own_leaves == (".probe/token.json",)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [host_auth.ENTITLEMENT_OWN_CREDENTIAL_FILE, host_auth.ENTITLEMENT_HOST_VAULT],
+)
+def test_logout_recycling_is_refused_off_the_host_store(source: str) -> None:
+    """A host logout says nothing about a store the harness never reads, so
+    retiring its running child on that signal would end a live turn for no reason.
+    Refused at declaration time because the consumer is a membership test that
+    cannot tell a deliberate opt-in from a mistaken one."""
+    with pytest.raises(ValueError, match="says nothing about"):
+        host_auth.AgentAuthDeclaration(
+            **_declaration_kwargs(host_logout_retires_children=True, entitlement_source=source)
+        )
+
+
+def test_a_host_store_harness_that_survives_a_host_logout_is_refused() -> None:
+    """The reverse of the rule above, and the same failure in the other direction.
+
+    A harness reading the host identity store that is not retired on an account change
+    keeps serving turns on the previous account's credentials.
+    """
+    with pytest.raises(ValueError, match="survive a host logout"):
+        host_auth.AgentAuthDeclaration(
+            **_declaration_kwargs(
+                host_logout_retires_children=False,
+                entitlement_source=host_auth.ENTITLEMENT_HOST_IDENTITY_STORE,
+            )
+        )
+
+
+def test_logout_recycling_is_accepted_on_the_host_store() -> None:
+    """The pair above is a constraint, not a ban: a harness that DOES resolve its
+    tokens from the host store must be retired, or it keeps serving turns on the
+    previous account's credentials."""
+    declaration = host_auth.AgentAuthDeclaration(
+        **_declaration_kwargs(
+            host_logout_retires_children=True,
+            entitlement_source=host_auth.ENTITLEMENT_HOST_IDENTITY_STORE,
+        )
+    )
+    assert declaration.host_logout_retires_children is True
+
+
+# ── 5. An unnamed harness fails closed ───────────────────────────────────────
+
+
+def test_an_unnamed_harness_gets_the_fail_closed_declaration() -> None:
+    """Every consumer here is a security control reading the table during its own
+    construction, so the lookup is TOTAL: an unrecognised id gets an answer that
+    fences nothing extra and retires nothing, rather than an exception on a
+    security path."""
+    declaration = host_auth.declaration_for("nonexistent")
+    assert declaration is host_auth.UNKNOWN_AGENT_AUTH
+    assert declaration.credential_leaves == ()
+    assert declaration.home_override_env_vars == ()
+    assert declaration.adapter_own_leaves == ()
+    assert declaration.host_logout_retires_children is False
+    assert declaration.sign_in_remedy.strip()
+
+
+def test_the_unknown_answer_contributes_nothing_to_any_projection() -> None:
+    """Fail-closed has to hold at the projections too. An UNKNOWN that leaked a
+    leaf would fence a path on behalf of a harness nobody can name; one that
+    leaked into the logout set would end live turns for it."""
+    assert host_auth.UNKNOWN_AGENT_AUTH not in host_auth.AGENT_AUTH_DECLARATIONS
+    assert "nonexistent" not in host_auth.backends_retired_by_host_logout()
+
+
+# ── 6. The in-product sign-in flow is OPTIONAL ───────────────────────────────
+
+
+class _FullLogin:
+    """A driver that offers every part of an in-product sign-in."""
+
+    def login_flows(self):
+        return ("device_code",)
+
+    async def begin_login(self, flow):
+        return {}
+
+    async def poll_login(self, flow):
+        return {}
+
+    async def logout(self):
+        return True
+
+
+class _MissingPoll:
+    """A driver that starts a flow it can never report the completion of."""
+
+    def login_flows(self):
+        return ("device_code",)
+
+    async def begin_login(self, flow):
+        return {}
+
+    async def logout(self):
+        return True
+
+
+def test_the_login_protocol_is_satisfied_structurally() -> None:
+    """A driver satisfies the flow with no base class to inherit and no
+    registration step to forget, so the capability cannot be claimed by a driver
+    that only registered and never implemented."""
+    assert isinstance(_FullLogin(), host_auth.AgentInteractiveLogin)
+
+
+def test_a_partial_login_implementation_does_not_satisfy_the_protocol() -> None:
+    """Half a flow is worse than none: a consumer that found ``begin_login`` and
+    called it would strand the operator at a started sign-in it can never poll.
+    ``runtime_checkable`` checks method PRESENCE, so this is the check that a
+    missing member is actually observed."""
+    assert not isinstance(_MissingPoll(), host_auth.AgentInteractiveLogin)
+
+
+def test_no_current_driver_implements_the_login_protocol() -> None:
+    """Asserted POSITIVELY, so the day a harness gains an in-product sign-in this
+    test is the thing that notices.
+
+    The panel, doctor row and remedy string have no answer yet for a login Kiro Crew
+    drives, so a first implementer must be noticed.
+    """
+    implementers: list[str] = []
+    # A matched class defines every protocol method, so only the files whose text
+    # holds all of their names are parsed.
+    for source, _text, tree in parsed_candidates(
+        require_all=sorted(_LOGIN_PROTOCOL_METHODS), skip_syntax_errors=False
+    ):
+        if source == HOST_AUTH_PY:
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ClassDef):
+                continue
+            methods = {
+                child.name
+                for child in node.body
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
+            }
+            if _LOGIN_PROTOCOL_METHODS <= methods:
+                implementers.append(f"{source.relative_to(SRC)}::{node.name}")
+    assert implementers == [], (
+        f"{implementers} now implement AgentInteractiveLogin. That is a real "
+        "capability change, not a refactor: the panel, the doctor row and the "
+        "sign-in remedy each need an answer for a harness Kiro Crew logs in itself"
+    )
+
+
+# ── 7. The resolved-root cache key covers every declared override ────────────
+
+
+@pytest.fixture()
+def _no_adapter_overrides(monkeypatch):
+    """Clear every declared override so a developer machine that exports one
+    cannot make a default-location assertion pass for the wrong reason."""
+    for env_var in paths_targets._ADAPTER_ROOT_ENVS:
+        monkeypatch.delenv(env_var, raising=False)
+    security._home_targets_cache.clear()
+    yield
+    security._home_targets_cache.clear()
+
+
+def test_the_resolved_root_key_is_still_hashable(_no_adapter_overrides, tmp_path) -> None:
+    """The resolved roots ARE the TTL cache key, so they have to hash. Holding the
+    declared overrides as a tuple of pairs rather than a mapping is what keeps that
+    true, and the fallback -- dropping them from the key -- is the fail-open shape
+    the key exists to prevent."""
+    roots = security._resolve_root_anchors(str(tmp_path))
+    assert isinstance(hash(roots), int)
+    assert isinstance(roots.adapter_roots, tuple)
+    assert {env for env, _root in roots.adapter_roots} == set(paths_targets._ADAPTER_ROOT_ENVS)
+
+
+def test_a_changed_declared_override_changes_the_key(monkeypatch, tmp_path) -> None:
+    """The fail-OPEN guard. The builder anchors a declared leaf under each override
+    root, so a key that omits those roots would serve targets computed for the
+    PREVIOUS value -- leaving a token an operator just relocated outside the gate
+    while the cache still reports it covered."""
+    assert "CODEX_HOME" in host_auth.home_override_env_vars(), (
+        "premise gone: CODEX_HOME is no longer a declared override, so this case "
+        "no longer exercises an adapter root"
+    )
+    first_root = tmp_path / "codex-a"
+    second_root = tmp_path / "codex-b"
+    first_root.mkdir()
+    second_root.mkdir()
+
+    monkeypatch.setenv("CODEX_HOME", str(first_root))
+    first = security._resolve_root_anchors(str(tmp_path))
+    monkeypatch.setenv("CODEX_HOME", str(second_root))
+    second = security._resolve_root_anchors(str(tmp_path))
+
+    assert first != second, (
+        "the resolved-root key did not change when a declared override moved; the "
+        "cached target set would keep naming the old location"
+    )
+    assert dict(first.adapter_roots)["CODEX_HOME"] != dict(second.adapter_roots)["CODEX_HOME"]
+
+
+def test_an_unset_declared_override_resolves_to_none(_no_adapter_overrides, tmp_path) -> None:
+    """Every declared variable is present in the key with a ``None`` value rather
+    than absent, so setting one for the first time changes the key instead of
+    merely adding a field the previous key never had."""
+    roots = security._resolve_root_anchors(str(tmp_path))
+    assert all(root is None for _env, root in roots.adapter_roots)
+
+
+# A re-exposure must be a NARROWING of the mask, never a hole in the floor
+
+
+def test_every_declared_expose_leaf_sits_under_a_masked_directory() -> None:
+    """A re-exposed file must be inside something the mask hides, for EVERY harness.
+
+    A leaf under nothing the mask hides is a new hole, not a carve-out. Containment is
+    necessary but not sufficient (a private key under a masked dir passes too), so the
+    table stays host-owned with no declared field.
+    """
+    from kiro_crew.agent_sdk import tool_gate as gate
+
+    for backend, leaves in gate.ADAPTER_EXPOSED_CREDENTIAL_LEAVES.items():
+        if not leaves or not gate.is_enforced(backend):
+            continue
+        hidden = gate.adapter_hidden_credential_dirs(backend)
+        exposed = gate.adapter_expose_files(backend, hidden)
+        assert exposed, f"{backend!r} names {leaves!r} and none survived containment"
+        for path in exposed:
+            assert gate._sits_under_any(path, hidden), (
+                f"{path!r} is re-exposed for {backend!r} but sits under no directory "
+                "the mask hides"
+            )
+
+
+def test_an_uncontained_expose_leaf_is_dropped_not_honoured(monkeypatch) -> None:
+    """An expose leaf the mask does not cover is refused, and fails CLOSED.
+
+    Dropping it costs a session that names its own failure; honouring it exposes a
+    file with no signal at all. Checked at the point of use, against the mask
+    actually being applied, rather than where the table is written: the floor is not
+    readable from a leaf this early.
+    """
+    from kiro_crew.agent_sdk import tool_gate as gate
+
+    enforced = next(
+        b
+        for b, leaves in gate.ADAPTER_EXPOSED_CREDENTIAL_LEAVES.items()
+        if leaves and gate.is_enforced(b)
+    )
+    # A leaf under nothing this mask hides. Deliberately NOT a private key: that one
+    # IS under a masked directory, so containment honours it -- which is exactly why
+    # a re-exposure stays a HOST decision rather than a declared one.
+    monkeypatch.setitem(gate.ADAPTER_EXPOSED_CREDENTIAL_LEAVES, enforced, ("Documents/notes.txt",))
+    hidden = gate.adapter_hidden_credential_dirs(enforced)
+    assert gate.adapter_expose_files(enforced, hidden) == ()
+
+
+def test_a_sibling_of_a_masked_directory_is_not_treated_as_inside_it() -> None:
+    """``~/.awsconfig`` is not inside ``~/.aws``, and a prefix test must not say so.
+
+    A bare ``startswith`` on the root reports a sibling whose name merely begins
+    with the root's as contained, which would re-expose a different file from the
+    one the declaration named. A root that IS the target is not inside itself
+    either.
+    """
+    from kiro_crew.agent_sdk import tool_gate as gate
+
+    root = os.path.join(os.path.sep, "tmp", "authseam-root", ".aws")
+    assert gate._sits_under_any(os.path.join(root, "config"), (root,))
+    assert not gate._sits_under_any(root + "config", (root,))
+    assert not gate._sits_under_any(root, (root,))
+
+
+# Two registers, because only one of them has evidence behind it
+
+
+def test_the_unprobed_remedy_never_asserts_the_sign_in_state() -> None:
+    """A string rendered without a measurement states the ACTION, not the STATE.
+
+    It is shown as a standing caveat, so a "not signed in" claim would be false for a
+    signed-in operator. Only ``signed_out_message`` asserts the state, on evidence.
+    """
+    for declaration in host_auth.AGENT_AUTH_DECLARATIONS:
+        remedy = declaration.sign_in_remedy.lower()
+        for claim in ("is not signed in", "is not logged in"):
+            assert claim not in remedy, (
+                f"{declaration.backend!r} asserts {claim!r} in a remedy that is "
+                "rendered with no measurement behind it"
+            )
+
+
+def test_the_kiro_signed_out_message_is_unchanged() -> None:
+    """The auth-required path raises exactly the string it always raised.
+
+    That path reaches the message on the harness's own stderr evidence, so moving
+    it into a declaration must not reword what an operator already reads when
+    kiro-cli's login has lapsed.
+    """
+    expected = (
+        "kiro-cli is not logged in. Run `kiro-cli login` in your terminal, "
+        "then start a new chat."
+    )
+    assert host_auth.signed_out_message("") == expected
+    # Choosing KAS means Kiro Crew's own sign-in: where kiro-cli cannot run a
+    # session the spawn moves onto Crew's own engine, so the KAS sentence names
+    # the Kiro sign-in card alone and never sends the user to kiro-cli.
+    kas = host_auth.signed_out_message("kas")
+    assert kas != expected
+    assert "kiro-cli login" not in kas
+    assert "Settings → Agent Harness → Kiro sign-in" in kas
+    assert "start a new chat" in kas
+    # The standing (unprobed) remedy names the same path, in plain prose.
+    remedy = host_auth.declaration_for("kas").sign_in_remedy
+    assert "Settings → Agent Harness → Kiro sign-in" in remedy and "kiro-cli login" not in remedy
+
+
+def test_kas_messages_name_the_route_the_last_spawn_took(monkeypatch):
+    """Once a spawn chose a route, the KAS messages lead with it, so a person reads
+    which engine answered; other harnesses' messages are untouched."""
+    from kiro_crew.acp import kas_route
+
+    base = host_auth.signed_out_message("kas")
+    monkeypatch.setattr(
+        kas_route,
+        "_LAST_SPAWN_ROUTE",
+        kas_route.KasRoute(bundle=True, reason=kas_route.REASON_NO_KIRO_CLI),
+    )
+    led = host_auth.signed_out_message("kas")
+    assert led == ("KAS runs on Kiro Crew's own engine because kiro-cli is not installed. " + base)
+    assert host_auth.sign_in_remedy("kas").startswith("KAS runs on Kiro Crew's own engine")
+    assert "Kiro Crew's own engine" not in host_auth.signed_out_message("")
+
+
+# The kiro-cli command named is the one this host's spawn runs
+
+_BUNDLED_POSIX_DIR = "/Applications/Kiro Crew.app/Contents/Resources/kiro-cli"
+_BUNDLED_WINDOWS_DIR = r"C:\Program Files\Kiro Crew\resources\kiro-cli"
+
+
+def _gate_login_command(environ: dict, platform_name: str) -> str:
+    """The sign-in command the setup gate serves for the binary a spawn resolves."""
+    binary = kiro_cli_bundle.spawn_kiro_cli_binary(environ, platform_name)
+    login, _sso, _bundled = kiro_cli_bundle.login_commands(
+        binary, environ, windows=platform_name == "win32"
+    )
+    return login
+
+
+# KAS names the Kiro sign-in, never a kiro-cli command (test_kas_messages_*).
+@pytest.mark.parametrize("backend", [ACP_BACKEND_KIRO])
+@pytest.mark.parametrize("platform_name", ["linux", "darwin", "win32"])
+def test_a_path_install_names_the_bare_sign_in_command(backend: str, platform_name: str) -> None:
+    """With no bundled copy and no override, the shell finds ``kiro-cli`` on PATH,
+    so both strings are the declared ones word for word."""
+    declaration = host_auth.declaration_for(backend)
+    environ = {"PATH": "/usr/bin"}
+    assert host_auth.sign_in_remedy(backend, environ, platform_name) == declaration.sign_in_remedy
+    assert (
+        host_auth.signed_out_message(backend, environ, platform_name)
+        == declaration.signed_out_message
+    )
+    assert kiro_cli_bundle.KIRO_CLI_LOGIN_COMMAND in declaration.sign_in_remedy
+
+
+# KAS names the Kiro sign-in, never a kiro-cli command (test_kas_messages_*).
+@pytest.mark.parametrize("backend", [ACP_BACKEND_KIRO])
+@pytest.mark.parametrize(
+    ("platform_name", "bundled_dir", "entry"),
+    [
+        ("darwin", _BUNDLED_POSIX_DIR, "kiro-cli-chat"),
+        ("linux", "/opt/Kiro Crew/resources/kiro-cli", "kiro-cli-chat"),
+        ("win32", _BUNDLED_WINDOWS_DIR, "kiro-cli.exe"),
+    ],
+)
+def test_a_bundled_install_names_the_absolute_path_the_gate_serves(
+    backend: str, platform_name: str, bundled_dir: str, entry: str
+) -> None:
+    """The desktop app's bundled copy is not on the user's shell PATH, so a bare
+    ``kiro-cli login`` fails there with command-not-found. Both strings carry the
+    same absolute-path command the setup gate serves, in place of the bare one."""
+    environ = {"PATH": "/usr/bin", kiro_cli_bundle.BUNDLED_KIRO_DIR_ENV: bundled_dir}
+    command = _gate_login_command(environ, platform_name)
+    assert command != kiro_cli_bundle.KIRO_CLI_LOGIN_COMMAND
+    assert entry in command
+    if platform_name == "win32":
+        assert command.startswith("powershell.exe -NoProfile -Command ")
+    remedy = host_auth.sign_in_remedy(backend, environ, platform_name)
+    signed_out = host_auth.signed_out_message(backend, environ, platform_name)
+    for text in (remedy, signed_out):
+        assert command in text
+        assert text.count(command) == 1
+        assert f" {kiro_cli_bundle.KIRO_CLI_LOGIN_COMMAND} " not in text
+        assert f"`{kiro_cli_bundle.KIRO_CLI_LOGIN_COMMAND}`" not in text
+    # The rewritten remedy keeps the panel's plain-text rules.
+    assert "--" not in remedy
+    assert "`" not in remedy
+
+
+# KAS names the Kiro sign-in, never a kiro-cli command (test_kas_messages_*).
+@pytest.mark.parametrize("backend", [ACP_BACKEND_KIRO])
+def test_doctor_prints_the_bundled_sign_in_command_on_one_line(
+    backend: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``kirocrew doctor`` wraps its details at 80 columns, and the default macOS
+    app path has a space in it. A break there would leave two halves that run as
+    nothing, so the command the signed-out row names is kept on one line."""
+    environ = {"PATH": "/usr/bin", kiro_cli_bundle.BUNDLED_KIRO_DIR_ENV: _BUNDLED_POSIX_DIR}
+    command = kiro_cli_bundle.spawn_login_command(environ, "darwin")
+    signed_out = host_auth.signed_out_message(backend, environ, "darwin")
+    assert " " in command and command in signed_out
+    render._print_wrapped(signed_out, keep=(command,))
+    lines = [line.strip() for line in capsys.readouterr().out.splitlines()]
+    assert any(command in line for line in lines), lines
+    assert " ".join(lines) == " ".join(signed_out.split())
+
+
+@pytest.mark.parametrize("bundled", [False, True])
+def test_an_off_path_override_keeps_the_bare_command(bundled: bool) -> None:
+    """An operator's ``KIROCREW_KIRO_BIN`` may name a binary that is gone, and the
+    spawn then runs an install directory or the bundled copy instead. The remedy
+    cannot stat which one ran, so it never names the override's path."""
+    environ = {"PATH": "/usr/bin", kiro_cli_bundle.KIRO_BIN_OVERRIDE_ENV: "/opt/gone/kiro-cli"}
+    if bundled:
+        environ[kiro_cli_bundle.BUNDLED_KIRO_DIR_ENV] = _BUNDLED_POSIX_DIR
+    declaration = host_auth.declaration_for(ACP_BACKEND_KIRO)
+    assert host_auth.sign_in_remedy(ACP_BACKEND_KIRO, environ, "linux") == (
+        declaration.sign_in_remedy
+    )
+    assert "/opt/gone" not in host_auth.signed_out_message(ACP_BACKEND_KIRO, environ, "linux")
+
+
+def test_an_override_on_path_keeps_the_bare_command() -> None:
+    """An override inside a PATH directory is what the shell already runs."""
+    environ = {
+        "PATH": "/usr/local/bin",
+        kiro_cli_bundle.KIRO_BIN_OVERRIDE_ENV: "/usr/local/bin/kiro-cli",
+    }
+    declaration = host_auth.declaration_for(ACP_BACKEND_KIRO)
+    assert host_auth.sign_in_remedy(ACP_BACKEND_KIRO, environ, "linux") == (
+        declaration.sign_in_remedy
+    )
+
+
+def test_a_harness_off_the_host_store_ignores_the_bundled_copy() -> None:
+    """Only a harness that signs in through kiro-cli names its command, so a bundled
+    kiro-cli says nothing about how any other harness signs in."""
+    environ = {kiro_cli_bundle.BUNDLED_KIRO_DIR_ENV: _BUNDLED_POSIX_DIR}
+    for declaration in (*host_auth.AGENT_AUTH_DECLARATIONS, host_auth.UNKNOWN_AGENT_AUTH):
+        if declaration.entitlement_source == host_auth.ENTITLEMENT_HOST_IDENTITY_STORE:
+            continue
+        backend = declaration.backend
+        if backend == ACP_BACKEND_KIRO:
+            # The unknown declaration's id is the empty string, which is kiro's.
+            continue
+        assert host_auth.sign_in_remedy(backend, environ, "darwin") == declaration.sign_in_remedy
+        assert (
+            host_auth.signed_out_message(backend, environ, "darwin")
+            == declaration.signed_out_message
+        )
+
+
+def test_the_sign_in_command_leaf_imports_only_the_stdlib() -> None:
+    """The table imports this leaf at module scope, so the leaf carries the same
+    stdlib-only rule, read from its source."""
+    imports = _module_scope_imports(ast.parse(KIRO_CLI_BUNDLE_PY.read_text(encoding="utf-8")))
+    assert imports, "parsed no module-scope imports; the gate would pass vacuously"
+    assert sorted(name for name in imports if name not in _ALLOWED_BUNDLE_STDLIB) == []
+
+
+@pytest.mark.parametrize("blank", ["", "   ", "\n\t"])
+def test_an_empty_signed_out_message_is_refused(blank: str) -> None:
+    """A declaration with no signed-out message would raise a blank auth error."""
+    with pytest.raises(ValueError, match="signed-out message"):
+        host_auth.AgentAuthDeclaration(**_declaration_kwargs(signed_out_message=blank))
+
+
+def test_the_panel_remedy_reads_as_prose_not_as_terminal_output() -> None:
+    """``sign_in_remedy`` is rendered as PLAIN TEXT, so it must not carry markup.
+
+    The dashboard has no markdown pass there, so ``--`` and backticks show raw.
+    ``signed_out_message`` is exempt: its terminal row and chat card render them.
+    """
+    for declaration in (*host_auth.AGENT_AUTH_DECLARATIONS, host_auth.UNKNOWN_AGENT_AUTH):
+        remedy = declaration.sign_in_remedy
+        assert "--" not in remedy, (
+            f"{declaration.backend!r} writes '--' in a string rendered as plain text; "
+            "use an em dash"
+        )
+        assert "`" not in remedy, (
+            f"{declaration.backend!r} writes a markdown backtick in a string rendered "
+            "as plain text"
+        )
+
+
+def test_every_entitlement_source_has_an_operator_facing_label() -> None:
+    """A triage row an operator reads must not print a code identifier.
+
+    Doctor printed ``own_credential_file`` raw, and the KAS token row read
+    ``host_identity_store`` where it had said "owned by kiro-cli". A source with no
+    label falls back to the identifier, so the gate is that every source HAS one.
+    """
+    assert set(host_auth.ENTITLEMENT_LABELS) == host_auth.ENTITLEMENT_SOURCES
+    for source, label in host_auth.ENTITLEMENT_LABELS.items():
+        assert label.strip(), source
+        assert "_" not in label, f"{source!r} labels itself with a code identifier"
+    for declaration in host_auth.AGENT_AUTH_DECLARATIONS:
+        assert "_" not in host_auth.entitlement_label(declaration.backend)
+
+
+def test_the_host_vault_source_is_declared_and_labelled() -> None:
+    """The host-vault entitlement is in both the source set and the label map.
+
+    Missing from the set, ``__post_init__`` refuses it; missing a label, doctor prints
+    it raw.
+    """
+    assert host_auth.ENTITLEMENT_HOST_VAULT in host_auth.ENTITLEMENT_SOURCES
+    assert host_auth.ENTITLEMENT_HOST_VAULT in host_auth.ENTITLEMENT_LABELS
+    assert host_auth.ENTITLEMENT_HOST_VAULT not in (
+        host_auth.ENTITLEMENT_HOST_IDENTITY_STORE,
+        host_auth.ENTITLEMENT_OWN_CREDENTIAL_FILE,
+    )
+    # A harness entitled from Crew's vault signs in somewhere other than the host
+    # identity store, so the panel still shows its standing caveat: the operator has
+    # to put a key in the vault and map it, which is an action doctor has not
+    # measured.
+    for declaration in host_auth.AGENT_AUTH_DECLARATIONS:
+        if declaration.entitlement_source != host_auth.ENTITLEMENT_HOST_VAULT:
+            continue
+        assert host_auth.signs_in_separately(declaration.backend)
+        assert declaration.backend not in host_auth.backends_retired_by_host_logout()
+
+
+def test_a_host_vault_harness_names_the_config_surface_that_feeds_it() -> None:
+    """Its remedy must send the operator to the vault, not to the harness's own file.
+
+    A file-based remedy would point at a credential file the child mask hides.
+    """
+    declarations = [
+        d
+        for d in host_auth.AGENT_AUTH_DECLARATIONS
+        if d.entitlement_source == host_auth.ENTITLEMENT_HOST_VAULT
+    ]
+    assert declarations, "no harness declares the host-vault source; this would be vacuous"
+    for declaration in declarations:
+        for text in (declaration.sign_in_remedy, declaration.signed_out_message):
+            assert "Secrets" in text, declaration.backend

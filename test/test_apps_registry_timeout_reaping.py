@@ -1,0 +1,900 @@
+"""Regression tests for subprocess-timeout remediation in apps/registry_pipeline/.
+
+These cover the audit findings that timed-out child subprocesses were left
+un-reaped (zombie/leak) or, for the install-script path, only sent a single
+SIGTERM with no reap and no SIGKILL escalation:
+
+  * git-clone manifest fetch  -> _communicate_with_timeout (tree-kill + reap)
+  * external registry index    -> _communicate_with_timeout (tree-kill + reap)
+  * list_registry detect probe -> _communicate_with_timeout (tree-kill + reap)
+  * install detect probe       -> _communicate_with_timeout (tree-kill + reap)
+  * install-script timeout      -> _kill_process_group (reap + SIGKILL)
+
+``_communicate_with_timeout`` now signals the child's whole process group
+(``platform_compat.kill_process_tree_async``) instead of ``proc.kill()``-ing
+only the immediate child, so a hung ``git clone``/``/bin/sh -c <probe>`` cannot
+leave re-parented grandchildren running. Each spawn feeding it is started with
+``start_new_session`` so the group signal targets the child's own group.
+
+This file lives in ``test/`` (not ``tests/``) so the ``setup.cfg``
+``testpaths = test transfer`` gate — and therefore CI — actually collects it.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import sys
+from unittest.mock import MagicMock
+
+import pytest
+from apps_registry_helpers import _catalog_absent  # noqa: F401 - fixture
+from apps_registry_helpers import _explicit_registry_execution_admission  # noqa: F401 - fixture
+from apps_registry_helpers import _install_script_runs_on_this_host  # noqa: F401 - fixture
+from apps_registry_helpers import unsandboxed_spawn  # noqa: F401 - fixture
+
+from kiro_crew import platform_compat
+from kiro_crew.apps import registry
+from kiro_crew.testing.wait import await_until
+
+# A portable long-lived child: sleeps well past any test timeout without
+# relying on POSIX-only binaries (``sleep``/``bash`` are absent on native
+# Windows, where they would fail collection with FileNotFoundError).
+_SLEEP_SCRIPT = "import time; time.sleep(60)"
+
+
+# A portable child that ignores SIGTERM so the group kill must escalate to
+# SIGKILL to stop it. SIGTERM-ignore + SIGKILL escalation is POSIX signal
+# semantics, so tests using this are guarded with skipif(not IS_POSIX).
+#
+# The self-exit deadline is load-bearing, not decoration: this child is spawned
+# ``start_new_session``, so it leads its own group and a sweep of the pytest
+# worker's group never reaches it, and it is SIGTERM-immune by construction, so
+# the usual polite shutdown cannot end it either. Its ONLY reaper is the
+# escalation under test — so if that escalation regresses (precisely what these
+# tests exist to catch), or the worker is SIGKILLed by ``--timeout``/
+# ``--max-worker-restart`` before the reap, where no ``finally`` would run, an
+# unbounded ``while True`` loop would leave an immortal process pegged to the
+# host until a reboot or a manual hunt. Bounding it matches the three sibling
+# SIG_IGN children in this suite and does not soften any assertion: SIGTERM is
+# ``SIG_IGN``, so it is never delivered to Python and cannot cut the sleep short
+# via EINTR — the child is still alive and still immune across the grace period,
+# and SIGKILL still lands at the same instant.
+_SIGTERM_IGNORE_SCRIPT = (
+    "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN)\ntime.sleep(60)"
+)
+
+
+class _TimeoutProc:
+    """Fake subprocess whose ``communicate()`` times out.
+
+    Lets us exercise the timeout branch instantly (no real long-running
+    process) while recording whether the branch killed and reaped the child.
+    """
+
+    def __init__(self) -> None:
+        # nosemgrep: kirocrew.mock-pid-allocatable -- pre-existing literal pid on the fake process, moved verbatim; tracked for a de-flake pass
+        self.pid = 987654
+        self.returncode: int | None = None
+        self.kill_calls = 0
+        self.wait_calls = 0
+        self.communicate_calls = 0
+
+    async def communicate(self) -> tuple[bytes, bytes]:
+        self.communicate_calls += 1
+        if self.communicate_calls == 1:
+            raise asyncio.TimeoutError
+        # The reap: pipes drained, exit status collected.
+        if self.returncode is None:
+            self.returncode = -9
+        return b"", b""
+
+    def kill(self) -> None:
+        self.kill_calls += 1
+        self.returncode = -9
+
+    async def wait(self) -> int:
+        self.wait_calls += 1
+        if self.returncode is None:
+            self.returncode = -9
+        return self.returncode
+
+
+def _record_tree_kill(monkeypatch) -> list[int]:
+    """Patch the process-tree killer to record the pids it was asked to kill.
+
+    Returns the list that each ``_communicate_with_timeout`` timeout appends
+    its ``proc.pid`` to — proving the whole group was signalled rather than a
+    single ``proc.kill()``.
+    """
+    killed: list[int] = []
+
+    async def _fake_tree_kill(pid, sig):
+        killed.append(pid)
+        return True
+
+    monkeypatch.setattr(registry.platform_compat, "kill_process_tree_async", _fake_tree_kill)
+    return killed
+
+
+# --------------------------------------------------------------------------
+# Shared helper: _communicate_with_timeout (mechanism behind bugs 1, 2a, 2b)
+# --------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_communicate_with_timeout_kills_and_reaps_real_subprocess():
+    """A hung child (its own session leader) must be group-killed AND reaped."""
+    # flake-ok: pre-existing real sleeper child whose only reaper is the code under test; it exits on its own after 60 s, moved verbatim
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        _SLEEP_SCRIPT,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+        start_new_session=platform_compat.IS_POSIX,
+        creationflags=platform_compat.CREATE_NEW_PROCESS_GROUP,
+    )
+    pid = proc.pid
+    with pytest.raises(asyncio.TimeoutError):
+        await registry._communicate_with_timeout(proc, timeout=0.2)
+
+    # Reaped: returncode is populated, so the child is not a zombie.
+    assert proc.returncode is not None
+    # And the process is genuinely gone (portable liveness check — never the
+    # prohibited raw ``os.kill(pid, 0)``, which kills on Windows PID reuse).
+    assert not platform_compat.pid_exists(pid)
+
+
+@pytest.mark.asyncio
+async def test_communicate_with_timeout_kills_whole_process_tree(monkeypatch):
+    """The timeout path signals the child's whole group, not just proc.kill()."""
+    proc = _TimeoutProc()
+    killed: list[tuple[int, int]] = []
+
+    async def _fake_tree_kill(pid, sig):
+        killed.append((pid, sig))
+        return True
+
+    monkeypatch.setattr(registry.platform_compat, "kill_process_tree_async", _fake_tree_kill)
+    with pytest.raises(asyncio.TimeoutError):
+        await registry._communicate_with_timeout(proc, timeout=0.01)
+
+    # Whole-tree kill was invoked with the child's pid + SIGKILL ...
+    assert killed == [(proc.pid, registry.platform_compat.SIGKILL)]
+    # ... the child was reaped by draining pipes via a SECOND communicate(),
+    # never a bare wait() that a full pipe could hang ...
+    assert proc.communicate_calls == 2
+    assert proc.wait_calls == 0
+    # ... and the helper's pid-scoped kill backs up the group signal.
+    assert proc.kill_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_communicate_with_timeout_falls_back_when_group_kill_fails(monkeypatch):
+    """If the group kill raises OSError, fall back to a pid-scoped kill + reap."""
+    proc = _TimeoutProc()
+
+    async def _boom(pid, sig):
+        raise ProcessLookupError  # subclass of OSError
+
+    monkeypatch.setattr(registry.platform_compat, "kill_process_tree_async", _boom)
+    with pytest.raises(asyncio.TimeoutError):
+        await registry._communicate_with_timeout(proc, timeout=0.01)
+
+    assert proc.kill_calls == 1
+    assert proc.communicate_calls == 2
+    assert proc.wait_calls == 0
+
+
+# --------------------------------------------------------------------------
+# Bug 1 — git-clone manifest fetch reaps the clone tree on timeout
+# --------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_fetch_app_manifest_reaps_clone_tree_on_timeout(monkeypatch):
+    proc = _TimeoutProc()
+    killed = _record_tree_kill(monkeypatch)
+
+    async def _fake_exec(*args, **kwargs):
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec)
+    # The SSRF host-trust gate short-circuits untrusted hosts before the clone
+    # spawns; this test targets the timeout-reap path AFTER the gate admits the
+    # host, so treat the test host as trusted.
+    monkeypatch.setattr(registry, "is_clone_host_trusted", lambda url: True)
+
+    result = await registry._fetch_app_manifest(
+        repo="https://example.com/demo.git",
+        branch="main",
+        git_url="https://example.com/demo.git",
+    )
+
+    # Timeout is swallowed (listing must never crash) ...
+    assert result is None
+    # ... but the clone's whole process group was killed and the child reaped.
+    assert killed == [proc.pid]
+    assert proc.communicate_calls == 2
+    assert proc.wait_calls == 0
+
+
+# --------------------------------------------------------------------------
+# Bug 2a — list_registry detectInstalled probe reaps the tree on timeout
+# --------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_list_registry_reaps_detect_probe_tree_on_timeout(monkeypatch):
+    entry = {"name": "probeapp", "repo": "x", "detectInstalled": "true"}
+    monkeypatch.setattr(registry, "_manifest_shell_platform_refusal", lambda: None)
+    monkeypatch.setattr(registry, "_load_registry_file", lambda: [entry])
+
+    async def _no_external():
+        return []
+
+    monkeypatch.setattr(registry, "_load_external_registries", _no_external)
+    monkeypatch.setattr(registry, "list_installed_apps", lambda: [])
+
+    async def _resolve(e):
+        return e
+
+    monkeypatch.setattr(registry, "_resolve_manifest", _resolve)
+    # Return the entries themselves: list_registry's tail now feeds this
+    # result into _apply_trust_fields, which iterates rows as dicts.
+    monkeypatch.setattr(registry, "_enrich_with_install_status", lambda e, m, d: e)
+
+    proc = _TimeoutProc()
+    killed = _record_tree_kill(monkeypatch)
+
+    async def _fake_exec(*args, **kwargs):
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec)
+
+    await registry.list_registry()
+
+    assert killed == [proc.pid]
+    assert proc.communicate_calls == 2
+    assert proc.wait_calls == 0
+
+
+# --------------------------------------------------------------------------
+# The off-network switch also covers the listing's per-row manifest clone
+# --------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_resolve_manifest_does_not_clone_under_the_skip_switch(monkeypatch, tmp_path):
+    """A seed row with no cached manifest renders its minimal info, no clone.
+
+    ``KIROCREW_SKIP_APP_STORE_FETCH=1`` is what the E2E harness gateway runs
+    with; the seed fallback otherwise pays a shallow clone per row, bounded by
+    the clone timeout, on a rig that promises to stay offline.
+    """
+    from kiro_crew.apps import official_catalog
+
+    monkeypatch.setenv(official_catalog.SKIP_FETCH_ENV, "1")
+    monkeypatch.setattr(registry, "_read_manifest_cache", lambda entry: None)
+
+    async def _must_not_clone(*args, **kwargs):
+        raise AssertionError("the listing reached the clone under the skip switch")
+
+    monkeypatch.setattr(registry, "_fetch_app_manifest", _must_not_clone)
+    entry = {"name": "demoapp", "repo": "https://example.com/demo.git", "branch": "main"}
+
+    assert await registry._resolve_manifest(dict(entry)) == entry
+
+
+# --------------------------------------------------------------------------
+# Bug 2b — install_from_registry detect probe reaps the tree on timeout
+# --------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_install_from_registry_reaps_detect_probe_tree_on_timeout(monkeypatch):
+    entry = {
+        "name": "demoapp",
+        "repo": "https://example.com/demo.git",
+        "detectInstalled": "true",
+    }
+    monkeypatch.setattr(registry, "_manifest_shell_platform_refusal", lambda: None)
+    monkeypatch.setattr(registry, "get_registry_app", lambda n: entry)
+    monkeypatch.setattr(registry, "_entry_git_url", lambda e: "https://example.com/demo.git")
+
+    async def _fake_manifest(*args, **kwargs):
+        return {}
+
+    monkeypatch.setattr(registry, "_fetch_app_manifest", _fake_manifest)
+    monkeypatch.setattr(registry, "app_admission_denied", lambda *a, **k: None)
+    monkeypatch.setattr(registry, "sel", lambda: MagicMock())
+
+    proc = _TimeoutProc()
+    killed = _record_tree_kill(monkeypatch)
+
+    async def _fake_exec(*args, **kwargs):
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec)
+
+    # Stop right after the detect probe by failing the build fast.
+    async def _fake_build(*args, **kwargs):
+        return {"ok": False, "error": "stop-after-detect"}
+
+    monkeypatch.setattr(registry, "_clone_build_app", _fake_build)
+
+    await registry.install_from_registry("demoapp")
+
+    assert killed == [proc.pid]
+    assert proc.communicate_calls == 2
+    assert proc.wait_calls == 0
+
+
+# --------------------------------------------------------------------------
+# Bug 3 — install-script timeout: reap + SIGKILL escalation
+# --------------------------------------------------------------------------
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not platform_compat.IS_POSIX,
+    reason="SIGTERM-ignore + SIGKILL escalation is POSIX signal semantics",
+)
+async def test_kill_process_group_reaps_and_escalates_to_sigkill(monkeypatch):
+    """A process group that ignores SIGTERM must be escalated to SIGKILL and reaped."""
+    monkeypatch.setattr(registry, "_KILL_GRACE_PERIOD", 0.3)
+
+    # Child ignores SIGTERM and keeps running -> only SIGKILL can stop it.
+    # flake-ok: pre-existing SIGTERM-immune child whose only reaper is the escalation under test; it exits at its own deadline, moved verbatim
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        _SIGTERM_IGNORE_SCRIPT,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+        start_new_session=platform_compat.IS_POSIX,
+        creationflags=platform_compat.CREATE_NEW_PROCESS_GROUP,
+    )
+    pid = proc.pid
+
+    await registry._kill_process_group(proc)
+
+    # Reaped after escalation.
+    assert proc.returncode is not None
+    # Portable liveness check — never the prohibited raw ``os.kill(pid, 0)``.
+    assert not platform_compat.pid_exists(pid)
+
+
+@pytest.mark.asyncio
+async def test_kill_process_group_escalation_reaps_via_communicate_not_wait(monkeypatch):
+    """The SIGKILL escalation reaps by draining pipes via communicate(); a
+    bare wait() on a killed child blocked writing into a full pipe would
+    hang the app-build timeout path forever."""
+    monkeypatch.setattr(registry, "_KILL_GRACE_PERIOD", 0.01)
+    killed: list[tuple[int, int]] = []
+
+    async def _tree(pid, sig):
+        killed.append((pid, sig))
+        return True
+
+    monkeypatch.setattr(registry.platform_compat, "kill_process_tree_async", _tree)
+
+    class _StubbornProc:
+        pid = 987654
+        returncode: int | None = None
+
+        def __init__(self) -> None:
+            self.kill_calls = 0
+            self.wait_calls = 0
+            self.communicate_calls = 0
+
+        async def wait(self) -> int:
+            self.wait_calls += 1
+            if self.wait_calls == 1:
+                # The site's own grace wait: SIGTERM is ignored, so this
+                # outlives _KILL_GRACE_PERIOD and the escalation fires.
+                # flake-ok: the stub's own grace-wait hang, which the patched _KILL_GRACE_PERIOD cuts short; moved verbatim
+                # nosemgrep: kirocrew.test-sleep-as-barrier -- the stub's own grace-wait hang, which _KILL_GRACE_PERIOD cuts short; not a barrier
+                await asyncio.sleep(3600)
+            raise AssertionError("bare wait() used as the post-SIGKILL reap (#5989)")
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            self.communicate_calls += 1
+            self.returncode = -9
+            return b"", b""
+
+        def kill(self) -> None:
+            self.kill_calls += 1
+
+    proc = _StubbornProc()
+    await registry._kill_process_group(proc)
+
+    pc = registry.platform_compat
+    assert killed == [(proc.pid, pc.SIGTERM), (proc.pid, pc.SIGKILL)]
+    assert proc.wait_calls == 1  # the grace wait only — never the reap
+    assert proc.communicate_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_install_script_timeout_routes_through_kill_process_group(monkeypatch, tmp_path):
+    """On install-script timeout the code must call _kill_process_group (reap +
+    SIGKILL escalation), not the old fire-and-forget single SIGTERM."""
+    entry = {"name": "demoapp", "repo": "https://example.com/demo.git", "branch": "main"}
+    monkeypatch.setattr(registry, "get_registry_app", lambda n: entry)
+    monkeypatch.setattr(registry, "_entry_git_url", lambda e: "https://example.com/demo.git")
+
+    async def _fake_manifest(*args, **kwargs):
+        return {}
+
+    monkeypatch.setattr(registry, "_fetch_app_manifest", _fake_manifest)
+    monkeypatch.setattr(registry, "app_admission_denied", lambda *a, **k: None)
+    monkeypatch.setattr(registry, "sel", lambda: MagicMock())
+
+    # Cloned app source carries an install script. Its manifest must declare the
+    # entry's name, or the identity gate refuses before the script ever runs.
+    (tmp_path / "app.json").write_text(
+        json.dumps({"name": "demoapp", "setup": {"onInstall": "sleep 999"}}),
+        encoding="utf-8",
+    )
+
+    async def _fake_build(git_url, name, log_lines, branch="main", **kwargs):
+        return {"ok": True, "pkg_dir": tmp_path}
+
+    monkeypatch.setattr(registry, "_clone_build_app", _fake_build)
+
+    kpg_calls: list[object] = []
+
+    async def _fake_kpg(proc):
+        kpg_calls.append(proc)
+        proc.returncode = -9  # emulate reap
+
+    monkeypatch.setattr(registry, "_kill_process_group", _fake_kpg)
+
+    proc = _TimeoutProc()
+
+    async def _fake_exec(*args, **kwargs):
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec)
+
+    result = await registry.install_from_registry("demoapp")
+
+    assert result["ok"] is False
+    assert "timed out" in result["error"]
+    # The timeout path routed through the reaping/escalating helper.
+    assert kpg_calls == [proc]
+
+
+class _ExitProc:
+    """Fake subprocess that exits at once with a fixed return code."""
+
+    def __init__(self, code: int, output: bytes = b"secret-output") -> None:
+        self.pid = None  # skips the post-exit straggler reap
+        self.returncode: int | None = None
+        self._code = code
+        self._output = output
+
+    async def communicate(self) -> tuple[bytes, bytes]:
+        self.returncode = self._code
+        return self._output, b""
+
+
+async def _install_with_fake_script(monkeypatch, tmp_path, proc) -> MagicMock:
+    """Run a registry install whose ``onInstall`` spawn is *proc*; return the SEL mock."""
+    entry = {"name": "demoapp", "repo": "https://example.com/demo.git", "branch": "main"}
+    monkeypatch.setattr(registry, "get_registry_app", lambda n: entry)
+    monkeypatch.setattr(registry, "_entry_git_url", lambda e: "https://example.com/demo.git")
+
+    async def _fake_manifest(*args, **kwargs):
+        return {}
+
+    monkeypatch.setattr(registry, "_fetch_app_manifest", _fake_manifest)
+    monkeypatch.setattr(registry, "app_admission_denied", lambda *a, **k: None)
+    audit = MagicMock()
+    monkeypatch.setattr(registry, "sel", lambda: audit)
+    (tmp_path / "app.json").write_text(
+        json.dumps({"name": "demoapp", "setup": {"onInstall": "true"}}), encoding="utf-8"
+    )
+
+    async def _fake_build(git_url, name, log_lines, branch="main", **kwargs):
+        return {"ok": True, "pkg_dir": tmp_path}
+
+    monkeypatch.setattr(registry, "_clone_build_app", _fake_build)
+
+    async def _fake_kpg(proc):
+        proc.returncode = -9
+
+    monkeypatch.setattr(registry, "_kill_process_group", _fake_kpg)
+
+    async def _fake_exec(*args, **kwargs):
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec)
+
+    await registry.install_from_registry("demoapp")
+    return audit
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("make_proc", "expected"),
+    [
+        (_TimeoutProc, ("timed_out", " exit=-9")),
+        (lambda: _ExitProc(3), ("failed", " exit=3")),
+        (lambda: _ExitProc(0), ("completed", " exit=0")),
+    ],
+)
+async def test_install_script_emits_terminal_sel_event(monkeypatch, tmp_path, make_proc, expected):
+    """Every onInstall exit records a terminal SEL event after `started`."""
+    audit = await _install_with_fake_script(monkeypatch, tmp_path, make_proc())
+
+    events = [
+        c.kwargs
+        for c in audit.log_api_access.call_args_list
+        if c.kwargs.get("operation") == "app_install_script"
+    ]
+    assert [e["outcome"] for e in events] == ["started", expected[0]]
+    assert events[1]["resources"].endswith(expected[1])
+    # Script output is never written into the audit record.
+    assert all("secret-output" not in str(e) for e in events)
+
+
+@pytest.mark.asyncio
+async def test_a_failed_install_script_leaves_its_redacted_output_tail_in_the_gateway_log(
+    monkeypatch, tmp_path, caplog
+):
+    """The reason an onInstall failed outlives the install response: its output
+    tail reaches the gateway log on one line, with a credential in it redacted."""
+    token = "ghp_" + "a" * 36
+    output = f"step one\nnpm ERR! token {token}\n".encode()
+    caplog.set_level(logging.WARNING, logger=registry.__name__)
+
+    await _install_with_fake_script(monkeypatch, tmp_path, _ExitProc(3, output))
+
+    tails = [r.getMessage() for r in caplog.records if "output tail" in r.getMessage()]
+    assert len(tails) == 1
+    assert "exit 3" in tails[0]
+    assert "step one\\nnpm ERR! token [REDACTED" in tails[0]
+    assert token not in tails[0]
+    assert "\n" not in tails[0]
+
+
+@pytest.mark.asyncio
+async def test_the_gateway_log_tail_is_capped_and_cut_after_redaction(
+    monkeypatch, tmp_path, caplog
+):
+    """One huge output line is cut to the cap, and only after redaction: a credential
+    the cut lands inside leaves no fragment of itself in the log."""
+    cap = registry._SCRIPT_LOG_TAIL_CHARS
+    token = "ghp_" + "a" * 36
+    # The raw output's last `cap` characters begin 19 characters into the token.
+    output = ("x" * cap + " " + token + " " + "y" * (cap - 20)).encode()
+    caplog.set_level(logging.WARNING, logger=registry.__name__)
+
+    await _install_with_fake_script(monkeypatch, tmp_path, _ExitProc(3, output))
+
+    (tail,) = [r.getMessage() for r in caplog.records if "output tail" in r.getMessage()]
+    logged = tail.split("output tail: ", 1)[1]
+    assert len(logged) == cap + 2  # the cap, plus the two quotes %r adds
+    assert "a" * 8 not in logged
+
+
+class _CancelledProc:
+    """Fake subprocess whose wait is cancelled (gateway shutdown, task cancel)."""
+
+    def __init__(self) -> None:
+        self.pid = None  # skips the post-exit straggler reap
+        self.returncode: int | None = None
+
+    async def communicate(self) -> tuple[bytes, bytes]:
+        raise asyncio.CancelledError
+
+
+@pytest.mark.asyncio
+async def test_install_script_cancel_reaps_the_script_before_propagating(monkeypatch, tmp_path):
+    """A cancelled onInstall wait stops the script's whole process group,
+    records a terminal `cancelled` SEL event, and still re-raises the cancel."""
+    entry = {"name": "demoapp", "repo": "https://example.com/demo.git", "branch": "main"}
+    monkeypatch.setattr(registry, "get_registry_app", lambda n: entry)
+    monkeypatch.setattr(registry, "_entry_git_url", lambda e: "https://example.com/demo.git")
+
+    async def _fake_manifest(*args, **kwargs):
+        return {}
+
+    monkeypatch.setattr(registry, "_fetch_app_manifest", _fake_manifest)
+    monkeypatch.setattr(registry, "app_admission_denied", lambda *a, **k: None)
+    audit = MagicMock()
+    monkeypatch.setattr(registry, "sel", lambda: audit)
+    (tmp_path / "app.json").write_text(
+        json.dumps({"name": "demoapp", "setup": {"onInstall": "sleep 999"}}), encoding="utf-8"
+    )
+
+    async def _fake_build(git_url, name, log_lines, branch="main", **kwargs):
+        return {"ok": True, "pkg_dir": tmp_path}
+
+    monkeypatch.setattr(registry, "_clone_build_app", _fake_build)
+    stop_calls: list[tuple[object, float]] = []
+
+    async def _fake_stop(proc, *, grace, reap_timeout=None):
+        stop_calls.append((proc, grace))
+        proc.returncode = -9
+
+    async def _no_shell_only_kill(proc):
+        raise AssertionError("the cancel arm must stop the whole group, not wait on the shell")
+
+    # The group-wide stop: SIGTERM, wait for the GROUP up to the grace, SIGKILL
+    # what is left. ``_kill_process_group`` waits only on the shell, so a
+    # SIGTERM-ignoring child the script started would survive the cancel.
+    monkeypatch.setattr(registry.platform_compat, "terminate_and_reap", _fake_stop)
+    monkeypatch.setattr(registry, "_kill_process_group", _no_shell_only_kill)
+    proc = _CancelledProc()
+
+    async def _fake_exec(*args, **kwargs):
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec)
+
+    with pytest.raises(asyncio.CancelledError):
+        await registry.install_from_registry("demoapp")
+
+    assert stop_calls == [(proc, registry._KILL_GRACE_PERIOD)]
+    events = [
+        c.kwargs
+        for c in audit.log_api_access.call_args_list
+        if c.kwargs.get("operation") == "app_install_script"
+    ]
+    assert [e["outcome"] for e in events] == ["started", "cancelled"]
+    assert events[1]["resources"].endswith(" exit=-9")
+
+
+# Read at import, before the module's autouse pin replaces it for every test.
+_REAL_PLATFORM_REFUSAL = registry._install_script_platform_refusal
+
+
+def test_install_script_platform_refusal_is_native_windows_only(monkeypatch):
+    """`onInstall` runs through /bin/bash: refused off POSIX, allowed on POSIX."""
+    monkeypatch.setattr(platform_compat, "IS_POSIX", True)
+    assert _REAL_PLATFORM_REFUSAL() is None
+
+    monkeypatch.setattr(platform_compat, "IS_POSIX", False)
+    reason = _REAL_PLATFORM_REFUSAL()
+    assert reason is not None
+    assert "native Windows" in reason
+    assert "/bin/bash" in reason
+
+
+@pytest.mark.asyncio
+async def test_install_script_on_native_windows_fails_clearly_without_spawning(
+    monkeypatch, tmp_path
+):
+    """On native Windows there is no /bin/bash to run onInstall through. The
+    install returns a failed outcome naming the platform and starts no process."""
+    monkeypatch.setattr(registry, "_install_script_platform_refusal", _REAL_PLATFORM_REFUSAL)
+    monkeypatch.setattr(platform_compat, "IS_POSIX", False)
+
+    entry = {"name": "demoapp", "repo": "https://example.com/demo.git", "branch": "main"}
+    monkeypatch.setattr(registry, "get_registry_app", lambda n: entry)
+    monkeypatch.setattr(registry, "_entry_git_url", lambda e: "https://example.com/demo.git")
+
+    async def _fake_manifest(*args, **kwargs):
+        return {}
+
+    monkeypatch.setattr(registry, "_fetch_app_manifest", _fake_manifest)
+    monkeypatch.setattr(registry, "app_admission_denied", lambda *a, **k: None)
+    audit = MagicMock()
+    monkeypatch.setattr(registry, "sel", lambda: audit)
+    (tmp_path / "app.json").write_text(
+        json.dumps({"name": "demoapp", "setup": {"onInstall": "npm install"}}),
+        encoding="utf-8",
+    )
+
+    async def _fake_build(git_url, name, log_lines, branch="main", **kwargs):
+        return {"ok": True, "pkg_dir": tmp_path}
+
+    monkeypatch.setattr(registry, "_clone_build_app", _fake_build)
+
+    async def _no_spawn(*args, **kwargs):
+        raise FileNotFoundError(2, "The system cannot find the file specified")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _no_spawn)
+    monkeypatch.setattr(registry, "create_subprocess_limited", _no_spawn)
+
+    result = await registry.install_from_registry("demoapp")
+
+    assert result["ok"] is False
+    assert "native Windows" in result["error"]
+    assert "/bin/bash" in result["error"]
+    assert "native Windows" in result["log"]
+    # The script never started, so no `started` audit event was written.
+    assert not [
+        c
+        for c in audit.log_api_access.call_args_list
+        if c.kwargs.get("operation") == "app_install_script"
+    ]
+
+
+# --------------------------------------------------------------------------
+# A cancelled wait abandons the detached child just as a timeout does
+# --------------------------------------------------------------------------
+class _BlockingProc:
+    """Fake subprocess whose first ``communicate()`` waits until cancelled.
+
+    ``waiting`` is set once that first call is parked, so a test cancels the
+    caller exactly while it is inside the wait. Any later ``communicate()`` is
+    the reap and returns at once.
+    """
+
+    def __init__(self) -> None:
+        self.returncode: int | None = None
+        self.communicate_calls = 0
+        self.waiting = asyncio.Event()
+
+    async def communicate(self) -> tuple[bytes, bytes]:
+        self.communicate_calls += 1
+        if self.communicate_calls == 1:
+            self.waiting.set()
+            await asyncio.Event().wait()
+        if self.returncode is None:
+            self.returncode = -9
+        return b"", b""
+
+
+def _fake_git_spawn(monkeypatch, proc: _BlockingProc) -> list[object]:
+    """Route the sandbox and spawn seams to *proc*; return the group-kill record."""
+    killed: list[object] = []
+
+    async def _wrap(argv, **kwargs):
+        return list(argv), None
+
+    async def _spawn(*argv, **kwargs):
+        return proc
+
+    async def _kill(target):
+        killed.append(target)
+
+    monkeypatch.setattr(registry, "wrap_argv_async", _wrap)
+    monkeypatch.setattr(registry, "cgroup_scope_argv", lambda argv: argv)
+    monkeypatch.setattr(registry, "create_subprocess_limited", _spawn)
+    monkeypatch.setattr(registry, "_kill_process_group", _kill)
+    return killed
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_communicate_with_timeout_kills_and_reaps_the_real_subprocess():
+    """Cancelling the wait group-kills and reaps the child before re-raising."""
+    # flake-ok: real sleeper child whose only reaper is the code under test; it exits on its own after 60 s
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        _SLEEP_SCRIPT,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+        start_new_session=platform_compat.IS_POSIX,
+        creationflags=platform_compat.CREATE_NEW_PROCESS_GROUP,
+    )
+    pid = proc.pid
+    # Cancel only once the wait is entered: a task cancelled before its first
+    # step never reaches the wait, and so never reaches the arm under test.
+    waiting = asyncio.Event()
+    real_communicate = proc.communicate
+
+    async def _communicate(*args, **kwargs):
+        waiting.set()
+        return await real_communicate(*args, **kwargs)
+
+    proc.communicate = _communicate
+    try:
+        task = asyncio.create_task(registry._communicate_with_timeout(proc, timeout=60))
+        await await_until(waiting, what="the wait to reach communicate()")
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=30)
+
+        assert proc.returncode is not None
+        assert not platform_compat.pid_exists(pid)
+    finally:
+        # A regression fails the asserts above with the sleeper still alive;
+        # stop it here so the failing run does not leave it behind.
+        await platform_compat.kill_and_reap(proc)
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_origin_read_kills_the_git_child(tmp_path, monkeypatch):
+    (tmp_path / ".git").mkdir()
+    proc = _BlockingProc()
+    killed = _fake_git_spawn(monkeypatch, proc)
+
+    task = asyncio.create_task(registry._clone_origin_url(tmp_path))
+    await await_until(proc.waiting, what="the git wait to start")
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=30)
+
+    assert killed == [proc]
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_pull_kills_the_git_child(tmp_path, monkeypatch):
+    dest = tmp_path / "slot" / "demo-app"
+    (dest / ".git").mkdir(parents=True)
+    url = "https://github.com/acme/demo-app.git"
+
+    async def _origin(path):
+        return url
+
+    monkeypatch.setattr(registry, "is_clone_host_trusted", lambda target: True)
+    monkeypatch.setattr(registry, "_clone_origin_url", _origin)
+    monkeypatch.setattr(registry, "_read_clone_branch", lambda path: "main")
+    proc = _BlockingProc()
+    killed = _fake_git_spawn(monkeypatch, proc)
+
+    task = asyncio.create_task(registry._git_clone_or_pull(url, "main", dest, []))
+    await await_until(proc.waiting, what="the git wait to start")
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=30)
+
+    assert killed == [proc]
+    assert (dest / ".git").is_dir(), "a cancelled pull leaves the checkout in place"
+
+
+class _OrphanedGroupProc:
+    """The shell already exited, but a child it backgrounded holds stdout open."""
+
+    def __init__(self) -> None:
+        # nosemgrep: kirocrew.mock-pid-allocatable -- fake process; the group signal is patched out below
+        self.pid = 987655
+        self.returncode: int | None = 0
+
+    async def communicate(self) -> tuple[bytes, bytes]:
+        raise asyncio.CancelledError
+
+
+@pytest.mark.asyncio
+async def test_install_script_cancel_kills_a_group_whose_shell_already_exited(
+    monkeypatch, tmp_path
+):
+    """`onInstall: "sleep 999 &"`: the shell is gone, its child is not. The
+    graceful stop has no live leader to address, so the cancel arm signals the
+    known group id (the shell's pid) itself, before the cancel propagates."""
+    entry = {"name": "demoapp", "repo": "https://example.com/demo.git", "branch": "main"}
+    monkeypatch.setattr(registry, "get_registry_app", lambda n: entry)
+    monkeypatch.setattr(registry, "_entry_git_url", lambda e: "https://example.com/demo.git")
+
+    async def _fake_manifest(*args, **kwargs):
+        return {}
+
+    monkeypatch.setattr(registry, "_fetch_app_manifest", _fake_manifest)
+    monkeypatch.setattr(registry, "app_admission_denied", lambda *a, **k: None)
+    monkeypatch.setattr(registry, "sel", lambda: MagicMock())
+    (tmp_path / "app.json").write_text(
+        json.dumps({"name": "demoapp", "setup": {"onInstall": "sleep 999 &"}}), encoding="utf-8"
+    )
+
+    async def _fake_build(git_url, name, log_lines, branch="main", **kwargs):
+        return {"ok": True, "pkg_dir": tmp_path}
+
+    monkeypatch.setattr(registry, "_clone_build_app", _fake_build)
+    order: list[str] = []
+
+    async def _fake_stop(proc, *, grace, reap_timeout=None):
+        order.append("graceful-stop")
+
+    group_kills: list[int] = []
+
+    def _fake_killpg(pgid, sig):
+        order.append("group-kill")
+        group_kills.append(pgid)
+
+    async def _fake_tree_kill(pid, sig):
+        order.append("group-kill")
+        group_kills.append(pid)
+
+    monkeypatch.setattr(registry.platform_compat, "terminate_and_reap", _fake_stop)
+    monkeypatch.setattr(registry.platform_compat, "kill_process_tree_async", _fake_tree_kill)
+    monkeypatch.setattr(os, "killpg", _fake_killpg, raising=False)
+    proc = _OrphanedGroupProc()
+
+    async def _fake_exec(*args, **kwargs):
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec)
+
+    with pytest.raises(asyncio.CancelledError):
+        await registry.install_from_registry("demoapp")
+
+    # The group is signalled before the graceful stop (which only reaps the
+    # exited shell) and swept once more after it.
+    assert order == ["group-kill", "graceful-stop", "group-kill"]
+    assert group_kills == [proc.pid, proc.pid]

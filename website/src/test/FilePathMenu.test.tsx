@@ -1,0 +1,530 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { act, screen, fireEvent, waitFor } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
+import { renderWithProviders } from './helpers'
+import FilePathMenu from '../components/FilePathMenu'
+import { i18nT } from '../i18n/t'
+import {
+  consumeChatHandoff,
+  installSoftNavigate,
+  __resetErrorJournalForTests,
+  __resetNavSeamForTests,
+} from '../utils/errorReport'
+
+// ── Mocks ────────────────────────────────────────────────────────────────────
+
+const brandingEnv = vi.hoisted(() => ({ directLocal: true, desktopLauncher: true }))
+const platformEnv = vi.hoisted(() => ({ value: 'other' as 'other' | 'darwin' | 'windows' }))
+const editorEnv = vi.hoisted(() => ({
+  enabled: false,
+  open: vi.fn(),
+}))
+
+vi.mock('../hooks/useBranding', () => ({
+  useBranding: () => ({
+    botName: 'Test', avatar: '',
+    directLocal: brandingEnv.directLocal,
+    desktopLauncher: brandingEnv.desktopLauncher,
+  }),
+}))
+
+// The reveal label is platform-aware (names Finder / File Explorer on the
+// gateway's own OS). Drive it explicitly so the label assertions are stable
+// regardless of the test host.
+vi.mock('../hooks/useGatewayPlatform', () => ({
+  useGatewayPlatform: () => platformEnv.value,
+}))
+
+vi.mock('../lib/electron', () => ({
+  canOpenFileInEditor: () => editorEnv.enabled,
+  openFileInEditor: editorEnv.open,
+}))
+
+vi.mock('../api/client', async importOriginal => {
+  const mod = await importOriginal<typeof import('../api/client')>()
+  return {
+    ...mod,
+    api: {
+      ...mod.api,
+      revealPath: vi.fn().mockResolvedValue({ ok: true }),
+    },
+  }
+})
+
+vi.mock('../utils/clipboard', () => ({
+  // Resolves TRUE by default: the real signature is `Promise<boolean>`, and a
+  // bare `vi.fn()` returning undefined is falsy, so it could not tell a
+  // successful clipboard write from a failed one.
+  copyToClipboard: vi.fn().mockResolvedValue(true),
+}))
+
+import { api } from '../api/client'
+import { copyToClipboard } from '../utils/clipboard'
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+beforeEach(() => {
+  vi.clearAllMocks()
+  brandingEnv.directLocal = true
+  brandingEnv.desktopLauncher = true
+  platformEnv.value = 'other'
+  editorEnv.enabled = false
+  editorEnv.open.mockResolvedValue({ ok: true })
+  vi.mocked(api.revealPath).mockResolvedValue({ ok: true })
+  vi.mocked(copyToClipboard).mockResolvedValue(true)
+  __resetErrorJournalForTests()
+  __resetNavSeamForTests()
+  sessionStorage.clear()
+  installSoftNavigate(() => {})
+})
+
+afterEach(() => {
+  brandingEnv.directLocal = true
+  brandingEnv.desktopLauncher = true
+  platformEnv.value = 'other'
+  editorEnv.enabled = false
+  __resetNavSeamForTests()
+})
+
+function rightClick(el: Element) {
+  fireEvent.contextMenu(el)
+}
+
+// ── FilePathMenu (right-click wrapper) ───────────────────────────────────────
+
+describe('FilePathMenu', () => {
+  const TEST_PATH = '/home/user/project/report.md'
+
+  describe('when directLocal is true', () => {
+    it('renders all three items: open, reveal, copy path', async () => {
+      renderWithProviders(
+        <FilePathMenu filePath={TEST_PATH}>
+          <span data-testid="trigger">report.md</span>
+        </FilePathMenu>,
+      )
+
+      rightClick(screen.getByTestId('trigger'))
+
+      await waitFor(() => {
+        expect(screen.getByText('Open with default app')).toBeInTheDocument()
+      })
+      expect(screen.getByText('Show in file manager')).toBeInTheDocument()
+      expect(screen.getByText('Copy path')).toBeInTheDocument()
+    })
+
+    it('calls revealPath with "open" when Open item is selected', async () => {
+      renderWithProviders(
+        <FilePathMenu filePath={TEST_PATH}>
+          <span data-testid="trigger">report.md</span>
+        </FilePathMenu>,
+      )
+
+      rightClick(screen.getByTestId('trigger'))
+
+      await waitFor(() => {
+        expect(screen.getByText('Open with default app')).toBeInTheDocument()
+      })
+      fireEvent.click(screen.getByText('Open with default app'))
+
+      await waitFor(() => {
+        expect(api.revealPath).toHaveBeenCalledWith(TEST_PATH, 'open')
+      })
+    })
+
+    it('calls revealPath with "reveal" when Reveal item is selected', async () => {
+      renderWithProviders(
+        <FilePathMenu filePath={TEST_PATH}>
+          <span data-testid="trigger">report.md</span>
+        </FilePathMenu>,
+      )
+
+      rightClick(screen.getByTestId('trigger'))
+
+      await waitFor(() => {
+        expect(screen.getByText('Show in file manager')).toBeInTheDocument()
+      })
+      fireEvent.click(screen.getByText('Show in file manager'))
+
+      await waitFor(() => {
+        expect(api.revealPath).toHaveBeenCalledWith(TEST_PATH, 'reveal')
+      })
+    })
+
+    it('calls copyToClipboard when Copy path item is selected', async () => {
+      renderWithProviders(
+        <FilePathMenu filePath={TEST_PATH}>
+          <span data-testid="trigger">report.md</span>
+        </FilePathMenu>,
+      )
+
+      rightClick(screen.getByTestId('trigger'))
+
+      await waitFor(() => {
+        expect(screen.getByText('Copy path')).toBeInTheDocument()
+      })
+      fireEvent.click(screen.getByText('Copy path'))
+
+      await waitFor(() => expect(copyToClipboard).toHaveBeenCalledWith(TEST_PATH))
+    })
+  })
+
+  describe('when directLocal is false (remote session)', () => {
+    beforeEach(() => { brandingEnv.directLocal = false })
+
+    it('hides open and reveal items, shows only copy path', async () => {
+      renderWithProviders(
+        <FilePathMenu filePath={TEST_PATH}>
+          <span data-testid="trigger">report.md</span>
+        </FilePathMenu>,
+      )
+
+      rightClick(screen.getByTestId('trigger'))
+
+      await waitFor(() => {
+        expect(screen.getByText('Copy path')).toBeInTheDocument()
+      })
+      expect(screen.queryByText('Open with default app')).not.toBeInTheDocument()
+      expect(screen.queryByText('Show in file manager')).not.toBeInTheDocument()
+    })
+  })
+
+  // The reported case: a direct-local browser (an `ssh -L` tunnel reads as one)
+  // on a gateway host with no desktop launcher, a headless Linux box. Every
+  // reveal or open there could only be answered with a clipboard copy, so
+  // "Show in file manager" copied the path and the Copy row read "Path copied".
+  // Neither native row is offered on such a host.
+  describe('a direct-local session whose gateway host has no desktop launcher', () => {
+    beforeEach(() => { brandingEnv.desktopLauncher = false })
+
+    it('offers neither native row, only Copy path', async () => {
+      renderWithProviders(
+        <FilePathMenu filePath={TEST_PATH}>
+          <span data-testid="trigger">report.md</span>
+        </FilePathMenu>,
+      )
+
+      rightClick(screen.getByTestId('trigger'))
+
+      await waitFor(() => {
+        expect(screen.getByText('Copy path')).toBeInTheDocument()
+      })
+      expect(screen.queryByText('Show in file manager')).not.toBeInTheDocument()
+      expect(screen.queryByText('Open with default app')).not.toBeInTheDocument()
+      expect(api.revealPath).not.toHaveBeenCalled()
+    })
+
+    it('hides the native rows for a directory too, as in the report', async () => {
+      renderWithProviders(
+        <FilePathMenu filePath="/home/user/project/reports" kind="dir">
+          <span data-testid="trigger">reports</span>
+        </FilePathMenu>,
+      )
+
+      rightClick(screen.getByTestId('trigger'))
+
+      const rows = await screen.findAllByRole('menuitem')
+      expect(rows.map(r => r.getAttribute('aria-label'))).toEqual(['Copy path'])
+    })
+  })
+
+  // The other half of the pair: the same direct-local session on a host that
+  // can open a file manager keeps both rows, so the gate hides them only where
+  // they could never work.
+  it('keeps both native rows on a direct-local host that can open a file manager', async () => {
+    brandingEnv.desktopLauncher = true
+    renderWithProviders(
+      <FilePathMenu filePath={TEST_PATH}>
+        <span data-testid="trigger">report.md</span>
+      </FilePathMenu>,
+    )
+
+    rightClick(screen.getByTestId('trigger'))
+
+    const rows = await screen.findAllByRole('menuitem')
+    expect(rows.map(r => r.getAttribute('aria-label'))).toEqual([
+      'Open with default app',
+      'Show in file manager',
+      'Copy path',
+    ])
+  })
+
+  // A host WITH a launcher can still fail to start it, and the backend then
+  // answers the clipboard fallback (`{ copy }`). The menu says so in its notice
+  // and never dresses the copy up as the Copy row's own "Path copied", which is
+  // what made the reveal row read as if it were wired to Copy.
+  describe('a reveal or open the host could only answer with a copy', () => {
+    it.each([
+      ['Show in file manager', 'reveal'],
+      ['Open with default app', 'open'],
+    ])('"%s" says the path was copied instead, and leaves the Copy row alone', async (row, action) => {
+      vi.mocked(api.revealPath).mockResolvedValueOnce({ ok: true, copy: TEST_PATH })
+
+      renderWithProviders(
+        <FilePathMenu filePath={TEST_PATH}>
+          <span data-testid="trigger">report.md</span>
+        </FilePathMenu>,
+      )
+
+      rightClick(screen.getByTestId('trigger'))
+      fireEvent.click(await screen.findByText(row))
+
+      const notice = await screen.findByTestId('file-path-menu-error')
+      expect(notice).toHaveTextContent(i18nT('components.filePathMenu.reveal_copied_instead'))
+      expect(api.revealPath).toHaveBeenCalledWith(TEST_PATH, action)
+      expect(copyToClipboard).toHaveBeenCalledWith(TEST_PATH)
+      expect(screen.queryByText('Path copied')).not.toBeInTheDocument()
+      expect(screen.getByRole('menuitem', { name: 'Copy path' })).toBeInTheDocument()
+    })
+
+    it('reports the plain failure when the clipboard write fails too', async () => {
+      // Nothing reached the clipboard, so the notice must not claim a copy: the
+      // user would paste whatever was there before.
+      vi.mocked(copyToClipboard).mockResolvedValueOnce(false)
+      vi.mocked(api.revealPath).mockResolvedValueOnce({ ok: true, copy: TEST_PATH })
+
+      renderWithProviders(
+        <FilePathMenu filePath={TEST_PATH}>
+          <span data-testid="trigger">report.md</span>
+        </FilePathMenu>,
+      )
+
+      rightClick(screen.getByTestId('trigger'))
+      fireEvent.click(await screen.findByText('Show in file manager'))
+
+      const notice = await screen.findByTestId('file-path-menu-error')
+      expect(notice).toHaveTextContent(i18nT('components.filePathMenu.reveal_failed'))
+      expect(notice).not.toHaveTextContent(i18nT('components.filePathMenu.reveal_copied_instead'))
+      expect(screen.queryByText('Path copied')).not.toBeInTheDocument()
+      expect(screen.queryByText('Couldn’t copy the path')).not.toBeInTheDocument()
+    })
+
+    it('says nothing when the file manager opened', async () => {
+      renderWithProviders(
+        <FilePathMenu filePath={TEST_PATH}>
+          <span data-testid="trigger">report.md</span>
+        </FilePathMenu>,
+      )
+
+      rightClick(screen.getByTestId('trigger'))
+      fireEvent.click(await screen.findByText('Show in file manager'))
+
+      await waitFor(() => expect(api.revealPath).toHaveBeenCalledWith(TEST_PATH, 'reveal'))
+      expect(copyToClipboard).not.toHaveBeenCalled()
+      expect(screen.queryByTestId('file-path-menu-error')).not.toBeInTheDocument()
+    })
+  })
+
+  describe('Copy path acknowledgment', () => {
+    it('flips the Copy row to the failed wording when the write returns false', async () => {
+      // Same defect, second site: `copyPath`'s try/catch only ever saw the
+      // throwing branch, so a `false` return read as success.
+      ;(copyToClipboard as ReturnType<typeof vi.fn>).mockResolvedValueOnce(false)
+
+      renderWithProviders(
+        <FilePathMenu filePath={TEST_PATH}>
+          <span data-testid="trigger">report.md</span>
+        </FilePathMenu>,
+      )
+
+      rightClick(screen.getByTestId('trigger'))
+
+      await waitFor(() => {
+        expect(screen.getByText('Copy path')).toBeInTheDocument()
+      })
+      fireEvent.click(screen.getByText('Copy path'))
+
+      await waitFor(() => {
+        expect(screen.getByText('Couldn’t copy the path')).toBeInTheDocument()
+      })
+      expect(screen.queryByText('Path copied')).not.toBeInTheDocument()
+    })
+  })
+
+  describe('menu error hand-offs', () => {
+    it.each([
+      ['Enter', '{Enter}'],
+      ['Space', ' '],
+    ])('keeps reveal activation on its row and stages the failure with %s', async (_label, key) => {
+      const user = userEvent.setup()
+      vi.mocked(api.revealPath).mockRejectedValue(new Error('reveal refused'))
+      renderWithProviders(
+        <FilePathMenu filePath={TEST_PATH}>
+          <span data-testid="trigger">report.md</span>
+        </FilePathMenu>,
+      )
+
+      rightClick(screen.getByTestId('trigger'))
+      const reveal = await screen.findByRole('menuitem', { name: 'Show in file manager' })
+      act(() => { reveal.focus() })
+      await user.keyboard('{Enter}')
+      const alert = await screen.findByTestId('file-path-menu-error')
+      expect(api.revealPath).toHaveBeenCalledTimes(1)
+
+      act(() => { reveal.focus() })
+      await user.keyboard('{Enter}')
+      await waitFor(() => expect(api.revealPath).toHaveBeenCalledTimes(2))
+      await screen.findByTestId('file-path-menu-error')
+
+      act(() => { reveal.focus() })
+      await user.keyboard('{ArrowDown}')
+      const handoff = screen.getByRole('menuitem', { name: /^ask the agent$/i })
+      expect(handoff).toHaveFocus()
+      expect(handoff).toHaveAttribute('aria-describedby', alert.id)
+      expect(handoff.getAttribute('title')).toBeTruthy()
+      expect(handoff.querySelector('svg')).toHaveClass('text-muted')
+      await act(async () => { await user.keyboard(key) })
+
+      expect(consumeChatHandoff()).toContain('Couldn’t open this path on the machine running Kiro Crew.')
+      expect(api.revealPath).toHaveBeenCalledTimes(2)
+    })
+
+    it('gives an editor-launch failure its own described hand-off item', async () => {
+      const user = userEvent.setup()
+      editorEnv.enabled = true
+      editorEnv.open.mockResolvedValue({ ok: false, error: 'editor refused' })
+      renderWithProviders(
+        <FilePathMenu filePath={TEST_PATH}>
+          <span data-testid="trigger">report.md</span>
+        </FilePathMenu>,
+      )
+
+      rightClick(screen.getByTestId('trigger'))
+      const openInEditor = await screen.findByRole('menuitem', { name: 'Open in editor' })
+      act(() => { openInEditor.focus() })
+      await user.keyboard('{Enter}')
+      const alert = await screen.findByTestId('file-path-menu-editor-error')
+
+      act(() => { openInEditor.focus() })
+      await user.keyboard('{ArrowDown}')
+      const handoff = screen.getByRole('menuitem', { name: /^ask the agent$/i })
+      expect(handoff).toHaveFocus()
+      expect(handoff).toHaveAttribute('aria-describedby', alert.id)
+      await act(async () => { await user.keyboard('{Enter}') })
+
+      expect(consumeChatHandoff()).toContain('editor refused')
+      expect(editorEnv.open).toHaveBeenCalledTimes(1)
+    })
+  })
+
+  describe('platform-aware reveal label', () => {
+    it('names Finder on a macOS gateway', async () => {
+      platformEnv.value = 'darwin'
+      renderWithProviders(
+        <FilePathMenu filePath={TEST_PATH}>
+          <span data-testid="trigger">report.md</span>
+        </FilePathMenu>,
+      )
+
+      rightClick(screen.getByTestId('trigger'))
+
+      await waitFor(() => {
+        expect(screen.getByText('Open in Finder')).toBeInTheDocument()
+      })
+      // The reveal label follows the gateway OS; the generic wording is gone.
+      expect(screen.queryByText('Show in file manager')).not.toBeInTheDocument()
+      fireEvent.click(screen.getByText('Open in Finder'))
+      await waitFor(() => {
+        expect(api.revealPath).toHaveBeenCalledWith(TEST_PATH, 'reveal')
+      })
+    })
+
+    it('names File Explorer on a Windows gateway', async () => {
+      platformEnv.value = 'windows'
+      renderWithProviders(
+        <FilePathMenu filePath={TEST_PATH}>
+          <span data-testid="trigger">report.md</span>
+        </FilePathMenu>,
+      )
+
+      rightClick(screen.getByTestId('trigger'))
+
+      await waitFor(() => {
+        expect(screen.getByText('Open in File Explorer')).toBeInTheDocument()
+      })
+    })
+  })
+
+  describe('Windows suppresses "Open with default app"', () => {
+    // The gateway's files.py refuses the launch-by-association verb on Windows
+    // and degrades an `open` to a clipboard copy, so the row must not appear
+    // there — it would promise a launch the backend never performs. Reveal
+    // (which does work) and Copy path stay.
+    it('hides Open on a Windows gateway but keeps reveal + copy', async () => {
+      platformEnv.value = 'windows'
+      renderWithProviders(
+        <FilePathMenu filePath={TEST_PATH}>
+          <span data-testid="trigger">report.md</span>
+        </FilePathMenu>,
+      )
+
+      rightClick(screen.getByTestId('trigger'))
+
+      await waitFor(() => {
+        expect(screen.getByText('Open in File Explorer')).toBeInTheDocument()
+      })
+      expect(screen.queryByText('Open with default app')).not.toBeInTheDocument()
+      expect(screen.getByText('Copy path')).toBeInTheDocument()
+    })
+
+    it('shows Open on a macOS gateway', async () => {
+      platformEnv.value = 'darwin'
+      renderWithProviders(
+        <FilePathMenu filePath={TEST_PATH}>
+          <span data-testid="trigger">report.md</span>
+        </FilePathMenu>,
+      )
+
+      rightClick(screen.getByTestId('trigger'))
+
+      await waitFor(() => {
+        expect(screen.getByText('Open with default app')).toBeInTheDocument()
+      })
+    })
+  })
+
+  describe('directory paths', () => {
+    it('hides "Open with default app" for a directory but keeps reveal + copy', async () => {
+      renderWithProviders(
+        <FilePathMenu filePath="/home/user/project" kind="dir">
+          <span data-testid="trigger">project</span>
+        </FilePathMenu>,
+      )
+
+      rightClick(screen.getByTestId('trigger'))
+
+      await waitFor(() => {
+        expect(screen.getByText('Show in file manager')).toBeInTheDocument()
+      })
+      expect(screen.getByText('Copy path')).toBeInTheDocument()
+      // A directory cannot be "opened" — /api/reveal 400s an open on a dir.
+      expect(screen.queryByText('Open with default app')).not.toBeInTheDocument()
+    })
+  })
+})
+
+// ── Item-row aria labels ─────────────────────────────────────────────────────
+// The render/hide/open-click/copy-click behaviour of the item rows is already
+// covered by the `describe('FilePathMenu')` suite above through the same public
+// wrapper (FilePathMenuItems is a private building block with no other entry
+// point), so those cases are not repeated here. Only the accessible-name
+// assertion — which the suite above does not make — is kept.
+
+describe('FilePathMenu aria labels', () => {
+  const TEST_PATH = '/tmp/demo.html'
+
+  it('each item has an accessible aria-label', async () => {
+    renderWithProviders(
+      <FilePathMenu filePath={TEST_PATH}>
+        <span data-testid="ctx-trigger">file.txt</span>
+      </FilePathMenu>,
+    )
+
+    rightClick(screen.getByTestId('ctx-trigger'))
+
+    await waitFor(() => {
+      expect(screen.getByLabelText('Open with default app')).toBeInTheDocument()
+    })
+    expect(screen.getByLabelText('Show in file manager')).toBeInTheDocument()
+    expect(screen.getByLabelText('Copy path')).toBeInTheDocument()
+  })
+})

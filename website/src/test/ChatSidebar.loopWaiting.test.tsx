@@ -1,0 +1,358 @@
+/**
+ * Chat sidebar loop-waiting subtitle ("Waiting on you"):
+ * an ARMED loop (goal loop or structured monitor) whose NEWEST assistant reply
+ * ends with an `[OPTIONS:]` ask renders an owed-decision row instead of the
+ * pulsing "Loop N/M" progress row — the user cannot otherwise tell a loop that
+ * is holding for their answer apart from one that is working.
+ *
+ * The state is derived from the newest reply only (payload `has_options`), so
+ * a later cycle that talks over the marker clears it. That is the supersede
+ * semantics that reverted the buried-[OPTIONS:] backward scan (#10615): an old
+ * ask can never be resurrected, and a session WITHOUT an armed loop never gets
+ * the badge — its composer chips are the whole surface.
+ */
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
+import { render } from '@testing-library/react'
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { Provider } from 'react-redux'
+import { MemoryRouter } from 'react-router-dom'
+import { createTestStore } from './helpers'
+import { ThemeProvider } from '../hooks/useTheme'
+import type { StructuredMonitor } from '../monitoring/automation'
+
+// Render framer-motion elements as plain DOM (jsdom can't run projection).
+vi.mock('framer-motion', async () => {
+  const React = await import('react')
+  const FRAMER_PROPS = new Set([
+    'layout', 'layoutId', 'layoutScroll', 'initial', 'animate', 'exit',
+    'transition', 'variants', 'whileHover', 'whileTap', 'whileInView',
+    'drag', 'dragConstraints', 'dragElastic', 'onAnimationComplete',
+  ])
+  const make = (tag: string) =>
+    React.forwardRef((props: Record<string, unknown>, ref: React.Ref<unknown>) => {
+      const clean: Record<string, unknown> = {}
+      for (const k of Object.keys(props)) {
+        if (k === 'children') continue
+        if (k === 'layoutId') { clean['data-layout-id'] = props[k]; continue }
+        if (FRAMER_PROPS.has(k)) continue
+        clean[k] = props[k]
+      }
+      return React.createElement(tag, { ...clean, ref }, props.children as React.ReactNode)
+    })
+  // One component per tag: a fresh type on every read would remount the subtree.
+  const byTag = new Map<string, ReturnType<typeof make>>()
+  const motion = new Proxy({}, {
+    get: (_t, tag: string) => {
+      if (!byTag.has(tag)) byTag.set(tag, make(tag))
+      return byTag.get(tag)
+    },
+  })
+  return {
+    motion,
+    useReducedMotion: () => false,
+    AnimatePresence: ({ children }: { children?: React.ReactNode }) => React.createElement(React.Fragment, null, children),
+    LayoutGroup: ({ children }: { children?: React.ReactNode }) => React.createElement(React.Fragment, null, children),
+  }
+})
+
+vi.mock('../components/ProjectPicker', () => ({ default: () => null }))
+// Legacy single-lane list (no tag columns) keeps the rows flat + easy to query.
+vi.mock('../pages/chat/ChatSettings', () => ({
+  loadChatConfig: () => ({ tagColumnsEnabled: false, confirmCloseSession: false }),
+  saveChatConfig: vi.fn(),
+}))
+
+vi.mock('../api/client', () => ({
+  SEARCH_MIN_CHARS: 2,
+  api: new Proxy({} as Record<string, unknown>, {
+    get: () => vi.fn().mockResolvedValue([]),
+  }),
+}))
+
+Object.defineProperty(window, 'matchMedia', {
+  writable: true,
+  value: vi.fn().mockImplementation((q: string) => ({
+    matches: false, media: q, onchange: null,
+    addListener: vi.fn(), removeListener: vi.fn(),
+    addEventListener: vi.fn(), removeEventListener: vi.fn(), dispatchEvent: vi.fn(),
+  })),
+})
+
+import ChatSidebar from '../pages/ChatSidebar'
+import type { RootState } from '../store'
+import type { ChatSlot } from '../types'
+import { expectLoopIcon } from './GoalLoopIconTestUtils'
+
+const WAITING_LABEL = 'Waiting on you'
+
+function renderSidebar(
+  slots: ChatSlot[],
+  chat: Record<string, unknown>,
+  { unreadSlots = [] }: { unreadSlots?: string[] } = {},
+) {
+  const legacyFixtures = chat.goalLoops as Record<string, { cycle_count: number; max_cycles: number }> | undefined
+  const { goalLoops: _legacyFixtures, ...chatState } = chat
+  const migratedLegacy = Object.fromEntries(Object.entries(legacyFixtures ?? {}).map(([slotKey, loop]) => [
+    slotKey,
+    {
+      kind: 'legacy_goal_loop', id: `loop-${slotKey}`, slotKey, message: '', idleSecs: 60,
+      maxCycles: loop.max_cycles, cycleCount: loop.cycle_count, active: true,
+      lastFireAt: 0, stoppedReason: '',
+    },
+  ]))
+  const store = createTestStore({
+    dashboard: {
+      status: {}, connected: true, slots, approvalMode: 'normal',
+      channelTrusted: false, refreshTrigger: 0, unreadSlots, updateProgress: null,
+      slotsLoaded: true,
+      subagentRunning: {}, subagentDetails: {}, subagentText: {},
+      sessionDefaultColor: null, sessionColorsMode: 'tint', sessionColorsPalette: 'horizon', sessionColorsIntensity: 'clear',
+    } as unknown as RootState['dashboard'],
+    chat: {
+      activeSlot: null, slotStatusDetail: {}, subagents: {}, slotActivity: {},
+      ...chatState,
+      automations: { ...migratedLegacy, ...((chatState.automations as object) ?? {}) },
+    } as unknown as RootState['chat'],
+  })
+  const qc = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
+  qc.setQueryData(['chat-folders'], [])
+  return render(
+    <QueryClientProvider client={qc}>
+      <Provider store={store}>
+        <ThemeProvider>
+          <MemoryRouter>
+            <ChatSidebar
+              slots={slots} activeSlot={null} unreadSlots={unreadSlots}
+              history={[]} historyHasMore={false} defaultAgent="" installedAgents={[]}
+            />
+          </MemoryRouter>
+        </ThemeProvider>
+      </Provider>
+    </QueryClientProvider>,
+  )
+}
+
+const structuredMonitor = (overrides: Partial<StructuredMonitor> = {}): StructuredMonitor => ({
+  kind: 'structured_monitor', id: 'monitor-1', slotKey: 'k', active: true,
+  actionable: true, version: 1, monitorKind: 'github_pull_request', objective: 'review_ready',
+  target: 'https://github.com/kirodotdev/KiroCrew/pull/42', cadenceSecs: 300,
+  nextProbeAt: 1_800_000_300, wakeInstructions: '',
+  budgets: { maxRuntimeSecs: 14_400, maxAgentTurns: 8, maxTokens: 250_000, maxProviderErrors: 3 },
+  latest: { classification: 'unchanged', reasonCode: '', observedAt: 1_800_000_000, decision: 'stay_quiet' },
+  usage: { probes: 5, wakes: 2, agentTurns: 1, inputTokens: 100, outputTokens: 20, providerErrors: 0, tokenUsageKnown: true },
+  action: { wakeInFlight: false, wakeDelivery: '' }, terminal: null,
+  ...overrides,
+})
+
+// The clock the row reads stale moments against, pinned so a case never races it.
+const NOW = 1_800_000_000_000
+beforeEach(() => { localStorage.clear(); vi.spyOn(Date, 'now').mockReturnValue(NOW) })
+afterEach(() => { vi.restoreAllMocks(); vi.clearAllMocks() })
+
+describe('chat sidebar — loop waiting-on-you subtitle', () => {
+  it('an idle loop whose newest reply carries [OPTIONS:] shows the waiting row, keeping the cycle detail', () => {
+    const slots = [{ key: 'k', title: 'loop', running: false, messages: 5, has_options: true }]
+    const { getByText, queryByText } = renderSidebar(slots, { goalLoops: { k: { cycle_count: 7, max_cycles: 24 } } })
+    expect(getByText(WAITING_LABEL)).toBeTruthy()
+    // The loop identity survives as trailing detail, but PREFIXED with
+    // "Paused at" — reusing the working row's "Loop N/M" verbatim made the
+    // two rows read as the same state (UX span 03f52eaca7f7).
+    expect(getByText(/Paused at 7\/24/)).toBeTruthy()
+    expect(queryByText(/Loop 7\/24/)).toBeNull()
+    // The tooltip glosses the fraction: the UX blind-reader could not tell the
+    // trailing "Loop 7/24" was a cycle counter, so the title names it outright.
+    expect(getByText(WAITING_LABEL).closest('[title]')?.getAttribute('title'))
+      .toBe('Paused at cycle 7 of 24 — the last reply asked you to choose. Open the session to answer.')
+    // The plain pulsing progress reading did not ALSO render.
+    expect(queryByText(/interrupted/)).toBeNull()
+  })
+
+  it('a loop with no ask on its newest reply keeps the ordinary progress row — the supersede path', () => {
+    // has_options is derived from the NEWEST reply, so a later cycle that talks
+    // over an old [OPTIONS:] marker arrives here as has_options=false: the badge
+    // clears by construction, never by a dismiss endpoint (#10615).
+    const slots = [{ key: 'k', title: 'loop', running: false, messages: 5, has_options: false }]
+    const { container, queryByText } = renderSidebar(slots, { goalLoops: { k: { cycle_count: 8, max_cycles: 24 } } })
+    expectLoopIcon(container, 8, 24)
+    expect(queryByText(WAITING_LABEL)).toBeNull()
+  })
+
+  it('a RUNNING loop turn is the loop working, not waiting — even with options still on the newest reply', () => {
+    const slots = [{ key: 'k', title: 'loop', running: true, messages: 5, has_options: true }]
+    const { container, queryByText } = renderSidebar(slots, { goalLoops: { k: { cycle_count: 3, max_cycles: 24 } } })
+    expectLoopIcon(container, 3, 24)
+    expect(queryByText(WAITING_LABEL)).toBeNull()
+  })
+
+  it('a session WITHOUT an armed loop never gets the badge — composer chips are its whole surface', () => {
+    // The #10615 invariant: options on an ordinary session render as composer
+    // chips in the open tab, and the sidebar must not re-grow a waiting state.
+    const slots = [{ key: 'k', title: 'plain', running: false, messages: 5, has_options: true, last_message: 'pick one' }]
+    const { getByText, queryByText } = renderSidebar(slots, {})
+    expect(getByText('pick one')).toBeTruthy()
+    expect(queryByText(WAITING_LABEL)).toBeNull()
+  })
+
+  it('a conductor loop whose dispatched worker is running stays on the progress row despite [OPTIONS:]', () => {
+    // Between patrol cycles the conductor turn is idle and its reply ends with
+    // a courtesy [OPTIONS:] menu, but the worker it opened is mid-turn: the
+    // loop is moving, so the row must not claim it waits on the person.
+    const slots = [
+      { key: 'k', title: 'conductor', running: false, messages: 5, has_options: true },
+      { key: 'w', title: 'worker', running: true, messages: 3, created_by: 'k' },
+    ]
+    const { container, queryByText } = renderSidebar(slots, { goalLoops: { k: { cycle_count: 5, max_cycles: 300 } } })
+    expectLoopIcon(container, 5, 300)
+    expect(queryByText(WAITING_LABEL)).toBeNull()
+    expect(queryByText(/Paused at 5\/300/)).toBeNull()
+  })
+
+  it('a loop whose own sub-agents run stays on the progress row despite [OPTIONS:]', () => {
+    const slots = [{ key: 'k', title: 'loop', running: false, messages: 5, has_options: true, subagents_running: true }]
+    const { container, queryByText } = renderSidebar(slots, { goalLoops: { k: { cycle_count: 7, max_cycles: 24 } } })
+    expectLoopIcon(container, 7, 24)
+    expect(queryByText(WAITING_LABEL)).toBeNull()
+  })
+
+  it('a loop whose workers are all idle and whose ledger holds no open item still waits on you', () => {
+    const slots = [
+      { key: 'k', title: 'conductor', running: false, messages: 5, has_options: true, crew_work: { open: 0, person: 0, items: [] } },
+      { key: 'w', title: 'worker', running: false, messages: 3, created_by: 'k' },
+      // A running session someone ELSE opened does not count for this loop.
+      { key: 'o', title: 'other', running: true, messages: 3, created_by: 'x' },
+    ]
+    const { getByText, queryByTestId } = renderSidebar(slots, { goalLoops: { k: { cycle_count: 5, max_cycles: 300 } } })
+    expect(getByText(WAITING_LABEL)).toBeTruthy()
+    expect(getByText(/Paused at 5\/300/)).toBeTruthy()
+    expect(queryByTestId('crew-work-waiting')).toBeNull()
+  })
+
+  it('with no ledger summary (older gateway, board not folded yet) an idle-worker loop keeps the old reading', () => {
+    const slots = [
+      { key: 'k', title: 'conductor', running: false, messages: 5, has_options: true },
+      { key: 'w', title: 'worker', running: false, messages: 3, created_by: 'k' },
+    ]
+    const { getByText } = renderSidebar(slots, { goalLoops: { k: { cycle_count: 5, max_cycles: 300 } } })
+    expect(getByText(WAITING_LABEL)).toBeTruthy()
+  })
+
+  it('a loop whose idle worker parked an open item is waiting on its next check, not on you', () => {
+    // The user's report: the worker reported progress and ended its turn, so
+    // nothing runs, while the ledger item is still the worker's to move.
+    const slots = [
+      { key: 'k', title: 'conductor', running: false, messages: 5, has_options: true,
+        crew_work: { open: 1, person: 0, items: [{ worker: 'w', stale_at_ms: NOW + 14 * 60_000 }] } },
+      { key: 'w', title: 'worker', running: false, messages: 3, created_by: 'k' },
+    ]
+    const { getByTestId, queryByText } = renderSidebar(slots, { goalLoops: { k: { cycle_count: 5, max_cycles: 300 } } })
+    expect(queryByText(WAITING_LABEL)).toBeNull()
+    expect(getByTestId('crew-work-waiting').textContent).toBe('Waiting · 1 open')
+  })
+
+  it('a loop whose open item went quiet past the window reads stalled', () => {
+    const slots = [
+      { key: 'k', title: 'conductor', running: false, messages: 5, has_options: true,
+        crew_work: { open: 1, person: 0, items: [{ worker: 'w', stale_at_ms: NOW - 5 * 60_000 }] } },
+      { key: 'w', title: 'worker', running: false, messages: 3, created_by: 'k' },
+    ]
+    const { getByTestId, queryByText, queryByTestId } = renderSidebar(slots, { goalLoops: { k: { cycle_count: 5, max_cycles: 300 } } })
+    expect(queryByText(WAITING_LABEL)).toBeNull()
+    expect(queryByTestId('crew-work-waiting')).toBeNull()
+    expect(getByTestId('crew-work-stalled').textContent).toBe('Stalled · 1 gone quiet')
+    // Muted: a stall is the conductor's to pick up; only "needs you" is warm.
+    expect(getByTestId('crew-work-stalled').className).toContain('text-muted')
+    expect(getByTestId('crew-work-stalled').innerHTML).not.toContain('var(--warn)')
+  })
+
+  it('an open item that names a person waits on you even without an [OPTIONS:] line', () => {
+    const slots = [
+      { key: 'k', title: 'conductor', running: false, messages: 5, has_options: false,
+        crew_work: { open: 2, person: 1, items: [{ worker: 'w', stale_at_ms: NOW + 14 * 60_000 }] } },
+      { key: 'w', title: 'worker', running: false, messages: 3, created_by: 'k' },
+    ]
+    const { getByText } = renderSidebar(slots, { goalLoops: { k: { cycle_count: 5, max_cycles: 300 } } })
+    expect(getByText(WAITING_LABEL)).toBeTruthy()
+  })
+
+  it('an item on a person waits on you even while another worker runs', () => {
+    const slots = [
+      { key: 'k', title: 'conductor', running: false, messages: 5, has_options: true,
+        crew_work: { open: 2, person: 1, items: [{ worker: 'w', stale_at_ms: NOW + 60_000 }] } },
+      { key: 'w', title: 'worker', running: true, messages: 3, created_by: 'k' },
+    ]
+    const { getByText } = renderSidebar(slots, { goalLoops: { k: { cycle_count: 5, max_cycles: 300 } } })
+    expect(getByText(WAITING_LABEL)).toBeTruthy()
+  })
+
+  it('an item on a person waits on you after its patrol stops', () => {
+    const slots = [
+      { key: 'k', title: 'conductor', running: false, messages: 5, has_options: false,
+        crew_work: { open: 1, person: 1, items: [] } },
+    ]
+    const { getByText, queryByText } = renderSidebar(slots, {})
+    expect(getByText(WAITING_LABEL)).toBeTruthy()
+    expect(queryByText(/Monitor paused/)).toBeNull()
+  })
+
+  it('a running worker keeps a conductor with open work on the progress row', () => {
+    const slots = [
+      { key: 'k', title: 'conductor', running: false, messages: 5, has_options: true,
+        crew_work: { open: 1, person: 0, items: [{ worker: 'w', stale_at_ms: NOW - 5 * 60_000 }] } },
+      { key: 'w', title: 'worker', running: true, messages: 3, created_by: 'k' },
+    ]
+    const { container, queryByText, queryByTestId } = renderSidebar(slots, { goalLoops: { k: { cycle_count: 5, max_cycles: 300 } } })
+    expectLoopIcon(container, 5, 300)
+    expect(queryByText(WAITING_LABEL)).toBeNull()
+    expect(queryByTestId('crew-work-stalled')).toBeNull()
+    expect(queryByTestId('crew-work-waiting')).toBeNull()
+  })
+
+  it('an owed approval outranks the waiting row', () => {
+    const slots = [{ key: 'k', title: 'loop', running: false, messages: 5, has_options: true, pending_approval: true }]
+    const { getByText, queryByText } = renderSidebar(slots, { goalLoops: { k: { cycle_count: 7, max_cycles: 24 } } })
+    expect(getByText('Needs approval')).toBeTruthy()
+    expect(queryByText(WAITING_LABEL)).toBeNull()
+  })
+
+  it('a parked question card outranks the waiting row — the card is the stronger ask', () => {
+    const slots = [{ key: 'k', title: 'loop', running: false, messages: 5, has_options: true, needs_input: true }]
+    const { getByText, queryByText } = renderSidebar(slots, { goalLoops: { k: { cycle_count: 7, max_cycles: 24 } } })
+    expect(getByText('Needs your answer')).toBeTruthy()
+    expect(queryByText(WAITING_LABEL)).toBeNull()
+  })
+
+  it('a stalled loop keeps its danger reading — a dead turn cannot collect the answer', () => {
+    const slots = [{ key: 'k', title: 'loop', running: false, messages: 5, has_options: true, interrupted: true }]
+    const { getByText, queryByText } = renderSidebar(slots, { goalLoops: { k: { cycle_count: 7, max_cycles: 24 } } })
+    // The row's own reading, not the shelf's "N interrupted sessions" row.
+    expect(getByText('interrupted')).toBeTruthy()
+    expect(queryByText(WAITING_LABEL)).toBeNull()
+  })
+
+  it('an ACTIVE structured monitor with an ask on the newest reply also shows the waiting row', () => {
+    const slots = [{ key: 'k', title: 'watch', running: false, messages: 5, has_options: true }]
+    const { getByText, queryByText } = renderSidebar(slots, { automations: { k: structuredMonitor() } })
+    expect(getByText(WAITING_LABEL)).toBeTruthy()
+    // The visible detail is a paused gloss, NOT the live status string:
+    // "Waiting on you · active" read as a contradiction (UX span 4a221cc48433).
+    expect(getByText(/Monitor paused/)).toBeTruthy()
+    expect(queryByText(/·\s*active/)).toBeNull()
+    // Monitors carry no cycle fraction, so the tooltip stays generic — the
+    // count-naming variant is the goal-loop path's alone.
+    expect(getByText(WAITING_LABEL).closest('[title]')?.getAttribute('title'))
+      .toBe('The last reply asked you to choose. Open the session to answer.')
+  })
+
+  it('a TERMINAL structured monitor never claims to be waiting — the loop is over', () => {
+    const slots = [{ key: 'k', title: 'watch', running: false, messages: 5, has_options: true, last_message: 'done' }]
+    const { queryByText } = renderSidebar(slots, {
+      automations: {
+        k: structuredMonitor({
+          active: false,
+          terminal: { outcome: 'success', reason: 'objective_met', at: 1_800_000_500 } as unknown as StructuredMonitor['terminal'],
+        }),
+      },
+    })
+    expect(queryByText(WAITING_LABEL)).toBeNull()
+  })
+})

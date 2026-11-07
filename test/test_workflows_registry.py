@@ -1,0 +1,406 @@
+"""M6.1 — background run registry + WorkflowRunner.run_background.
+
+A workflow run must outlive a single request and be addressable by run_id:
+  * start a background run → returns run_id immediately, status 'running'
+  * events stream into the handle as the run progresses (live monitoring)
+  * on completion the handle holds the result + 'finished' status
+  * on_done fires once with a terminal snapshot (M6.4 wires this to chat)
+  * cancel() stops a long run → 'cancelled'
+  * list() shows runs newest-first; eviction never drops a running run
+
+All against a stub agent_fn — no real model, no kiro-cli.
+See ``docs/system-specs/modules/workflows.md`` (run registry) + GATES (M6).
+"""
+
+from __future__ import annotations
+
+import asyncio
+
+import pytest
+
+from kiro_crew.testing.wait import async_wait_until, await_until
+from kiro_crew.workflows import WorkflowEvent
+from kiro_crew.workflows.registry import (
+    STATUS_CANCELLED,
+    STATUS_FAILED,
+    STATUS_FINISHED,
+    STATUS_PAUSED,
+    STATUS_RUNNING,
+    RunHandle,
+    RunRegistry,
+    start_background_run,
+)
+from kiro_crew.workflows.runner import WorkflowRunner
+
+pytestmark = pytest.mark.asyncio
+
+NOW = "2026-06-18T00:00:00Z"
+
+
+async def _echo(prompt: str, opts: dict):
+    return f"echo:{prompt}"
+
+
+GOOD = (
+    'META = {"name": "demo"}\n'
+    "async def workflow(ctx):\n"
+    "    ctx.phase('Work')\n"
+    "    ctx.log('hi')\n"
+    "    await ctx.agent('go')\n"
+    "    return {'done': True}\n"
+)
+
+
+async def _wait_terminal(reg: RunRegistry, run_id: str) -> dict:
+    """Wait until the run leaves 'running'; one that never does fails by name."""
+
+    def _terminal() -> dict | None:
+        snap = reg.status(run_id)
+        return snap if snap and snap["status"] != STATUS_RUNNING else None
+
+    return await async_wait_until(
+        _terminal, describe=lambda: f"run {run_id} did not finish: {reg.status(run_id)}"
+    )
+
+
+async def test_background_run_finishes_and_captures_result() -> None:
+    reg = RunRegistry()
+    runner = WorkflowRunner(agent_fn=_echo, audit=lambda *a, **k: None)
+
+    rid = await runner.run_background(
+        GOOD, registry=reg, run_id="wf_bg1", now=NOW, name="demo", author="a-contributor"
+    )
+    assert rid == "wf_bg1"
+    # immediately addressable
+    assert reg.status(rid)["status"] in (STATUS_RUNNING, STATUS_FINISHED)
+
+    snap = await _wait_terminal(reg, rid)
+    assert snap["status"] == STATUS_FINISHED
+    assert snap["result"] == {"done": True}
+    assert snap["author"] == "a-contributor"
+
+
+async def test_events_stream_into_handle_live() -> None:
+    reg = RunRegistry()
+    seen: list[str] = []
+    reg.set_on_event(lambda rid, ev: seen.append(ev["type"]))
+    runner = WorkflowRunner(agent_fn=_echo, audit=lambda *a, **k: None)
+
+    rid = await runner.run_background(GOOD, registry=reg, run_id="wf_bg2", now=NOW, name="demo")
+    await _wait_terminal(reg, rid)
+
+    # live subscriber saw the lifecycle + in-script events, in order
+    assert seen[0] == "run_started"
+    assert "phase_started" in seen and "log" in seen and "agent_started" in seen
+    assert seen[-1] == "run_finished"
+    # and the handle retained the full event list
+    full = reg.status(rid, include_events=True)
+    assert full["event_count"] == len(full["events"]) > 0
+
+
+async def test_on_done_fires_once_with_terminal_snapshot() -> None:
+    reg = RunRegistry()
+    done: list[dict] = []
+    notified = asyncio.Event()
+
+    def on_done(rid: str, snap: dict) -> None:
+        done.append({"rid": rid, **snap})
+        notified.set()
+
+    reg.set_on_done(on_done)
+    runner = WorkflowRunner(agent_fn=_echo, audit=lambda *a, **k: None)
+
+    rid = await runner.run_background(
+        GOOD, registry=reg, run_id="wf_bg3", now=NOW, name="demo", session_key="slot:main"
+    )
+    await _wait_terminal(reg, rid)
+    # Terminal state precedes the durable flush and the on_done callback.
+    await await_until(notified, what="the on_done notification")
+
+    assert len(done) == 1
+    assert done[0]["rid"] == rid
+    assert done[0]["status"] == STATUS_FINISHED
+    assert done[0]["session_key"] == "slot:main"  # M6.4 uses this to route to chat
+
+
+async def test_cancel_stops_a_long_run() -> None:
+    reg = RunRegistry()
+    never = asyncio.Event()
+
+    async def _hang(prompt: str, opts: dict):
+        await never.wait()
+        return "never"
+
+    script = (
+        'META = {"name": "slow"}\n'
+        "async def workflow(ctx):\n"
+        "    await ctx.agent('hang')\n"
+        "    return 'never'\n"
+    )
+    runner = WorkflowRunner(agent_fn=_hang, audit=lambda *a, **k: None)
+    rid = await runner.run_background(script, registry=reg, run_id="wf_bg4", now=NOW, name="slow")
+
+    await asyncio.sleep(0.05)
+    assert reg.status(rid)["status"] == STATUS_RUNNING
+    ok = await reg.cancel(rid)
+    assert ok
+    snap = await _wait_terminal(reg, rid)
+    assert snap["status"] == STATUS_CANCELLED
+
+
+async def test_list_newest_first_and_running_not_evicted() -> None:
+    reg = RunRegistry(max_runs=2)
+    runner = WorkflowRunner(agent_fn=_echo, audit=lambda *a, **k: None)
+    for i in range(3):
+        rid = await runner.run_background(GOOD, registry=reg, run_id=f"wf_l{i}", now=NOW, name="d")
+        await _wait_terminal(reg, rid)
+    runs = reg.list()
+    assert len(runs) <= 2  # bounded
+    assert runs[0]["run_id"] == "wf_l2"  # newest first
+
+
+async def test_list_is_compact_no_result_payload() -> None:
+    """The list view never ships result payloads.
+
+    A finished run's result can be hundreds of KB. The payload rides only on
+    the detail snapshot (``status``/``result``), and the ``on_done``
+    completion snapshot keeps it too.
+    """
+    reg = RunRegistry()
+    done_snapshots: list[dict] = []
+    notified = asyncio.Event()
+
+    def on_done(_rid: str, snap: dict) -> None:
+        done_snapshots.append(snap)
+        notified.set()
+
+    reg.set_on_done(on_done)
+    runner = WorkflowRunner(agent_fn=_echo, audit=lambda *a, **k: None)
+    rid = await runner.run_background(GOOD, registry=reg, run_id="wf_c1", now=NOW, name="d")
+    await _wait_terminal(reg, rid)
+
+    (row,) = reg.list()
+    assert "result" not in row
+
+    # The detail snapshot (compact-or-full) still carries the payload …
+    assert reg.status(rid)["result"] == {"done": True}
+    assert reg.status(rid, include_events=True)["result"] == {"done": True}
+    # … and so does the completion-injection snapshot, which lands after the
+    # terminal transition the poll above returned on.
+    await await_until(notified, what="the on_done notification")
+    assert done_snapshots and done_snapshots[0]["result"] == {"done": True}
+
+
+async def test_list_reports_when_a_run_ended() -> None:
+    """``ended_at`` is the terminal event's ``ts``, so a reader can tell a fresh
+    failure from an old one; a run still going has none."""
+    reg = RunRegistry()
+    runner = WorkflowRunner(agent_fn=_echo, audit=lambda *a, **k: None)
+    rid = await runner.run_background(GOOD, registry=reg, run_id="wf_end1", now=NOW, name="d")
+    snap = await _wait_terminal(reg, rid)
+    terminal = [
+        e for e in reg.status(rid, include_events=True)["events"] if e["type"] == "run_finished"
+    ]
+
+    (row,) = reg.list()
+    assert row["ended_at"] == snap["ended_at"] == terminal[-1]["ts"]
+
+
+async def test_a_run_interrupted_by_restart_ends_at_its_last_event() -> None:
+    stored = RunHandle(
+        run_id="wf_old",
+        name="d",
+        events=[
+            WorkflowEvent("wf_old", 0, "2026-06-01T00:00:00Z", "run_started"),
+            WorkflowEvent("wf_old", 1, "2026-06-01T00:05:00Z", "log"),
+        ],
+    ).to_store_json()
+
+    handle = RunHandle.from_store_json(stored)
+    again = RunHandle.from_store_json(handle.to_store_json())
+
+    assert handle.status == STATUS_FAILED
+    assert handle.snapshot()["ended_at"] == "2026-06-01T00:05:00Z"
+    assert again.snapshot()["ended_at"] == "2026-06-01T00:05:00Z"
+
+
+@pytest.mark.parametrize("status", [STATUS_RUNNING, STATUS_PAUSED])
+async def test_an_active_run_without_a_terminal_event_has_not_ended(status: str) -> None:
+    handle = RunHandle(
+        run_id="wf_live",
+        name="d",
+        status=status,
+        events=[WorkflowEvent("wf_live", 0, NOW, "run_started")],
+    )
+
+    assert handle.snapshot()["ended_at"] is None
+
+
+@pytest.mark.parametrize(
+    "status", [STATUS_RUNNING, STATUS_PAUSED, STATUS_FAILED, STATUS_FINISHED, STATUS_CANCELLED]
+)
+async def test_a_run_without_events_has_no_known_end_time(status: str) -> None:
+    handle = RunHandle(run_id="wf_empty", name="d", status=status)
+
+    assert handle.snapshot()["ended_at"] is None
+    restored = RunHandle.from_store_json(handle.to_store_json())
+    assert restored.snapshot()["ended_at"] is None
+
+
+@pytest.mark.parametrize("event_type", ["run_failed", "run_finished", "run_cancelled"])
+async def test_a_terminal_event_sets_ended_at_over_later_events(event_type: str) -> None:
+    handle = RunHandle(
+        run_id="wf_ended",
+        name="d",
+        status=STATUS_FAILED,
+        events=[
+            WorkflowEvent("wf_ended", 0, "2026-06-01T00:01:00Z", event_type),
+            WorkflowEvent("wf_ended", 1, "2026-06-01T00:02:00Z", "log"),
+        ],
+    )
+
+    assert handle.snapshot()["ended_at"] == "2026-06-01T00:01:00Z"
+
+
+async def test_a_driver_exception_without_terminal_event_ends_at_its_last_event() -> None:
+    reg = RunRegistry()
+
+    async def crash(record):
+        record(WorkflowEvent("wf_crash", 0, NOW, "run_started"))
+        raise RuntimeError("driver failed")
+
+    rid = await start_background_run(reg, crash, run_id="wf_crash", name="d")
+    handle = reg.get(rid)
+    assert handle is not None and handle.task is not None
+    await await_until(handle.task, what="crashing workflow driver")
+
+    (row,) = reg.list()
+    assert row["status"] == STATUS_FAILED
+    assert row["error"] == "RuntimeError('driver failed')"
+    assert row["ended_at"] == NOW
+    assert RunHandle.from_store_json(handle.to_store_json()).snapshot()["ended_at"] == NOW
+
+
+async def test_cancel_unknown_run_is_false() -> None:
+    reg = RunRegistry()
+    assert await reg.cancel("nope") is False
+
+
+async def test_async_persistence_serializes_and_discards_superseded_snapshots(
+    monkeypatch,
+) -> None:
+    class RecordingStore:
+        def __init__(self) -> None:
+            self.saved_names: list[str] = []
+
+        def save(self, _run_id: str, payload: dict) -> None:
+            self.saved_names.append(payload["name"])
+
+    store = RecordingStore()
+    registry = RunRegistry(store=store)
+    handle = RunHandle(run_id="wf_serial", name="first")
+    registry.register(handle, persist=False)
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+
+    async def controlled_to_thread(fn, *args):
+        payload = args[1]
+        if payload["name"] == "first":
+            first_started.set()
+            await release_first.wait()
+        return fn(*args)
+
+    monkeypatch.setattr("kiro_crew.workflows.registry.asyncio.to_thread", controlled_to_thread)
+
+    first = asyncio.create_task(registry.persist_async(handle.run_id))
+    await first_started.wait()
+    handle.name = "superseded"
+    superseded = asyncio.create_task(registry.persist_async(handle.run_id))
+    await asyncio.sleep(0)
+    handle.name = "latest"
+    latest = asyncio.create_task(registry.persist_async(handle.run_id))
+    await asyncio.sleep(0)
+
+    release_first.set()
+    await asyncio.gather(first, superseded, latest)
+
+    assert store.saved_names == ["first", "latest"]
+
+
+async def test_pending_work_is_scoped_to_originating_session() -> None:
+    reg = RunRegistry()
+    handle = RunHandle("owned", "owned", session_key="dashboard:chat-a")
+    reg.register(handle)
+    reg.register(RunHandle("ui", "ui"))
+    assert reg.has_pending_work_for("dashboard:chat-a") is True
+    assert reg.has_pending_work_for("dashboard:chat-b") is False
+    assert reg.has_pending_work_for("") is False
+    reg.mark_terminal("owned", STATUS_FINISHED)
+    assert reg.has_pending_work_for("dashboard:chat-a") is False
+
+
+async def test_terminal_handoff_counts_until_driver_exits() -> None:
+    reg = RunRegistry()
+    release = asyncio.Event()
+    task = asyncio.create_task(release.wait())
+    try:
+        handle = RunHandle(
+            "handoff", "handoff", status=STATUS_FINISHED, session_key="dashboard:chat-a", task=task
+        )
+        reg.register(handle)
+        assert reg.has_pending_work_for("dashboard:chat-a") is True
+        release.set()
+        await task
+        assert reg.has_pending_work_for("dashboard:chat-a") is False
+    finally:
+        release.set()
+        await task
+
+
+def test_runhandle_bounds_retained_fallback_fields() -> None:
+    # A field the run RETAINS must be bounded where it is stored, not only at
+    # delivery: a direct POST can forward a body value that skipped the MCP
+    # schema. __post_init__ caps both on every construction path.
+    handle = RunHandle(
+        run_id="wf_b",
+        name="n",
+        fallback_title="x" * 5000,
+        fallback_folder_id="y" * 5000,
+    )
+    assert len(handle.fallback_title) == 200
+    assert len(handle.fallback_folder_id) == 64
+
+
+def test_runhandle_redacts_title_credential_before_the_cap() -> None:
+    # A credential that crosses the length cap must be REDACTED, not sliced:
+    # cutting first would leave a partial token below the redactor's threshold,
+    # and that partial would then survive checkpoint/snapshot redaction and
+    # reach disk/the dashboard. Redaction runs on the full title before the cap.
+    token = "ghp_" + "A" * 36  # a full 40-char credential the redactor catches
+    handle = RunHandle(run_id="wf_sec", name="n", fallback_title="x" * 175 + token)
+    assert "ghp_" not in handle.fallback_title
+    assert token not in handle.fallback_title
+    assert "A" * 36 not in handle.fallback_title
+    assert len(handle.fallback_title) <= 200
+
+
+def test_runhandle_coerces_non_string_fallback_fields() -> None:
+    # A non-string slipped past typing is coerced to "" rather than retained.
+    handle = RunHandle(run_id="wf_c", name="n", fallback_title=123, fallback_folder_id=object())  # type: ignore[arg-type]
+    assert handle.fallback_title == ""
+    assert handle.fallback_folder_id == ""
+
+
+def test_runhandle_restore_bounds_fallback_fields() -> None:
+    # Restore from a stored record also bounds the fields (same chokepoint).
+    handle = RunHandle.from_store_json(
+        {
+            "run_id": "wf_r",
+            "name": "n",
+            "status": STATUS_FINISHED,
+            "fallback_title": "t" * 5000,
+            "fallback_folder_id": "f" * 5000,
+        }
+    )
+    assert len(handle.fallback_title) == 200
+    assert len(handle.fallback_folder_id) == 64

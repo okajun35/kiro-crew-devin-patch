@@ -1,0 +1,716 @@
+[
+  {
+    "agent_capabilities": {
+      "_meta": {
+        "cognition.ai/chains": true,
+        "cognition.ai/commandRevision": true,
+        "cognition.ai/documentLifecycle": true,
+        "cognition.ai/editableCommands": true,
+        "cognition.ai/megaplan": true,
+        "cognition.ai/mentionTypes": [
+          {
+            "type": "file"
+          },
+          {
+            "type": "directory"
+          },
+          {
+            "type": "git"
+          },
+          {
+            "icon": "book",
+            "label": "Rules",
+            "type": "rule"
+          },
+          {
+            "icon": "zap",
+            "label": "Skills",
+            "type": "skill"
+          },
+          {
+            "icon": "file-text",
+            "label": "Plans",
+            "type": "plan"
+          },
+          {
+            "type": "conversation"
+          },
+          {
+            "type": "terminal"
+          },
+          {
+            "icon": "map",
+            "label": "Codemaps",
+            "type": "codemap"
+          }
+        ],
+        "cognition.ai/midTurnPrompts": true,
+        "cognition.ai/multiRootWorkspace": true,
+        "cognition.ai/persistOnCreate": true,
+        "cognition.ai/ruleMentions": true,
+        "cognition.ai/sessionDefaultConfigOptions": true,
+        "cognition.ai/sessionListContentSearch": true,
+        "cognition.ai/sessionListOrderBy": [
+          "updated_at",
+          "created_at"
+        ],
+        "cognition.ai/sessionListSortDirection": true,
+        "cognition.ai/sessionRename": true,
+        "cognition.ai/sessionShare": true,
+        "cognition.ai/terminalLifecycle": true,
+        "cognition.ai/userConfig": true,
+        "cognition.ai/userEdits": true,
+        "cognition.ai/userShellCommand": true
+      },
+      "auth": {},
+      "loadSession": true,
+      "mcpCapabilities": {
+        "http": true,
+        "sse": true
+      },
+      "promptCapabilities": {
+        "audio": false,
+        "embeddedContext": true,
+        "image": true
+      },
+      "sessionCapabilities": {
+        "additionalDirectories": {},
+        "close": {
+          "_meta": {
+            "cognition.ai/force": true
+          }
+        },
+        "delete": {},
+        "list": {}
+      }
+    },
+    "agent_version": "0.0.0-dev",
+    "frame": "response",
+    "id": 1,
+    "protocol_version": 1
+  },
+  {
+    "config_options": [
+      {
+        "category": "mode",
+        "currentValue": "accept-edits",
+        "id": "mode",
+        "name": "Session Mode",
+        "options": [
+          {
+            "_meta": {
+              "cognition.ai/icon": "code"
+            },
+            "description": "Write and edit code",
+            "name": "Code",
+            "value": "accept-edits"
+          },
+          {
+            "_meta": {
+              "cognition.ai/icon": "sparkles"
+            },
+            "description": "Auto-approve actions the model judges safe",
+            "name": "Smart",
+            "value": "smart"
+          },
+          {
+            "_meta": {
+              "cognition.ai/icon": "message-circle"
+            },
+            "description": "Answer questions without code changes",
+            "name": "Ask",
+            "value": "ask"
+          },
+          {
+            "_meta": {
+              "cognition.ai/icon": "file-text"
+            },
+            "description": "Plan changes before implementing",
+            "name": "Plan",
+            "value": "plan"
+          },
+          {
+            "_meta": {
+              "cognition.ai/icon": "shield-off"
+            },
+            "description": "Auto-approve all tool calls unless your organization's policy requires approval",
+            "name": "Bypass Permissions",
+            "value": "bypass"
+          }
+        ],
+        "type": "select"
+      },
+      {
+        "category": "model",
+        "currentValue": "swe-2-high",
+        "description": "AI model to use",
+        "id": "model",
+        "name": "Model",
+        "options": [
+          {
+            "_meta": {
+              "cognition.ai/supportsImages": true
+            },
+            "name": "Adaptive",
+            "value": "adaptive"
+          },
+          {
+            "_meta": {
+              "cognition.ai/supportsImages": true
+            },
+            "name": "SWE-2",
+            "value": "swe-2-high"
+          }
+        ],
+        "type": "select"
+      },
+      {
+        "category": "thought_level",
+        "currentValue": "max",
+        "id": "thought_level",
+        "name": "Thinking",
+        "options": [
+          {
+            "name": "Medium",
+            "value": "medium"
+          },
+          {
+            "name": "High",
+            "value": "high"
+          },
+          {
+            "name": "Max",
+            "value": "max"
+          }
+        ],
+        "type": "select"
+      },
+      {
+        "category": "model_config",
+        "currentValue": "standard",
+        "id": "speed",
+        "name": "Speed",
+        "options": [
+          {
+            "name": "Standard",
+            "value": "standard"
+          },
+          {
+            "name": "Fast",
+            "value": "fast"
+          }
+        ],
+        "type": "select"
+      }
+    ],
+    "frame": "response",
+    "id": 2,
+    "modes": {
+      "advertised": true,
+      "current": "accept-edits",
+      "ids": [
+        "accept-edits",
+        "smart",
+        "ask",
+        "plan",
+        "bypass"
+      ]
+    },
+    "session_id": "devin-session-1"
+  },
+  {
+    "config_options": [
+      {
+        "category": "mode",
+        "currentValue": "accept-edits",
+        "id": "mode",
+        "name": "Session Mode",
+        "options": [
+          {
+            "_meta": {
+              "cognition.ai/icon": "code"
+            },
+            "description": "Write and edit code",
+            "name": "Code",
+            "value": "accept-edits"
+          },
+          {
+            "_meta": {
+              "cognition.ai/icon": "sparkles"
+            },
+            "description": "Auto-approve actions the model judges safe",
+            "name": "Smart",
+            "value": "smart"
+          },
+          {
+            "_meta": {
+              "cognition.ai/icon": "message-circle"
+            },
+            "description": "Answer questions without code changes",
+            "name": "Ask",
+            "value": "ask"
+          },
+          {
+            "_meta": {
+              "cognition.ai/icon": "file-text"
+            },
+            "description": "Plan changes before implementing",
+            "name": "Plan",
+            "value": "plan"
+          },
+          {
+            "_meta": {
+              "cognition.ai/icon": "shield-off"
+            },
+            "description": "Auto-approve all tool calls unless your organization's policy requires approval",
+            "name": "Bypass Permissions",
+            "value": "bypass"
+          }
+        ],
+        "type": "select"
+      },
+      {
+        "category": "model",
+        "currentValue": "swe-2-high",
+        "description": "AI model to use",
+        "id": "model",
+        "name": "Model",
+        "options": [
+          {
+            "_meta": {
+              "cognition.ai/supportsImages": true
+            },
+            "name": "Adaptive",
+            "value": "adaptive"
+          },
+          {
+            "_meta": {
+              "cognition.ai/supportsImages": true
+            },
+            "name": "SWE-2",
+            "value": "swe-2-high"
+          }
+        ],
+        "type": "select"
+      },
+      {
+        "category": "thought_level",
+        "currentValue": "max",
+        "id": "thought_level",
+        "name": "Thinking",
+        "options": [
+          {
+            "name": "Medium",
+            "value": "medium"
+          },
+          {
+            "name": "High",
+            "value": "high"
+          },
+          {
+            "name": "Max",
+            "value": "max"
+          }
+        ],
+        "type": "select"
+      },
+      {
+        "category": "model_config",
+        "currentValue": "standard",
+        "id": "speed",
+        "name": "Speed",
+        "options": [
+          {
+            "name": "Standard",
+            "value": "standard"
+          },
+          {
+            "name": "Fast",
+            "value": "fast"
+          }
+        ],
+        "type": "select"
+      }
+    ],
+    "frame": "response",
+    "id": 3
+  },
+  {
+    "action": "update",
+    "events": [
+      {
+        "kind": "text_chunk",
+        "text": "I'll call the crew"
+      }
+    ],
+    "frame": "session/update",
+    "session_update": "agent_message_chunk",
+    "text_chunk": {
+      "text": "I'll call the crew",
+      "thinking": false
+    }
+  },
+  {
+    "action": "update",
+    "events": [
+      {
+        "kind": "text_chunk",
+        "text": "-probe echo"
+      }
+    ],
+    "frame": "session/update",
+    "session_update": "agent_message_chunk",
+    "text_chunk": {
+      "text": "-probe echo",
+      "thinking": false
+    }
+  },
+  {
+    "action": "update",
+    "events": [
+      {
+        "kind": "text_chunk",
+        "text": " tool. First I"
+      }
+    ],
+    "frame": "session/update",
+    "session_update": "agent_message_chunk",
+    "text_chunk": {
+      "text": " tool. First I",
+      "thinking": false
+    }
+  },
+  {
+    "action": "update",
+    "events": [
+      {
+        "kind": "text_chunk",
+        "text": " need to discover its"
+      }
+    ],
+    "frame": "session/update",
+    "session_update": "agent_message_chunk",
+    "text_chunk": {
+      "text": " need to discover its",
+      "thinking": false
+    }
+  },
+  {
+    "action": "update",
+    "events": [
+      {
+        "kind": "text_chunk",
+        "text": " tool schema, then"
+      }
+    ],
+    "frame": "session/update",
+    "session_update": "agent_message_chunk",
+    "text_chunk": {
+      "text": " tool schema, then",
+      "thinking": false
+    }
+  },
+  {
+    "action": "update",
+    "events": [
+      {
+        "kind": "text_chunk",
+        "text": " call it"
+      }
+    ],
+    "frame": "session/update",
+    "session_update": "agent_message_chunk",
+    "text_chunk": {
+      "text": " call it",
+      "thinking": false
+    }
+  },
+  {
+    "action": "update",
+    "events": [
+      {
+        "kind": "text_chunk",
+        "text": "."
+      }
+    ],
+    "frame": "session/update",
+    "session_update": "agent_message_chunk",
+    "text_chunk": {
+      "text": ".",
+      "thinking": false
+    }
+  },
+  {
+    "action": "update",
+    "events": [
+      {
+        "kind": "tool_call",
+        "raw_tool_params": {
+          "server_name": "crew-probe"
+        },
+        "title": "Listed MCP tools for crew-probe",
+        "tool_call_id": "mcp_list_tools:0#23da428e821343f3900bccfcd6b0adcd",
+        "tool_input": "{\n  \"server_name\": \"crew-probe\"\n}",
+        "tool_kind": "unknown",
+        "wire_title": "Listed MCP tools for crew-probe"
+      }
+    ],
+    "frame": "session/update",
+    "session_update": "tool_call"
+  },
+  {
+    "action": "update",
+    "events": [],
+    "frame": "session/update",
+    "session_update": "tool_call_update"
+  },
+  {
+    "action": "update",
+    "events": [
+      {
+        "kind": "tool_call_update",
+        "title": "Connecting to crew-probe...",
+        "tool_call_id": "mcp_list_tools:0#23da428e821343f3900bccfcd6b0adcd",
+        "wire_title": "Connecting to crew-probe..."
+      }
+    ],
+    "frame": "session/update",
+    "session_update": "tool_call_update"
+  },
+  {
+    "action": "update",
+    "events": [
+      {
+        "kind": "tool_call_update",
+        "title": "Listed MCP tools for crew-probe",
+        "tool_call_id": "mcp_list_tools:0#23da428e821343f3900bccfcd6b0adcd",
+        "wire_title": "Listed MCP tools for crew-probe"
+      }
+    ],
+    "frame": "session/update",
+    "session_update": "tool_call_update"
+  },
+  {
+    "action": "update",
+    "events": [
+      {
+        "kind": "tool_result",
+        "tool_call_id": "mcp_list_tools:0#23da428e821343f3900bccfcd6b0adcd",
+        "tool_final": true,
+        "tool_output": "\n- `echo`",
+        "tool_output_bytes": 9,
+        "tool_output_digest": "8d54f83df11e34d532e96d6c6815582eff59dddc3cc44854740c2a10d3184683",
+        "tool_status": "completed"
+      }
+    ],
+    "frame": "session/update",
+    "session_update": "tool_call_update"
+  },
+  {
+    "action": "update",
+    "events": [
+      {
+        "kind": "tool_call",
+        "raw_tool_params": {
+          "text": "DEVIN_MCP_OK"
+        },
+        "title": "Calling echo from crew-probe",
+        "tool_call_id": "mcp_call_tool:0#22d70ccb04504eddb5b331d671869cd8",
+        "tool_input": "{\n  \"text\": \"DEVIN_MCP_OK\"\n}",
+        "tool_kind": "unknown",
+        "wire_title": "Calling echo from crew-probe"
+      }
+    ],
+    "frame": "session/update",
+    "session_update": "tool_call"
+  },
+  {
+    "action": "permission",
+    "events": [
+      {
+        "kind": "permission_request",
+        "mcp_identity_trusted": true,
+        "options": [
+          {
+            "id": "allow_once",
+            "label": "Allow"
+          },
+          {
+            "id": "allow_session",
+            "label": "Yes, allow calling echo on the crew-probe MCP server (this session)"
+          },
+          {
+            "id": "allow_always",
+            "label": "Yes, always allow calling echo on the crew-probe MCP server"
+          },
+          {
+            "id": "allow_server_session",
+            "label": "Yes, allow calling all tools on the crew-probe MCP server (this session)"
+          },
+          {
+            "id": "allow_server_always",
+            "label": "Yes, always allow calling tools on the crew-probe MCP server"
+          },
+          {
+            "id": "switch_bypass",
+            "label": "Yes, switch to bypass mode"
+          },
+          {
+            "id": "reject_once",
+            "label": "Reject"
+          }
+        ],
+        "raw_params_trusted": true,
+        "raw_tool_params": {
+          "text": "DEVIN_MCP_OK"
+        },
+        "request_id": "f06837be-b78d-4ed1-ba26-11350045fcc1",
+        "title": "unknown",
+        "tool_call_id": "mcp_call_tool:0#22d70ccb04504eddb5b331d671869cd8",
+        "tool_input": "{\n  \"text\": \"DEVIN_MCP_OK\"\n}"
+      }
+    ],
+    "frame": "session/request_permission",
+    "recorded_options": {
+      "always": "allow_session",
+      "once": "allow_once",
+      "reject": "reject_once"
+    }
+  },
+  {
+    "action": "update",
+    "events": [],
+    "frame": "session/update",
+    "session_update": "tool_call_update"
+  },
+  {
+    "action": "update",
+    "events": [
+      {
+        "kind": "tool_call_update",
+        "title": "Called echo from crew-probe",
+        "tool_call_id": "mcp_call_tool:0#22d70ccb04504eddb5b331d671869cd8",
+        "wire_title": "Called echo from crew-probe"
+      }
+    ],
+    "frame": "session/update",
+    "session_update": "tool_call_update"
+  },
+  {
+    "action": "update",
+    "events": [
+      {
+        "kind": "tool_result",
+        "tool_call_id": "mcp_call_tool:0#22d70ccb04504eddb5b331d671869cd8",
+        "tool_final": true,
+        "tool_output": "DEVIN_MCP_OK",
+        "tool_output_bytes": 12,
+        "tool_output_digest": "4ffdc3e537796c55045fc471581427b679346888aecb37d170ddbcb4052d5e85",
+        "tool_status": "completed"
+      }
+    ],
+    "frame": "session/update",
+    "session_update": "tool_call_update"
+  },
+  {
+    "action": "update",
+    "events": [
+      {
+        "kind": "text_chunk",
+        "text": "Done. The crew"
+      }
+    ],
+    "frame": "session/update",
+    "session_update": "agent_message_chunk",
+    "text_chunk": {
+      "text": "Done. The crew",
+      "thinking": false
+    }
+  },
+  {
+    "action": "update",
+    "events": [
+      {
+        "kind": "text_chunk",
+        "text": "-probe"
+      }
+    ],
+    "frame": "session/update",
+    "session_update": "agent_message_chunk",
+    "text_chunk": {
+      "text": "-probe",
+      "thinking": false
+    }
+  },
+  {
+    "action": "update",
+    "events": [
+      {
+        "kind": "text_chunk",
+        "text": " `echo` tool"
+      }
+    ],
+    "frame": "session/update",
+    "session_update": "agent_message_chunk",
+    "text_chunk": {
+      "text": " `echo` tool",
+      "thinking": false
+    }
+  },
+  {
+    "action": "update",
+    "events": [
+      {
+        "kind": "text_chunk",
+        "text": " returned: `DEV"
+      }
+    ],
+    "frame": "session/update",
+    "session_update": "agent_message_chunk",
+    "text_chunk": {
+      "text": " returned: `DEV",
+      "thinking": false
+    }
+  },
+  {
+    "action": "update",
+    "events": [
+      {
+        "kind": "text_chunk",
+        "text": "IN_MCP_OK"
+      }
+    ],
+    "frame": "session/update",
+    "session_update": "agent_message_chunk",
+    "text_chunk": {
+      "text": "IN_MCP_OK",
+      "thinking": false
+    }
+  },
+  {
+    "action": "update",
+    "events": [
+      {
+        "kind": "text_chunk",
+        "text": "`"
+      }
+    ],
+    "frame": "session/update",
+    "session_update": "agent_message_chunk",
+    "text_chunk": {
+      "text": "`",
+      "thinking": false
+    }
+  },
+  {
+    "frame": "response",
+    "id": 4,
+    "prompt_tokens": [
+      25659,
+      39,
+      25600,
+      0
+    ],
+    "stop_reason": "end_turn"
+  }
+]

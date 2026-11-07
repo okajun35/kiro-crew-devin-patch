@@ -1,0 +1,333 @@
+# Slack Integration
+
+Kiro Crew connects to Slack via Socket Mode. You interact with it through DMs
+or in channels where the bot is present.
+
+## Activation Modes
+
+Slack interaction is restricted to the owner — see [Access control](#access-control).
+
+Each channel can have a different activation mode:
+
+| Mode | Behavior | Default for |
+|------|----------|-------------|
+| `always` | Process every message from allowed users | DMs |
+| `mention` | Only respond when @mentioned; continue in thread replies | Group channels |
+| `observe` | Passively record messages; respond only when @mentioned (full context) | — |
+| `off` | Ignore all messages | — |
+| `review` | Require explicit activation before replying to each message | — |
+
+Set per-channel: `!channel always` / `!channel mention` / `!channel observe` / `!channel review` / `!channel off`
+
+## Owner Commands
+
+Only the owner (set via `KIROCREW_OWNER_ID`) can use these:
+
+| Command | Description |
+|---------|-------------|
+| `!yolo` / `!yolo on/off/renew` | Show, toggle, or renew auto-approve for all tool calls |
+| `!agent <name>` | Switch to a different agent globally |
+| `!agent off` | Switch back to default kirocrew agent |
+| `!ta <name>` | Set agent for this thread only |
+| `!ta off` | Remove thread agent override |
+| `!ta` | Show the current thread agent |
+| `/agent <name>` | Same as `!ta <name>` (type a space first if Slack offers it as a slash command) |
+| `!channel` | Show current channel activation mode |
+| `!channel always/mention/observe/review/off` | Set channel activation mode |
+| `!channel agent <name/off>` | Set per-channel agent override |
+| `!voice on/off` | Speak this thread's answers as well as typing them |
+| `!link-to-dashboard` | Import this thread's history into a dashboard session and link it |
+
+`!allowlist` and `/kirocrew @user` are not accepted while access is owner-only, and
+`slack.allowed_users` in config has no effect.
+
+## Commands for All Allowed Users
+
+| Command | Description |
+|---------|-------------|
+| `!dashboard` | Get a presigned dashboard link (DM'd to you) |
+| `!dashboard 2h` | Dashboard link with custom duration (max 20h) |
+| `!stop` | Force-halt the current agent turn in this thread. Bypasses the per-session semaphore and cancels the active task. See "Emergency Stop" below |
+
+## Keyword Commands
+
+Available to all allowed users (no `!` prefix needed):
+
+| Command | Description |
+|---------|-------------|
+| `status` | Show runtime stats (uptime, sessions, crons, lessons) |
+| `ping` | Auto-reply with `pong` |
+| `cron list` | List all scheduled cron jobs |
+| `cron remove <id>` | Remove a cron job |
+| `cron pause <id>` | Pause a cron job |
+| `cron resume <id>` | Resume a paused cron job |
+| `spawn run "task"` | Spawn a background subagent |
+| `spawn list` | List running subagents |
+| `task run <path>` | Run an autonomous task from a spec file (`project run` is an alias; a bare `run <path>` is not a command) |
+| `task run status` | Check task runner status |
+| `task run cancel` | Cancel the running task |
+| `sessions` | List recent dashboard sessions with resume buttons, newest by your last message; `slack.sessions_limit` rows (default 10, at most 17) |
+| `!compact` | Manually trigger context compaction |
+| `!incognito <msg>` | Send message in incognito mode (reads memory, blocks writes) |
+| `!temporary <msg>` | Send message in temporary mode (blocks both reads and writes) |
+
+## Slash Commands
+
+| Command | Description |
+|---------|-------------|
+| `/kirocrew dashboard` | Same as `!dashboard` |
+| `/kirocrew agent` | Switch the active agent |
+| `/kirocrew voice` | Configure TTS voice settings |
+| `/kirocrew yolo` | Toggle auto-approve for all tool calls |
+| `/kirocrew config` | Edit the tracked-channel list (owner only); its user half is inert |
+| `/kirocrew users` | Always refuses — multi-user access is disabled |
+| `/kirocrew channels` | Manage tracked channels |
+| `/kirocrew sessions` | List recent sessions, ranked like `sessions` and capped by `slack.sessions_limit` (default 10, at most 17) |
+| `/kirocrew status` | Show runtime stats |
+| `/kirocrew restart` | Restart the gateway (owner only) |
+
+## Tool Approval Flow
+
+When Kiro Crew needs to run a tool (file write, bash command, etc.):
+
+1. **Auto mode** (`!yolo on`): silently approves everything
+2. **Interactive mode** (default): posts Approve / Trust session / Reject buttons
+3. `agent.tool_approval_timeout_secs` timeout (default 600 seconds) —
+   auto-rejects if no click. The other five channels that prompt at all wait
+   five minutes, and four channels do not prompt. See [Channel capabilities](channel-capabilities.md).
+4. "Trust session" approves all remaining tools for that session
+
+Approval buttons appear in both Slack and the dashboard. Approving in either
+place resolves both.
+
+## Emergency Stop
+
+When Kiro Crew is executing and you need to halt it immediately, type `!stop`
+in the thread where the agent is running.
+
+`!stop` is intercepted before the per-session semaphore in the Slack event
+handler, so it acts even when the agent is mid-tool-call or mid-stream.
+The active asyncio task is cancelled, your own queued messages for that
+session are dropped (including any not-yet-dispatched attachments), and the
+session is reset. For a `!stop` sent as a message in the thread, messages
+other members of the thread have queued stay queued and are answered in
+order once the turn stops: everybody in a thread shares its session, so that
+stop only withdraws what its caller sent. A stop that escalates to a hard
+stop, and **Kill Now**, still tear the session down with its whole queue,
+every member's messages included. Three
+answers, one per outcome: "⏹ Execution stopped." when the turn stopped
+cooperatively, "⛔ Execution stopped — session reset." when it had to be
+escalated to a hard stop, and "Nothing running." when no turn was active.
+
+Authorization: owner and allowed users. Unauthorized callers get
+"⛔ Not authorized." and an audit log entry under `slack.stop_command`.
+
+## Streaming
+
+Responses stream in real-time via progressive Slack message edits. A cursor
+(▍) shows during streaming. Tool calls appear as 🔧 _tool name_ inline.
+
+With `slack.reactions_enabled` on, where Slack shows the bot's native thread status
+("is working on your request") your message gets no reaction; elsewhere it gets 👀
+while it is answered, removed when the reply lands (the reply is the done signal).
+A failed turn gets 😱.
+
+## File attachments
+
+Slack ingests attachments on incoming messages and can upload local image references from completed replies, including a scheduled cron's result posted to Slack: an `![alt](/abs/path.png)` the reply embeds is uploaded as a native image into the same thread, limited to files inside the session's workspace. Outbound uploads are limited to 10 files, 10 MiB per file, and 25 MiB total per reply. A reference that cannot be sent is named in a short note in the thread rather than dropped.
+
+## DM Sessions
+
+By default a session is scoped to a Slack **thread**, so every top-level message
+in a DM starts a fresh session and replies arrive as threaded replies. To keep
+one conversation, reply in the thread.
+
+Set `slack.dm_single_session` to `true` to treat each 1:1 DM as one continuous
+session instead: every message in that DM continues the same conversation, and a
+top-level reply posts at channel root so the DM reads as a normal chat. A
+threaded reply joins that same conversation too — in a 1:1 DM a thread is usually
+a layout choice, not a new topic — while the answer still lands inside the thread
+you asked in. Group channels and group DMs are unaffected.
+
+The setting applies only on the default messaging transport
+(`messaging.use_transport`, on by default) and never in a DM set to `review` mode;
+there, each top-level DM message still starts its own thread session.
+
+Off by default, because turning it on routes your next DM to a different session
+than the previous one. Existing threads keep working either way.
+
+## Auto-connect new dashboard sessions
+
+Every dashboard session can be mirrored into a Slack thread from its session
+actions menu: the **Connect to Slack** rows offer your bot DM and each channel the
+bot can post in. Turn on **Connect new sessions to Slack automatically** at
+`/settings/channels/slack` (`slack.auto_link_sessions`) and the dashboard does that
+for you: the thread opens when a new session sends its first message, so you can
+follow and reply to it from Slack without clicking the row each time. A tab you
+open and abandon leaves nothing behind, because nothing is posted until the first
+message.
+
+The automatic thread always opens in your DM with the bot, which only you can
+read. To mirror a session into a channel instead, use the **Connect to Slack**
+rows in its session actions menu.
+
+Only sessions a person starts in the dashboard qualify. Sessions started by cron
+jobs, apps, sub-agents or another channel, incognito and temporary sessions, and
+sessions that already existed when the setting was turned on are left alone. A
+session connected this way behaves exactly like one connected by hand: pause
+replies to Slack, unlink it from Slack, or reply in the thread as usual. It stays where it is in the
+sidebar: the **File sessions in a folder** setting below applies only to
+conversations that start in Slack. If Slack is slow when the first message is
+sent, the thread still opens and picks up from the next message; if Slack cannot
+be reached, the session simply stays unconnected, and you can connect it from the
+session actions menu later.
+
+Off by default. Applies to the next new session with no restart.
+
+## OPTIONS Buttons
+
+When Kiro Crew presents choices, each one is a button: one click sends that
+choice back to the conversation. To send several at once, open the card's ⋯ menu
+and pick **Choose several…**, then tick them in the dialog and press Send. Once a
+card is answered its buttons give way to a line saying who chose what and when;
+a later click on it only gets a private "Already answered".
+
+## Access control
+
+Kiro Crew on Slack answers the bot owner (`KIROCREW_OWNER_ID`) and nobody else.
+Multi-user access is disabled because an allowed user would act under the owner's
+system identity — the owner's file permissions and cloud credentials — with no scope
+limit and no expiry. `!allowlist`, `/kirocrew @user`, `slack.allowed_users` and
+`slack.open_channels` are all inert as a result, and stale allowlist entries are
+pruned at startup.
+
+`!dashboard` presigned links go to the owner only.
+
+## Tracked channels
+
+`slack.tracking_channels` is the allowlist for unattended channel delivery (for
+example, heartbeat reports) and for the startup probe that checks whether each
+tracked channel is readable. It does not grant inbound access or enable member
+allowlisting: Slack remains owner-only, and member-join events do not prompt for
+new users.
+
+### Channel Activation Modes
+
+Each tracked channel has an activation mode:
+
+| Mode | Behavior |
+|------|----------|
+| `always` | Respond to every message in the channel |
+| `mention` | Respond only when @mentioned or in active threads |
+| `observe` | Record authorized messages; respond only when @mentioned or in active threads, with channel context |
+| `review` | Generate an owner approval draft instead of posting a public response |
+| `off` | Disabled |
+
+Review mode is useful for channels where you want human approval before the
+bot posts publicly.
+
+## Setting Up Your Slack App
+
+Kiro Crew connects to Slack as a Socket Mode app that you create and install in
+your own workspace.
+
+1. **Create a Slack app** at https://api.slack.com/apps and enable **Socket Mode**. Generate an app-level token (`xapp-`) with the `connections:write` scope.
+2. **Add a bot user** with these Bot Token Scopes:
+   `app_mentions:read`, `channels:history`, `channels:read`, `chat:write`,
+   `commands`, `files:read`, `files:write`, `groups:history`, `groups:read`,
+   `im:history`, `im:read`, `im:write`, `reactions:write`, and `users:read`.
+3. **Add User Token Scopes** if the same app supplies a user token to a
+   separately configured Slack MCP/search integration: `channels:history`,
+   `channels:read`, `groups:history`, `groups:read`, `im:history`, `im:read`,
+   `mpim:history`, `mpim:read`, `search:read`, and `users:read`. The gateway
+   does not consume this `xoxp-...` token.
+4. **Subscribe to bot events**: `message.im`, `message.channels`,
+   `message.groups`, `app_mention`, `app_home_opened`, `file_change`, and
+   `member_joined_channel`. Install or reinstall the app to grant the scopes and
+   get the bot token (`xoxb-`).
+5. **Set credentials** in `~/.kiro/crew/.env` (`SLACK_APP_TOKEN`, `SLACK_BOT_TOKEN`, `KIROCREW_OWNER_ID`). Slack has no `enabled` setting: both Slack tokens opt the channel in.
+6. **Slash command** (optional) — the command name is configurable via
+   `slack.command` in config.json (default: `kirocrew`). Each app instance
+   should use a unique name.
+
+## Settings page
+
+The Slack channel view at `/settings/channels/slack` shows the connection state, the
+masked token previews, the owner ID, the slash command and the behaviour toggles. Three
+things about it are worth knowing before you use it:
+
+- **Editing is loopback-only.** A request reaching the dashboard through a proxy or from
+  another machine is read-only, so a remote browser sees the state and cannot change it.
+- **A token is verified against Slack before it is stored.** A rejected token is not
+  written. If the host is offline the save succeeds with a warning instead, and clearing
+  a token takes an explicit clear action rather than an empty field.
+- **Some changes need a restart** — the tokens, the owner ID, the slash command and the
+  enterprise-org allowlist are read at boot. Reactions and thinking-indicator toggles
+  apply immediately.
+
+Secrets are written to `.env` in the config directory with owner-only permissions, never
+to `config.json`.
+
+## Slack Code: agent sessions and code channels
+
+Two switches in the Slack channel view's **Slack Code** section, each off by default and
+applied without a restart. A switch that is on runs only once your installed Slack app can use the
+feature: its permissions (read from Slack each time the gateway connects) include the
+feature's scope, and Slack has not refused it for your workspace. Until then Slack works
+exactly as with the switch off, and the page says why under the switch.
+
+- **Agent sessions** (`slack.agent_sessions`) declares the Slack app an agent
+  (`features.agent_view`): threads show a live status and title, and Slack's own Stop
+  button cancels a running turn. Turning the switch on only changes the manifest the
+  page generates; the permanent step is saving that manifest in Slack, which cannot
+  switch an app back from the agent view to the older assistant view, so the update
+  steps warn you there.
+- **Code channels** (`slack.code_channels`) lets the agent open a Slack code channel for
+  coding work: one channel per task, with a context bar, a diff tab and channel commands.
+  It adds the `code_channels:manage`, `chat:write.customize`, `canvases:write`,
+  `channels:write.invites` and `groups:write.invites` scopes. Your workspace must have
+  Slack code channels enabled.
+
+**Defaults for new code channels** (`slack.code_channel_defaults`, applied without a
+restart): a folder, an agent, a model and a reasoning effort. Set any of them; anything
+empty falls through:
+
+- folder: the default folder here, else a top-level **Code channels** folder. That folder is
+  created the first time a code channel needs it, with `kirocrew-conductor` as its default
+  agent, so a code channel with nothing set runs the conductor there. **New folder…** in
+  the folder list creates a sidebar folder (name, optional project directory and default
+  agent) and selects it;
+- agent: the default agent here, then the folder's default agent, then the agent Slack
+  already uses. The list offers every agent a chat can run, the shipped ones included,
+  except background-only ones (`kirocrew-lite`, `kirocrew-guest`, `kirocrew-heartbeat`);
+- project: the folder's project directory, then the project of the thread the channel was
+  opened from;
+- model and effort: set here, else the agent's own.
+
+The page previews what a new code channel will run with. A folder or agent deleted after
+you saved it is flagged on the page and skipped; the other defaults still apply.
+
+**Updating an existing Slack app.** A switch changes the manifest (scopes, events and
+feature blocks), and Slack grants scopes only when the app is (re)installed. The
+**Update your Slack app** panel lists what each switch adds, compares it with the scopes
+your installed app holds, and reads one of: *Up to date*, *Needs update*, *Workspace not
+enabled* (Slack refuses a feature, such as code channels, for this workspace), *Cannot check* (Slack did not
+report the app's scopes: select **Check again** first, and open the update steps with
+**Show update steps** only if it still cannot check and threads show no Stop button). To update:
+copy the manifest, open the app's **App Manifest** page (the panel links it), replace the
+YAML, save, reinstall the app when Slack asks, then select **Check again**: the gateway
+picks up the new permissions at once. Slack does not report event subscriptions, so the
+check covers scopes only. If Slack refuses a feature at runtime (`feature_disabled`,
+`missing_scope`), Kiro Crew posts one notification, keeps Slack working as before and
+retries after the next reconnect.
+
+The same manifest is printed by `kirocrew manifest`, which renders the switches saved in
+`config.json`. Kiro Crew does not push the manifest into your app itself:
+`apps.manifest.update` replaces the whole app configuration and needs a workspace-wide
+configuration token (see `docs/request-for-change/rfc-slack-code-channels.md`).
+
+## Related docs
+
+- [Channel capabilities](channel-capabilities.md): the ten-channel matrix — streaming, buttons, uploads, reply length, approval timeout
+- [Getting Started](getting-started.md): install, first run, connecting a channel
+- [Configuration](configuration.md): the config file and environment variables

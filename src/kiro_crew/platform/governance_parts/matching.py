@@ -1,0 +1,610 @@
+"""How a governed item matches a rule pattern.
+
+The enforcer-owned registries the governance model never reads from a policy or profile
+document: ``_ORDINAL_SCALES`` (each ordinal's strictness order) and ``_MATCHERS`` (the
+seven match strategies, extended only through ``register_matcher``). Beside them, the
+item normalization the ``path`` matcher applies (``_norm_item``) and the host the
+``host`` matcher tests (``_url_host``). A new match strategy goes here.
+
+Served through :mod:`kiro_crew.platform.governance`, which callers and tests import
+and patch; this module never imports it.
+"""
+
+from __future__ import annotations
+
+import fnmatch
+import os
+import re
+from typing import Callable, Dict, Tuple
+
+from kiro_crew.platform.guest_paths import GuestPath, guest_norm
+
+# ──────────────────────────────────────────────────────────────────────────
+# Enforcer-owned registries (NEVER sourced from a policy/profile document)
+# ──────────────────────────────────────────────────────────────────────────
+# Keeping the strictness order and the match strategy in code — not in the
+# governed files — is what makes the ceiling un-weakenable: a malicious profile
+# cannot reorder "strict < off" to defeat a sandbox floor, nor redefine how a
+# path glob matches.  Both registries are append-only by construction.
+
+# Ordinal strictness scales, strictness-ASCENDING (loosest first → strictest
+# last).  ``approval`` and ``sandbox`` are verified against the live enforcers
+# (approval pipeline; ``sandbox_tiers.py`` level dirs off<standard<cc<strict).
+_ORDINAL_SCALES: Dict[str, Tuple[str, ...]] = {
+    "approval": ("yolo", "auto", "interactive"),
+    "sandbox": ("off", "standard", "cc", "strict"),
+}
+
+
+def _match_identifier(item: str, pattern: str) -> bool:
+    """Case-insensitive fnmatch for opaque identifiers (tools, apps, agents)."""
+    return fnmatch.fnmatch(item.strip().casefold(), pattern.strip().casefold())
+
+
+def _match_command(item: str, pattern: str) -> bool:
+    """Case-sensitive fnmatch on a shell command body (deterministic per-OS).
+
+    Uses ``fnmatchcase`` (not ``fnmatch``) so the decision does not depend on
+    the host's filesystem case-folding — matching ``security``/``admission``.
+    """
+    return fnmatch.fnmatchcase(item, pattern)
+
+
+def _match_path(item: str, pattern: str, *, any_case: bool = False) -> bool:
+    """Glob match for filesystem paths, expanding ``~`` / ``$HOME``.
+
+    Case-sensitive on POSIX. On Windows either separator also matches, and with
+    *any_case* (a deny pattern only, ``_match_denied_path``) so does an ASCII
+    letter's other case (``_match_local_path``).  ``fnmatch``'s ``*`` already crosses
+    directory separators, which is the documented (broad) behaviour for a
+    deny-oriented read block; callers wanting precise segment semantics should
+    prefer narrower patterns.
+
+    Only the ITEM is normalized (``_norm_item``: expand → absolutize → lexically
+    collapse ``.``/``..``); the PATTERN is only ``~``/``$VAR``-expanded and is
+    matched verbatim.  Normalizing the item — never the pattern — does two jobs
+    and avoids one trap:
+
+    * a ``..`` traversal cannot satisfy an ALLOW-mode prefix:
+      ``/home/u/ws/../.bashrc`` normalizes to ``/home/u/.bashrc`` and does not
+      fnmatch ``/home/u/ws/**`` (without this ``*`` spans the ``..`` and the
+      write is wrongly PERMITTED though the OS resolves it outside the allow-list);
+    * an agent-supplied RELATIVE item is anchored to an absolute form, so it can
+      still match an absolute DENY glob (``../../etc/passwd`` cannot dodge
+      ``/etc/**``) instead of silently failing to match and falling open;
+    * the trap avoided: ``os.path.normpath`` must NOT touch the pattern — it treats
+      ``*``/``**`` as ordinary segments and collapses an adjacent ``..`` against
+      them (``/a/**/../b`` → ``/a/b``, silently dropping the ``**``), which would
+      widen an allow / shrink a deny.  Matching the pattern verbatim preserves the
+      operator's authored globs exactly.
+
+    Normalization is purely lexical (no filesystem ``resolve()``), so it adds no
+    I/O.  The relative-item anchor is the host process CWD (the same anchor the
+    resolved ``is_sensitive_path`` keystone uses); it cannot perfectly reconstruct
+    a backend's CWD, so that always-on keystone remains the authoritative,
+    resolved block for the trust-root / credential dirs.
+
+    LEXICAL-ONLY CONTRACT (no ``realpath``): matching does NOT resolve symlinks.
+    A symlink that lexically sits inside an allow-prefix
+    (``<allow>/link -> <secret>/key``) passes ``_match_path`` even though the OS
+    write lands at ``<secret>/key`` outside the allow-list.  This is intentional:
+    resolving would add filesystem I/O on every gate call and would refuse writes
+    through symlinks an operator placed deliberately (a common workspace layout).
+    The contract is therefore: **allow-mode prefixes are a lexical scoping aid,
+    not a hardened sandbox against symlinks** — the resolved ``is_sensitive_path``
+    keystone (which DOES ``resolve()``) is the authoritative guard for the
+    trust-root / credential dirs, and an operator must not rely on an allow-mode
+    prefix to confine writes in a directory that contains untrusted symlinks.
+    See ``docs/system-specs/modules/governance.md`` → "Path matcher".
+
+    A REMOTE-WORKSPACE target (:class:`~kiro_crew.platform.guest_paths.GuestPath`,
+    which only ``classify_tool_args`` mints, from arguments the permission-event
+    builder tagged) names a file on the Linux guest, so it is normalized with
+    ``posixpath`` instead (:func:`~kiro_crew.platform.guest_paths.guest_norm`):
+    anchored at the guest workdir, ``..`` and a leading ``//`` collapsed, no
+    ``~``/``$VAR`` expansion with this gateway's values. Chosen per item, so a local
+    call on a Windows gateway is matched exactly as before. One with no anchor
+    matches no pattern; ``classify_tool_args`` pairs it with the never-permittable
+    unverifiable item, which an allow-mode set refuses.
+    """
+    if isinstance(item, GuestPath):
+        norm = guest_norm(item)
+        return norm is not None and fnmatch.fnmatchcase(norm, _expand(pattern))
+    return _match_local_path(_norm_item(item), _expand(pattern), any_case=any_case)
+
+
+def _match_denied_path(item: str, pattern: str) -> bool:
+    """``_match_path`` for a DENY pattern: on Windows a letter also meets its other case.
+
+    Only a deny folds case. A Windows directory can be case sensitive
+    (``fsutil file setCaseSensitiveInfo``, which needs no elevation), and in one
+    ``private`` and ``Private`` are two directories. Folding case in an allow would
+    admit the one the operator did not name; folding it in a deny refuses at most
+    a directory the operator did not name, which fails closed.
+    """
+    return _match_path(item, pattern, any_case=True)
+
+
+def _match_host(item: str, pattern: str) -> bool:
+    """Case-insensitive fnmatch for network egress hosts / globs (DNS is CI)."""
+    return fnmatch.fnmatch(item.strip().casefold(), pattern.strip().casefold())
+
+
+def _match_mcp(item: str, pattern: str) -> bool:
+    """Match an MCP reference where a server grant covers all its tools.
+
+    ``item`` is the queried reference in canonical ``@server`` / ``@server/tool``
+    form (convert a raw ``mcp__server__tool`` title with :func:`mcp_title_to_ref`
+    first).  A ``@server`` pattern matches any ``@server/tool`` under it
+    (server-level grant); ``@server/tool`` matches only itself.  A deny at either
+    granularity is therefore final (handled by ``ScopedRuleset.permits`` in deny
+    mode).  Comparison is case-insensitive on the server/tool identifiers.
+    """
+    it = item.strip().casefold()
+    pat = pattern.strip().casefold()
+    if it == pat:
+        return True
+    # A whole-server pattern (no '/') covers every tool under that server.
+    if "/" not in pat:
+        return it.startswith(pat + "/")
+    return False
+
+
+#: ``scheme://host[:port]`` and nothing else: no path, query, fragment or userinfo.
+_ORIGIN_ITEM_RE = re.compile(r"^[a-z][a-z0-9+.-]*://(\[[0-9a-f:.]+\]|[^/?#@\s\[\]:]+)(:[0-9]+)?$")
+
+
+def _browser_idna(host: str) -> "str | None":
+    """*host* in the ``xn--`` form a browser sends (UTS #46, non-transitional).
+
+    ``None`` when the ``idna`` package is missing or the name does not convert, so
+    a caller refuses it rather than guessing: the standard-library codec is
+    IDNA2003, which maps ``faß.de`` to ``fass.de``, a different domain.
+    """
+    try:
+        import idna
+    except ImportError:
+        return None
+    try:
+        return idna.encode(host, uts46=True, transitional=False).decode("ascii").lower()
+    except (idna.IDNAError, UnicodeError, ValueError):
+        return None
+
+
+def _origin_form(text: str) -> str:
+    """*text* in one canonical origin spelling, so equal origins compare equal.
+
+    Lower-case; no trailing ``/``; no default port; the host's root dot dropped; an
+    IP literal in canonical form (``[2001:0db8::0:1]`` is ``[2001:db8::1]``); a
+    non-ASCII host in IDNA ``xn--`` form, as clients send it. Glob characters in a
+    policy entry are left as they are. Text that is not ``scheme://host[:port]``
+    comes back lower-cased only, and :func:`_match_origin` refuses it.
+    """
+    import ipaddress
+
+    t = text.strip().rstrip("/")
+    m = re.match(r"^([A-Za-z][A-Za-z0-9+.-]*)://(\[[^\]]*\]|[^/?#@\s\[\]:]+)(?::([0-9]+))?$", t)
+    if not m:
+        return t.casefold()
+    scheme, host, port = m.group(1).lower(), m.group(2), m.group(3)
+    bracketed = host.startswith("[")
+    raw = host[1:-1] if bracketed else host.rstrip(".")
+    try:
+        ip = ipaddress.ip_address(raw)
+        host = f"[{ip.compressed}]" if ip.version == 6 else ip.compressed
+    except ValueError:
+        if bracketed:
+            host = host.casefold()
+        else:
+            host = raw.lower() if raw.isascii() else _browser_idna(raw)
+            if host is None:
+                # Not convertible the way a browser does: matches nothing.
+                return ""
+    if port is not None:
+        port = str(int(port))
+        if (scheme, port) in (("http", "80"), ("https", "443")):
+            port = None
+    return f"{scheme}://{host}:{port}" if port else f"{scheme}://{host}"
+
+
+def _browser_origin(text: str) -> str:
+    """*text* as a browser's ``Origin`` header carries it: lower-case, no trailing
+    ``/``, no default port. No IDNA conversion and no IP rewriting."""
+    t = text.strip().rstrip("/").lower()
+    for scheme, port in (("http://", ":80"), ("https://", ":443")):
+        if t.startswith(scheme) and t.endswith(port):
+            return t[: -len(port)]
+    return t
+
+
+#: An enterprise ``dashboard_origins`` entry: a literal lower-case ASCII
+#: ``scheme://host[:port]`` with no glob, path, userinfo or written-out default port.
+ENTERPRISE_ORIGIN_ENTRY_RE = re.compile(
+    r"^https?://(\[[0-9a-f:.]+\]|[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*)"
+    r"(:[1-9][0-9]{0,4})?$"
+)
+
+
+def _match_origin(item: str, pattern: str) -> bool:
+    """Case-insensitive fnmatch for ``scheme://host[:port]`` origins, brackets literal.
+
+    Item and entry are both put in browser form first (:func:`_origin_form`), so
+    ``https://evil.example.com/`` and ``https://evil.example.com:443`` name the same
+    origin. An IPv6 origin carries ``[...]``, which fnmatch would read as a character
+    class, so ``[`` and ``]`` match only themselves; ``*`` and ``?`` stay wildcards.
+    An item that is not exactly ``scheme://host[:port]`` matches nothing: a ``*``
+    must not let a path, query or userinfo stand in for the host.
+    """
+    from kiro_crew import edition
+
+    if edition.is_enterprise():
+        # Exact set membership on the browser form. Entries were checked literal at
+        # load (``parsing``), so no glob, IDNA or IP rewriting is applied here.
+        return _browser_origin(item) == pattern
+    it = _origin_form(item)
+    if not _ORIGIN_ITEM_RE.match(it):
+        return False
+    literal = "".join({"[": "[[]", "]": "[]]"}.get(ch, ch) for ch in _origin_form(pattern))
+    return fnmatch.fnmatchcase(it, literal)
+
+
+def _match_ip(item: str, pattern: str) -> bool:
+    """An IP literal compared in canonical form (``0:0::0`` is ``::``); else a glob."""
+    import ipaddress
+
+    try:
+        return ipaddress.ip_address(item.strip()) == ipaddress.ip_address(pattern.strip())
+    except ValueError:
+        return _match_identifier(item, pattern)
+
+
+# Match-strategy registry.  A ScopedRuleset names its matcher; permits() looks
+# it up here.  Adding a domain = (optionally) one new entry, not evaluator code.
+_MATCHERS: Dict[str, Callable[[str, str], bool]] = {
+    "identifier": _match_identifier,
+    "command": _match_command,
+    "path": _match_path,
+    "host": _match_host,
+    "mcp": _match_mcp,
+    "origin": _match_origin,
+    "ip": _match_ip,
+}
+
+_DEFAULT_MATCHER = "identifier"
+
+# The strategy a DENY pattern is matched with, where it differs from ``_MATCHERS``.
+# A deny may match more widely than an allow, since a wider deny only fails closed.
+_DENY_MATCHERS: Dict[str, Callable[[str, str], bool]] = {
+    "path": _match_denied_path,
+}
+
+
+def _expand(path_str: str) -> str:
+    """Expand ``~`` and ``$VAR`` without touching the filesystem (no resolve())."""
+    return os.path.expanduser(os.path.expandvars(path_str))
+
+
+def _norm_item(path_str: str) -> str:
+    """Expand, absolutize, then lexically collapse ``.``/``..`` in a queried item.
+
+    Applied to the queried ITEM only (never a pattern — see ``_match_path``).
+    Four steps, all purely lexical (no filesystem ``resolve()``, no I/O):
+
+    1. ``_expand`` — ``~`` / ``$VAR`` substitution.
+    2. on Windows, fold a namespace or default-stream alias of a local path to its
+       plain spelling (``_fold_windows_alias``, the keystone's own fold):
+       ``\\\\?\\C:\\x``, ``\\\\.\\C:\\x``, ``//?/C:/x``, ``\\??\\C:\\x`` and
+       ``C:\\x::$DATA`` all open ``C:\\x``, so each would otherwise dodge a deny
+       naming ``C:\\x`` and satisfy no allow that names it. UNC, volume GUID and
+       named-stream spellings stay as written. Identity off Windows.
+    3. ``os.path.abspath`` — anchor a relative path (e.g. ``../../etc/passwd`` or
+       ``etc/passwd``) to the host CWD so it cannot dodge an absolute DENY glob by
+       failing to match; ``abspath`` also runs ``normpath``, collapsing ``..``.
+       An already-absolute path is unchanged except for the collapse.
+    4. collapse a leading ``//`` to ``/`` — POSIX (4.13) leaves a path beginning
+       with exactly two slashes implementation-defined, and ``normpath`` PRESERVES
+       it (``normpath('//etc/passwd') == '//etc/passwd'``).  An item supplied as
+       ``//etc/passwd`` would then not match a ``/etc/**`` deny even though the OS
+       opens ``/etc/passwd`` — a deny bypass.  Collapse so the lexical form equals
+       what the OS resolves.  A leading ``///+`` already normalizes
+       to a single ``/``, so only the exact ``//`` case needs this.
+
+    Collapsing ``..`` is what stops a traversal from satisfying an allow-prefix
+    glob.  ``abspath`` cannot reconstruct an ACP backend's actual CWD, so it is a
+    best-effort anchor; the resolved ``is_sensitive_path`` keystone remains the
+    authoritative block for the trust-root / credential dirs.
+    """
+    from kiro_crew.security.paths_resolver import _fold_windows_alias
+
+    p = os.path.abspath(_fold_windows_alias(_expand(path_str)))
+    if p.startswith("//") and not p.startswith("///"):
+        p = p[1:]
+    return p
+
+
+# Whether a local path is a Windows one. A module constant rather than an inline
+# ``os.name`` test so a POSIX run can read a path the way a Windows gateway does.
+_WINDOWS_PATHS = os.name == "nt"
+
+
+def _match_local_path(item: str, pattern: str, *, any_case: bool = False) -> bool:
+    """Whether a normalized local item meets an expanded pattern on this gateway.
+
+    POSIX compares the two as written. On Windows ``abspath`` writes an item with
+    ``\\`` while an operator writes a pattern with ``/``, the form the spec
+    documents (``~/.ssh/**`` expands to ``C:\\Users\\u/.ssh/**``, both separators in
+    one string), and a directory usually opens a name whatever its case. So on
+    Windows a separator the pattern writes outside a bracket expression also meets
+    the other separator (``_windows_glob``), and with *any_case* an ASCII letter
+    also meets its other case. Only a deny asks for that (``_match_denied_path``):
+    a directory may be case sensitive, and there an allow that folded case would
+    admit a sibling the operator did not name.
+
+    Nothing else changes, which is what keeps every rule's character sets intact.
+    The item is matched exactly as written, and a bracket expression, ``?`` and
+    ``*`` read it as they do on POSIX. Rewriting the pattern instead changes what
+    a bracket expression covers: lower-casing turns ``[A-z]`` into ``[a-z]``,
+    dropping ``_``, and ``/`` for ``\\`` turns ``[\\-z]`` into ``[/-z]``, adding the
+    digits. The Windows readings are an OR beside the as-written comparison, so no
+    deny loses a path that comparison covers. A negated class (``[!a-z]``) stays
+    exactly as case sensitive as the as-written match.
+
+    Only ASCII letters fold (``re.ASCII``). Unicode simple case folding pairs
+    letters NTFS keeps apart (``I`` and ``İ``, ``k`` and the Kelvin sign ``K``,
+    ``s`` and ``ſ``), so a full fold would make a deny refuse a name no spelling
+    of it opens. A non-ASCII letter in another case therefore matches only as
+    written.
+    """
+    if fnmatch.fnmatchcase(item, pattern):
+        return True
+    if not _WINDOWS_PATHS:
+        return False
+    either_separator = _windows_glob(_upper_drive(pattern))
+    if re.match(either_separator, _upper_drive(item)):
+        return True
+    return any_case and re.match(either_separator, item, re.IGNORECASE | re.ASCII) is not None
+
+
+def _upper_drive(path: str) -> str:
+    """*path* with a leading drive letter (``c:``) in upper case.
+
+    A drive letter names a volume, never a directory entry, so no directory's case
+    sensitivity applies to it. Only a literal letter followed by ``:`` is
+    touched, so no bracket expression is rewritten.
+    """
+    if len(path) >= 2 and path[1] == ":" and "a" <= path[0] <= "z":
+        return path[0].upper() + path[1:]
+    return path
+
+
+def _windows_glob(pattern: str) -> str:
+    """``fnmatch.translate(pattern)`` with each separator outside a class as ``[\\\\/]``.
+
+    A bracket expression is copied verbatim. It is found with ``fnmatch``'s own
+    scan, so the two agree on where one starts and ends: ``[`` opens it, a
+    leading ``!`` and then a leading ``]`` belong to it, the next ``]`` closes it,
+    and a ``[`` with no closing ``]`` is a literal. Each separator outside one is
+    swapped for a code point the pattern does not contain, which ``translate``
+    emits as itself, and that code point is then swapped for the class.
+    """
+    mark = next(chr(c) for c in range(0xE000, 0xF900) if chr(c) not in pattern)
+    out: list[str] = []
+    i, n = 0, len(pattern)
+    while i < n:
+        c = pattern[i]
+        if c == "[":
+            j = i + 1
+            if j < n and pattern[j] == "!":
+                j += 1
+            if j < n and pattern[j] == "]":
+                j += 1
+            while j < n and pattern[j] != "]":
+                j += 1
+            if j < n:
+                out.append(pattern[i : j + 1])
+                i = j + 1
+                continue
+        out.append(mark if c in "\\/" else c)
+        i += 1
+    return fnmatch.translate("".join(out)).replace(mark, r"[\\/]")
+
+
+# Schemes that actually open a network connection to a host. A URL on any other
+# scheme (mailto:, data:, javascript:, tel:, file:, blob:, …) contacts no host,
+# so the egress gate must not derive a phantom host from it.
+_NETWORK_SCHEMES = frozenset({"http", "https", "ws", "wss", "ftp", "ftps"})
+
+
+def _looks_like_host(token: str) -> bool:
+    """True if *token* looks like a network host (vs. a URI scheme word).
+
+    A real ``host:port`` input (``example.com:8080``, ``localhost:3000``,
+    ``127.0.0.1:9``) is mis-parsed by urlparse as ``scheme:path`` — the host
+    becomes the "scheme".  A non-network URI (``tel:80``, ``gopher:1234``,
+    ``mailto:443``) has a bare alphabetic-word scheme.  We distinguish by SHAPE
+    rather than a denylist of every URI scheme: a hostname contains a ``.`` or a
+    digit, or is exactly ``localhost``; a bare scheme word never does.  This is
+    what stops a non-network scheme + numeric payload from yielding a phantom
+    host without having to enumerate ``tel``/``gopher``/``sms``/… .
+    """
+    t = token.lower()
+    return t == "localhost" or "." in t or any(c.isdigit() for c in t)
+
+
+def _url_host(url: str) -> str:
+    """Extract the host from a URL for the ``host`` matcher (no network I/O).
+
+    Returns ``""`` for a URL that carries no network host, so a hostless URL is
+    NOT mis-classified as egress to a phantom host the fetch would never contact.
+    The cases, by shape of the input:
+
+    * ``scheme://authority/…`` — a host only when ``scheme`` is a known NETWORK
+      scheme (``http``/``https``/``ws``/``wss``/``ftp``/``ftps``).  ``file:///…``
+      and any other scheme with an authority return ``""``.
+    * no scheme (``host/path`` or ``//host/path``) — recover the authority via a
+      ``//`` retry.
+    * ``scheme:rest`` with NO ``://`` — EITHER a non-network URI
+      (``mailto:``/``tel:``/``data:`` → no host) OR the scheme-less ``host:port``
+      form that urlparse mis-reads as ``scheme:path`` (``example.com:8080`` →
+      scheme ``example.com``, path ``8080``).  We retry as an authority ONLY when
+      ``rest`` begins with a bare numeric port AND the parsed "scheme" looks like
+      a host (``_looks_like_host``).  ``example.com:8080`` / ``localhost:3000`` →
+      host; ``tel:80`` / ``mailto:443`` / ``gopher:1234`` → ``""`` (a bare-word
+      URI scheme is never a hostname), so they cannot yield a phantom host.
+    """
+    from urllib.parse import urlparse
+
+    try:
+        s = url.strip()
+        parsed = urlparse(s)
+        netloc = parsed.netloc
+        scheme = parsed.scheme.lower()
+        if "://" in s:
+            # Real scheme + authority: only a network scheme contacts a host.
+            netloc = netloc if scheme in _NETWORK_SCHEMES else ""
+        elif not scheme:
+            # Scheme-less ``host/path`` (netloc empty → recover via ``//`` retry)
+            # or protocol-relative ``//host/path`` (netloc already parsed → keep).
+            netloc = netloc or urlparse("//" + s).netloc
+        elif not netloc:
+            # ``scheme:rest`` with no ``://``: the ``host:port`` form ONLY when
+            # ``rest`` is a bare numeric port AND the parsed "scheme" looks like a
+            # hostname.  ``tel:80``/``mailto:443``/``gopher:1234`` have a bare-word
+            # scheme (not a host) so they stay hostless; ``example.com:8080`` /
+            # ``localhost:3000`` have a host-shaped token and resolve.
+            first_seg = parsed.path.split("/", 1)[0]
+            host_port_form = first_seg.isdigit() and _looks_like_host(scheme)
+            netloc = urlparse("//" + s).netloc if host_port_form else ""
+    except Exception:
+        return ""
+    # Strip userinfo + port: ``user:pass@host:443`` → ``host``.
+    host = netloc.rsplit("@", 1)[-1]
+    if host.startswith("["):  # IPv6 literal [::1]:443
+        return host[1 : host.index("]")] if "]" in host else host
+    return host.rsplit(":", 1)[0] if ":" in host else host
+
+
+def register_matcher(name: str, fn: Callable[[str, str], bool]) -> None:
+    """Register an additional match strategy (extensibility seam, append-only).
+
+    Raises if *name* is already registered with a different function so a typo
+    cannot silently shadow a built-in matcher.
+    """
+    existing = _MATCHERS.get(name)
+    if existing is not None and existing is not fn:
+        raise ValueError(f"matcher {name!r} is already registered")
+    _MATCHERS[name] = fn
+
+
+def url_policy_hosts(url: object) -> Tuple[str, ...]:
+    """Every host a client could connect to for *url*, for a ``host``-matcher list item.
+
+    A policy that names hosts is only as strong as the host it is asked about, and
+    the HTTP clients in use read one URL differently: ``urllib`` percent-decodes the
+    authority, ``requests``/``urllib3`` and ``aiohttp``/``yarl`` treat a backslash
+    as the start of the path and IDNA-encode a non-ASCII name, and ``yarl`` reads
+    an ideographic full stop as a dot. Rather than chase spellings, each client's
+    own parser is asked (when installed), plus the standard library's plain and
+    percent-decoded readings. A caller permits the request only when EVERY reading
+    returned here is permitted.
+
+    Each reading is lower-cased and loses any IPv6 zone and terminal DNS root
+    dot, so entries are written without the dot. An IP literal is asked in canonical form only
+    (dotted IPv4, compressed IPv6), so an IP entry names a host in that form. A
+    non-ASCII reading is not asked, because no client sends it as written; the
+    clients that encode it supply the ``xn--`` form they do send. Every other
+    ASCII reading is asked as read, even one with characters a DNS name does not
+    use, so a deny glob still sees it. A URL with no ASCII reading is asked as ``""``, which
+    matches no entry: an allow list refuses it and a deny list does not. So, as
+    for ``network.egress``, an allow list is the hard bound, entries name ASCII
+    (``xn--``) hosts, and a deny list refuses the spellings it can name.
+    """
+    from urllib.parse import unquote, urlsplit
+
+    text = str(url or "").strip()
+    raw: list = []
+
+    def _add(read: "Callable[[], object]") -> None:
+        try:
+            host = read()
+        except Exception:
+            return
+        if isinstance(host, str) and host:
+            raw.append(host.strip("[]"))
+
+    _add(lambda: urlsplit(text).hostname)
+    # The host part only: decoding the userinfo too would cut the authority at an
+    # encoded ``@`` or ``/`` in a password and invent a host from it.
+    _add(lambda: urlsplit("//" + unquote(urlsplit(text).netloc.rpartition("@")[2])).hostname)
+    # What ``urllib``/``http.client`` connect to for a non-ASCII name: Python's own
+    # ``idna`` codec, which maps ``ß`` to ``ss`` where ``urllib3``/``yarl`` keep it.
+    for read in list(raw):  # the two standard-library readings so far
+        if not read.isascii():
+
+            def _python_idna(host: str = read) -> str:
+                return host.encode("idna").decode("ascii")
+
+            _add(_python_idna)
+    _add(lambda: urlsplit(text.replace("\\", "/")).hostname)
+    try:
+        from urllib3.util import parse_url
+    except ImportError:
+        pass
+    else:
+        _add(lambda: parse_url(text).host)
+    try:
+        import yarl
+    except ImportError:
+        pass
+    else:
+        _add(lambda: yarl.URL(text).raw_host)
+
+    hosts: list = []
+
+    def _keep(host: str) -> None:
+        if host not in hosts:
+            hosts.append(host)
+
+    for host in raw:
+        spelled = host.lower()
+        # An IPv6 zone (``fe80::1%eth0``) names an interface, not another host.
+        if ":" in spelled and "%" in spelled:
+            spelled = spelled.split("%", 1)[0]
+        bare = spelled.rstrip(".")
+        ip = _canonical_ip(bare)
+        if ip:
+            # An IP literal is asked in canonical form only, whatever spelling the
+            # resolver accepts (``167772165``, ``0x0a000005``, ``::ffff:10.0.0.5``).
+            _keep(ip)
+            continue
+        if not bare.isascii():
+            # Not ASCII: no client sends it as written. The clients that
+            # IDNA-encode it contribute their own reading.
+            continue
+        # Any other ASCII reading is asked as read, even an odd one
+        # (``clip+one.blocked.example``): a resolver may still answer for it, so
+        # a deny glob must see it, and an allow list refuses it.
+        _keep(bare)
+    if not hosts:
+        # No reading is a host a client would send: ``""``, which an allow list
+        # refuses.
+        hosts.append("")
+    return tuple(hosts)
+
+
+def _canonical_ip(host: str) -> str:
+    """The canonical text of *host* when it is an IP literal in any form, else ``""``."""
+    import ipaddress
+
+    from kiro_crew.security import canonicalize_ip
+
+    try:
+        return str(ipaddress.ip_address(canonicalize_ip(host)))
+    except ValueError:
+        return ""
+
+
+#: The characters a host reading can hold: a URL host's own characters (RFC 3986
+#: unreserved, sub-delims and ``%``), lower-cased, plus an IP literal's colons.
+#: ``url_policy_hosts`` asks every ASCII reading, so a list entry is held to these.
+_PLAIN_HOST_RE = re.compile(r"[a-z0-9._~!$&'()*+,;=%:-]+")

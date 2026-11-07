@@ -1,0 +1,218 @@
+# Agents & Configuration
+
+Kiro Crew uses agent JSON configurations for LLM interaction. A configuration can define a model, system prompt, tools, permissions, resources, and MCP servers. The default agent is `kirocrew`; custom agents can be added alongside it.
+
+## Default Agent
+
+The generated default configuration is `~/.kiro/agents/kirocrew.json`. Its shipped defaults include:
+
+- Model: `auto`, which leaves model selection to the configured provider.
+- Built-in tools: shell, file, code-search, web, introspection, session, reporting, and tool-search tools.
+- `allowedTools` grants for selected safe tools and Kiro Crew MCP operations.
+- MCP servers: `kirocrew-cron` and `kirocrew-core`; `kirocrew-computer` is emitted only when computer use is enabled and supported on the current platform.
+- A `postToolUse` audit hook for shell calls. It appends each command to
+  `audit.log` under the data home (`~/.kiro/crew` or `KIROCREW_HOME`); the gateway
+  (and a standalone `kirocrew chat`, at its start) rotates that file at 8 MiB,
+  keeping one previous generation as `audit.log.1`.
+
+## Switching Agents
+
+### Globally (All Sessions)
+
+```
+!agent code-reviewer     # switch to a custom agent
+!agent off               # back to default kirocrew
+```
+
+### Per-Thread (Slack)
+
+```
+!ta code-reviewer        # this thread uses code-reviewer
+!ta off                  # remove thread override
+!ta                      # show current thread agent
+/agent code-reviewer     # same as !ta code-reviewer (owner only)
+```
+
+### Per-Tab (Dashboard)
+
+Use the agent selector dropdown in the chat topbar or welcome screen, or type
+`/agent <name>` in the chat: it makes the same switch as the selector, and a name
+no agent answers to is refused rather than silently running the default agent.
+The same command works in a Slack thread linked to a dashboard chat (it switches
+that chat's agent). `/agent list` and kiro-cli's other `/agent` subcommands are
+passed through unchanged. kiro-cli's built-in agents (`kiro_default`,
+`kiro_guide`, `kiro_planner`) have no spec file and are accepted by name.
+
+### Per-Conversation (Webex, Discord, Teams, Feishu)
+
+Send `/agent` (`!agent` on Discord) to see the conversation's agent and the
+agents you can pick: the same list Telegram's `/agent` picker shows, so Kiro
+Crew's own agents and app agents are not offered. `/agent <name>` switches:
+the conversation moves to that agent's latest conversation in this chat, or a
+new one, and switching back returns to the one you left. `/agent default` goes
+back to the default agent. `/new` after a switch always starts fresh. A switch waits until the
+current reply finishes. A conversation that continues a dashboard session keeps
+that session's agent; change it from the dashboard.
+
+### Per-Cron Job
+
+Cron jobs can specify an agent at creation time.
+
+## Built-in Agent Specs
+
+Kiro Crew owns and rewrites a fixed set of specs; [agent-spec-fields.md](agent-spec-fields.md) lists every one of them with what refreshes it. The primary and lite specs are required; the others support goal conducting, pipeline fleet supervision, security conducting, knowledge extraction, research, and heartbeat features.
+
+`kirocrew-conductor` tracks its goal in the work ledger: it mounts `kirocrew-work`, binds each item to a session before seeding it, and settles every completion claim with the acceptance evaluator instead of by reading a transcript. **Crew Mode** is a chat that runs on a conductor: pick `kirocrew-conductor` in the agent picker and the chat keeps its memory and history and runs on it. From the first message on it is locked, so the chat stays on the conductor; start a new chat to work with another agent. Making the conductor the default agent starts every new chat on it the same way. `agent.crew_mode_agent` names the conductor Crew Mode runs (default `kirocrew-team-lead`); changing it, or an update that ships a new default, moves every Crew Mode chat, new and old, onto the new conductor (a busy chat at its next idle point), and the chat keeps its work ledger. Every conductor is Crew Mode: a chat you started on the team lead, the pipeline, security or ledger conductor, scheduled ones included, is a Crew Mode chat when the dashboard loads it, locked the same way. A chat that turned Crew Mode on (switched onto the conductor, or a new chat born on it) keeps the sessions it dispatches out of your folders; History still lists them. A conductor chat from before the switch existed keeps filing them as it always did. Nothing is deleted and no folder moves. The server enforces the lock: once the chat has a user message, switching a Crew Mode chat to another agent, from the picker, `/agent` or a session-control send, is refused with `409 crew_mode_locked`, and an agent switch the backend makes mid-turn is blocked the same way. Before the first message only a switch back to a template that is not a conductor passes. The pipeline and security conductors mount `kirocrew-work` too and record each item they dispatch as a work-ledger row, which is what their Dashboard tab reads; their own queue or findings ledger stays the detail behind that row. `kirocrew-ledger-conductor` is a deprecated alias of it — the same spec under the flow's old name, kept for one release so a session or cron that names the old string keeps resolving, and removed next release. `kirocrew-worker` is the agent a conductor names for a leaf item — the default agent's own resolved toolset plus the two reporting tools. In short, `kirocrew-worker` is `kirocrew` + `@kirocrew-work` − cron scheduling − the opt-in sets nobody assigned to it: a worker gets your default agent's own toolset so it can do any item's work, but it does not auto-approve scheduling a recurring job that would outlive the item. Which fields are mirrored, when the mirror is re-checked, and what happens when it cannot be re-derived are in [agent-spec-fields.md](agent-spec-fields.md).
+
+### Ultra Mode is a feature preview
+
+The dashboard's Ultra Mode is off until you turn on **Settings → Developer →
+Feature Previews → Ultra Mode**. It is a per-device switch, kept in this browser.
+On, a new chat's composer offers the Ultra Mode switch, an ongoing plain chat
+offers it right of the permission button (it turns that chat into an Ultra Mode
+chat, one way), an Ultra Mode chat shows its
+welcome, its side panel's **Crew** tab lists its crew members, and the Sessions
+list draws it as a crew card with an **Ultra Mode** filter. Its crew members are
+listed there, not as rows of your list.
+
+Off, the dashboard looks as it did before Ultra Mode:
+
+- no Ultra Mode switch, welcome, filter, Board tab or crew member breadcrumb;
+- the Ultra Mode agent templates are in the agent picker like any agent;
+- a chat already in Ultra Mode is an ordinary chat on its agent, and each of its
+  crew members is an ordinary row of your list, whose approvals and finished
+  turns alert you like any chat's;
+- an Ultra Mode chat you started yourself that has a message offers no agent
+  switch, since the gateway keeps it on its agent.
+
+The gateway is the same either way: the switch changes only what this dashboard
+shows. An Ultra Mode chat stays locked to its agent (`409 crew_mode_locked`) and
+its crew members stay out of your folders while the preview is off.
+
+## Custom Agents
+
+Custom agents are JSON or markdown files in `~/.kiro/agents/` (or a project's `.kiro/agents/`). They define their own system prompt, tools, MCP servers, and permissions. To create, edit or delete your own custom agents in the app, open **Customize → Custom agents**: it lists every installed custom agent by origin, edits the ones you own (description, model, prompt, tools, skills), duplicates a package or built-in one into one you own, and refuses to delete a custom agent while a Bot, the default agent, a schedule, a chat folder's default agent, a webhook token or a private copy still uses it — the refusal lists them. Deleting on disk also works: remove the file from `~/.kiro/agents/`. A crew still bound to a deleted name does not break: kiro-cli cannot resolve the missing spec and falls back to the default agent spec for that session, so the crew keeps running — with the default prompt and tools instead of the deleted template's. Check a template's bindings and repoint them before removing the file so no crew silently changes behavior.
+
+```json
+{
+  "name": "code-reviewer",
+  "description": "Reviews code changes",
+  "model": "claude-opus",
+  "prompt": "file:///path/to/prompt.md",
+  "tools": ["fs_read", "grep", "glob", "@kirocrew-core"],
+  "allowedTools": ["fs_read", "grep", "glob"]
+}
+```
+
+### Markdown agents
+
+The same agent can be one markdown file, the form kiro-cli v3 (KAS) and Kiro IDE read: YAML frontmatter carries the fields, the body is the system prompt.
+
+```markdown
+---
+name: code-reviewer
+description: Reviews code changes
+tools: ["read"]
+---
+
+# Code reviewer
+
+You review code changes. Keep every answer short.
+```
+
+Rules that decide whether a `.md` file is an agent:
+
+- It must open with `---` on the first line and close the frontmatter with a line that is exactly `---`. A markdown file without that fence (a `README.md`, notes) is not an agent and is never listed. A file that HAS the fence but fails to parse is not skipped: it announced itself as a spec, so it stays an unreadable spec and is reported as one.
+- The frontmatter must be a YAML mapping. Nested fields (`mcpServers`, `permissions`) work as in JSON.
+- The body is the prompt. A frontmatter `prompt` field is used only when the body is empty.
+- `<name>.json` and `<name>.md` side by side is the same agent twice. In Kiro Crew the JSON file wins and the markdown file is not read; the gateway log warns which file is shadowed. kiro-cli v3's own on-disk loader resolves the pair the other way round (checked against the loader bundled with kiro-cli 2.21.4: it reads files in name order and the later `.md` overwrites), so keep one file per name to get the same agent everywhere. If you kept a JSON copy as a workaround, delete one of the two.
+- `tools: read, write` (a comma-separated string, which kiro-cli v3 also accepts) is read as the list `["read", "write"]`.
+- The frontmatter must be a JSON-shaped document: YAML anchors and aliases (`&name` / `*name`) are refused (repeat the value instead), an unquoted date stays the text you typed, and a value with no JSON form (`!!binary`, `!!set`, a non-string key, `.inf`) makes the file unreadable as a spec, with the offending key named in the log.
+
+What differs from a JSON agent:
+
+| | JSON | Markdown |
+|---|---|---|
+| Listed in pickers, model resolution, MCP gateway stubs, Connections census | yes | yes |
+| Runs on the `kas` backend | yes | yes |
+| Runs on the `kiro` (kiro-cli) backend | yes | no: kiro-cli loads JSON only, so an agent that has no JSON spec in either the project's `.kiro/agents` or `~/.kiro/agents` does not become the session's active agent, and the session is refused at start with a message naming the markdown file. Switch `agent.acp_backend` to `kas` or add a JSON spec in either scope. |
+| Edited by Kiro Crew (Template pane PATCH, `kirocrew agent reset-model`, bookkeeping migration, fork refresh) | yes | no: the file is read-only to Kiro Crew. Edit the frontmatter yourself. The dashboard answers `409 markdown_spec_readonly`. |
+
+## Managing Agents
+
+**Customize → Custom agents** lists every agent definition and is where one is edited — model, system prompt, skills and tools. A Bot's editor (**Customize → Bots**, or the Bots page) shows the agent it is built from in its **Built from** section, read-only: a Bot does not own that definition, so editing it there would change every Bot built from the same agent. Drop a new JSON or markdown file into `~/.kiro/agents/` and it appears automatically. `/agents` redirects to Customize.
+
+## Mapping Skills to an Agent
+
+Each agent template can be given its own set of [skills](skills.md). Open **Customize → Custom agents**, select the agent, and use its **Skills** section to add or remove them. Every edit saves immediately.
+
+Under the hood a mapped skill is a `skill://` entry in the agent's `resources`. Kiro Crew reads that entry to scope the agent's skill directory and its `skill_search`/read access; it does not rely on the native backend loading `skill://` resources. Native launch views carry no `skill://` resources (see `src/kiro_crew/acp/skill_projection_parts/preparation.py`), and Kiro Crew supplies the skill directory itself:
+
+```json
+{
+  "name": "code-reviewer",
+  "resources": [
+    "file://.kiro/steering/**/*.md",
+    "skill://~/.kiro/skills/kirocrew-prepare-pr/SKILL.md"
+  ]
+}
+```
+
+Resolution rules:
+
+| Agent | Mapping | Skills it sees |
+|-------|---------|----------------|
+| `kirocrew` | none | the whole catalog (default) |
+| `kirocrew` | mapped | only the mapped skills |
+| custom | none | none — the agent brings its own |
+| custom | mapped | only the mapped skills |
+
+`file://` resources (steering globs) are never touched by the editor, and hand-authored `skill://` entries the editor cannot express — wildcards like `skill://~/.kiro/skills/*/SKILL.md`, or paths outside the known skill roots — are listed read-only and preserved across edits.
+
+What the Skills section shows:
+
+- When two installed package skills share a name, each chip and picker row adds a **Located in …** line naming that copy's directory, so you can tell which copy is mapped.
+- A mapped non-package skill with no installed copy shows as a warning chip, with a count under the list telling you to remove it and pick a replacement.
+- If the skill catalog cannot be read, the section shows **Could not load the skill catalog.** and **Add skill** is disabled.
+
+## Agent Config Files
+
+| File | Purpose |
+|------|---------|
+| `src/kiro_crew/config/defaults.json` | Shipped base configuration. A development project can override it with `agents/defaults.json`. |
+| `src/kiro_crew/config/prompt.md` | Shipped system prompt. A development project can override it with `agents/prompt.md`. |
+| `~/.kiro/crew/agent.json` | Optional user overrides merged on top of defaults. |
+| `~/.kiro/crew/prompt.md` | Optional user prompt override, which takes priority over the shipped prompt. It must be UTF-8: a file that is unreadable, misencoded (for example UTF-16 from PowerShell redirection) or refused falls back to the shipped prompt with a gateway WARNING. |
+| `~/.kiro/agents/kirocrew.json` | Installed generated agent configuration. Rebuilt on every gateway start; not the place to add an MCP server. |
+
+## MCP Servers on the Default Agent
+
+Kiro Crew rebuilds `kirocrew.json` on every gateway start from the shipped
+defaults, `~/.kiro/crew/agent.json`, and every MCP source it reads: the Kiro
+global `~/.kiro/settings/mcp.json`, the dashboard's own server list
+(`~/.kiro/crew/mcp.json`), installed apps, and edition-provided servers. It
+copies those servers into the spec itself, so the spec pins `includeMcpJson`
+off.
+
+To add, turn on or turn off an MCP server, use **Customize → Connections → MCP
+Servers** (`/capabilities?tab=mcp&view=mcp-servers`). An agent asked to do it
+opens that page with `find_ui` or a guide, or offers an MCP card through
+`propose_change`. It does not tell you to hand-edit `kirocrew.json` or run
+`jq`/`sed` on it.
+
+If a server's tools are missing from sessions, check that tab first. A server
+whose program is not found on this computer is dropped from the spec at the
+rebuild, and the gateway log names it (`Dropping MCP server ...: command not
+found`).
+
+## Reinstalling Agent Config
+
+```bash
+kirocrew setup --agent-only
+```
+
+This regenerates `kirocrew.json` from the current defaults and user overrides.
+
+## Architecture Note
+
+Each agent session runs through the configured ACP backend and has its own system prompt, tools, and MCP servers.

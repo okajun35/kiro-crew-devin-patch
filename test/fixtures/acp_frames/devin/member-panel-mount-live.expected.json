@@ -1,0 +1,554 @@
+[
+  {
+    "agent_capabilities": {
+      "_meta": {
+        "cognition.ai/chains": true,
+        "cognition.ai/commandRevision": true,
+        "cognition.ai/documentLifecycle": true,
+        "cognition.ai/editableCommands": true,
+        "cognition.ai/megaplan": true,
+        "cognition.ai/mentionTypes": [
+          {
+            "type": "file"
+          },
+          {
+            "type": "directory"
+          },
+          {
+            "type": "git"
+          },
+          {
+            "icon": "book",
+            "label": "Rules",
+            "type": "rule"
+          },
+          {
+            "icon": "zap",
+            "label": "Skills",
+            "type": "skill"
+          },
+          {
+            "icon": "file-text",
+            "label": "Plans",
+            "type": "plan"
+          },
+          {
+            "type": "conversation"
+          },
+          {
+            "type": "terminal"
+          },
+          {
+            "icon": "map",
+            "label": "Codemaps",
+            "type": "codemap"
+          }
+        ],
+        "cognition.ai/midTurnPrompts": true,
+        "cognition.ai/multiRootWorkspace": true,
+        "cognition.ai/persistOnCreate": true,
+        "cognition.ai/ruleMentions": true,
+        "cognition.ai/sessionDefaultConfigOptions": true,
+        "cognition.ai/sessionListContentSearch": true,
+        "cognition.ai/sessionListOrderBy": [
+          "updated_at",
+          "created_at"
+        ],
+        "cognition.ai/sessionListSortDirection": true,
+        "cognition.ai/sessionRename": true,
+        "cognition.ai/sessionShare": true,
+        "cognition.ai/terminalLifecycle": true,
+        "cognition.ai/userConfig": true,
+        "cognition.ai/userEdits": true,
+        "cognition.ai/userShellCommand": true
+      },
+      "auth": {},
+      "loadSession": true,
+      "mcpCapabilities": {
+        "http": true,
+        "sse": true
+      },
+      "promptCapabilities": {
+        "audio": false,
+        "embeddedContext": true,
+        "image": true
+      },
+      "sessionCapabilities": {
+        "additionalDirectories": {},
+        "close": {
+          "_meta": {
+            "cognition.ai/force": true
+          }
+        },
+        "delete": {},
+        "list": {}
+      }
+    },
+    "agent_version": "0.0.0-dev",
+    "frame": "response",
+    "id": 1,
+    "protocol_version": 1
+  },
+  {
+    "action": "skip",
+    "frame": "_cognition.ai/mcp/serversChanged"
+  },
+  {
+    "action": "skip",
+    "frame": "_cognition.ai/mcp/serversChanged"
+  },
+  {
+    "action": "skip",
+    "frame": "_cognition.ai/mcp/serversChanged"
+  },
+  {
+    "action": "update",
+    "events": [],
+    "frame": "session/update",
+    "session_update": "available_commands_update"
+  },
+  {
+    "config_options": [
+      {
+        "category": "mode",
+        "currentValue": "accept-edits",
+        "id": "mode",
+        "name": "Session Mode",
+        "options": [
+          {
+            "_meta": {
+              "cognition.ai/icon": "code"
+            },
+            "description": "Write and edit code",
+            "name": "Code",
+            "value": "accept-edits"
+          }
+        ],
+        "type": "select"
+      },
+      {
+        "category": "model",
+        "currentValue": "swe-2-high",
+        "description": "AI model to use",
+        "id": "model",
+        "name": "Model",
+        "options": [
+          {
+            "_meta": {
+              "cognition.ai/supportsImages": true
+            },
+            "name": "SWE-2",
+            "value": "swe-2-high"
+          }
+        ],
+        "type": "select"
+      },
+      {
+        "category": "thought_level",
+        "currentValue": "high",
+        "id": "thought_level",
+        "name": "Thinking",
+        "options": [
+          {
+            "name": "High",
+            "value": "high"
+          }
+        ],
+        "type": "select"
+      },
+      {
+        "category": "model_config",
+        "currentValue": "standard",
+        "id": "speed",
+        "name": "Speed",
+        "options": [
+          {
+            "name": "Standard",
+            "value": "standard"
+          }
+        ],
+        "type": "select"
+      }
+    ],
+    "frame": "response",
+    "id": 2,
+    "modes": {
+      "advertised": true,
+      "current": "accept-edits",
+      "ids": [
+        "accept-edits",
+        "smart",
+        "ask",
+        "plan",
+        "bypass"
+      ]
+    },
+    "session_id": "devin-session-1"
+  },
+  {
+    "action": "update",
+    "events": [],
+    "frame": "session/update",
+    "session_update": "session_info_update"
+  },
+  {
+    "action": "skip",
+    "frame": "_cognition.ai/mcp/serversChanged"
+  },
+  {
+    "action": "update",
+    "events": [
+      {
+        "kind": "thinking_chunk",
+        "text": "The user wants me to call `panel_templates` on `kirocrew-panel` once, but also said to use no other tools. My policy requires calling `mcp_list_tools` first to discover the schema, which conflicts with the user's constraint. Since the user explicitly named the tool, I'll prioritize their instruction and call `mcp_call_tool` directly with `server_name=\"kirocrew-panel\"`, `tool_name=\"panel_templates\"`, and `arguments={}`."
+      }
+    ],
+    "frame": "session/update",
+    "session_update": "agent_thought_chunk",
+    "text_chunk": {
+      "text": "The user wants me to call `panel_templates` on `kirocrew-panel` once, but also said to use no other tools. My policy requires calling `mcp_list_tools` first to discover the schema, which conflicts with the user's constraint. Since the user explicitly named the tool, I'll prioritize their instruction and call `mcp_call_tool` directly with `server_name=\"kirocrew-panel\"`, `tool_name=\"panel_templates\"`, and `arguments={}`.",
+      "thinking": true
+    }
+  },
+  {
+    "action": "update",
+    "events": [
+      {
+        "kind": "text_chunk",
+        "text": "I'll"
+      }
+    ],
+    "frame": "session/update",
+    "session_update": "agent_message_chunk",
+    "text_chunk": {
+      "text": "I'll",
+      "thinking": false
+    }
+  },
+  {
+    "action": "skip",
+    "frame": "_cognition.ai/thinking_complete",
+    "params": {
+      "blockIndex": 0,
+      "durationMs": 1,
+      "sessionId": "devin-session-1"
+    }
+  },
+  {
+    "action": "update",
+    "events": [],
+    "frame": "session/update",
+    "session_update": "usage_update",
+    "usage": [
+      16660,
+      262000
+    ],
+    "usage_cost": null
+  },
+  {
+    "action": "update",
+    "events": [],
+    "frame": "session/update",
+    "session_update": "usage_update",
+    "usage": [
+      16660,
+      262000
+    ],
+    "usage_cost": null
+  },
+  {
+    "action": "permission",
+    "events": [
+      {
+        "kind": "permission_request",
+        "options": [
+          {
+            "id": "allow_once",
+            "label": "Allow once"
+          },
+          {
+            "id": "reject_once",
+            "label": "Reject"
+          }
+        ],
+        "request_id": "crew-devin-gate-df19b9c89f0041a58e3ae1b25990c3d1",
+        "title": "mcp__kirocrew-panel__panel_templates",
+        "tool_call_id": "mcp_call_tool:0#7f348f8db9ee48a9ad8ce6b4bbb03049"
+      }
+    ],
+    "frame": "session/request_permission",
+    "recorded_options": {
+      "always": "allow_once",
+      "once": "allow_once",
+      "reject": "reject_once"
+    }
+  },
+  {
+    "action": "update",
+    "events": [
+      {
+        "kind": "tool_call",
+        "title": "Calling panel_templates from kirocrew-panel",
+        "tool_call_id": "mcp_call_tool:0#7f348f8db9ee48a9ad8ce6b4bbb03049",
+        "tool_kind": "unknown",
+        "wire_title": "Calling panel_templates from kirocrew-panel"
+      }
+    ],
+    "frame": "session/update",
+    "session_update": "tool_call"
+  },
+  {
+    "action": "update",
+    "events": [],
+    "frame": "session/update",
+    "session_update": "tool_call_update"
+  },
+  {
+    "action": "update",
+    "events": [
+      {
+        "kind": "tool_call_update",
+        "title": "Called panel_templates from kirocrew-panel",
+        "tool_call_id": "mcp_call_tool:0#7f348f8db9ee48a9ad8ce6b4bbb03049",
+        "wire_title": "Called panel_templates from kirocrew-panel"
+      }
+    ],
+    "frame": "session/update",
+    "session_update": "tool_call_update"
+  },
+  {
+    "action": "update",
+    "events": [
+      {
+        "kind": "tool_result",
+        "tool_call_id": "mcp_call_tool:0#7f348f8db9ee48a9ad8ce6b4bbb03049",
+        "tool_final": true,
+        "tool_output": "Error: tool 'panel_templates' is unavailable because this server could not reach the gateway to read session dashboard_member-probe's tool policy (resolution_failed): the read got no answer, or the gateway answered that it is broken (cause: URLError). No agent spec is implicated and nothing needs editing. Refusing the call rather than ignoring an operator's exclusion list; the call succeeds on retry within 60s of the gateway answering again.",
+        "tool_output_bytes": 445,
+        "tool_output_digest": "c400faa39ffae6c88c831b0f5b29c078ee02f6da53b9dca6ad6c6a396f0387a1",
+        "tool_status": "completed"
+      }
+    ],
+    "frame": "session/update",
+    "session_update": "tool_call_update"
+  },
+  {
+    "action": "skip",
+    "frame": "_cognition.ai/thinking_complete",
+    "params": {
+      "blockIndex": 1,
+      "durationMs": 2,
+      "sessionId": "devin-session-1"
+    }
+  },
+  {
+    "action": "update",
+    "events": [
+      {
+        "kind": "text_chunk",
+        "text": " only called it once"
+      }
+    ],
+    "frame": "session/update",
+    "session_update": "agent_message_chunk",
+    "text_chunk": {
+      "text": " only called it once",
+      "thinking": false
+    }
+  },
+  {
+    "action": "update",
+    "events": [
+      {
+        "kind": "text_chunk",
+        "text": "."
+      }
+    ],
+    "frame": "session/update",
+    "session_update": "agent_message_chunk",
+    "text_chunk": {
+      "text": ".",
+      "thinking": false
+    }
+  },
+  {
+    "action": "update",
+    "events": [],
+    "frame": "session/update",
+    "session_update": "usage_update",
+    "usage": [
+      17075,
+      262000
+    ],
+    "usage_cost": null
+  },
+  {
+    "action": "update",
+    "events": [],
+    "frame": "session/update",
+    "session_update": "usage_update",
+    "usage": [
+      17075,
+      262000
+    ],
+    "usage_cost": null
+  },
+  {
+    "action": "skip",
+    "frame": "_cognition.ai/turn_stats",
+    "params": {
+      "responseDimensions": [
+        {
+          "groupTitle": "Response Statistics",
+          "kind": {
+            "pluralTail": " messages",
+            "prefix": "",
+            "tail": " message",
+            "type": "cumulativeMetric",
+            "value": 2.0
+          },
+          "label": "Agent messages",
+          "uid": "agent_messages"
+        },
+        {
+          "groupTitle": "Response Statistics",
+          "kind": {
+            "type": "metric",
+            "value": "SWE-2 High"
+          },
+          "label": "Model",
+          "uid": "model"
+        },
+        {
+          "groupTitle": "Token Usage",
+          "kind": {
+            "pluralTail": " tokens",
+            "prefix": "",
+            "tail": " token",
+            "type": "cumulativeMetric",
+            "value": 6701.0
+          },
+          "label": "Input tokens",
+          "uid": "input_tokens"
+        },
+        {
+          "groupTitle": "Token Usage",
+          "kind": {
+            "pluralTail": " tokens",
+            "prefix": "",
+            "tail": " token",
+            "type": "cumulativeMetric",
+            "value": 602.0
+          },
+          "label": "Output tokens",
+          "uid": "output_tokens"
+        },
+        {
+          "groupTitle": "Token Usage",
+          "kind": {
+            "pluralTail": " tokens",
+            "prefix": "",
+            "tail": " token",
+            "type": "cumulativeMetric",
+            "value": 26432.0
+          },
+          "label": "Cached input tokens",
+          "uid": "cached_input_tokens"
+        }
+      ],
+      "sessionId": "devin-session-1",
+      "turnClientMessageId": "ae569847-ddee-4d6d-8939-88ed0b7bd7e8",
+      "turnRequestId": "7ad15f0d-f42d-4d54-9527-f874424534dd"
+    }
+  },
+  {
+    "action": "skip",
+    "frame": "_cognition.ai/agent_stopped",
+    "params": {
+      "cause": "complete",
+      "sessionId": "devin-session-1",
+      "stats": {
+        "commandsRun": 0,
+        "filesChanged": 0,
+        "inputTokens": 16782,
+        "modelLabel": "SWE-2 High",
+        "outputTokens": 293,
+        "requestId": "7ad15f0d-f42d-4d54-9527-f874424534dd",
+        "responseDimensions": [
+          {
+            "groupTitle": "Response Statistics",
+            "kind": {
+              "pluralTail": " messages",
+              "prefix": "",
+              "tail": " message",
+              "type": "cumulativeMetric",
+              "value": 2.0
+            },
+            "label": "Agent messages",
+            "uid": "agent_messages"
+          },
+          {
+            "groupTitle": "Response Statistics",
+            "kind": {
+              "type": "metric",
+              "value": "SWE-2 High"
+            },
+            "label": "Model",
+            "uid": "model"
+          },
+          {
+            "groupTitle": "Token Usage",
+            "kind": {
+              "pluralTail": " tokens",
+              "prefix": "",
+              "tail": " token",
+              "type": "cumulativeMetric",
+              "value": 6701.0
+            },
+            "label": "Input tokens",
+            "uid": "input_tokens"
+          },
+          {
+            "groupTitle": "Token Usage",
+            "kind": {
+              "pluralTail": " tokens",
+              "prefix": "",
+              "tail": " token",
+              "type": "cumulativeMetric",
+              "value": 602.0
+            },
+            "label": "Output tokens",
+            "uid": "output_tokens"
+          },
+          {
+            "groupTitle": "Token Usage",
+            "kind": {
+              "pluralTail": " tokens",
+              "prefix": "",
+              "tail": " token",
+              "type": "cumulativeMetric",
+              "value": 26432.0
+            },
+            "label": "Cached input tokens",
+            "uid": "cached_input_tokens"
+          }
+        ],
+        "tokensPerSec": 523.2142857142858,
+        "toolCalls": 1,
+        "totalTimeMs": 2962,
+        "ttftMs": 2402
+      }
+    }
+  },
+  {
+    "frame": "response",
+    "id": 3,
+    "prompt_tokens": [
+      16782,
+      293,
+      16640,
+      0
+    ],
+    "stop_reason": "end_turn"
+  }
+]

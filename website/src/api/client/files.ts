@@ -1,0 +1,355 @@
+/**
+ * Files and projects on the gateway host: worktree creation, recent
+ * projects, directory, drive and file browsing, project git status/log/tree,
+ * named workspaces, reveal/open, the file picker, diff, fuzzy search, path
+ * completion, composer and Files-panel uploads, screenshots, and PlantUML
+ * diagrams drawn by the host's own `plantuml`.
+ */
+
+import { COMPOSER_UPLOAD_PATH, uploadComposerFiles } from '../../utils/composerUpload'
+import { chatSlotParam } from '../../utils/fileReadUrl'
+import type { ClientTransport } from './transport'
+
+/** Response of POST /api/reveal. When the backend cannot drive a file manager
+ *  (a remote or headless session) it degrades to a clipboard copy: `copy` is the
+ *  path to write. The caller (`revealOrOpen`) writes the clipboard silently — the
+ *  affordance that routed here already promised a copy. */
+type RevealResult = { copy?: string }
+
+/** GET/PUT /api/aws/project-profile. `profile` is the bound name, `boundDir` the mapped directory
+ *  that binds it (the project itself or an ancestor), `status` the sign-in health of a bound
+ *  profile: `expired` is an SSO sign-in that no longer resolves. Names only: no account or ARN. */
+export interface ProjectAwsProfile {
+  path: string
+  profile: string | null
+  boundDir: string | null
+  profiles: string[]
+  status?: 'ok' | 'expired' | 'unavailable' | null
+}
+
+/** localStorage key of the Files panel's "Show hidden files" toggle (`usePersistedBool`, off by default). */
+export const SHOW_HIDDEN_FILES_KEY = 'mc-files-show-hidden'
+
+/** Whether that toggle is on, read when a listing is requested. The listings' query keys stay as
+ *  they are, so every reader of one key keeps sharing one request; the toggle refetches both
+ *  listings when it flips (`FileBrowserRail`). On, `browseFiles` also lists dot-files and
+ *  `projectTree` also lists the dot-files `.gitignore` names, both still behind the server's
+ *  sensitive-path checks. */
+function showHiddenFiles(): boolean {
+  try {
+    return localStorage.getItem(SHOW_HIDDEN_FILES_KEY) === '1'
+  } catch {
+    return false
+  }
+}
+
+/** GET /api/project/tree: one folder level of a project directory. */
+export interface ProjectTreePayload {
+  root: string
+  dir?: string
+  paths: string[]
+  directories?: string[]
+  repo: boolean
+  truncated?: boolean
+  truncatedDirectories?: string[]
+  hiddenOnlyDirectories?: string[]
+  unreadableDirectories?: string[]
+  linkedDirectories?: string[]
+  nestedRepoDirectories?: string[]
+}
+
+/** One file a chat session edited: absolute path, latest change time (ISO),
+ *  and whether it is still on disk. */
+export interface SessionFile {
+  path: string
+  ts: string
+  exists: boolean
+}
+
+/** GET /api/project/session-files. `truncated`: more files than the list
+ *  holds, the oldest left out. `withheld`: edits it cannot name here (a
+ *  sensitive or unresolvable path, files a turn's own record left out). */
+export interface SessionFilesPayload {
+  files: SessionFile[]
+  truncated: boolean
+  withheld?: boolean
+}
+
+/** GET /api/project/session-file-diff: the texts of the newest change this chat
+ *  recorded to one file. `available` false: no whole pair is recorded, so the
+ *  caller shows the working-tree diff instead. */
+export interface SessionFileDiffPayload {
+  path: string
+  available: boolean
+  before: string
+  after: string
+}
+
+/** Deadline for the whole-tree walks, `api.fileSearch` and `api.projectTree`. Its own literal,
+ *  deliberately not an alias of the skills menu's: the two happen to agree today, and retuning
+ *  that menu must not silently retune these walks. The tree read shares this bound rather than
+ *  the listings' 10s because it walks the tree, which is what the figures below timed.
+ *  This bounds an unbounded wait, it does not judge staleness — a reply for a
+ *  superseded query cannot be shown as the answer to a newer one, since the query key
+ *  carries `debouncedQuery` — so a merely slow walk is still worth waiting for.
+ *
+ *  It has to be, because the timeout path offers recovery: a bound under the honest walk time
+ *  fails every attempt alike. The walk is ceilinged, not open-ended (`_WALK_MAX_DIRS_VISITED`
+ *  20k dirs, `_WALK_MAX_SCAN_SCOPED` 50k entries), so its worst case follows those ceilings
+ *  rather than repo size. Measured on trees that reach a ceiling: an 877k-dir tree 4.20s,
+ *  `/var` 0.35s cold against 0.34s warm, `/usr` 0.17s. The worst is 28% of this budget, and
+ *  cold-vs-warm moved 2%, so store latency dominates cache state — a store ~3.6x slower than
+ *  that tree would exhaust 15s, and no tree size alone can.
+ *
+ *  Margin: this is the only wall-clock bound on either read — the backend's pool ceiling bounds
+ *  how many probes can wedge, not how long a client waits (`_PATH_PROBE_EXEC_CEILING_SECS`). The
+ *  search's own work is the ceilinged walk above, worst 4.20s, leaving ~10s of 15 for admission
+ *  (2s at most, then a coded 503) and round trips. The tree read's git steps carry per-step kill
+ *  switches (`rev-parse` 5s, `ls-files` 15s) that sum PAST this bound on purpose: a git wedged that
+ *  long is what the bound is for, and the read rejects here at 15s into the Refresh notice.
+ *  The walk figures are local-disk only; a network-mount sample, and a slow-store escape if the
+ *  headroom does not hold there, are tracked in #11419 -- until then a timed-out search's Retry /
+ *  Refresh re-enters this same bound, deliberately (see lib/withDeadline.ts on retry).
+ *
+ *  One constant rather than one per surface: a caller's `limit` only caps rows returned
+ *  (the server truncates before responding), so a wider page is not a longer walk. */
+export const FILE_SEARCH_TIMEOUT_MS = 15_000
+
+/** Deadline for the picker/panel listing endpoints (`api.browseFiles`, `api.browseDirs`,
+ *  `api.recentProjects`). Its own constant rather than the composer menus' 15s: a listing
+ *  is a different endpoint on the same wedged gateway, so retuning the skills menu must
+ *  not silently retune folder listings.
+ *
+ *  Shorter than the search's 15s because a listing is ONE `scandir` plus a per-entry directory
+ *  test, so its cost tracks a single directory's ENTRY COUNT rather than tree size. Measured that
+ *  way: the widest directory on the dev host, `/usr/share/man/man3` at 8,974 entries, listed in
+ *  3.1ms cold against 3.0ms warm — 0.03% of this budget, so cache state is not the term and the
+ *  bound tolerates a store some 3,200x slower per entry. Local storage only; no network mount was
+ *  available to sample, which is the one case this figure does not cover.
+ *
+ *  Margin, in place of that sample: this is the only wall-clock bound on the read — the backend's
+ *  pool ceiling bounds how many probes can wedge, not how long a client waits, by design. Its own
+ *  per-request work is a 2s admission wait at most (then a coded 503, not silence) plus the
+ *  millisecond listing above, so healthy work spends under a quarter of the 10s and the rest is
+ *  round trips and store latency. A mount whose per-entry stats outrun that remainder rejects HERE
+ *  at 10s into the notice (Retry / Refresh) path: the bounded refusal is the designed outcome, not a
+ *  hang. No config knob, because a knob asks the user to know a number this comment exists to spare
+ *  them. */
+export const BROWSE_FILES_TIMEOUT_MS = 10_000
+
+/** Bytes of a request body sent so far, and the body's size. */
+type UploadProgress = (loaded: number, total: number) => void
+
+/** `fetch`, over XMLHttpRequest: the one browser API that reports upload
+ *  progress, from its start at zero bytes on. It settles as `fetch` does, so
+ *  the caller and the journal read it the same way: a Response for any HTTP
+ *  answer, a TypeError when the network fails, an AbortError once
+ *  `init.signal` aborts (at once, whatever the request does next). */
+function sendWithProgress(url: string, init: RequestInit | undefined, onProgress?: UploadProgress): Promise<Response> {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest()
+    xhr.open(init?.method ?? 'GET', url)
+    if (onProgress) xhr.upload.onloadstart = xhr.upload.onprogress = e => onProgress(e.loaded, e.total)
+    xhr.onload = () => {
+      const headers = new Headers()
+      for (const line of xhr.getAllResponseHeaders().split('\r\n')) {
+        const colon = line.indexOf(':')
+        if (colon > 0) headers.append(line.slice(0, colon), line.slice(colon + 1).trim())
+      }
+      resolve(new Response(xhr.responseText || null, { status: xhr.status, statusText: xhr.statusText, headers }))
+    }
+    xhr.onerror = () => reject(new TypeError('Failed to fetch'))
+    init?.signal?.addEventListener('abort', () => {
+      xhr.abort()
+      reject(new DOMException('The upload was cancelled.', 'AbortError'))
+    }, { once: true })
+    xhr.send(init?.body as XMLHttpRequestBodyInit | null | undefined)
+  })
+}
+
+export function createFilesEndpoints({ post, put, del, j, jfetch: fetch, checkSessionExpired, withJournaledDeadline }: ClientTransport) {
+  const projects = {
+    // Follow-up card: create a sibling git worktree of `repo` on a new `branch`.
+    // Resolves with the created path, or rejects with the server's message
+    // (branch/dir already exists, not a git repo, git unavailable).
+    createWorktree: (repo: string, branch: string) =>
+      post('/api/worktree/create', { repo, branch }).then(j) as Promise<{
+        ok?: boolean
+        path?: string
+        branch?: string
+        base?: string
+        error?: string
+      }>,
+    recentProjects: () => withJournaledDeadline(BROWSE_FILES_TIMEOUT_MS, undefined, '/api/recent-projects', s => fetch('/api/recent-projects', { signal: s }).then(j)) as Promise<{ dirs: string[] }>,
+    /** The favourited project directories, in the order the user built. Bounded like the
+     *  recents read beside it: same wedged-gateway failure, same notice path. */
+    favoriteProjects: () => withJournaledDeadline(BROWSE_FILES_TIMEOUT_MS, undefined, '/api/favorite-projects', s => fetch('/api/favorite-projects', { signal: s }).then(j)) as Promise<{ dirs: string[] }>,
+    /** Favourite one directory. Resolves with the WHOLE list as the server now holds it, so a
+     *  caller renders the server's answer rather than a locally-guessed one; rejects with the
+     *  journaled `ApiError` when the path is refused (not a directory, or a sensitive path).
+     *  Unbounded, like every other `post` here: a write is not a read the user is waiting on a
+     *  listing for, and re-sending it is not idempotent in the way re-asking a listing is. */
+    addFavoriteProject: (path: string) => post('/api/favorite-projects', { path }).then(j) as Promise<{ dirs: string[] }>,
+    /** Un-favourite one directory. The path rides the QUERY STRING, not a body: a DELETE body is
+     *  not carried reliably by every client, which is why the endpoint reads it from the query. */
+    removeFavoriteProject: (path: string) => del('/api/favorite-projects?path=' + encodeURIComponent(path)).then(j) as Promise<{ dirs: string[] }>,
+    /** The AWS named profile `path` is bound to (`aws.project_profiles`), its sign-in health and the
+     *  profile names the picker offers. Owner-only on the server, so a non-owner read rejects. */
+    projectAwsProfile: (path: string) =>
+      withJournaledDeadline(BROWSE_FILES_TIMEOUT_MS, undefined, '/api/aws/project-profile', s =>
+        fetch('/api/aws/project-profile?path=' + encodeURIComponent(path), { signal: s }).then(j)) as Promise<ProjectAwsProfile>,
+    /** Bind `path` to `profile`; `''` removes the binding for exactly that directory. Resolves with
+     *  the binding as the server now holds it (no health word: the chip re-reads for that). */
+    setProjectAwsProfile: (path: string, profile: string) =>
+      put('/api/aws/project-profile', { path, profile }).then(j) as Promise<ProjectAwsProfile>,
+    // Bounded HERE, not per initiator: react-query dedupes on the key, so the weakest
+    // initiator would decide the bound.
+    browseDirs: (path?: string) => withJournaledDeadline(BROWSE_FILES_TIMEOUT_MS, undefined, '/api/browse-dirs', s => fetch('/api/browse-dirs' + (path ? '?path=' + encodeURIComponent(path) : ''), { signal: s }).then(j)) as Promise<{ path: string; parent: string; dirs: { name: string; path: string }[] }>,
+    /** Windows only: the mounted drive roots, as the virtual level above every `X:\`. `path` is `""`: this listing is not a directory. */
+    browseDrives: () => withJournaledDeadline(BROWSE_FILES_TIMEOUT_MS, undefined, '/api/browse-dirs', s => fetch('/api/browse-dirs?drives=1', { signal: s }).then(j)) as Promise<{ path: string; parent: string; dirs: { name: string; path: string }[] }>,
+    browseFiles: (path?: string, signal?: AbortSignal) => withJournaledDeadline(BROWSE_FILES_TIMEOUT_MS, signal, '/api/browse-files', s =>
+      fetch('/api/browse-files' + (path ? '?path=' + encodeURIComponent(path) + (showHiddenFiles() ? '&hidden=1' : '') : (showHiddenFiles() ? '?hidden=1' : '')), { signal: s }).then(j)) as Promise<{ path: string; parent: string; dirs: { name: string; path: string; mtime: number }[]; files: { name: string; path: string; mtime: number }[] }>,
+    projectGit: (path: string) => fetch('/api/project/git?path=' + encodeURIComponent(path)).then(j) as Promise<{ path: string; repo: boolean; repoRoot?: string; isRepoRoot?: boolean; branch?: string; detached?: boolean; head?: string }>,
+    projectGitStatus: (path: string) => fetch('/api/project/git/status?path=' + encodeURIComponent(path)).then(j) as Promise<{ repo: boolean; repoRoot?: string; branch?: string; ahead?: number; behind?: number; truncated?: boolean; files: { path: string; status: string; staged: boolean; additions?: number; deletions?: number }[] }>,
+    projectGitLog: (path: string, limit = 20) => fetch('/api/project/git/log?path=' + encodeURIComponent(path) + '&limit=' + limit).then(j) as Promise<{ repo: boolean; commits: { sha: string; message: string; author: string; date: string; isHead: boolean }[] }>,
+    /** Every change the branch committed since it left its base (`origin/HEAD`,
+     *  else `main`, else the older default name), as one masked patch. `base` is null when the
+     *  repository has none; `omitted` counts changed files the patch leaves out. */
+    projectGitBranchDiff: (path: string) => fetch('/api/project/git/branch-diff?path=' + encodeURIComponent(path)).then(j) as Promise<{ repo: boolean; base?: string | null; diff?: string; omitted?: number }>,
+    /** The repositories the Git tab lists for one chat: its project (when that
+     *  is in a repository) first, then every repository its tool calls worked
+     *  in, most recent first. Each `path` is accepted by the status/log routes.
+     *  `listed` counts the agent rows shown and `omitted` the ones past the cap.
+     *  `incomplete` means bounded tool-path tracking may have missed repositories. */
+    projectGitRepos: (slot: string) => fetch('/api/project/git/repos?slot=' + encodeURIComponent(slot)).then(j) as Promise<{ repos: { path: string; source: 'project' | 'agent' }[]; omitted: number; listed: number; incomplete: boolean }>,
+    /** `dir` lists one project-relative folder (one the whole listing named in
+     *  `truncatedDirectories`) instead of the whole tree; its paths stay project-relative. */
+    // One level per request (`shallow=1`): the folders inside come back in
+    // `lazyDirectories`, unread. They are folded into `nestedRepoDirectories`,
+    // the set the tree already lists on open with no state row, so opening a
+    // folder fetches just that folder and a large workspace never walks whole.
+    projectTree: (path: string, dir?: string) => withJournaledDeadline(FILE_SEARCH_TIMEOUT_MS, undefined, '/api/project/tree', s =>
+      fetch('/api/project/tree?shallow=1&path=' + encodeURIComponent(path) + (dir ? '&dir=' + encodeURIComponent(dir) : '') + (showHiddenFiles() ? '&hidden=1' : ''), { signal: s })
+        .then(j)
+        .then((body: ProjectTreePayload & { lazyDirectories?: string[] }) => {
+          const lazy = body?.lazyDirectories
+          if (!Array.isArray(lazy) || lazy.length === 0) return body
+          return { ...body, nestedRepoDirectories: [...new Set([...(body.nestedRepoDirectories ?? []), ...lazy])].sort() }
+        })) as Promise<ProjectTreePayload>,
+    /** The files this chat session edited, newest first (`GET /api/project/session-files`). */
+    sessionFiles: (slot: string) => withJournaledDeadline(FILE_SEARCH_TIMEOUT_MS, undefined, '/api/project/session-files', s =>
+      fetch('/api/project/session-files?slot=' + encodeURIComponent(slot), { signal: s }).then(j)) as Promise<SessionFilesPayload>,
+    /** The texts of this chat's newest recorded change to one file (`GET /api/project/session-file-diff`). */
+    sessionFileDiff: (slot: string, path: string) => withJournaledDeadline(FILE_SEARCH_TIMEOUT_MS, undefined, '/api/project/session-file-diff', s =>
+      fetch('/api/project/session-file-diff?slot=' + encodeURIComponent(slot) + '&path=' + encodeURIComponent(path), { signal: s }).then(j)) as Promise<SessionFileDiffPayload>,
+    workspaces: () => fetch('/api/workspaces').then(j),
+    createWorkspace: (body: object) => post('/api/workspaces', body).then(j),
+    updateWorkspace: (name: string, body: object) =>
+      put('/api/workspaces/' + encodeURIComponent(name), body).then(j),
+    deleteWorkspace: (name: string) =>
+      del('/api/workspaces/' + encodeURIComponent(name)).then(j),
+  }
+
+  const reveal = {
+    // `action` mirrors the backend's own two modes: 'reveal' selects the path in
+    // the OS file manager (the default every existing caller relies on), 'open'
+    // hands a regular file to its default application. Headless hosts have
+    // neither, so the backend answers with `copy` and the path goes to the
+    // clipboard instead of the call silently doing nothing.
+    // This is a SIDE-EFFECT-FREE transport call: it neither writes the clipboard
+    // nor shows a dialog. The single caller `revealOrOpen` owns the clipboard copy,
+    // so the degrade is presented in exactly one place instead of in the transport
+    // layer where a dialog is a surprise.
+    revealPath: (path: string, action: 'open' | 'reveal' = 'reveal') =>
+      post('/api/reveal', { path, action }).then(j) as Promise<RevealResult>,
+  }
+
+  const fileOps = {
+    pickFiles: () => post('/api/upload').then(j) as Promise<{ paths: string[] }>,
+    /** `slot` names the chat asking; the gateway refuses one that runs remotely. */
+    fileDiff: (path: string, slot?: string | null) => fetch('/api/file-diff?path=' + encodeURIComponent(path) + chatSlotParam(slot)).then(j) as Promise<{ diff: string; original: string; status?: 'clean' | 'modified' | 'untracked' | 'not_git' | 'error' }>,
+    /** Fuzzy file search for @-mention picker. `kind` distinguishes folder hits from files.
+     *  `kinds` narrows the result set server-side — 'files' or 'dirs'; omitted returns both.
+     *  Filtering server-side rather than dropping unwanted hits here matters because the
+     *  backend caps results BEFORE the response, so a client-side filter would silently
+     *  shrink an already-capped list. `limit` raises the server's result cap (default 15);
+     *  the server clamps it to a fixed ceiling, so a large value cannot amplify the walk.
+     *
+     *  Bounded HERE, not per initiator: react-query dedupes on the key, so the
+     *  weakest initiator would otherwise decide whether the promise is bounded —
+     *  and a future caller would arrive unbounded by default. */
+    fileSearch: (q: string, project?: string, signal?: AbortSignal, kinds?: 'files' | 'dirs', limit?: number) => {
+      const p = new URLSearchParams({ q })
+      if (project) p.set('project', project)
+      if (kinds) p.set('kinds', kinds)
+      if (limit) p.set('limit', String(limit))
+      return withJournaledDeadline(FILE_SEARCH_TIMEOUT_MS, signal, '/api/file-search', s =>
+        fetch(`/api/file-search?${p}`, { signal: s }).then(j)) as Promise<{ results: Array<{ path: string; name: string; size: number; mtime: number; kind?: 'file' | 'dir' }>; root: string }>
+    },
+    /** One directory level of a project, for the composer's `./` path completion.
+     *  `dir` is the literal prefix typed (`./`, `../src/`) and `q` the partial entry
+     *  name; the server resolves `dir` under the named project and answers an empty
+     *  set for anything that leaves the project root. */
+    pathComplete: (project: string, dir: string, q: string, signal?: AbortSignal) => {
+      const p = new URLSearchParams({ path: project, dir })
+      if (q) p.set('q', q)
+      return fetch(`/api/path-complete?${p}`, signal ? { signal } : undefined).then(j) as Promise<{ results: Array<{ path: string; name: string; size: number; mtime: number; kind?: 'file' | 'dir' }>; root: string; outside?: boolean }>
+    },
+    /** Upload files via browser File API (cross-platform).
+     *  `signal` lets the composer abort an upload still in flight: the
+     *  request dies client-side and the server unlinks its partials through
+     *  the disconnect path the upload handler already has. `onProgress`
+     *  hears each step of the bytes going out. */
+    uploadFiles: async (files: File[], signal?: AbortSignal, onProgress?: UploadProgress) =>
+      uploadComposerFiles(files, async body => {
+        const res = await fetch(COMPOSER_UPLOAD_PATH, { method: 'POST', body, ...(signal ? { signal } : {}) },
+          (url, init) => sendWithProgress(url, init, onProgress))
+        checkSessionExpired(res)
+        return res
+      }, signal),
+    /**
+     * Upload one OS file into an existing workspace directory (Files panel
+     * drag-and-drop / "Upload files…" row menu).
+     *
+     * Sibling of `uploadFiles` above: that one always lands in the fixed
+     * chat-attachment scratch directory; this one targets whatever directory
+     * the caller resolved (a drop target row, or the tree root). One request
+     * per file — the caller loops for multiple files — so a name collision is
+     * reported per file rather than for a whole batch at once. Returns a
+     * discriminated result rather than throwing, so a `name_collision` (409)
+     * reads as data the caller can report instead of an exception to catch.
+     */
+    uploadToDirectory: async (
+      dir: string, file: File,
+    ): Promise<
+      { ok: true; path: string; name: string } | { ok: false; status: number; code?: string; error: string }
+    > => {
+      const fd = new FormData()
+      fd.append('file', file)
+      const q = new URLSearchParams({ dir })
+      const res = await fetch(`/api/directory-upload?${q}`, { method: 'POST', body: fd })
+      checkSessionExpired(res)
+      let body: { path?: string; name?: string; error?: string; code?: string }
+      try { body = await res.json() } catch { body = {} }
+      if (!res.ok) {
+        return { ok: false, status: res.status, code: body.code, error: body.error || res.statusText }
+      }
+      return { ok: true, path: body.path ?? '', name: body.name ?? file.name }
+    },
+    screenshot: () => post('/api/screenshot').then(j) as Promise<{ path: string }>,
+    /** A ```plantuml fence as SVG from the host's PlantUML. The route's designed
+     *  answers keep the code view unjournaled: no renderer (404), not the owner
+     *  (403), a diagram PlantUML cannot draw (422, `failed`). A lapsed session's
+     *  403 goes through `j`, which starts the refresh. */
+    plantUmlSvg: async (source: string): Promise<{ svg: string | null; failed: boolean }> => {
+      const res = await post('/api/plantuml/svg', { source })
+      const lapsed = res.headers.get('X-Auth-Required') === 'true'
+      if (res.status === 404 || res.status === 422 || (res.status === 403 && !lapsed)) {
+        return { svg: null, failed: res.status === 422 }
+      }
+      return { svg: ((await j(res)) as { svg: string }).svg, failed: false }
+    },
+  }
+
+  return { projects, reveal, fileOps }
+}

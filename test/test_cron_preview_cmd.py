@@ -1,0 +1,415 @@
+"""Unit tests for ``kirocrew cron preview`` CLI subcommand."""
+
+from __future__ import annotations
+
+import argparse
+import importlib.util
+import sys
+from pathlib import Path
+from typing import Iterator
+from unittest.mock import patch
+
+import pytest
+
+from conftest import forget_env_at_teardown
+from kiro_crew.cli_commands import _cron_preview
+
+
+@pytest.fixture(autouse=True)
+def _bytecode_stays_in_tmp_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Keep the bytecode of the script each test imports inside ``tmp_path``.
+
+    The conftest's suite-wide ``sys.pycache_prefix`` mirrors the script's absolute path,
+    which is a new ``tmp_path`` each run, so a ``.pyc`` would pile up per run and never be
+    reclaimed. The teardown checks the pyc was written under ``tmp_path``.
+    """
+    monkeypatch.setattr(sys, "pycache_prefix", str(tmp_path / "pycache"))
+    yield
+    script = tmp_path / "s.py"
+    if not script.exists() or sys.dont_write_bytecode:
+        return  # no script was imported, or this interpreter writes no bytecode anywhere
+    cached = Path(importlib.util.cache_from_source(str(script)))
+    assert cached.is_relative_to(tmp_path), f"bytecode for {script} would land at {cached}"
+    assert cached.is_file(), f"{script} was imported but its bytecode is not at {cached}"
+
+
+def _make_args(script: str, message: str = "test-msg", env: list | None = None) -> argparse.Namespace:
+    return argparse.Namespace(script=script, message=message, env=env or [])
+
+
+def _write_script(tmp_path: Path, name: str, code: str) -> Path:
+    p = tmp_path / name
+    p.write_text(code)
+    return p
+
+
+def _patch_resolve(tmp_path: Path, name: str = "s.py", func: str = "run"):
+    """Patch resolve_script_path to allow temp dir scripts."""
+    p = tmp_path / name
+    return patch(
+        "kiro_crew.cron_script.resolve_script_path",
+        return_value=(str(p), func),
+    )
+
+
+class TestCronPreviewReport:
+    def test_report_prints_message(self, tmp_path: Path, capsys):
+        p = _write_script(
+            tmp_path, "s.py",
+            "from kiro_crew.cron_script import Report\n"
+            "def run(ctx): raise Report(f'hello {ctx.message}')\n")
+        with _patch_resolve(tmp_path):
+            _cron_preview(_make_args(f"{p}:run", message="world"))
+        assert "hello world" in capsys.readouterr().out
+
+
+class TestCronPreviewSkip:
+    def test_skip_output(self, tmp_path: Path, capsys):
+        p = _write_script(
+            tmp_path, "s.py",
+            "from kiro_crew.cron_script import Skip\n"
+            "def run(ctx): raise Skip()\n")
+        with _patch_resolve(tmp_path):
+            _cron_preview(_make_args(f"{p}:run"))
+        assert "Skip" in capsys.readouterr().out
+
+
+class TestCronPreviewDone:
+    def test_done_output(self, tmp_path: Path, capsys):
+        p = _write_script(
+            tmp_path, "s.py",
+            "from kiro_crew.cron_script import Done\n"
+            "def run(ctx): raise Done('finished')\n")
+        with _patch_resolve(tmp_path):
+            _cron_preview(_make_args(f"{p}:run"))
+        out = capsys.readouterr().out
+        assert "Done" in out
+        assert "finished" in out
+
+
+class TestCronPreviewPostponedAnnotations:
+    def test_dataclass_with_postponed_annotations_loads(self, tmp_path: Path, capsys):
+        """``dataclasses`` resolves string annotations via ``sys.modules[cls.__module__]``,
+        so preview must register the script module before executing it."""
+        p = _write_script(
+            tmp_path, "s.py",
+            "from __future__ import annotations\n"
+            "from dataclasses import dataclass\n"
+            "from kiro_crew.cron_script import Report\n"
+            "@dataclass\n"
+            "class Item:\n"
+            "    name: str\n"
+            "def run(ctx): raise Report(f'item {Item(\"x\").name}')\n")
+        with _patch_resolve(tmp_path):
+            _cron_preview(_make_args(f"{p}:run"))
+        assert "item x" in capsys.readouterr().out
+
+
+class TestCronPreviewError:
+    def test_error_output(self, tmp_path: Path, capsys):
+        p = _write_script(
+            tmp_path, "s.py",
+            "def run(ctx): raise ValueError('oops')\n")
+        with _patch_resolve(tmp_path):
+            with pytest.raises(SystemExit):
+                _cron_preview(_make_args(f"{p}:run"))
+        out = capsys.readouterr().out
+        assert "Error" in out
+        assert "ValueError" in out
+
+
+class TestCronPreviewValidation:
+    def test_invalid_format_no_colon(self):
+        with pytest.raises(SystemExit):
+            _cron_preview(_make_args("/some/path.py"))
+
+    def test_nonexistent_script(self):
+        with pytest.raises(SystemExit):
+            _cron_preview(_make_args("~/.kirocrew/crons/nonexistent.py:run"))
+
+    def test_permission_error_rejected(self, capsys):
+        """resolve_script_path rejects scripts that fail validation."""
+        with patch(
+            "kiro_crew.cron_script.resolve_script_path",
+            side_effect=PermissionError("blocked by policy"),
+        ):
+            with pytest.raises(SystemExit):
+                _cron_preview(_make_args("~/.kirocrew/crons/bad.py:run"))
+        out = capsys.readouterr()
+        assert out.out == ""
+        assert out.err == "Error: blocked by policy\n"
+
+    def test_unloadable_script_refused_on_stderr(self, tmp_path: Path, capsys):
+        # Not named s.py: the bytecode fixture expects s.py to be imported,
+        # and this script never is.
+        _write_script(tmp_path, "unloadable.py", "def run(ctx): pass\n")
+        with _patch_resolve(tmp_path, name="unloadable.py"), patch(
+            "importlib.util.spec_from_file_location", return_value=None
+        ):
+            with pytest.raises(SystemExit) as exc:
+                _cron_preview(_make_args(f"{tmp_path / 'unloadable.py'}:run"))
+        assert exc.value.code == 1
+        out = capsys.readouterr()
+        assert out.out == ""
+        assert out.err.startswith("Error: cannot load ")
+
+    def test_missing_function(self, tmp_path: Path, capsys):
+        _write_script(tmp_path, "s.py", "def other(ctx): pass\n")
+        with _patch_resolve(tmp_path, func="run"):
+            with pytest.raises(SystemExit):
+                _cron_preview(_make_args(f"{tmp_path / 's.py'}:run"))
+        out = capsys.readouterr()
+        assert out.out == ""
+        assert "Error: function 'run' not found in " in out.err
+
+    def test_async_function_rejected(self, tmp_path: Path, capsys):
+        _write_script(tmp_path, "s.py", "async def run(ctx): pass\n")
+        with _patch_resolve(tmp_path):
+            with pytest.raises(SystemExit):
+                _cron_preview(_make_args(f"{tmp_path / 's.py'}:run"))
+        out = capsys.readouterr()
+        assert out.out == ""
+        assert "Error: function 'run' is async" in out.err
+
+
+class TestCronPreviewEnv:
+    def test_env_vars_set(self, tmp_path: Path, capsys, monkeypatch):
+        # `--env` is applied to the LIVE process environment (the script reads it
+        # through os.environ), and the preview does not undo it -- so without this
+        # the variable outlived the test and reached later ones on the worker.
+        forget_env_at_teardown(monkeypatch, "TEST_CRON_VAR")
+        _write_script(
+            tmp_path, "s.py",
+            "import os\n"
+            "from kiro_crew.cron_script import Report\n"
+            "def run(ctx): raise Report(os.environ.get('TEST_CRON_VAR', 'MISSING'))\n")
+        with _patch_resolve(tmp_path):
+            _cron_preview(_make_args(f"{tmp_path / 's.py'}:run", env=["TEST_CRON_VAR=hello123"]))
+        assert "hello123" in capsys.readouterr().out
+
+
+class TestCronPreviewCallToolPath:
+    """Tests for the security-relevant call_tool path: redaction, SEL audit, notify."""
+
+    def test_call_tool_redacts_credentials(self, tmp_path: Path, capsys):
+        """Tool args are redacted before passing to McpToolClient."""
+        _write_script(
+            tmp_path, "s.py",
+            "from kiro_crew.cron_script import Report\n"
+            "def run(ctx):\n"
+            "    result = ctx.call_tool('builder-mcp', 'ReadInternalWebsites',\n"
+            "        {'inputs': ['https://example.com']})\n"
+            "    raise Report('ok')\n")
+        call_args = []
+        mock_client = type("MC", (), {
+            "call_tool": lambda self, tool, args: (call_args.append(args), "result")[1],
+            "close": lambda self: None,
+        })()
+        with _patch_resolve(tmp_path):
+            with patch("kiro_crew.cron_script.McpToolClient", return_value=mock_client):
+                _cron_preview(_make_args(f"{tmp_path / 's.py'}:run"))
+        # Verify call was made (redaction doesn't alter clean inputs)
+        assert len(call_args) == 1
+        assert call_args[0] == {"inputs": ["https://example.com"]}
+
+    def test_call_tool_audits_via_sel(self, tmp_path: Path, capsys):
+        """SEL log_tool_invocation fires for each call_tool."""
+        _write_script(
+            tmp_path, "s.py",
+            "from kiro_crew.cron_script import Report\n"
+            "def run(ctx):\n"
+            "    ctx.call_tool('builder-mcp', 'ReadInternalWebsites', {'inputs': []})\n"
+            "    raise Report('done')\n")
+        mock_client = type("MC", (), {
+            "call_tool": lambda self, tool, args: "result",
+            "close": lambda self: None,
+        })()
+        sel_calls = []
+        with _patch_resolve(tmp_path):
+            with patch("kiro_crew.cron_script.McpToolClient", return_value=mock_client):
+                with patch("kiro_crew.cli_commands.sel") as mock_sel:
+                    mock_sel.return_value.log_tool_invocation = lambda **kw: sel_calls.append(kw)
+                    mock_sel.return_value.log_api_access = lambda **kw: None
+                    _cron_preview(_make_args(f"{tmp_path / 's.py'}:run"))
+        assert any(c.get("tool_name") == "builder-mcp/ReadInternalWebsites" for c in sel_calls)
+        assert any(c.get("outcome") == "ok" for c in sel_calls)
+
+    def test_call_tool_keeps_one_server_per_name_until_the_script_returns(
+        self, tmp_path: Path, capsys
+    ):
+        """Two calls to one server start one client, closed once, after the script returned."""
+        _write_script(
+            tmp_path, "s.py",
+            "from kiro_crew.cron_script import Report\n"
+            "def run(ctx):\n"
+            "    ctx.call_tool('builder-mcp', 'ReadInternalWebsites', {'inputs': []})\n"
+            "    ctx.call_tool('builder-mcp', 'InternalSearch', {'query': 'x'})\n"
+            "    raise Report('done')\n")
+        events: list[str] = []
+
+        class _FakeClient:
+            def __init__(self, server, session_key=""):
+                events.append(f"start {server} session_key={session_key!r}")
+
+            def call_tool(self, tool, args):
+                events.append(f"call {tool}")
+                return "result"
+
+            def is_running(self):
+                return True
+
+            def close(self):
+                events.append("close")
+
+        with _patch_resolve(tmp_path):
+            with patch("kiro_crew.cron_script.McpToolClient", _FakeClient):
+                _cron_preview(_make_args(f"{tmp_path / 's.py'}:run"))
+        assert "done" in capsys.readouterr().out
+        assert events == [
+            "start builder-mcp session_key=''",
+            "call ReadInternalWebsites",
+            "call InternalSearch",
+            "close",
+        ]
+
+    def test_notify_prints_suppressed(self, tmp_path: Path, capsys):
+        """ctx.notify() prints suppression message instead of delivering."""
+        _write_script(
+            tmp_path, "s.py",
+            "from kiro_crew.cron_script import Report\n"
+            "def run(ctx):\n"
+            "    ctx.notify('hello world')\n"
+            "    raise Report('done')\n")
+        with _patch_resolve(tmp_path):
+            _cron_preview(_make_args(f"{tmp_path / 's.py'}:run"))
+        out = capsys.readouterr().out
+        assert "[notify suppressed]" in out
+        assert "hello world" in out
+
+
+class TestCronPreviewNotifyParity:
+    """The preview ctx must accept everything production ScriptContext.notify accepts.
+
+    A monitor cron exists to speak up; `session="origin"` is the documented way to
+    reach the chat that created it. A preview that only validates the silent branch
+    validates nothing that matters, and a TypeError there reads exactly like a script
+    bug -- inviting the "fix" of dropping the kwarg, which silently breaks delivery.
+    """
+
+    def test_notify_accepts_documented_routing_kwarg(self, tmp_path: Path, capsys):
+        _write_script(
+            tmp_path,
+            "s.py",
+            "from kiro_crew.cron_script import Report\n"
+            "def run(ctx):\n"
+            "    ctx.notify('stall suspected', session='origin')\n"
+            "    raise Report('done')\n",
+        )
+        with _patch_resolve(tmp_path):
+            _cron_preview(_make_args(f"{tmp_path / 's.py'}:run"))
+        out = capsys.readouterr().out
+        assert "[notify suppressed]" in out
+        assert "stall suspected" in out
+        # Routing surfaced, not swallowed: preview is how you confirm where it goes.
+        assert "origin" in out
+        assert "Error" not in out
+
+    def test_notify_signature_derived_from_production(self, tmp_path: Path, capsys):
+        """Expectations come from ScriptContext.notify itself, so future drift fails here."""
+        _write_script(
+            tmp_path,
+            "s.py",
+            "import inspect\n"
+            "from kiro_crew.cron_script import Report, ScriptContext\n"
+            "def run(ctx):\n"
+            "    prod = inspect.signature(ScriptContext.notify)\n"
+            "    stub = inspect.signature(ctx.notify)\n"
+            "    # Same first parameter name, so keyword calls work in both.\n"
+            "    assert list(stub.parameters)[0] == list(prod.parameters)[1]\n"
+            "    # Anything production can bind, the stub must bind too.\n"
+            "    call = {'session': 'origin', 'channel': 'C123'}\n"
+            "    prod.bind(object(), 'x', **call)\n"
+            "    stub.bind('x', **call)\n"
+            "    raise Report('parity ok')\n",
+        )
+        with _patch_resolve(tmp_path):
+            _cron_preview(_make_args(f"{tmp_path / 's.py'}:run"))
+        out = capsys.readouterr().out
+        assert "parity ok" in out
+        assert "Error" not in out
+
+    def test_notify_redacts_credentials_in_text_and_kwargs(self, tmp_path: Path, capsys):
+        """Production redacts before sending; preview must redact before printing."""
+        _write_script(
+            tmp_path,
+            "s.py",
+            "from kiro_crew.cron_script import Report\n"
+            "def run(ctx):\n"
+            "    ctx.notify('leak aws_secret_access_key=AKIAIOSFODNN7EXAMPLE',\n"
+            "               detail='aws_secret_access_key=wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY')\n"
+            "    raise Report('done')\n",
+        )
+        with _patch_resolve(tmp_path):
+            _cron_preview(_make_args(f"{tmp_path / 's.py'}:run"))
+        out = capsys.readouterr().out
+        assert "AKIAIOSFODNN7EXAMPLE" not in out
+        # The kwarg value is redacted too, not just the text.
+        assert "wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY" not in out
+        assert "REDACTED" in out
+
+
+class TestCronPreviewMatchesScriptContext:
+    """A script that runs as a cron must preview: same methods, same parameters."""
+
+    def test_every_public_method_has_production_parameters(self, tmp_path: Path, capsys):
+        _write_script(
+            tmp_path,
+            "s.py",
+            "import inspect\n"
+            "from kiro_crew.cron_script import Report, ScriptContext\n"
+            "def shape(fn):\n"
+            "    params = inspect.signature(fn).parameters.values()\n"
+            "    return [(p.name, p.kind, p.default) for p in params if p.name != 'self']\n"
+            "def run(ctx):\n"
+            "    methods = inspect.getmembers(ScriptContext, inspect.isfunction)\n"
+            "    drift = [name for name, fn in methods if not name.startswith('_')\n"
+            "             and (not hasattr(ctx, name) or shape(fn) != shape(getattr(ctx, name)))]\n"
+            "    raise Report(f'drift={drift}')\n",
+        )
+        with _patch_resolve(tmp_path):
+            _cron_preview(_make_args(f"{tmp_path / 's.py'}:run"))
+        assert "drift=[]" in capsys.readouterr().out
+
+    def test_session_and_crew_log_calls_print_redacted_and_return_stand_ins(
+        self, tmp_path: Path, capsys
+    ):
+        _write_script(
+            tmp_path,
+            "s.py",
+            "from kiro_crew.cron_script import Report\n"
+            "def run(ctx):\n"
+            "    folders = ctx.list_session_folders()\n"
+            "    folder = ctx.create_session_folder('Reports')\n"
+            "    slot = ctx.open_session('Daily', folder_id=folder['id'])\n"
+            "    key = 'aws_secret_access_key=' + 'wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY'\n"
+            "    sent = ctx.send_to_session(slot, key)['ok']\n"
+            "    mode = ctx.set_session_mode(slot, 'trust_reads')['mode']\n"
+            "    logged = ctx.crew_log_append('note', {'text': key}, max_age_s=120)\n"
+            "    logged = logged['recorded']['type']\n"
+            "    raise Report(f'{len(folders)} {slot} {sent} {mode} {logged}')\n",
+        )
+        with _patch_resolve(tmp_path):
+            _cron_preview(_make_args(f"{tmp_path / 's.py'}:run"))
+        out = capsys.readouterr().out
+        for method in (
+            "list_session_folders",
+            "create_session_folder",
+            "open_session",
+            "send_to_session",
+            "set_session_mode",
+            "crew_log_append",
+        ):
+            assert f"[{method} suppressed]" in out, out
+        assert "wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY" not in out
+        assert "REDACTED" in out
+        assert "0 preview-dry-run-slot True trust_reads note" in out, out

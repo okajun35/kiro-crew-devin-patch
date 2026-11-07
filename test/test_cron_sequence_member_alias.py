@@ -1,0 +1,751 @@
+"""A sequence cron carrying a captured member runs each step as its OWN crew.
+
+A schedule whose captured execution names a crew member must still dispatch each
+``agent_sequence`` step under that step's own crew runtime, workspace, pinned
+model and capability gates. The captured member is the run's shared memory
+identity, not the agent every step runs as. Before the fix, the captured-member
+pin in ``_resolve_cron_agent`` collapsed every step onto the one member, so the
+other crews named in the sequence never actually ran.
+"""
+
+import asyncio
+import json
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+from member_memory_helpers import write_member_home
+
+from kiro_crew import agent_discovery, subagent
+from kiro_crew.config import loader
+from kiro_crew.config.loader import KiroCrewConfig, config_dir
+from kiro_crew.cron import CronJob
+from kiro_crew.execution_context import (
+    ExecutionContext,
+    MemoryStoreRef,
+    read_session_execution,
+)
+
+
+async def _cron_callback(monkeypatch, cfg):
+    from kiro_crew.slack import gateway
+
+    # Resolution reads ``live.snapshot() or self._cfg``; pin both to the test
+    # config so the two crew aliases are visible without a live config watcher.
+    monkeypatch.setattr(gateway.live, "snapshot", lambda: cfg)
+
+    gw = gateway.GatewayOrchestrator.__new__(gateway.GatewayOrchestrator)
+    gw.sessions = MagicMock()
+    gw.sessions.get_or_create = AsyncMock(side_effect=RuntimeError("stop before the provider"))
+    gw.ctx_builder = MagicMock()
+    gw.slack = gw.conv_log = gw.dashboard_state = gw.subagent_mgr = None
+    gw._owner_id = "owner"
+    gw._cron_injecting = {}
+    gw._cron_runs_holding = set()
+    gw._no_crons = False
+    gw._cfg = cfg
+    gw.cron_svc = None
+    callbacks = []
+
+    async def create(on_job=None, **kwargs):
+        callbacks.append(on_job)
+        service = MagicMock()
+        service.start = AsyncMock()
+        return service
+
+    monkeypatch.setattr(gateway.CronService, "create", create)
+    monkeypatch.setattr(
+        gateway, "_await_cron_fire_time_gate", AsyncMock(return_value=(None, False))
+    )
+    await gw._init_cron()
+    return gw, callbacks[0]
+
+
+@pytest.mark.asyncio
+async def test_each_crew_in_a_sequence_is_dispatched_as_itself(monkeypatch, tmp_path):
+    write_member_home(config_dir(), "alpha", "beta")  # two crew members, alpha and beta
+    loader._invalidate_config_cache()
+    cfg = KiroCrewConfig.load()
+
+    # Give crew beta its own kiro_agent and a mapped workspace so the step's
+    # runtime (agent) and tree (cwd) are pinned, not just its crew_agent alias.
+    # A regression that put the step back on the captured member's runtime or in
+    # the base workspace would then red, not pass silently.
+    from kiro_crew.config.sections import WorkspaceConfig
+
+    beta_tree = tmp_path / "beta-tree"
+    beta_tree.mkdir()
+    cfg.workspaces["beta-ws"] = WorkspaceConfig(dir=str(beta_tree))
+    cfg.agents["beta"].kiro_agent = "beta-mode"
+    cfg.agents["beta"].workspace = "beta-ws"
+
+    gw, callback = await _cron_callback(monkeypatch, cfg)
+
+    # The schedule was created as alpha, so it carries alpha's captured execution.
+    captured = ExecutionContext(
+        "alpha", MemoryStoreRef("member-alpha", "alpha"), "member", "alpha", "persistent", "app"
+    )
+    job = CronJob(
+        id="seq",
+        name="sequence",
+        message="task",
+        agent_sequence=["beta", "alpha"],  # first step is crew beta
+        execution_context=captured.to_record(),
+    )
+    with pytest.raises(RuntimeError, match="stop before the provider"):
+        await callback(job)
+
+    first = gw.sessions.get_or_create.call_args_list[0]
+    assert first.args[0] == "cron:seq:beta"  # the session key names beta
+    # Each step resolves its OWN crew, not the captured member alpha: its
+    # crew_agent alias, its kiro_agent mode, and its own workspace tree.
+    assert first.kwargs["crew_agent"] == "beta"
+    assert first.kwargs["agent"] == "beta-mode"
+    assert first.kwargs["cwd"] == str(beta_tree)
+
+
+@pytest.mark.asyncio
+async def test_sequence_step_binds_its_spawn_policy_to_the_captured_store(monkeypatch, tmp_path):
+    write_member_home(config_dir(), "alpha", "beta")
+    loader._invalidate_config_cache()
+    cfg = KiroCrewConfig.load()
+    cfg.agents["beta"].kiro_agent = "beta-mode"
+
+    agents_dir = tmp_path / "agents"
+    agents_dir.mkdir()
+    monkeypatch.setattr(agent_discovery, "_KIRO_AGENTS_DIR", agents_dir)
+    for name, allowed in (("alpha", "alpha-child"), ("beta-mode", "beta-child")):
+        (agents_dir / f"{name}.json").write_text(
+            json.dumps(
+                {
+                    "name": name,
+                    "toolsSettings": {"subagent": {"availableAgents": [allowed]}},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    _gw, callback = await _cron_callback(monkeypatch, cfg)
+    captured = ExecutionContext(
+        "alpha", MemoryStoreRef("member-alpha", "alpha"), "member", "alpha", "persistent", "app"
+    )
+    job = CronJob(
+        id="seq-authz",
+        name="sequence authorization",
+        message="task",
+        agent_sequence=["beta", "alpha"],
+        execution_context=captured.to_record(),
+    )
+
+    with pytest.raises(RuntimeError, match="stop before the provider"):
+        await callback(job)
+
+    bound = read_session_execution("cron:seq-authz:beta", required=True)
+    assert bound.template_id == "beta-mode"
+    assert bound.selection_kind == "template"
+    assert bound.selection_name == "beta"
+    assert subagent.parent_spawn_allowlists(bound.template_id) == (("beta-child",),)
+    assert bound.member_id == captured.member_id
+    assert bound.store == captured.store
+    assert bound.memory_mode == captured.memory_mode
+    assert bound.app == captured.app
+
+
+@pytest.mark.asyncio
+async def test_second_sequence_fire_rebinds_a_prior_captured_execution(monkeypatch, tmp_path):
+    write_member_home(config_dir(), "alpha", "beta")
+    loader._invalidate_config_cache()
+    cfg = KiroCrewConfig.load()
+    cfg.agents["beta"].kiro_agent = "beta-mode"
+
+    _gw, callback = await _cron_callback(monkeypatch, cfg)
+    captured = ExecutionContext(
+        "alpha", MemoryStoreRef("member-alpha", "alpha"), "member", "alpha", "persistent", "app"
+    )
+    job = CronJob(
+        id="seq-refire",
+        name="sequence refire",
+        message="task",
+        agent_sequence=["beta", "alpha"],
+        execution_context=captured.to_record(),
+    )
+    session_key = "cron:seq-refire:beta"
+
+    # Model the first fire under the earlier sequence binding, which published
+    # the schedule's captured execution before attempting provider startup.
+    with monkeypatch.context() as first_fire:
+        first_fire.setattr(ExecutionContext, "with_template", lambda self, *_args: self)
+        with pytest.raises(RuntimeError, match="stop before the provider"):
+            await callback(job)
+    assert read_session_execution(session_key, required=True) == captured
+
+    # The next fire upgrades only the step selection and reaches the provider.
+    with pytest.raises(RuntimeError, match="stop before the provider"):
+        await callback(job)
+    assert read_session_execution(session_key, required=True) == captured.with_template(
+        "beta-mode", "beta"
+    )
+
+
+@pytest.mark.asyncio
+async def test_first_step_agent_mismatch_defers_the_whole_sequence(monkeypatch):
+    write_member_home(config_dir(), "alpha", "beta")
+    loader._invalidate_config_cache()
+    cfg = KiroCrewConfig.load()
+    cfg.agents["beta"].kiro_agent = "beta-mode"
+    cfg.agents["alpha"].kiro_agent = "alpha-mode"
+
+    gw, callback = await _cron_callback(monkeypatch, cfg)
+    gw.sessions._get_session_agent = MagicMock(
+        side_effect=lambda key: (
+            "retained-beta-mode" if key == "cron:seq-first-mismatch:beta" else ""
+        )
+    )
+    captured = ExecutionContext(
+        "alpha", MemoryStoreRef("member-alpha", "alpha"), "member", "alpha", "persistent", "app"
+    )
+    job = CronJob(
+        id="seq-first-mismatch",
+        name="sequence first mismatch",
+        message="task",
+        agent_sequence=["beta", "alpha"],
+        execution_context=captured.to_record(),
+    )
+
+    result = await callback(job)
+
+    assert result is None
+    gw.sessions.get_or_create.assert_not_awaited()
+    assert job.run_never_started is True
+    assert "sequence step 'beta'" in (job.last_error or "")
+    assert "retained-beta-mode" in (job.last_error or "")
+    assert "beta-mode" in (job.last_error or "")
+
+
+@pytest.mark.asyncio
+async def test_later_step_agent_mismatch_defers_before_first_dispatch(monkeypatch):
+    write_member_home(config_dir(), "alpha", "beta")
+    loader._invalidate_config_cache()
+    cfg = KiroCrewConfig.load()
+    cfg.agents["beta"].kiro_agent = "beta-mode"
+    cfg.agents["alpha"].kiro_agent = "alpha-mode"
+
+    gw, callback = await _cron_callback(monkeypatch, cfg)
+    gw.sessions._get_session_agent = MagicMock(
+        side_effect=lambda key: (
+            "retained-alpha-mode" if key == "cron:seq-later-mismatch:alpha" else ""
+        )
+    )
+    captured = ExecutionContext(
+        "alpha", MemoryStoreRef("member-alpha", "alpha"), "member", "alpha", "persistent", "app"
+    )
+    job = CronJob(
+        id="seq-later-mismatch",
+        name="sequence later mismatch",
+        message="task",
+        agent_sequence=["beta", "alpha"],
+        execution_context=captured.to_record(),
+    )
+
+    result = await callback(job)
+
+    assert result is None
+    gw.sessions.get_or_create.assert_not_awaited()
+    assert gw.sessions._get_session_agent.call_args_list == [
+        (("cron:seq-later-mismatch:beta",),),
+        (("cron:seq-later-mismatch:alpha",),),
+    ]
+    assert job.run_never_started is True
+    assert "sequence step 'alpha'" in (job.last_error or "")
+    assert "retained-alpha-mode" in (job.last_error or "")
+    assert "alpha-mode" in (job.last_error or "")
+
+
+@pytest.mark.asyncio
+async def test_an_empty_sequence_step_aborts_a_member_captured_cron(monkeypatch):
+    write_member_home(config_dir(), "alpha", "beta")
+    loader._invalidate_config_cache()
+    cfg = KiroCrewConfig.load()
+
+    gw, callback = await _cron_callback(monkeypatch, cfg)
+    captured = ExecutionContext(
+        "alpha", MemoryStoreRef("member-alpha", "alpha"), "member", "alpha", "persistent", "app"
+    )
+    job = CronJob(
+        id="seq-empty-step",
+        name="sequence empty step",
+        message="task",
+        agent_sequence=["", "beta"],
+        execution_context=captured.to_record(),
+    )
+
+    result = await callback(job)
+
+    assert result is None
+    gw.sessions.get_or_create.assert_not_awaited()
+    assert job.run_never_started is True
+    assert "empty agent_sequence step cannot resolve a crew; refusing to dispatch" in (
+        job.last_error or ""
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_empty_step_does_not_consume_a_delete_after_run_oneshot(monkeypatch):
+    write_member_home(config_dir(), "alpha", "beta")
+    loader._invalidate_config_cache()
+    cfg = KiroCrewConfig.load()
+
+    gw, callback = await _cron_callback(monkeypatch, cfg)
+    captured = ExecutionContext(
+        "alpha", MemoryStoreRef("member-alpha", "alpha"), "member", "alpha", "persistent", "app"
+    )
+    job = CronJob(
+        id="seq-empty-step-oneshot",
+        name="sequence empty step one-shot",
+        message="task",
+        agent_sequence=["", "beta"],
+        execution_context=captured.to_record(),
+        delete_after_run=True,
+    )
+
+    result = await callback(job)
+
+    assert result is None
+    gw.sessions.get_or_create.assert_not_awaited()
+    assert job.run_never_started is True
+    assert "empty agent_sequence step cannot resolve a crew; refusing to dispatch" in (
+        job.last_error or ""
+    )
+
+
+def _let_sequence_complete(monkeypatch, gw):
+    """Replace the stop-before-provider seam with one complete sequence turn."""
+    from kiro_crew.slack import gateway
+
+    client = MagicMock()
+    gw.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
+    gw.sessions.reset = AsyncMock()
+    monkeypatch.setattr(gateway, "publish_turn_identity", AsyncMock())
+    monkeypatch.setattr(gateway, "run_in_embed_pool", AsyncMock(return_value=("message", None)))
+    monkeypatch.setattr(
+        gateway,
+        "_cron_stream_with_posttoken_resume",
+        AsyncMock(return_value=("done", 0)),
+    )
+    monkeypatch.setattr(gateway, "consume_reinjection", lambda *_args: False)
+    monkeypatch.setattr(gateway, "rearm_reinjection", MagicMock())
+    monkeypatch.setattr(gateway, "persist_token_record_async", AsyncMock())
+
+
+@pytest.mark.asyncio
+async def test_a_crew_edit_after_the_sweep_does_not_change_the_dispatch(monkeypatch, tmp_path):
+    write_member_home(config_dir(), "alpha", "beta")
+    loader._invalidate_config_cache()
+    cfg = KiroCrewConfig.load()
+
+    from kiro_crew.config.sections import WorkspaceConfig
+
+    beta_tree = tmp_path / "beta-tree"
+    edited_tree = tmp_path / "edited-tree"
+    beta_tree.mkdir()
+    edited_tree.mkdir()
+    cfg.workspaces["beta-ws"] = WorkspaceConfig(dir=str(beta_tree))
+    cfg.workspaces["edited-ws"] = WorkspaceConfig(dir=str(edited_tree))
+    cfg.agents["beta"].kiro_agent = "beta-mode"
+    cfg.agents["beta"].workspace = "beta-ws"
+    cfg.agents["alpha"].kiro_agent = "alpha-mode"
+
+    gw, callback = await _cron_callback(monkeypatch, cfg)
+
+    def edit_beta_after_the_sweep(key):
+        if key == "cron:seq-live-edit:alpha":
+            cfg.agents["beta"].kiro_agent = "edited-beta-mode"
+            cfg.agents["beta"].workspace = "edited-ws"
+        return ""
+
+    gw.sessions._get_session_agent = MagicMock(side_effect=edit_beta_after_the_sweep)
+    captured = ExecutionContext(
+        "alpha", MemoryStoreRef("member-alpha", "alpha"), "member", "alpha", "persistent", "app"
+    )
+    job = CronJob(
+        id="seq-live-edit",
+        name="sequence live edit",
+        message="task",
+        agent_sequence=["beta", "alpha"],
+        execution_context=captured.to_record(),
+    )
+
+    with pytest.raises(RuntimeError, match="stop before the provider"):
+        await callback(job)
+
+    assert gw.sessions._get_session_agent.call_args_list == [
+        (("cron:seq-live-edit:beta",),),
+        (("cron:seq-live-edit:alpha",),),
+    ]
+    first = gw.sessions.get_or_create.call_args_list[0]
+    assert first.kwargs["agent"] == "beta-mode"
+    assert first.kwargs["cwd"] == str(beta_tree)
+    assert (
+        read_session_execution("cron:seq-live-edit:beta", required=True).template_id == "beta-mode"
+    )
+
+
+@pytest.mark.asyncio
+async def test_each_sequence_step_is_resolved_exactly_once_per_fire(monkeypatch):
+    write_member_home(config_dir(), "alpha", "beta")
+    loader._invalidate_config_cache()
+    cfg = KiroCrewConfig.load()
+    cfg.agents["beta"].kiro_agent = "beta-mode"
+    cfg.agents["alpha"].kiro_agent = "alpha-mode"
+
+    resolve_calls = 0
+    resolve_agent_bindings = loader.resolve_agent_bindings
+
+    def counting_wrapper(*args, **kwargs):
+        nonlocal resolve_calls
+        resolve_calls += 1
+        return resolve_agent_bindings(*args, **kwargs)
+
+    monkeypatch.setattr(loader, "resolve_agent_bindings", counting_wrapper)
+    gw, callback = await _cron_callback(monkeypatch, cfg)
+    _let_sequence_complete(monkeypatch, gw)
+    captured = ExecutionContext(
+        "alpha", MemoryStoreRef("member-alpha", "alpha"), "member", "alpha", "persistent", "app"
+    )
+    job = CronJob(
+        id="seq-one-resolve",
+        name="sequence one resolve",
+        message="task",
+        agent_sequence=["beta", "alpha"],
+        execution_context=captured.to_record(),
+    )
+
+    assert await callback(job) == "done"
+    assert resolve_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_a_sequence_repeating_one_crew_dispatches_it_twice(monkeypatch):
+    write_member_home(config_dir(), "alpha", "beta")
+    loader._invalidate_config_cache()
+    cfg = KiroCrewConfig.load()
+    cfg.agents["beta"].kiro_agent = "beta-mode"
+
+    gw, callback = await _cron_callback(monkeypatch, cfg)
+    _let_sequence_complete(monkeypatch, gw)
+    captured = ExecutionContext(
+        "alpha", MemoryStoreRef("member-alpha", "alpha"), "member", "alpha", "persistent", "app"
+    )
+    job = CronJob(
+        id="seq-repeat",
+        name="sequence repeat",
+        message="task",
+        agent_sequence=["beta", "beta"],
+        execution_context=captured.to_record(),
+    )
+
+    assert await callback(job) == "done"
+    assert [call.args[0] for call in gw.sessions.get_or_create.call_args_list] == [
+        "cron:seq-repeat:beta",
+        "cron:seq-repeat:beta",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_config_write_between_resolve_and_dispatch_keeps_the_dispatched_template(
+    monkeypatch,
+):
+    write_member_home(config_dir(), "alpha", "beta")
+    loader._invalidate_config_cache()
+    cfg = KiroCrewConfig.load()
+    cfg.agents["beta"].kiro_agent = "stale-beta-mode"
+    cfg.agents["alpha"].kiro_agent = "alpha-mode"
+
+    gw, callback = await _cron_callback(monkeypatch, cfg)
+    _let_sequence_complete(monkeypatch, gw)
+    prepared_beta = MagicMock()
+    prepared_beta.loaded_capability_template = "prepared-beta-mode"
+    prepared_alpha = MagicMock()
+    prepared_alpha.loaded_capability_template = "alpha-mode"
+    gw.sessions.get_or_create = AsyncMock(
+        side_effect=[
+            (prepared_beta, True, False),
+            (prepared_alpha, True, False),
+        ]
+    )
+    captured = ExecutionContext(
+        "alpha", MemoryStoreRef("member-alpha", "alpha"), "member", "alpha", "persistent", "app"
+    )
+    job = CronJob(
+        id="seq-config-write",
+        name="sequence config write",
+        message="task",
+        agent_sequence=["beta", "alpha"],
+        execution_context=captured.to_record(),
+    )
+
+    assert await callback(job) == "done"
+    bound = read_session_execution("cron:seq-config-write:beta", required=True)
+    assert bound.template_id == "prepared-beta-mode"
+    assert bound.template_id != "stale-beta-mode"
+    assert bound.selection_name == "beta"
+    assert bound.member_id == captured.member_id
+    assert bound.store == captured.store
+    assert bound.memory_mode == captured.memory_mode
+    assert bound.app == captured.app
+
+
+@pytest.mark.asyncio
+async def test_each_sequence_step_streams_under_the_runs_task_and_ends_its_continue_attempt(
+    monkeypatch,
+):
+    """Each step's turn runs in the run's own task, which is in ``_cron_runs_holding``
+    while the step streams, so the idle cleanup leaves a step's session and key to
+    the run's finalizer. Each step hands the dispatcher an ``on_resume`` that ends
+    the interrupted prompt's attempt (``settle_turn`` on its key), so a CONTINUE
+    re-prompt's landing never confirms what only the interrupted prompt received.
+    The set is empty once the run ends."""
+    from kiro_crew.slack import gateway
+
+    write_member_home(config_dir(), "alpha", "beta")
+    loader._invalidate_config_cache()
+    cfg = KiroCrewConfig.load()
+    gw, callback = await _cron_callback(monkeypatch, cfg)
+    _let_sequence_complete(monkeypatch, gw)
+    seen = []
+
+    async def stream(_client, _message, **kw):
+        resume = kw.get("on_resume")
+        seen.append((asyncio.current_task() in gw._cron_runs_holding, resume))
+        if resume is not None:
+            resume()  # the dispatcher's one-shot CONTINUE path
+        return "done", 0
+
+    monkeypatch.setattr(gateway, "_cron_stream_with_posttoken_resume", stream)
+    captured = ExecutionContext(
+        "alpha", MemoryStoreRef("member-alpha", "alpha"), "member", "alpha", "persistent", "app"
+    )
+    job = CronJob(
+        id="seq-holding",
+        name="sequence holding",
+        message="task",
+        agent_sequence=["beta", "alpha"],
+        execution_context=captured.to_record(),
+    )
+
+    assert await callback(job) == "done"
+    assert [held for held, _resume in seen] == [True, True], "a step streamed unheld"
+    assert all(resume is not None for _held, resume in seen), "a step passed no on_resume"
+    assert [c.args[0] for c in gw.sessions.settle_turn.call_args_list] == [
+        "cron:seq-holding:beta",
+        "cron:seq-holding:alpha",
+    ]
+    assert gw._cron_runs_holding == set(), "the run's task is still held after it ended"
+
+
+@pytest.mark.asyncio
+async def test_each_sequence_step_marks_its_key_finished_just_before_it_releases_it(monkeypatch):
+    """A step's finally tells the cron service the run is done with that step's key
+    (``finish_session_key``) as it hands the session back, so the last sub-agent's
+    cleanup can retire a step key whose reset was deferred while the run goes on to
+    its next step."""
+    write_member_home(config_dir(), "alpha", "beta")
+    loader._invalidate_config_cache()
+    cfg = KiroCrewConfig.load()
+    gw, callback = await _cron_callback(monkeypatch, cfg)
+    _let_sequence_complete(monkeypatch, gw)
+    order = []
+    gw.cron_svc = MagicMock()
+    gw.cron_svc.finish_session_key.side_effect = lambda job_id, key: order.append(
+        ("finish", job_id, key)
+    )
+    gw.sessions.release.side_effect = lambda key: order.append(("release", key))
+    captured = ExecutionContext(
+        "alpha", MemoryStoreRef("member-alpha", "alpha"), "member", "alpha", "persistent", "app"
+    )
+    job = CronJob(
+        id="seq-finish",
+        name="sequence finish",
+        message="task",
+        agent_sequence=["beta", "alpha"],
+        execution_context=captured.to_record(),
+    )
+
+    assert await callback(job) == "done"
+    steps = ["cron:seq-finish:beta", "cron:seq-finish:alpha"]
+    assert [entry for entry in order if entry[0] == "finish"] == [
+        ("finish", "seq-finish", key) for key in steps
+    ]
+    for key in steps:
+        assert order.index(("finish", "seq-finish", key)) == order.index(("release", key)) - 1
+
+
+def _context_templates(monkeypatch):
+    """The ``agent=`` each cron turn hands ``ctx_builder.build_message``.
+
+    That keyword is the execution template: a private crewmate's essentials
+    read the named template's documents and refuse the turn with
+    ``Essential template '<name>': not found`` when no such template exists,
+    which is the case for a crew alias whose ``kiro_agent`` differs from it.
+    """
+    from kiro_crew.slack import gateway
+
+    seen = []
+
+    async def record(fn, *args, **kwargs):
+        seen.append(kwargs.get("agent"))
+        return "message", None
+
+    monkeypatch.setattr(gateway, "run_in_embed_pool", record)
+    return seen
+
+
+@pytest.mark.asyncio
+async def test_sequence_steps_build_context_from_their_dispatched_template(monkeypatch):
+    write_member_home(config_dir(), "alpha", "beta")
+    loader._invalidate_config_cache()
+    cfg = KiroCrewConfig.load()
+    cfg.agents["beta"].kiro_agent = "beta-mode"
+    cfg.agents["alpha"].kiro_agent = "alpha-mode"
+    gw, callback = await _cron_callback(monkeypatch, cfg)
+    _let_sequence_complete(monkeypatch, gw)
+    seen = _context_templates(monkeypatch)
+    captured = ExecutionContext(
+        "alpha", MemoryStoreRef("member-alpha", "alpha"), "member", "alpha", "persistent", "app"
+    )
+    job = CronJob(
+        id="seq-context",
+        name="sequence context",
+        message="task",
+        agent_sequence=["beta", "alpha"],
+        execution_context=captured.to_record(),
+    )
+
+    assert await callback(job) == "done"
+    assert seen == ["beta-mode", "alpha-mode"]
+
+
+@pytest.mark.asyncio
+async def test_each_sequence_step_hands_the_gate_its_alias_not_its_template(monkeypatch):
+    """The governance gate looks a task profile up by the agent it is given, so
+    each step names its alias, as a chat turn on that agent does, not the
+    template it dispatches."""
+    from kiro_crew.slack import gateway
+
+    write_member_home(config_dir(), "alpha", "beta")
+    loader._invalidate_config_cache()
+    cfg = KiroCrewConfig.load()
+    cfg.agents["beta"].kiro_agent = "beta-mode"
+    cfg.agents["alpha"].kiro_agent = "alpha-mode"
+    gw, callback = await _cron_callback(monkeypatch, cfg)
+    _let_sequence_complete(monkeypatch, gw)
+    gate_identity = []
+
+    async def stream(_client, _message, **kw):
+        gate_identity.append((kw.get("session_key"), kw.get("agent"), kw.get("unattended")))
+        return "done", 0
+
+    monkeypatch.setattr(gateway, "_cron_stream_with_posttoken_resume", stream)
+    captured = ExecutionContext(
+        "alpha", MemoryStoreRef("member-alpha", "alpha"), "member", "alpha", "persistent", "app"
+    )
+    job = CronJob(
+        id="seq-gate",
+        name="sequence gate",
+        message="task",
+        agent_sequence=["beta", "alpha"],
+        execution_context=captured.to_record(),
+    )
+
+    assert await callback(job) == "done"
+    assert gate_identity == [
+        ("cron:seq-gate:beta", "beta", True),
+        ("cron:seq-gate:alpha", "alpha", True),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("agent_id", "member", "expected"),
+    [
+        # A private crewmate's alias builds from that crewmate's template.
+        ("beta", "beta", "beta-mode"),
+        # A plain template name passes through. A name no agent declares is
+        # refused before dispatch (test_cron_agent_presence.py).
+        ("kirocrew-lite", None, "kirocrew-lite"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_single_agent_cron_builds_context_from_its_dispatched_template(
+    monkeypatch, agent_id, member, expected
+):
+    from kiro_crew.cron_service import agent_presence
+
+    # The test home holds no spec for the template name.
+    monkeypatch.setattr(agent_presence, "cron_agent_missing", lambda *_a: False)
+    write_member_home(config_dir(), "alpha", "beta")
+    loader._invalidate_config_cache()
+    cfg = KiroCrewConfig.load()
+    cfg.agents["beta"].kiro_agent = "beta-mode"
+    gw, callback = await _cron_callback(monkeypatch, cfg)
+    _let_sequence_complete(monkeypatch, gw)
+    seen = _context_templates(monkeypatch)
+    record = None
+    if member:
+        record = ExecutionContext(
+            member,
+            MemoryStoreRef(f"member-{member}", member),
+            "member",
+            member,
+            "persistent",
+            "app",
+        ).to_record()
+    job = CronJob(
+        id="single-context",
+        name="single context",
+        message="task",
+        agent_id=agent_id,
+        execution_context=record,
+    )
+
+    await callback(job)
+    assert seen == [expected]
+    assert gw.sessions.get_or_create.call_args.kwargs["agent"] == expected
+
+
+@pytest.mark.asyncio
+async def test_a_sequence_with_a_project_path_runs_every_step_there(monkeypatch, tmp_path):
+    """The job's project directory is one per job, so it outranks
+    each step's own workspace; the step still runs as its own crew."""
+    import os
+
+    write_member_home(config_dir(), "alpha", "beta")
+    loader._invalidate_config_cache()
+    cfg = KiroCrewConfig.load()
+    from kiro_crew.config.sections import WorkspaceConfig
+
+    beta_tree = tmp_path / "beta-tree"
+    beta_tree.mkdir()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg.workspaces["beta-ws"] = WorkspaceConfig(dir=str(beta_tree))
+    cfg.agents["beta"].kiro_agent = "beta-mode"
+    cfg.agents["beta"].workspace = "beta-ws"
+
+    gw, callback = await _cron_callback(monkeypatch, cfg)
+    captured = ExecutionContext(
+        "alpha", MemoryStoreRef("member-alpha", "alpha"), "member", "alpha", "persistent", "app"
+    )
+    job = CronJob(
+        id="seq-proj",
+        name="sequence in a repo",
+        message="task",
+        agent_sequence=["beta", "alpha"],
+        execution_context=captured.to_record(),
+        project_path=os.path.realpath(repo),
+    )
+    with pytest.raises(RuntimeError, match="stop before the provider"):
+        await callback(job)
+
+    first = gw.sessions.get_or_create.call_args_list[0]
+    assert first.kwargs["cwd"] == os.path.realpath(repo)
+    assert first.kwargs["agent"] == "beta-mode"
+    assert first.kwargs["crew_agent"] == "beta"

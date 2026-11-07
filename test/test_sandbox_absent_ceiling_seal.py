@@ -1,0 +1,1136 @@
+"""An ABSENT crew-home ceiling is still sealed read-only by the Linux launcher.
+
+``mount(2)`` cannot target a path that does not exist, so the launcher's read-only seal
+(``sandbox_launcher_program.seal_readonly``) skips a ceiling that has never been written
+— and on a default install that is most of them, which would leave the data home
+writable at exactly the names the seal exists to protect. ``_materialize_sealable_ceilings()``
+closes that by creating the absent ceiling first, but only for the leaves that clear both
+tests the production comment states: an empty document must mean what an absent file
+means, and a STALE read of it must fail toward refusal.
+
+The load-bearing test here is
+:meth:`TestSealAppliesToAPreviouslyAbsentCeiling.test_bind_and_remount_pair_is_emitted`:
+it runs the launcher program's own seal stage against a real filesystem, with a libc that
+records each ``mount(2)`` instead of making it. Delete the materialiser and that stage
+records nothing, because the pin finds no object to seal — which is the whole defect.
+What each spawn hands the launcher -- the masked, sealed and required paths -- is read
+off the confinement plan (``sandbox._spawn_plan``), or off the plan line of the launcher
+``namespace_argv`` wrote when the spawn path itself is under test.
+
+:class:`TestCeilingsThatMustNotBeMaterialized` is the fence in the opposite direction,
+and it is the one to read before adding a leaf: two ceilings read a present-but-empty
+file as something other than absent, and a third is seeded at first run.
+
+The alias decision over the no-alias and masked leaves, with the shapes it tolerates, has
+a module of its own, ``test_sandbox_absent_ceiling_seal_symlinks.py``; a second hard link on
+a masked credential leaf and the inode-alias walk that finds it are in
+``test_sandbox_absent_ceiling_seal_hard_links.py``. The materialiser's own symlink and
+alias cases -- a dangling or resolving link at a ceiling, an alias-backed ceiling, a
+symlinked maskable-dir leaf -- stay here. The auth store's staging leaf is in
+``test_sandbox_absent_ceiling_seal_auth_store.py``, and the fixtures the four share live in
+``sandbox_absent_ceiling_seal_helpers.py``.
+"""
+
+from __future__ import annotations
+
+import errno
+import json
+import os
+import stat
+import sys
+import tempfile
+from pathlib import Path
+from unittest import mock
+
+import pytest
+from sandbox_absent_ceiling_seal_helpers import (  # noqa: F401 -- fixtures are requested by name
+    _POSIX_ONLY,
+    _no_host_ssh_probe,
+    _written_plan,
+    crew_home_fixture,
+    program,
+)
+from test_sandbox_launcher_program import RecordingLibc, identity, launch, payload
+
+from kiro_crew import sandbox
+from kiro_crew.sandbox_plan import BACKEND_NAMESPACE, ConfinementPlan
+
+#: The ``mount(2)`` flag values a seal must pass, as the kernel defines them.
+_MS_RDONLY = 1
+_MS_REMOUNT = 32
+_MS_BIND = 4096
+
+
+class _SealRecorder(RecordingLibc):
+    """A :class:`RecordingLibc` that records each mount by the OBJECTS it reached.
+
+    The shared recorder also resolves every ``/proc/self/fd/<n>`` spelling back to a
+    path, which only Linux can. The seal assertions need only the identity each mount
+    landed on, which :func:`identity` reads through the descriptor the stage still holds
+    open, on every POSIX host -- so the seal stage is driven off Linux too, where its
+    no-``O_PATH`` refusal is what is under test.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.mounts: list[tuple[object, object, int]] = []
+
+    def mount(self, source, target, fstype, flags, data):  # noqa: ANN001, ANN201
+        self.mounts.append((identity(source), identity(target), flags))
+        return 0
+
+
+def _run_seal_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, targets: list[str]
+) -> list[tuple[str, int]]:
+    """Run the launcher's seal stage over *targets*, recording every mount call.
+
+    ``sandbox_launcher_program.seal_readonly`` runs as the child runs it, against real
+    files. Each mount is reported by the configured NAME whose object it reached, so
+    these assertions are about the names while still proving the mount landed on that
+    name's object. ``_locked_mount_flags`` is stubbed to 0 so the bind+remount PAIR is
+    asserted exactly; the flag re-assertion itself is covered by
+    test_sandbox_seal_locked_flags.py against the real helper.
+    """
+    libc = _SealRecorder()
+    run = launch(tmp_path, payload(readonly_dirs=list(targets)), libc=libc)
+    with monkeypatch.context() as patched:
+        patched.setattr(program, "_locked_mount_flags", lambda _target: 0)
+        program.seal_readonly(run)
+    names = {identity(target): target for target in targets if identity(target) is not None}
+    calls: list[tuple[str, int]] = []
+    for source_id, target_id, flags in libc.mounts:
+        assert source_id == target_id, "a ceiling is bound over ITSELF, not over an empty source"
+        calls.append((names.get(target_id, repr(target_id)), flags))
+    return calls
+
+
+def _namespace_plan(tier: str, **kwargs: object) -> ConfinementPlan:
+    """The confinement plan a namespace spawn at *tier* hands its launcher, on this host."""
+    return sandbox._spawn_plan(BACKEND_NAMESPACE, tier, **kwargs)
+
+
+@_POSIX_ONLY
+@pytest.mark.parametrize("leaf", ("subagents", "member-memory-bindings"))
+def test_run_authority_root_is_sealed_before_its_first_record(
+    crew_home, tmp_path, monkeypatch, leaf
+):
+    target = crew_home / leaf
+    assert not target.exists()
+    sandbox._materialize_sealable_ceilings()
+    assert target.is_dir()
+    assert list(target.iterdir()) == []
+    assert _run_seal_loop(tmp_path, monkeypatch, [str(target)]) == [
+        (str(target), _MS_BIND),
+        (str(target), _MS_REMOUNT | _MS_BIND | _MS_RDONLY),
+    ]
+
+
+@_POSIX_ONLY
+def test_deny_ceiling_is_primed_before_the_operator_first_saves_it(crew_home, monkeypatch):
+    """An absent deny ceiling is created for the seal, and the deny set it yields is unchanged."""
+    from kiro_crew.config import loader
+    from kiro_crew.hooks import effective_denied_regexes_from_config
+
+    target = crew_home / "denied_commands.json"
+    monkeypatch.setattr(loader, "denied_commands_path", lambda: target)
+    before = effective_denied_regexes_from_config()
+    assert str(target) in sandbox._materialize_sealable_ceilings()
+    assert effective_denied_regexes_from_config() == before
+
+
+@_POSIX_ONLY
+def test_member_memory_is_not_an_os_hidden_root(crew_home):
+    target = crew_home / "memory_stores"
+    assert not target.exists()
+    sandbox.namespace_argv(["/bin/true"])
+    assert str(target) not in _namespace_plan("standard").sensitive_dirs
+
+
+@_POSIX_ONLY
+class TestSealAppliesToAPreviouslyAbsentCeiling:
+    def test_bind_and_remount_pair_is_emitted(self, crew_home, tmp_path, monkeypatch):
+        """The seal reaches a ceiling that did not exist when the spawn started.
+
+        Both calls are asserted, not just the first: ``MS_RDONLY`` is ignored on the
+        initial ``MS_BIND``, so a bind without the remount grants exactly the write
+        access the loop exists to withhold.
+        """
+        target = str(crew_home / "computer_use.json")
+        assert not os.path.exists(target)
+
+        assert target in sandbox._materialize_sealable_ceilings()
+        calls = _run_seal_loop(tmp_path, monkeypatch, [target])
+
+        assert calls == [
+            (target, _MS_BIND),
+            (target, _MS_REMOUNT | _MS_BIND | _MS_RDONLY),
+        ]
+
+    def test_loop_skips_the_ceiling_when_it_was_never_materialized(
+        self, crew_home, tmp_path, monkeypatch
+    ):
+        """The defect, pinned: no target on disk means no seal at all."""
+        target = str(crew_home / "computer_use.json")
+
+        assert _run_seal_loop(tmp_path, monkeypatch, [target]) == []
+
+    def test_every_sealable_leaf_is_created(self, crew_home):
+        created = sandbox._materialize_sealable_ceilings()
+
+        for leaf in sandbox._CREW_PRECREATE_READONLY_FILE_LEAVES:
+            path = crew_home / leaf
+            assert str(path) in created
+            assert json.loads(path.read_text(encoding="utf-8")) == {}
+            assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+        for leaf in sandbox._CREW_PRECREATE_READONLY_DIR_LEAVES:
+            path = crew_home / leaf
+            assert str(path) in created
+            assert path.is_dir()
+            assert stat.S_IMODE(path.stat().st_mode) == 0o700
+            if "/" in leaf:
+                assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
+
+    def test_a_nested_ceiling_refuses_a_symlinked_parent(self, crew_home, tmp_path):
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (crew_home / "mcp").symlink_to(outside, target_is_directory=True)
+
+        with pytest.raises(sandbox.SandboxCeilingUnsealable):
+            sandbox._materialize_sealable_ceilings()
+
+    def test_the_hidden_records_dir_is_materialised(self, crew_home):
+        """The MASK's counterpart to the ceiling case above.
+
+        A hidden leaf has the same existence requirement as a read-only ceiling and
+        the opposite reason for it: on Linux the mask is a bind mount whose loop
+        guards on ``isdir``, so an ABSENT directory is silently skipped -- and
+        skipped precisely on the fresh install where the agent could create it
+        first and write what the gateway later reads back as authoritative.
+
+        Derived from the tuple, so a second hidden leaf is covered without editing
+        this test.
+        """
+        created = set(sandbox._materialize_sealable_ceilings())
+
+        assert sandbox._CREW_PRECREATE_HIDDEN_DIR_LEAVES, "empty tuple would be vacuous"
+        for leaf in sandbox._CREW_PRECREATE_HIDDEN_DIR_LEAVES:
+            path = crew_home / leaf
+            assert str(path) in created, f"{leaf} was not materialised, so its mask is skipped"
+            assert path.is_dir()
+            assert stat.S_IMODE(path.stat().st_mode) == 0o700
+
+    def test_created_ceilings_are_in_the_launcher_readonly_list(self, crew_home):
+        """Creating a path is only useful if the seal loop is handed it.
+
+        Reconciled PER DISPOSITION rather than against one list, because two kinds
+        of path are materialised for opposite reasons and each has its own loop:
+
+        * a read-only ceiling is created so the SEAL can apply -> the plan's ``readonly``;
+        * a hidden leaf is created so the MASK can -> the plan's ``sensitive_dirs``.
+
+        Asserting every created path against the read-only list alone would demand
+        that a directory meant to be invisible in the sandbox be exposed read-only
+        instead -- the exact inversion of its purpose. Derived from the
+        precreate tuples, so a leaf added to either disposition must appear in the
+        matching launcher list rather than in whichever list this test happened to name.
+        """
+        created = set(sandbox._materialize_sealable_ceilings())
+        plan = _namespace_plan("strict")
+
+        readonly = set(plan.readonly)
+        masked = set(plan.sensitive_dirs)
+
+        # Every created path is handed to exactly the loop its disposition needs.
+        readonly_leaves = (
+            sandbox._CREW_PRECREATE_READONLY_DIR_LEAVES
+            + sandbox._CREW_PRECREATE_READONLY_FILE_LEAVES
+        )
+        for leaf in readonly_leaves:
+            path = str(crew_home / leaf)
+            if path not in created:
+                continue  # covered by test_every_sealable_leaf_is_created
+            assert (
+                path in readonly
+            ), f"{leaf} is created to be read-only but is not sealed read-only"
+            assert path not in masked, (
+                f"{leaf} is masked instead of exposed READ-ONLY; masking a governance "
+                "ceiling removes it and restores the permissive default"
+            )
+
+        for leaf in sandbox._CREW_PRECREATE_HIDDEN_DIR_LEAVES:
+            path = str(crew_home / leaf)
+            if path not in created:
+                continue  # covered by test_the_hidden_records_dir_is_materialised
+            assert path in masked, f"{leaf} is created to be masked but is not masked"
+            assert path not in readonly, (
+                f"{leaf} is exposed READ-ONLY as well as masked; a hidden leaf that "
+                "is also readable is not hidden"
+            )
+
+        # And nothing created is left with no disposition at all -- the original
+        # invariant, widened rather than weakened.
+        unaccounted = created - readonly - masked
+        assert not unaccounted, f"created but handed to no seal loop: {sorted(unaccounted)}"
+
+    def test_namespace_argv_materializes_before_the_launcher_runs(self, crew_home):
+        """The production wiring, not just the helper.
+
+        The seal happens in the launcher CHILD after ``namespace_argv`` returns, so the
+        creation has to be on this path — a helper nobody calls seals nothing.
+        """
+        sandbox.namespace_argv(["/bin/true"])
+
+        assert (crew_home / "computer_use.json").is_file()
+        assert (crew_home / "profiles").is_dir()
+
+    @pytest.mark.parametrize(
+        "materialiser",
+        [
+            "_materialize_sealable_ceilings",
+            "_materialize_live_target_mask_target",
+            "_materialize_md_notebook_mask_targets",
+        ],
+    )
+    def test_every_lost_publication_branch_records_the_winner(self, crew_home, materialiser):
+        """Losing the publish race still ends with the object THERE and just seen.
+
+        The invariant, not the four lines that currently implement it: any branch that
+        returns after losing a publication must record the winner, because the launcher
+        then requires that name and refuses if it later goes missing. Asserted per
+        materialiser and driven by FORCING the loss, so a publish site added later is
+        covered without anyone remembering this test, and so the no-``else`` shape --
+        where the lost path simply falls through -- is covered like the rest.
+        """
+        real = sandbox._publish_empty_ceiling
+        lost: list[str] = []
+
+        def lost_race(target, parent, **kwargs):
+            # What a real loser leaves behind: the object present, publish reporting False.
+            real(target, parent, **kwargs)
+            lost.append(target)
+            return False
+
+        established: list[str] = []
+        with mock.patch.object(sandbox, "_publish_empty_ceiling", side_effect=lost_race):
+            getattr(sandbox, materialiser)(established)
+
+        assert lost, f"{materialiser} never reached a publication, so nothing was exercised"
+        missing = [target for target in lost if target not in established]
+        assert not missing, (
+            f"{materialiser} lost the publication race for {missing} and did not record "
+            "them, so the launcher will treat those names as optional"
+        )
+
+    def test_a_target_nested_under_a_masked_directory_is_never_required(self, crew_home):
+        """The predicate is the DISTINCTION, not presence.
+
+        "Absent because my own parent's mask already covers me" and "absent because the
+        name moved" are different facts, and only the second is a race. A target under a
+        directory the launcher masks earlier is legitimately gone by the time it is
+        pinned, so requiring it would refuse every spawn on an ordinary host.
+
+        The nested pair is CONSTRUCTED rather than looked for: on most hosts no nested
+        entry reaches the required set at all, so asserting over whatever the host
+        happens to have would assert that an empty set is empty and would still pass
+        with the filter deleted. This drives the filter with both members present.
+        """
+        parent = str(crew_home / "nested-parent")
+        child = f"{parent}/credential.json"
+
+        plan = _namespace_plan(
+            "strict",
+            extra_hidden_dirs=(parent,),
+            required_mask_targets=(parent, child),
+        )
+        required = set(plan.identities.required_mask_targets)
+
+        assert child not in required, (
+            "a target under a masked ancestor was required, so the launcher will refuse "
+            "the spawn once the parent's mask hides it"
+        )
+        assert parent in required, "the masked parent itself must still be required"
+
+    def test_the_required_set_survives_a_second_spawn_on_the_same_home(self, crew_home):
+        """The set must describe what is THERE, not what this spawn happened to create.
+
+        A materialiser reports what it created, and on every spawn after the first it
+        creates nothing, so collecting only creations makes the launcher's absence
+        refusal cover exactly one spawn per data home and nothing afterwards -- which is
+        every real install. Pinning two consecutive spawns is what makes that visible;
+        a single-spawn assertion passes with the defect present.
+        """
+
+        def required():
+            argv = sandbox.namespace_argv(["/bin/true"], "strict")
+            return set(_written_plan(argv)["required_mask_targets"])
+
+        first = required()
+        second = required()
+
+        assert first, "the first spawn established nothing"
+        assert second == first, (
+            "the required set collapsed on the second spawn against the same home: "
+            f"lost {sorted(first - second)}"
+        )
+
+    def test_every_materialized_path_reaches_the_launcher_required_set(self, crew_home):
+        """What a materialiser created must be named as required, not re-derived.
+
+        The child cannot tell a leaf that was never configured from one that was
+        moved after it was established -- both are simply an absent name by the
+        time it looks. Only this side knows, because it just created the object,
+        so the proof travels with the script. A materialiser whose result is not
+        collected leaves its leaves silently skippable again, which is the whole
+        defect, and no other assertion here would notice.
+        """
+        argv = sandbox.namespace_argv(["/bin/true"], "strict")
+        required = set(_written_plan(argv)["required_mask_targets"])
+
+        # Derived from the precreate tuples rather than from a materialiser's return
+        # value: each returns only what it newly CREATED, so calling one again after
+        # the spawn path already ran returns nothing and would assert vacuously.
+        leaves = (
+            sandbox._CREW_PRECREATE_READONLY_DIR_LEAVES
+            + sandbox._CREW_PRECREATE_READONLY_FILE_LEAVES
+            + sandbox._CREW_PRECREATE_HIDDEN_DIR_LEAVES
+        )
+        missing = [
+            leaf
+            for leaf in leaves
+            if (crew_home / leaf).exists() and str(crew_home / leaf) not in required
+        ]
+        assert not missing, f"materialised but not named as required: {missing}"
+
+    def test_relocated_data_home_is_covered(self, tmp_path, monkeypatch):
+        """A data home that escapes ``$HOME`` gets the same treatment.
+
+        Without this the fleets that relocate the data home — the ones most likely to
+        care about a governance ceiling — would be the only ones left unsealed.
+        """
+        relocated = tmp_path / "srv" / "crew"
+        relocated.mkdir(parents=True)
+        monkeypatch.setattr(sandbox, "config_dir", lambda: relocated)
+
+        assert str(relocated / "computer_use.json") in sandbox._materialize_sealable_ceilings()
+
+    def test_deprecated_home_spelling_gains_no_stubs(self, crew_home, tmp_path):
+        """Only the LIVE data home is materialised.
+
+        The deny lists cover both ``_CREW_HOME_PREFIXES`` because either tree may hold
+        bytes, but creation is the opposite case: a stub under a migrated host's leftover
+        ``~/.kirocrew`` is a file nothing will ever read.
+        """
+        legacy = tmp_path / ".kirocrew"
+        legacy.mkdir()
+
+        sandbox._materialize_sealable_ceilings()
+
+        assert list(legacy.iterdir()) == []
+
+
+@_POSIX_ONLY
+class TestPublishIsAllOrNothing:
+    """The ceiling path never appears holding anything but the complete document."""
+
+    def test_partial_write_publishes_nothing(self, crew_home, monkeypatch):
+        """A zero-length ``*.json`` would read as CORRUPT, not as absent."""
+
+        def _boom(fd, data):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(os, "write", _boom)
+
+        with pytest.raises(sandbox.SandboxCeilingUnsealable):
+            sandbox._materialize_sealable_ceilings()
+
+        for leaf in sandbox._CREW_PRECREATE_READONLY_FILE_LEAVES:
+            assert not (crew_home / leaf).exists()
+
+    def test_no_temp_file_is_left_behind(self, crew_home, monkeypatch):
+        """The temp sibling is reclaimed on the failure path as well as the success one."""
+
+        def _boom(src, dst):
+            raise OSError("cross-device link")
+
+        monkeypatch.setattr(os, "link", _boom)
+
+        with pytest.raises(sandbox.SandboxCeilingUnsealable):
+            sandbox._materialize_sealable_ceilings()
+
+        assert [p.name for p in crew_home.iterdir() if p.name.startswith(".kirocrew-ceiling")] == []
+
+    def test_publish_never_clobbers_a_racing_writer(self, crew_home):
+        """``os.link`` fails with EEXIST rather than overwriting.
+
+        The upstream ``os.path.exists`` check is an optimisation, not the guard — a
+        second spawn, or an operator writing the real document, can land between it and
+        the publish.
+        """
+        target = crew_home / "computer_use.json"
+        target.write_text('{"enabled": true}', encoding="utf-8")
+
+        assert sandbox._publish_empty_ceiling(str(target), str(crew_home)) is False
+        assert target.read_text(encoding="utf-8") == '{"enabled": true}'
+
+    def test_existing_ceiling_is_left_byte_for_byte_alone(self, crew_home):
+        """Never a truncate: an operator's document outranks the absent default."""
+        target = crew_home / "aws_service_consent.json"
+        target.write_text('{"s3": "confirmed"}', encoding="utf-8")
+
+        created = sandbox._materialize_sealable_ceilings()
+
+        assert str(target) not in created
+        assert target.read_text(encoding="utf-8") == '{"s3": "confirmed"}'
+
+
+@_POSIX_ONLY
+class TestAShortWriteNeverPublishes:
+    """``os.write`` may consume part of the buffer and report it as success."""
+
+    def test_partial_progress_is_completed_not_published_short(self, crew_home):
+        """The loop finishes the document; a one-byte-at-a-time write still lands whole."""
+        real_write = os.write
+        calls: list[int] = []
+
+        def _one_byte(fd, data):
+            calls.append(len(data))
+            return real_write(fd, bytes(data[:1]))
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(os, "write", _one_byte)
+            assert sandbox._publish_empty_ceiling(
+                str(crew_home / "computer_use.json"), str(crew_home)
+            )
+
+        assert len(calls) > 1, "a short write must be retried, not accepted"
+        assert (crew_home / "computer_use.json").read_bytes() == sandbox._EMPTY_CEILING_DOCUMENT
+
+    def test_zero_progress_publishes_nothing(self, crew_home, monkeypatch):
+        """A filesystem accepting nothing must fail, not spin forever."""
+        monkeypatch.setattr(os, "write", lambda fd, data: 0)
+
+        assert (
+            sandbox._publish_empty_ceiling(str(crew_home / "computer_use.json"), str(crew_home))
+            is False
+        )
+        assert not (crew_home / "computer_use.json").exists()
+
+
+@_POSIX_ONLY
+class TestAnUnsealedCeilingIsNeverSilent:
+    """A seal that could not be established is logged, because nothing else reports it.
+
+    Raising instead would reach far past this seal: ``namespace_argv`` runs under
+    ``wrap_argv``, whose callers catch narrowly and degrade their own operation, so an
+    additive control would take every sandboxed spawn on the host down with it.
+    """
+
+    def test_failed_dir_creation_warns(self, crew_home, monkeypatch, caplog):
+        monkeypatch.setattr(
+            os, "mkdir", lambda *a, **k: (_ for _ in ()).throw(OSError("read-only fs"))
+        )
+
+        with caplog.at_level("WARNING", logger="kiro_crew.sandbox"):
+            with pytest.raises(sandbox.SandboxCeilingUnsealable):
+                sandbox._materialize_sealable_ceilings()
+
+        assert "REFUSING to launch" in caplog.text
+        assert sandbox._CREW_PRECREATE_READONLY_DIR_LEAVES[0] in caplog.text
+
+    def test_failed_publish_warns(self, crew_home, monkeypatch, caplog):
+        monkeypatch.setattr(
+            os, "link", lambda *a, **k: (_ for _ in ()).throw(OSError("no hardlinks"))
+        )
+
+        with caplog.at_level("WARNING", logger="kiro_crew.sandbox"):
+            with pytest.raises(sandbox.SandboxCeilingUnsealable):
+                sandbox._materialize_sealable_ceilings()
+
+        # Only the FIRST unsealable ceiling is reached: the refusal is immediate, which is
+        # the point -- the loop must not carry on creating the rest behind a known hole.
+        assert "REFUSING to launch" in caplog.text
+        assert sandbox._CREW_PRECREATE_READONLY_FILE_LEAVES[0] in caplog.text
+
+    def test_success_is_quiet(self, crew_home, caplog):
+        with caplog.at_level("WARNING", logger="kiro_crew.sandbox"):
+            sandbox._materialize_sealable_ceilings()
+
+        assert "REFUSING to launch" not in caplog.text
+
+
+@_POSIX_ONLY
+class TestACreationFailureRefusesTheSpawn:
+    """A ceiling that cannot be created is a ceiling that will not be sealed.
+
+    Earlier revisions warned and continued here. That is the shape where the launcher's
+    ``exists`` guard silently skips the path and the agent runs with a writable keystone,
+    so the failure is fatal to the spawn instead — the ``_mount_or_die`` posture. No
+    ``wrap_argv`` caller falls back to running the command unconfined, so refusing costs
+    the operation, never the confinement.
+    """
+
+    def test_unwritable_data_home_refuses(self, crew_home, monkeypatch):
+        def _boom(*args, **kwargs):
+            raise OSError("read-only file system")
+
+        monkeypatch.setattr(os, "mkdir", _boom)
+        monkeypatch.setattr(tempfile, "mkstemp", _boom)
+
+        with pytest.raises(sandbox.SandboxCeilingUnsealable):
+            sandbox._materialize_sealable_ceilings()
+
+    def test_a_failed_publish_refuses(self, crew_home, monkeypatch):
+        monkeypatch.setattr(
+            os, "link", lambda *a, **k: (_ for _ in ()).throw(OSError("no hardlinks"))
+        )
+
+        with pytest.raises(sandbox.SandboxCeilingUnsealable):
+            sandbox._materialize_sealable_ceilings()
+
+    def test_a_race_that_another_writer_won_is_benign(self, crew_home, monkeypatch):
+        """``EEXIST`` means the path now exists, so the launcher seals it: nothing to do."""
+        target = crew_home / "computer_use.json"
+
+        def _link_but_someone_won(src_path, dst):
+            # Honour the dst actually being published: every ceiling in the loop goes
+            # through this stub, and a stub that only ever creates ONE of them leaves the
+            # others genuinely unsealable -- which is a different scenario.
+            Path(os.fsdecode(dst)).write_text('{"enabled": false}', encoding="utf-8")
+            raise FileExistsError("raced")
+
+        monkeypatch.setattr(os, "link", _link_but_someone_won)
+
+        created = sandbox._materialize_sealable_ceilings()
+
+        assert str(target) not in created
+        assert target.read_text(encoding="utf-8") == '{"enabled": false}'
+
+    def test_an_existing_dir_ceiling_is_benign(self, crew_home):
+        (crew_home / "profiles").mkdir()
+
+        created = sandbox._materialize_sealable_ceilings()
+
+        assert str(crew_home / "profiles") not in created
+
+    def test_absent_data_home_is_not_created(self, tmp_path, monkeypatch):
+        missing = tmp_path / "nope" / "crew"
+        monkeypatch.setattr(sandbox, "config_dir", lambda: missing)
+
+        assert sandbox._materialize_sealable_ceilings() == []
+        assert not missing.exists()
+
+    def test_unresolvable_data_home_yields_nothing(self, monkeypatch):
+        def _boom():
+            raise RuntimeError("no data home")
+
+        monkeypatch.setattr(sandbox, "config_dir", _boom)
+
+        assert sandbox._sealable_absent_ceilings() == ([], [])
+        assert sandbox._materialize_sealable_ceilings() == []
+
+
+class TestAMissingParentRefusesTheSpawn:
+    """A ceiling whose parent is not a directory refuses instead of scaffolding.
+
+    Building the parents would create a writable ancestor the agent could
+    rename through, so the materialiser names the path and raises rather than
+    running the spawn unprotected.
+    """
+
+    def test_missing_dir_parent_refuses(self, crew_home, monkeypatch, tmp_path):
+        ghost = str(tmp_path / "no-such-dir" / "profiles")
+        monkeypatch.setattr(sandbox, "_sealable_absent_ceilings", lambda: ([ghost], []))
+
+        with pytest.raises(sandbox.SandboxCeilingUnsealable):
+            sandbox._materialize_sealable_ceilings()
+        assert not (tmp_path / "no-such-dir").exists()
+
+    def test_missing_file_parent_refuses(self, crew_home, monkeypatch, tmp_path):
+        ghost = str(tmp_path / "no-such-dir" / "computer_use.json")
+        monkeypatch.setattr(sandbox, "_sealable_absent_ceilings", lambda: ([], [ghost]))
+
+        with pytest.raises(sandbox.SandboxCeilingUnsealable):
+            sandbox._materialize_sealable_ceilings()
+        assert not (tmp_path / "no-such-dir").exists()
+
+
+class TestEachCeilingIsJudgedAgainstItsOwnHome:
+    """The agents leaf hangs off kiro-cli's home, not the crew data home.
+
+    ``config_dir()`` mkdirs whatever it returns, so gating the agents ceiling on it
+    was true unconditionally and never described that leaf. The refusal then fired on
+    every host with no ``~/.kiro`` at all and took the launcher sweep with it
+    (``test_sandbox_launcher_sweep.py::TestNamespaceArgvPlacement``, whose ``fake_home``
+    creates ``.kirocrew`` and never ``.kiro``). These tests drive the real
+    ``_sealable_absent_ceilings`` and the real refusal rather than replacing the
+    function under test, which is the gap that let that ship.
+    """
+
+    # ``crew_home`` already creates ``tmp_path/.kiro/crew``, so the kiro home under
+    # test is a sibling name -- otherwise the fixture would have made it present
+    # before the test could assert its absence.
+    def test_an_absent_kiro_home_yields_no_agents_ceiling(self, crew_home, monkeypatch, tmp_path):
+        kiro_home = tmp_path / "no-kiro-install"
+        monkeypatch.setattr(sandbox, "kiro_agents_dir", lambda: kiro_home / "agents")
+
+        dir_targets, _ = sandbox._sealable_absent_ceilings()
+
+        assert str(kiro_home / "agents") not in dir_targets
+        # Absent, not refused: the spawn proceeds, and nothing is scaffolded.
+        assert str(kiro_home / "agents") not in sandbox._materialize_sealable_ceilings()
+        assert not kiro_home.exists()
+
+    def test_a_present_kiro_home_keeps_the_agents_ceiling(self, crew_home, monkeypatch, tmp_path):
+        kiro_home = tmp_path / "kiro-install"
+        kiro_home.mkdir()
+        monkeypatch.setattr(sandbox, "kiro_agents_dir", lambda: kiro_home / "agents")
+
+        dir_targets, _ = sandbox._sealable_absent_ceilings()
+
+        assert str(kiro_home / "agents") in dir_targets
+
+
+@_POSIX_ONLY
+class TestADanglingSymlinkRefusesTheSpawn:
+    """The one state that defeats every ``os.path.exists`` guard on this path at once.
+
+    ``exists`` FOLLOWS symlinks, so a dangling link reports as absent: the materialiser
+    tries to create and ``os.link`` refuses with ``EEXIST``, the launcher's seal loop
+    emits no mount, and the sandboxed process's write then follows the link to a file the
+    host afterwards reads through the ceiling path. The link is plantable through the very
+    hole this change closes, so an agent on an earlier build could pre-arm it.
+
+    It is REFUSED, not removed. ``islink`` followed by ``unlink`` is not atomic and the
+    dashboard publishes a real keystone over that same name with ``atomic_write``, so a
+    removal racing a validated operator write would delete the operator's new settings —
+    and POSIX has no unlink-only-if-still-a-symlink to close that window with.
+    """
+
+    def test_the_unguarded_chain_really_is_exploitable(self, crew_home, tmp_path, monkeypatch):
+        """Pin the mechanism itself, so the refusal below is not guarding a phantom.
+
+        Collected on every platform. The link reads as absent everywhere. On Linux
+        the seal stage skips it and a write through the link creates the referent,
+        so the host reads the agent's bytes back through the ceiling path. Off
+        Linux there is no ``O_PATH``, so the stage's pin refuses the link instead of
+        skipping and the chain never reaches the write. Both outcomes are asserted,
+        because a skipped witness would let the refusal below guard a phantom on the
+        platform that skipped it.
+        """
+        target = crew_home / "computer_use.json"
+        victim = crew_home / "elsewhere.json"
+        target.symlink_to(victim)
+
+        assert os.path.lexists(target) is True
+        assert os.path.exists(target) is False, "exists() follows the link -> reads as absent"
+        if sys.platform == "linux":
+            # The launcher's own guard therefore skips it: no bind, no remount.
+            assert _run_seal_loop(tmp_path, monkeypatch, [str(target)]) == []
+            # And a write through the link lands where the host will read it back.
+            target.write_text('{"enabled": true}', encoding="utf-8")
+            assert victim.exists()
+            assert target.read_text(encoding="utf-8") == '{"enabled": true}'
+        else:
+            # No ``O_PATH`` off Linux: the seal stage cannot pin a link no-follow and
+            # REFUSES it rather than skipping, so the chain stops before any write.
+            # The launcher never runs here; the assertion is that it fails closed.
+            with pytest.raises((SystemExit, OSError)):
+                _run_seal_loop(tmp_path, monkeypatch, [str(target)])
+            assert not victim.exists(), "the refused chain still wrote through the link"
+
+    def test_a_file_ceiling_squatter_refuses(self, crew_home):
+        target = crew_home / "computer_use.json"
+        target.symlink_to(crew_home / "elsewhere.json")
+
+        with pytest.raises(sandbox.SandboxCeilingUnsealable) as err:
+            sandbox._materialize_sealable_ceilings()
+
+        assert "computer_use.json" in str(err.value)
+        assert "elsewhere.json" in str(err.value), "the destination is the diagnostic value"
+
+    def test_a_dir_ceiling_squatter_refuses(self, crew_home):
+        target = crew_home / "profiles"
+        target.symlink_to(crew_home / "no-such-dir")
+
+        with pytest.raises(sandbox.SandboxCeilingUnsealable):
+            sandbox._materialize_sealable_ceilings()
+
+    def test_the_squatter_is_never_removed(self, crew_home):
+        """Removing it is the data-loss path this refusal exists to avoid."""
+        target = crew_home / "computer_use.json"
+        target.symlink_to(crew_home / "elsewhere.json")
+
+        with pytest.raises(sandbox.SandboxCeilingUnsealable):
+            sandbox._materialize_sealable_ceilings()
+
+        assert target.is_symlink(), "the link is the operator's to resolve, not ours to delete"
+        assert not (crew_home / "elsewhere.json").exists(), "nothing written through the link"
+
+    def test_namespace_argv_refuses_rather_than_launching(self, crew_home):
+        """The refusal has to reach the spawn path, or it protects nothing."""
+        (crew_home / "computer_use.json").symlink_to(crew_home / "elsewhere.json")
+
+        with pytest.raises(sandbox.SandboxCeilingUnsealable):
+            sandbox.namespace_argv(["/bin/true"])
+
+    def test_a_resolving_symlink_is_left_alone(self, crew_home):
+        """It reads as present, so the launcher seals the inode it resolves to.
+
+        The remaining exposure — the link NAME stays replaceable in a writable parent — is
+        pre-existing for every ceiling and cannot be closed without sealing the data-home
+        root, so this change must neither refuse nor delete on account of it.
+        """
+        real = crew_home / "elsewhere.json"
+        real.write_text('{"enabled": false}', encoding="utf-8")
+        target = crew_home / "computer_use.json"
+        target.symlink_to(real)
+
+        created = sandbox._materialize_sealable_ceilings()
+
+        assert str(target) not in created
+        assert target.is_symlink()
+        assert real.read_text(encoding="utf-8") == '{"enabled": false}'
+
+
+@_POSIX_ONLY
+class TestGatewayLauncherDirectoryNeedsARealLeaf:
+    @pytest.mark.parametrize("leaf", ("browser-harness", "subagents", "member-memory-bindings"))
+    def test_a_resolving_symlink_refuses_the_spawn(self, crew_home, tmp_path, leaf):
+        real = tmp_path / "attacker-controlled"
+        real.mkdir()
+        target = crew_home / leaf
+        target.symlink_to(real, target_is_directory=True)
+
+        with pytest.raises(sandbox.SandboxCeilingUnsealable):
+            sandbox._materialize_sealable_ceilings()
+
+        assert target.is_symlink(), "the operator must remove the refused link"
+
+    def test_a_symlink_winning_the_create_race_refuses(self, crew_home, tmp_path, monkeypatch):
+        target = crew_home / "browser-harness"
+        real = tmp_path / "race-winner"
+        real.mkdir()
+        real_mkdir = os.mkdir
+
+        def _mkdir(path, mode=0o777, *, dir_fd=None):
+            if os.fspath(path) == os.fspath(target):
+                target.symlink_to(real, target_is_directory=True)
+                raise FileExistsError("symlink won the race")
+            return real_mkdir(path, mode, dir_fd=dir_fd)
+
+        monkeypatch.setattr(os, "mkdir", _mkdir)
+
+        with pytest.raises(sandbox.SandboxCeilingUnsealable):
+            sandbox._materialize_sealable_ceilings()
+
+        assert target.is_symlink()
+
+
+@_POSIX_ONLY
+class TestAnAliasBackedCeilingIsReported:
+    """``MS_RDONLY`` binds a MOUNT, not an inode, so a second name survives the seal.
+
+    Both shapes are PRE-EXISTING -- the ceilings this module publishes end at
+    ``st_nlink == 1`` and are never symlinks (pinned below) -- so they are reported rather
+    than refused: a dotfile manager or a snapshot tool giving a config file a second name
+    is ordinary, and failing the spawn over it is a far wider blast radius than the hole.
+    """
+
+    def test_what_this_module_publishes_is_never_alias_backed(self, crew_home):
+        """The premise of reporting rather than refusing: we never create the shape."""
+        sandbox._materialize_sealable_ceilings()
+
+        for leaf in sandbox._CREW_PRECREATE_READONLY_FILE_LEAVES:
+            path = crew_home / leaf
+            assert path.stat().st_nlink == 1, "a published ceiling must have no alias"
+            assert not path.is_symlink()
+        assert [p.name for p in crew_home.iterdir() if p.name.startswith(".kirocrew-ceiling")] == []
+
+    def test_a_symlinked_ceiling_is_reported(self, crew_home, caplog):
+        real = crew_home / "elsewhere.json"
+        real.write_text("{}", encoding="utf-8")
+        (crew_home / "computer_use.json").symlink_to(real)
+
+        with caplog.at_level("WARNING", logger="kiro_crew.sandbox"):
+            sandbox._materialize_sealable_ceilings()
+
+        assert "is a SYMLINK" in caplog.text
+        assert "computer_use.json" in caplog.text
+
+    def test_a_hardlinked_ceiling_is_reported(self, crew_home, caplog):
+        target = crew_home / "computer_use.json"
+        target.write_text("{}", encoding="utf-8")
+        os.link(target, crew_home / "alias.json")
+        assert target.stat().st_nlink == 2
+
+        with caplog.at_level("WARNING", logger="kiro_crew.sandbox"):
+            sandbox._materialize_sealable_ceilings()
+
+        assert "hardlinks" in caplog.text
+        assert "computer_use.json" in caplog.text
+
+    def test_a_symlinked_dir_ceiling_is_reported(self, crew_home, caplog):
+        real = crew_home / "real-profiles"
+        real.mkdir()
+        (crew_home / "profiles").symlink_to(real)
+
+        with caplog.at_level("WARNING", logger="kiro_crew.sandbox"):
+            sandbox._materialize_sealable_ceilings()
+
+        assert "is a SYMLINK" in caplog.text
+        assert "profiles" in caplog.text
+
+    def test_reporting_never_refuses_and_never_removes(self, crew_home):
+        """The whole point of warning: an ordinary dotfile-manager host still runs."""
+        real = crew_home / "elsewhere.json"
+        real.write_text('{"enabled": false}', encoding="utf-8")
+        link = crew_home / "computer_use.json"
+        link.symlink_to(real)
+
+        sandbox._materialize_sealable_ceilings()  # must not raise
+
+        assert link.is_symlink()
+        assert real.read_text(encoding="utf-8") == '{"enabled": false}'
+
+    def test_an_ordinary_single_link_ceiling_is_quiet(self, crew_home, caplog):
+        (crew_home / "computer_use.json").write_text("{}", encoding="utf-8")
+
+        with caplog.at_level("WARNING", logger="kiro_crew.sandbox"):
+            sandbox._materialize_sealable_ceilings()
+
+        assert "SYMLINK" not in caplog.text
+        assert "hardlinks" not in caplog.text
+
+
+@_POSIX_ONLY
+class TestCeilingsThatMustNotBeMaterialized:
+    """Three ceilings the seal deliberately does not create.
+
+    Two read a present-but-empty file as something other than absent:
+    ``security_policy.json`` raises ``PlatformCompositionError`` out of
+    ``governance.load_security_policy`` (which reruns at boot and per app callback), and
+    ``app_admission.json`` flips ``open_default()`` into deny-all. The third,
+    ``admission_policy.json``, is already seeded at first run.
+    """
+
+    EXCLUDED = (
+        "security_policy.json",
+        "app_admission.json",
+        "admission_policy.json",
+    )
+
+    @pytest.mark.parametrize("leaf", EXCLUDED)
+    def test_leaf_is_not_in_the_precreate_set(self, leaf):
+        assert leaf in sandbox._CREW_READONLY_LEAVES
+        assert leaf not in sandbox._CREW_PRECREATE_READONLY_FILE_LEAVES
+        assert leaf not in sandbox._CREW_PRECREATE_READONLY_DIR_LEAVES
+
+    @pytest.mark.parametrize("leaf", EXCLUDED)
+    def test_leaf_is_not_written_to_disk(self, leaf, crew_home):
+        sandbox._materialize_sealable_ceilings()
+
+        assert not (crew_home / leaf).exists()
+
+
+class TestMaskableDirsAreMaterializedBeforeTheSpawn:
+    """An on-demand HIDDEN directory gets the mirror treatment of the ceilings above.
+
+    The launcher's directory mask skips a name that holds no directory, so a leaf the
+    gateway creates lazily is unmasked in every sandbox spawned before its first use -- and
+    once the gateway does create it, that running sandbox sees it. Creating it empty before
+    the spawn is what gives the mask a name to bind over.
+    """
+
+    def test_every_maskable_leaf_is_created_owner_only(self, crew_home):
+        created = sandbox._materialize_maskable_dirs()
+
+        for leaf in sandbox._CREW_PRECREATE_HIDDEN_DIR_LEAVES:
+            path = crew_home / leaf
+            assert str(path) in created
+            assert path.is_dir()
+            # The mode is a POSIX property; this materialisation feeds the Linux
+            # namespace launcher, and Windows ignores the mode argument.
+            if os.name == "posix":
+                assert stat.S_IMODE(path.stat().st_mode) == 0o700
+
+    def test_the_leaf_is_created_directly_under_the_data_home(self, crew_home):
+        # A top-level leaf on purpose: every intermediate directory between the
+        # data home and the mask would be an agent-writable ancestor that a rename
+        # could swap out from under a transfer (see storage.STAGING_DIR_LEAF).
+        sandbox._materialize_maskable_dirs()
+        for leaf in sandbox._CREW_PRECREATE_HIDDEN_DIR_LEAVES:
+            assert "/" not in leaf
+            assert (crew_home / leaf).is_dir()
+
+    def test_an_existing_directory_is_left_alone_and_not_reported(self, crew_home):
+        """Every leaf, not one of them: with a leaf hardcoded here, adding a second one to
+        ``_CREW_PRECREATE_HIDDEN_DIR_LEAVES`` makes materialisation report the new leaf and
+        this assertion fail for a reason that has nothing to do with what it checks."""
+        markers = []
+        for leaf in sandbox._CREW_PRECREATE_HIDDEN_DIR_LEAVES:
+            target = crew_home / leaf
+            target.mkdir(parents=True)
+            marker = target / "pre-existing-content"
+            marker.mkdir()
+            markers.append(marker)
+
+        assert sandbox._materialize_maskable_dirs() == []
+        assert markers, "no maskable leaves are declared, so this proves nothing"
+        for marker in markers:
+            assert marker.is_dir()
+
+    @_POSIX_ONLY
+    @pytest.mark.parametrize("mode", ["standard", "cc", "strict"])
+    def test_an_absent_ledgers_root_is_materialized_before_the_mask_binds(self, crew_home, mode):
+        """The sharpest case of this whole class, named on its own.
+
+        A crew log is the authority a reader trusts instead of re-deriving, and the
+        store creates this root on its first write. Absent, the ``isdir`` guard
+        skips it and the mask is vacuous for the life of every sandbox spawned
+        first -- one of which can then create the directory itself and fill it with
+        entries attributed to the gateway.
+        """
+        root = crew_home / "crew-log"
+        assert not root.exists(), "the point of the test is that it starts absent"
+
+        created = sandbox._materialize_maskable_dirs()
+
+        assert str(root) in created
+        assert root.is_dir()
+        assert stat.S_IMODE(root.stat().st_mode) == 0o700
+        assert str(root) in set(_namespace_plan(mode).sensitive_dirs)
+
+    @_POSIX_ONLY
+    @pytest.mark.parametrize("mode", ["standard", "cc", "strict"])
+    def test_created_dirs_are_in_the_launcher_hidden_list(self, crew_home, mode):
+        """Creating a path is only useful if the mask loop is handed it."""
+        created = sandbox._materialize_maskable_dirs()
+        hidden = set(_namespace_plan(mode).sensitive_dirs)
+
+        assert created
+        assert set(created) <= hidden
+
+    @_POSIX_ONLY
+    def test_namespace_argv_materializes_the_masked_dirs(self, crew_home):
+        sandbox.namespace_argv(["/bin/true"])
+
+        assert (crew_home / "aws-control-staging").is_dir()
+
+    def test_a_file_squatting_the_name_refuses_the_spawn(self, crew_home):
+        # A plain file where the directory should be cannot be masked by the dir
+        # loop (``isdir`` is false) and would be skipped silently; refuse instead.
+        squat = crew_home / "aws-control-staging"
+        squat.parent.mkdir(parents=True, exist_ok=True)
+        squat.write_text("not a directory", encoding="utf-8")
+
+        with pytest.raises(sandbox.SandboxCeilingUnsealable):
+            sandbox._materialize_maskable_dirs()
+
+    def test_an_unresolvable_data_home_refuses_the_spawn(self, monkeypatch):
+        # Skipping the mask because the data home could not be resolved would
+        # run the agent with the staging directory visible -- the exposure this
+        # function exists to prevent. Fail closed, like every other reason.
+        def boom():
+            raise OSError("data home unavailable")
+
+        monkeypatch.setattr(sandbox, "config_dir", boom)
+        with pytest.raises(sandbox.SandboxCeilingUnsealable):
+            sandbox._materialize_maskable_dirs()
+
+
+@_POSIX_ONLY
+class TestASymlinkMaskableLeafRefusesTheSpawn:
+    """A HIDDEN-dir leaf that is a symlink is GPT's staging-mask bypass, and is refused.
+
+    ``os.path.isdir`` follows a link, so a leaf that RESOLVES to a real directory reads as
+    a directory and the mask loop would bind over the link's TARGET, not the leaf name.
+    The name lives in the writable data home, so a sandboxed process can unlink it and put
+    an agent-owned directory in its place -- and the pre-created staging directory the
+    preview CLI writes into is then one the agent controls. ``_refuse_if_dangling_symlink``
+    only rejects a link that resolves to nothing, so ``_refuse_if_symlink_leaf`` closes the
+    RESOLVING case; the create-race re-check closes the swap-during-the-window case.
+    """
+
+    def test_the_unguarded_chain_really_is_exploitable(self, crew_home):
+        """Pin the mechanism: isdir() follows the link, so it reads as a maskable dir."""
+        victim = crew_home / "agent-writable"
+        victim.mkdir()
+        target = crew_home / "aws-control-staging"
+        target.symlink_to(victim)
+
+        assert os.path.islink(target) is True
+        assert os.path.isdir(target) is True, "isdir() follows the link -> reads as a dir"
+        # Without the guard the loop would hit the isdir() branch and mask the link's
+        # target, leaving the replaceable leaf name pointing at an agent-owned tree.
+
+    def test_a_resolving_symlink_leaf_refuses(self, crew_home):
+        victim = crew_home / "agent-writable"
+        victim.mkdir()
+        target = crew_home / "aws-control-staging"
+        target.symlink_to(victim)
+
+        with pytest.raises(sandbox.SandboxCeilingUnsealable) as err:
+            sandbox._materialize_maskable_dirs()
+
+        assert "aws-control-staging" in str(err.value)
+        assert "agent-writable" in str(err.value), "the destination is the diagnostic value"
+
+    def test_the_symlink_leaf_is_never_removed(self, crew_home):
+        """Removing it is a data-loss path; the link is the operator's to resolve."""
+        victim = crew_home / "agent-writable"
+        victim.mkdir()
+        target = crew_home / "aws-control-staging"
+        target.symlink_to(victim)
+
+        with pytest.raises(sandbox.SandboxCeilingUnsealable):
+            sandbox._materialize_maskable_dirs()
+
+        assert target.is_symlink(), "the link is not ours to delete"
+
+    def test_a_symlink_swapped_in_after_a_lost_create_race_refuses(self, crew_home, monkeypatch):
+        # The window between our checks and ``mkdir``: a sandboxed process wins the
+        # create with a symlink to a tree it owns, so mkdir raises FileExistsError and a
+        # plain isdir() re-check would follow the link and mask its target. The
+        # no-follow re-validation must refuse instead.
+        victim = crew_home / "agent-writable"
+        victim.mkdir()
+        target = crew_home / "aws-control-staging"
+
+        real_mkdir = os.mkdir
+
+        def racing_mkdir(path, mode=0o777, *args, **kwargs):
+            if os.path.abspath(path) == os.path.abspath(str(target)):
+                # Simulate the racer landing a symlink at the leaf, then report the
+                # collision the kernel would have raised.
+                os.symlink(str(victim), str(target))
+                raise FileExistsError(errno.EEXIST, "File exists", str(path))
+            return real_mkdir(path, mode, *args, **kwargs)
+
+        monkeypatch.setattr(os, "mkdir", racing_mkdir)
+
+        with pytest.raises(sandbox.SandboxCeilingUnsealable) as err:
+            sandbox._materialize_maskable_dirs()
+
+        assert "aws-control-staging" in str(err.value)
+        assert target.is_symlink(), "the raced-in link is not ours to delete"
+
+    def test_a_real_dir_winning_the_create_race_is_accepted(self, crew_home, monkeypatch):
+        # The benign race: another spawn created the real directory first. mkdir raises
+        # FileExistsError, the no-follow re-check finds a real dir, and the spawn proceeds.
+        target = crew_home / "aws-control-staging"
+
+        real_mkdir = os.mkdir
+
+        def racing_mkdir(path, mode=0o777, *args, **kwargs):
+            if os.path.abspath(path) == os.path.abspath(str(target)):
+                real_mkdir(str(target), 0o700)
+                raise FileExistsError(errno.EEXIST, "File exists", str(path))
+            return real_mkdir(path, mode, *args, **kwargs)
+
+        monkeypatch.setattr(os, "mkdir", racing_mkdir)
+
+        # Must not raise: a real directory won the race.
+        sandbox._materialize_maskable_dirs()
+        assert target.is_dir() and not target.is_symlink()

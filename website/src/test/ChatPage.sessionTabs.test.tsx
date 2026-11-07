@@ -1,0 +1,357 @@
+/**
+ * ChatPage ↔ session-tab strip wiring (#4477).
+ *
+ * The two facts that only a page-level render can pin:
+ *   1. On a normal visit the strip is NOT in the tree at all. Every unit test
+ *      of SessionTabStrip could pass while ChatPage mounted it unconditionally,
+ *      which would move the transcript down for every user of the surface.
+ *   2. The sidebar is handed a working `onOpenSlotInNewTab`, and using it is
+ *      what makes the strip appear. A callback that never reached the sidebar
+ *      would leave the whole feature unreachable with no test failing.
+ */
+import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { render, screen, act, fireEvent } from '@testing-library/react'
+import type { ReactNode } from 'react'
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { Provider } from 'react-redux'
+import { MemoryRouter, Routes, Route } from 'react-router-dom'
+import { createTestStore } from './helpers'
+import { ThemeProvider } from '../hooks/useTheme'
+
+// Capture the props ChatPage hands the sidebar; render nothing, so the assertions
+// are about ChatPage's own tree.
+const { focusComposerMock, switchSlotMock } = vi.hoisted(() => ({
+  focusComposerMock: vi.fn(),
+  // A plain action, not the real thunk: this file asserts WHICH gesture asks to
+  // move the user, and the real switchSlot's fetch/abort behaviour would decide
+  // that for us. Every other test here renders from the preloaded activeSlot.
+  switchSlotMock: vi.fn((key: string) => ({ type: 'chat/switchSlot/mocked', payload: key })),
+}))
+vi.mock('../store/chatSlice', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../store/chatSlice')>()
+  return { ...actual, switchSlot: (...args: unknown[]) => switchSlotMock(...(args as [string])) }
+})
+vi.mock('../pages/chat/composerFocus', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../pages/chat/composerFocus')>()
+  return { ...actual, focusComposer: focusComposerMock }
+})
+
+type OpenInTab = (key: string, opts?: { background?: boolean; requestSeq?: number }) => void
+const sidebarProps: Array<{ onOpenSlotInNewTab?: OpenInTab; onSelectSlot?: (key: string) => void }> = []
+vi.mock('../pages/ChatSidebar', () => ({
+  default: (props: { onOpenSlotInNewTab?: OpenInTab; onSelectSlot?: (key: string) => void }) => {
+    sidebarProps.push({ onOpenSlotInNewTab: props.onOpenSlotInNewTab, onSelectSlot: props.onSelectSlot })
+    return null
+  },
+  SIDEBAR_MIN: 200,
+  SIDEBAR_MAX: 500,
+}))
+
+vi.mock('react-virtuoso', () => ({ Virtuoso: () => null }))
+vi.mock('../components/ChatInput', () => ({ default: () => null }))
+vi.mock('../components/WelcomeView', () => ({ default: () => null }))
+vi.mock('../components/MarkdownPanel', () => ({ default: () => null }))
+vi.mock('../components/MarkdownRenderer', () => ({ default: () => null }))
+vi.mock('../components/TypewriterText', () => ({ default: () => null }))
+vi.mock('../components/OverlayDrawer', () => ({ default: ({ children }: { children?: ReactNode }) => children }))
+vi.mock('../components/AgentDropdownList', () => ({ default: () => null }))
+vi.mock('../components/ModelDropdownList', () => ({ default: () => null }))
+vi.mock('../components/InfoTip', () => ({ default: () => null }))
+vi.mock('../components/SegmentedControl', () => ({ default: () => null }))
+vi.mock('../pages/chat/CollapsibleToolGroup', () => ({ default: () => null }))
+vi.mock('../pages/chat/ActivityViewer', () => ({ default: () => null }))
+vi.mock('../pages/chat/SessionColorPicker', () => ({ default: () => null }))
+vi.mock('../pages/chat', () => ({ ChatFooter: () => null, AssistantMessage: () => null, McpInfoButton: () => null }))
+// What the mocked `loadChatConfig` adds on top of its defaults, so a test can
+// opt into a chat setting.
+const chatConfigState = vi.hoisted(() => ({ value: {} as Record<string, unknown> }))
+vi.mock('../pages/chat/ChatSettings', () => ({
+  loadChatConfig: () => ({ contentWidth: 'compact', ...chatConfigState.value }),
+  CONTENT_WIDTH: { compact: { messages: '900px', input: '916px' }, comfortable: { messages: '84%', input: '85%' }, full: { messages: '92%', input: '93%' } },
+}))
+vi.mock('../hooks/useBranding', () => ({ useBranding: () => ({ botName: 'Test', avatar: '' }) }))
+vi.mock('../hooks/useAgents', () => ({ useAgents: () => ({ agents: [], defaultAgent: null }) }))
+vi.mock('../hooks/useFilteredDropdown', () => ({ useFilteredDropdown: () => ({ filtered: [], query: '', setQuery: vi.fn(), selectedIndex: 0, setSelectedIndex: vi.fn(), onKeyDown: vi.fn() }) }))
+vi.mock('../hooks/useVoiceInput', () => ({ useVoiceInput: () => ({ recording: false, transcribing: false, toggle: vi.fn() }), voiceInputSupported: false }))
+
+const apiMocks: Record<string, ReturnType<typeof vi.fn>> = {}
+vi.mock('../api/client', () => ({
+  api: new Proxy({}, {
+    get: (_t, prop: string) => {
+      if (!(prop in apiMocks)) {
+        apiMocks[prop] = vi.fn().mockResolvedValue(
+          prop === 'chatSlotDetail' ? { messages: [], has_more: false, total: 0 }
+            : prop === 'pendingQuestions' || prop === 'approvals' ? [] : {},
+        )
+      }
+      return apiMocks[prop]
+    },
+  }),
+}))
+
+Object.defineProperty(window, 'matchMedia', {
+  writable: true,
+  value: vi.fn().mockImplementation((q: string) => ({
+    matches: false, media: q, onchange: null,
+    addListener: vi.fn(), removeListener: vi.fn(),
+    addEventListener: vi.fn(), removeEventListener: vi.fn(), dispatchEvent: vi.fn(),
+  })),
+})
+globalThis.fetch = vi.fn().mockResolvedValue({ ok: true, json: () => Promise.resolve({}) }) as never
+
+import ChatPage from '../pages/ChatPage'
+// `switchSlot.pending` moves `activeSlot` synchronously; `setActiveSlot` is that
+// one move, without the fetch bookkeeping this file's hand-built state lacks.
+import { setActiveSlot } from '../store/chatSlice'
+
+const SLOTS = [
+  { key: 'chat-1', title: 'First', messages: 1, running: false, mode: '', created: '', last_ts: '' },
+  { key: 'chat-2', title: 'Second', messages: 1, running: false, mode: '', created: '', last_ts: '' },
+  { key: 'chat-3', title: 'Third', messages: 1, running: false, mode: '', created: '', last_ts: '' },
+]
+
+async function renderChatPage(props: { embedded?: boolean; embedMode?: 'chat' | 'sessions'; connected?: boolean } = {}) {
+  apiMocks.chatSlots = vi.fn().mockResolvedValue(SLOTS)
+  const store = createTestStore({
+    dashboard: {
+      status: { platform: 'linux' }, connected: props.connected ?? true,
+      slots: SLOTS,
+      approvalMode: 'normal', channelTrusted: false, refreshTrigger: 0,
+      unreadSlots: [], updateProgress: null,
+      subagentRunning: {}, subagentDetails: {}, subagentText: {},
+      sessionDefaultColor: null, sessionColorsMode: 'tint', sessionColorsPalette: 'horizon', sessionColorsIntensity: 'clear',
+    } as never,
+    chat: {
+      activeSlot: 'chat-1',
+      messages: [], slotRunning: false, slotStopping: false, slotState: 'idle',
+      slotStatusDetail: {}, slotHasMore: false, slotOldestIndex: 0, loadingOlder: false,
+      lastChunkSeq: undefined, history: [], historyHasMore: false, historyOffset: 0,
+      pendingInput: null, slotContextPct: {}, voicePlaying: false, voiceAudio: null,
+      subagents: {}, toolLog: [], activityOpen: false, activityTab: 'tools', slotActivity: {}, slotHistory: [],
+    } as never,
+  })
+  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+  let rendered!: ReturnType<typeof render>
+  // Async act: the ChatPage and ThemeProvider boot queries resolve on microtasks
+  // after the first render, so they must land inside this barrier.
+  await act(async () => {
+  rendered = render(
+    <QueryClientProvider client={qc}>
+      <Provider store={store}>
+        <ThemeProvider>
+          <MemoryRouter initialEntries={['/chat']}>
+            <Routes>
+              <Route path="/chat/:slug?" element={<ChatPage mode="" {...props} />} />
+            </Routes>
+          </MemoryRouter>
+        </ThemeProvider>
+      </Provider>
+    </QueryClientProvider>,
+  )
+  })
+  return { store, ...rendered }
+}
+
+describe('ChatPage – session tab strip', () => {
+  beforeEach(() => {
+    sidebarProps.length = 0
+    localStorage.clear()
+  })
+
+  it('does NOT mount the strip on a normal visit', async () => {
+    await renderChatPage()
+    expect(screen.queryByTestId('session-tab-strip')).toBeNull()
+    expect(screen.queryByRole('tablist')).toBeNull()
+  })
+
+  it('hands the sidebar a usable open-in-new-tab callback', async () => {
+    await renderChatPage()
+    expect(typeof sidebarProps.at(-1)?.onOpenSlotInNewTab).toBe('function')
+  })
+
+  it('shows the strip once a second session is opened as a tab', async () => {
+    await renderChatPage()
+    const open = sidebarProps.at(-1)?.onOpenSlotInNewTab
+    act(() => open?.('chat-2'))
+    expect(screen.getByTestId('session-tab-strip')).toBeTruthy()
+    expect(screen.getByTestId('session-tab-chat-1')).toBeTruthy()
+    expect(screen.getByTestId('session-tab-chat-2')).toBeTruthy()
+  })
+
+  it('a BACKGROUND open queues the tab without moving the user', async () => {
+    // What the pointer gestures mean: middle-clicking three rows queues three
+    // sessions, and the transcript stays where it was.
+    await renderChatPage()
+    switchSlotMock.mockClear()
+    const open = sidebarProps.at(-1)?.onOpenSlotInNewTab
+    act(() => open?.('chat-2', { background: true }))
+    act(() => open?.('chat-3', { background: true }))
+    expect(screen.getAllByRole('tab')).toHaveLength(3)
+    // Nothing asked to move the user.
+    expect(switchSlotMock).not.toHaveBeenCalled()
+  })
+
+  it('withholds every tab-driven switch while the gateway is offline', async () => {
+    // Same lock as the sidebar row's own click: an offline switchSlot never
+    // resolves, switchSlot.rejected clears messages to [], and the user is left
+    // on the WelcomeView where their transcript was.
+    localStorage.setItem('mc-session-tabs-chat', JSON.stringify(['chat-1', 'chat-2', 'chat-3']))
+    await renderChatPage({ connected: false })
+    switchSlotMock.mockClear()
+    act(() => { screen.getByTestId('session-tab-chat-2').click() })
+    const open = sidebarProps.at(-1)?.onOpenSlotInNewTab
+    act(() => open?.('chat-3'))
+    act(() => { screen.getByLabelText(/^Close tab First/).click() })
+    expect(switchSlotMock).not.toHaveBeenCalled()
+  })
+
+  it('a FOREGROUND open (the menu item) activates the session', async () => {
+    await renderChatPage()
+    switchSlotMock.mockClear()
+    const open = sidebarProps.at(-1)?.onOpenSlotInNewTab
+    act(() => open?.('chat-2'))
+    // Foreground open is a user gesture on a session reference: it dispatches
+    // the ANNOUNCED form, so a deleted session explains itself (#6372).
+    expect(switchSlotMock).toHaveBeenCalledWith({ key: 'chat-2', announceOnMissing: true, gesture: true })
+  })
+
+  // #23564: a create opening the session it just made (the sidebar's "New
+  // chat in tab", carrying the create's `requestSeq`) is the page landing a
+  // request, not the user opening a chat, so it is not a gesture and records
+  // no user open.
+  it('a create opening its new tab is not a gesture', async () => {
+    await renderChatPage()
+    switchSlotMock.mockClear()
+    const open = sidebarProps.at(-1)?.onOpenSlotInNewTab
+    act(() => open?.('chat-2', { background: false, requestSeq: 4 }))
+    expect(switchSlotMock).toHaveBeenCalledWith({ key: 'chat-2', announceOnMissing: true, requestSeq: 4 })
+  })
+
+  it('restores a persisted working set on the next visit', async () => {
+    localStorage.setItem('mc-session-tabs-chat', JSON.stringify(['chat-1', 'chat-2']))
+    await renderChatPage()
+    expect(screen.getByTestId('session-tab-strip')).toBeTruthy()
+    expect(screen.getAllByRole('tab')).toHaveLength(2)
+  })
+
+  it('hides the strip again when the set drops back to one tab', async () => {
+    localStorage.setItem('mc-session-tabs-chat', JSON.stringify(['chat-1', 'chat-2']))
+    await renderChatPage()
+    act(() => { screen.getByLabelText('Close tab Second').click() })
+    expect(screen.queryByTestId('session-tab-strip')).toBeNull()
+  })
+
+  it('focuses the composer when the closing tab takes the strip with it', async () => {
+    // The strip unmounts below two tabs, so it cannot hand focus to a tab of its
+    // own; without this the keyboard user is left on document.body.
+    localStorage.setItem('mc-session-tabs-chat', JSON.stringify(['chat-1', 'chat-2']))
+    await renderChatPage()
+    focusComposerMock.mockClear()
+    act(() => { screen.getByLabelText('Close tab Second').click() })
+    expect(focusComposerMock).toHaveBeenCalled()
+  })
+
+  it('does NOT steal focus when the strip survives the close', async () => {
+    localStorage.setItem('mc-session-tabs-chat', JSON.stringify(['chat-1', 'chat-2', 'chat-3']))
+    await renderChatPage()
+    focusComposerMock.mockClear()
+    act(() => { screen.getByLabelText('Close tab Third').click() })
+    expect(focusComposerMock).not.toHaveBeenCalled()
+  })
+
+  // An EMBEDDED ChatPage — popped-out window, artifact companion panel, Papyrus
+  // co-author panel, app-SDK chat panel — must neither draw the strip nor touch
+  // the persisted set: it runs on the dashboard's origin and would otherwise
+  // reconcile the same localStorage key against its own active session.
+  it('draws no strip on an embedded host, even with a persisted set', async () => {
+    localStorage.setItem('mc-session-tabs-chat', JSON.stringify(['chat-1', 'chat-2']))
+    await renderChatPage({ embedded: true })
+    expect(screen.queryByTestId('session-tab-strip')).toBeNull()
+  })
+
+  it('leaves the persisted set untouched from an embedded host', async () => {
+    localStorage.setItem('mc-session-tabs-chat', JSON.stringify(['chat-1', 'chat-2']))
+    await renderChatPage({ embedded: true, embedMode: 'chat' })
+    expect(localStorage.getItem('mc-session-tabs-chat')).toBe('["chat-1","chat-2"]')
+  })
+
+  it('offers no open-in-new-tab gesture from an embedded host', async () => {
+    // The sidebar would otherwise bind a middle-click that writes into a set
+    // this surface cannot show.
+    sidebarProps.length = 0
+    await renderChatPage({ embedded: true })
+    if (sidebarProps.length) expect(sidebarProps.at(-1)?.onOpenSlotInNewTab).toBeUndefined()
+  })
+})
+
+/** What a sidebar row's plain click does, in its order: the switch moves
+ *  `activeSlot` at once, then the row calls `onSelectSlot`. */
+function sidebarClick(store: ReturnType<typeof createTestStore>, key: string) {
+  act(() => {
+    store.dispatch(setActiveSlot(key))
+    sidebarProps.at(-1)?.onSelectSlot?.(key)
+  })
+}
+
+/** The strip's tabs, left to right, as session keys. */
+function tabOrder(): string[] {
+  return screen.getAllByRole('tab').map(tab => (tab.getAttribute('data-testid') ?? '').replace('session-tab-', ''))
+}
+
+describe('ChatPage – "Open Sidebar Sessions in a Session Tab"', () => {
+  beforeEach(() => {
+    sidebarProps.length = 0
+    localStorage.clear()
+    chatConfigState.value = {}
+  })
+
+  it('off (the default), a sidebar click still replaces the active tab\'s session', async () => {
+    // The replace keeps the strip hidden for a user who never opens a second
+    // tab, so leaving the setting off must not change it.
+    localStorage.setItem('mc-session-tabs-chat', JSON.stringify(['chat-1', 'chat-2']))
+    const { store } = await renderChatPage()
+    sidebarClick(store, 'chat-3')
+    expect(tabOrder()).toEqual(['chat-3', 'chat-2'])
+  })
+
+  it('on, a sidebar click gives the session its own tab beside the active one', async () => {
+    chatConfigState.value = { sidebarClickOpensTab: true }
+    localStorage.setItem('mc-session-tabs-chat', JSON.stringify(['chat-1', 'chat-2']))
+    const { store } = await renderChatPage()
+    sidebarClick(store, 'chat-3')
+    // chat-1 keeps its session; chat-3 lands right after it, where the row
+    // menu's "Open in a session tab" puts it. The switch lands first here, so
+    // this also pins `openInNewTab` reading the active session when called:
+    // read later, it is already chat-3 and the tab goes to the end.
+    expect(tabOrder()).toEqual(['chat-1', 'chat-3', 'chat-2'])
+  })
+
+  it('on, the first sidebar click brings up the strip', async () => {
+    chatConfigState.value = { sidebarClickOpensTab: true }
+    const { store } = await renderChatPage()
+    expect(screen.queryByTestId('session-tab-strip')).toBeNull()
+    sidebarClick(store, 'chat-2')
+    expect(tabOrder()).toEqual(['chat-1', 'chat-2'])
+  })
+
+  it('on, a click on a session that already has a tab only selects it, with no cue', async () => {
+    chatConfigState.value = { sidebarClickOpensTab: true }
+    localStorage.setItem('mc-session-tabs-chat', JSON.stringify(['chat-1', 'chat-2']))
+    const { store } = await renderChatPage()
+    sidebarClick(store, 'chat-2')
+    expect(tabOrder()).toEqual(['chat-1', 'chat-2'])
+    // The switch is the response. The row menu's open would cue this tab.
+    expect(screen.getByTestId('session-tab-chat-2')).not.toHaveAttribute('data-cued')
+  })
+
+  it('on, a pick from the collapsed sidebar\'s recents flyout gets its own tab too', async () => {
+    // The flyout is the sidebar's list while the sidebar is collapsed.
+    chatConfigState.value = { sidebarClickOpensTab: true }
+    await renderChatPage()
+    fireEvent.click(screen.getByRole('button', { name: 'Hide sessions sidebar' }))
+    fireEvent.keyDown(screen.getByRole('button', { name: 'Show sessions sidebar' }), { key: 'ArrowDown' })
+    const menu = await screen.findByRole('menu')
+    fireEvent.click(menu.querySelector('[data-slot-key="chat-3"]')!)
+    expect(tabOrder()).toEqual(['chat-1', 'chat-3'])
+  })
+})

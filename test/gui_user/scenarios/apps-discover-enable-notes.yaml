@@ -1,0 +1,31 @@
+# Smoke: the App Store's core path -- find a bundled app and turn it on. This
+# runs in the Library, not Discover: Discover lists published catalog rows and
+# the registry fetch fails closed on the target, so nothing there is guaranteed.
+# The Library lists what is on the machine, including the default-off builtins
+# the wheel ships, in a "Disabled" section below the enabled apps. "Notes" is
+# such a builtin, needs nothing external and skips the third-party trust
+# prompt, so its tile shows an "Enable" button.
+name: apps-discover-enable-notes
+tier: smoke
+feature: apps
+user_story: >-
+  As a user, I want to see the apps already on my machine and switch one on
+  from its tile, so that the app appears in my dashboard without installing
+  anything.
+docs_url: docs/system-specs/modules/app-kit-platform.md
+summary: Open the Library, find Notes in the Disabled section and enable it from its tile
+preconditions:
+  seed: rich
+  members: [nova-sky]
+  start_url: /apps/library
+steps:
+  - You are on the Apps page, on its "Library" tab (heading "Library"). If a notice says the store or registry could not be reached, ignore it.
+  - Find the tile named "Notes" (a grid tile with an icon and the name "Notes"). If it is still off it sits under the "Disabled" heading, below the enabled apps, with an "Enable" button under its name; if an earlier attempt already enabled it, it sits among the enabled apps with a sidebar caption such as "In sidebar". Scroll down if you do not see it.
+  - Make sure the Notes app ends up enabled. If its tile shows an "Enable" button, click it. If the tile already shows a sidebar caption (it is enabled from an earlier attempt), leave it as it is and do not click "Disable".
+  - Wait two seconds for the tile to update.
+expectations:
+  - The "Notes" tile shows no "Enable" button; its caption reads "In sidebar", "Not in sidebar" or "No sidebar page".
+  - No red error message about failing to enable the app is visible.
+  - The "Notes" tile is listed among the enabled apps, not under the "Disabled" heading.
+max_steps: 14
+max_seconds: 300

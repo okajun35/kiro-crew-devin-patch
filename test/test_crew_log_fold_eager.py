@@ -1,0 +1,1381 @@
+"""Per-fold savepoint versions, and the eager folding mode built on them.
+
+Three properties, each the reason one piece of the change exists.
+
+A fold's stored shape is ITS OWN, so retiring one fold's savepoints costs a cold
+fold to that fold and nothing to the others
+(:func:`test_bumping_one_folds_version_retires_only_that_folds_savepoint`). Under the
+single global number every bump retired all six, so a counting fix in one fold made
+every long session refold every fold it had.
+
+An EAGER fold may never be one that every entry moves
+(:func:`test_an_eager_fold_must_declare_what_affects_it`): eager folding runs off the
+append path, and a fold with ``affects=None`` would wake it for every message body in
+the log -- which is the cost the mode exists to avoid paying on a read.
+
+And an eager fold ADVANCES with no reader
+(:func:`test_an_emitted_entry_advances_an_eager_fold_with_no_reader`), which is the
+whole claim: a dashboard reads the current value in O(1) because the value was already
+folded when the entry landed, not because the read got faster.
+
+What the warm memos hold (a closed session's drop, the byte budget, how a cell is
+charged and a cell above the whole ceiling) is in ``test_crew_log_fold_eager_memory.py``;
+the data home and slot-log helpers both files use live in ``crew_log_fold_eager_helpers.py``.
+"""
+
+from __future__ import annotations
+
+import json
+import queue
+import threading
+import time
+import unittest.mock
+from collections import Counter
+from dataclasses import replace
+from typing import Any
+
+import pytest
+from crew_log_drain import assert_drained
+from crew_log_fold_eager_helpers import (  # noqa: F401 -- the autouse fixture registers by import
+    GATEWAY,
+    WORK_SLOT,
+    _isolated_home,
+    _memo_keys,
+    _slot_log,
+    _work_entry,
+)
+
+from kiro_crew import crew_log as lg
+from kiro_crew.crew_log import CrewLog, bus
+from kiro_crew.crew_log import checkpoint as savepoints
+from kiro_crew.crew_log import eager, emit
+from kiro_crew.crew_log import projection as crew_log
+
+SESSION = "s-eager"
+
+#: Enough entries above the savepoint floor that ``save`` is owed one.
+_EARNING_TURNS = savepoints.MIN_ADVANCE_ENTRIES // 2 + 4
+
+
+def _log(unit_id: str = SESSION, **fields) -> CrewLog:
+    fields.setdefault("owner", "raymond")
+    fields.setdefault("agent", "kirocrew")
+    return CrewLog.create(lg.KIND_SESSION, unit_id, **fields)
+
+
+def _grow(handle: CrewLog, turns: int) -> None:
+    """*turns* whole turns, which is what both ``usage`` and ``status`` move on."""
+    for turn in range(1, turns + 1):
+        handle.append("turn/started", {"turn": turn, "actor": "user", "depth": 0}, src=GATEWAY)
+        handle.append(
+            "turn/completed",
+            {
+                "turn": turn,
+                "stop_reason": "end_turn",
+                "depth": 0,
+                "duration_ms": 900,
+                "model": "opus",
+                "provider": "kiro",
+                "credits": 0.5,
+                "tokens": {"input": 100, "output": 20, "cache_read": 5, "cache_write": 1},
+            },
+            src=GATEWAY,
+        )
+
+
+def _saved(handle: CrewLog, names: tuple[str, ...]) -> None:
+    """Fold *names* far enough that every one of them has a savepoint on disk."""
+    crew_log.fold_session(handle.id, names)
+    for name in names:
+        path = savepoints.checkpoint_path(handle.kind, handle.id, name)
+        assert path.exists(), f"the fixture must earn a savepoint for {name}"
+
+
+# --------------------------------------------------------------------------- #
+# 1. The version is the fold's own
+# --------------------------------------------------------------------------- #
+
+
+def test_every_fold_declares_its_own_state_version():
+    """The version lives on the fold, so there is one number per fold and no other."""
+    versions = {name: fold.state_version for name, fold in crew_log._FOLDS.items()}
+    assert set(versions) == set(crew_log.FOLD_NAMES)
+    assert all(isinstance(value, int) and value >= 1 for value in versions.values())
+
+
+def test_the_slot_wake_types_cover_every_eager_slot_folds_types():
+    """MUTATION-SENSITIVE: the slot folds' types are written down where a reader finds them.
+
+    ``_WAKE_TYPES`` is not a filter -- every committed entry wakes, because two
+    session folds read every type -- but it is still the one place the slot folds' types
+    and the closer are named together. They are DERIVED here from the registry, so a slot
+    fold whose type is missing fails CI rather than reading as lazy.
+    """
+    derived = {
+        entry_type
+        for name in crew_log.EAGER_SLOT_FOLD_NAMES
+        for entry_type in (crew_log._FOLDS[name].affects or ())
+    }
+    assert derived, "no eager slot fold declares an affects set, so this measured nothing"
+    assert eager._WAKE_TYPES == derived | {"session/closed"}, (
+        f"the wake set is {sorted(eager._WAKE_TYPES)} while the slot folds name "
+        f"{sorted(derived)}"
+    )
+
+
+def test_every_committed_type_wakes_because_session_folds_read_every_type():
+    """MUTATION-SENSITIVE: a ``message/chunk`` wakes the worker, not just a slot type.
+
+    ``status`` and ``class`` consume the whole vocabulary, so an append-path filter would
+    pass everything; one that kept the old slot-only filter would leave both stale.
+    """
+    eager.stop_for_tests()
+    eager.note_commit("s-any", "message/chunk", 3)
+    queued = eager._queue
+    assert queued is not None and not queued.empty(), "a message chunk did not wake"
+    assert queued.get_nowait().entry_type == "message/chunk"
+
+
+def test_a_savepoint_file_records_the_folds_own_version():
+    """The number in the file is that fold's, which is what makes the bump per fold."""
+    handle = _log()
+    _grow(handle, _EARNING_TURNS)
+    _saved(handle, ("usage",))
+
+    payload = json.loads(savepoints.checkpoint_path(handle.kind, handle.id, "usage").read_text())
+    assert payload["state_version"] == crew_log._FOLDS["usage"].state_version
+
+
+def test_bumping_one_folds_version_retires_only_that_folds_savepoint(monkeypatch):
+    """A version bump is per fold: the bumped one folds cold, its neighbour resumes.
+
+    The property the whole per-fold change exists for. Both folds have a savepoint on
+    disk written by this build; ``status`` is then rebuilt at a higher version and
+    ``usage`` is left alone, so the reload must refuse exactly one of the two files.
+    """
+    handle = _log()
+    _grow(handle, _EARNING_TURNS)
+    wanted = ("usage", "status")
+    _saved(handle, wanted)
+
+    both = savepoints.load(handle, wanted)
+    assert both is not None and set(both.checkpoints) == set(wanted)
+
+    status = crew_log._FOLDS["status"]
+    monkeypatch.setitem(
+        crew_log._FOLDS, "status", replace(status, state_version=status.state_version + 1)
+    )
+
+    resumed = savepoints.load(handle, wanted)
+    assert resumed is not None
+    assert "usage" in resumed.checkpoints, "usage's savepoint is at its own version, so it stands"
+    assert "status" not in resumed.checkpoints, "status moved version, so its savepoint retired"
+
+
+# --------------------------------------------------------------------------- #
+# 2. An eager fold must be selective
+# --------------------------------------------------------------------------- #
+
+
+def test_an_eager_fold_must_declare_what_affects_it():
+    """``mode="eager"`` with ``affects=None`` is refused where the fold is built.
+
+    An all-eating fold woken off the append path would fold on every message body in
+    the log, which is the cost the mode exists to avoid.
+    """
+    with pytest.raises(ValueError, match="eager"):
+        crew_log._Fold(
+            "throwaway",
+            dict,
+            lambda state, entry: None,
+            lambda state: {},
+            mode="eager",
+        )
+
+
+def test_an_eager_fold_with_an_affects_set_is_accepted():
+    """The control: the same fold with a declared ``affects`` set is built."""
+    fold = crew_log._Fold(
+        "throwaway",
+        dict,
+        lambda state, entry: None,
+        lambda state: {},
+        affects=frozenset({"turn/started"}),
+        mode="eager",
+    )
+    assert fold.mode == "eager"
+
+
+def test_every_fold_with_a_warm_path_is_eager_and_the_rest_say_why_not():
+    """Every fold is eager unless written down; the tree and internal slot folds say why.
+
+    An internal slot fold (``worker``) is read only through an advertised one. A tree fold
+    joins many slots' logs and no event fires when a member's log grows, so eager would serve
+    a stale tree. An empty ``LAZY_FOLD_REASONS`` cannot tell "no exception" from "unstated".
+    """
+    lazy = set(crew_log.TREE_PROJECTION_NAMES) | set(crew_log.INTERNAL_SLOT_PROJECTION_NAMES)
+    assert set(crew_log.EAGER_FOLD_NAMES) == set(crew_log.FOLD_NAMES) - lazy
+    assert set(crew_log.LAZY_FOLD_REASONS) == lazy
+    for name, reason in crew_log.LAZY_FOLD_REASONS.items():
+        assert reason.strip(), f"{name} is lazy with an empty reason"
+    assert set(crew_log.EAGER_SLOT_FOLD_NAMES) == set(crew_log.SLOT_PROJECTION_NAMES)
+    assert set(crew_log.EAGER_SESSION_FOLD_NAMES) == set(crew_log.SESSION_FOLD_NAMES)
+    assert not set(crew_log.EAGER_SLOT_FOLD_NAMES) & set(crew_log.EAGER_SESSION_FOLD_NAMES)
+    # A lazy fold must be in NEITHER eager family, or the folder would wake for it and
+    # then have nothing to continue -- a silent lazy fold, which is what the import-time
+    # ``_ORPHAN_EAGER`` guard refuses from the other direction.
+    assert not lazy & set(crew_log.EAGER_FOLD_NAMES)
+
+
+# --------------------------------------------------------------------------- #
+# 3. The fold advances off the append path
+# --------------------------------------------------------------------------- #
+
+
+def test_an_emitted_entry_advances_an_eager_fold_with_no_reader():
+    """A committed ``work/recorded`` leaves ``work`` folded before anyone reads it.
+
+    The whole claim of the mode. Nothing here calls a read path: the entry lands, the
+    eager worker is told, and the warm memo for (slot, ``work``) exists and stands at
+    that entry's seq -- so the dashboard's next read is a memo lookup.
+    """
+    slot = WORK_SLOT
+    handle = _slot_log("s-work-1", slot)
+    seq = _work_entry(handle, "it-1")
+    assert _memo_keys() == set(), "no reader has run, so nothing is warm yet"
+
+    eager.note_commit("s-work-1", "work/recorded", seq)
+    assert eager.drain(timeout=10.0)
+
+    assert (slot, "work") in _memo_keys()
+    folded = crew_log.read_slot_projection(slot, "work")
+    assert folded.seq == seq
+    assert folded.value["items"], "the eager fold carries the item it was woken for"
+
+
+def test_an_unrelated_entry_does_not_wake_the_work_fold():
+    """``message/sent`` is not in ``work``'s affects set, so nothing folds.
+
+    The other half of the cost claim: a log is mostly message bodies, and an eager
+    worker that woke for them would do on every append what the read was doing once.
+    """
+    slot = WORK_SLOT
+    handle = _slot_log("s-work-2", slot)
+    _work_entry(handle, "it-1")
+
+    eager.note_commit("s-work-2", "message/sent", 99)
+    assert eager.drain(timeout=10.0)
+
+    assert _memo_keys() == set(), "no eager fold names message/sent"
+
+
+def test_a_full_queue_drops_and_counts_instead_of_blocking(monkeypatch):
+    """Overflow is dropped and counted; the append path is never made to wait.
+
+    ``_run`` is stubbed, not just stopped: ``note_commit`` starts the worker itself, so a
+    live consumer would make the drop count a race instead of the bound.
+    """
+    eager.stop_for_tests()
+    monkeypatch.setattr(eager, "_run", lambda: None)
+    before = eager._dropped
+    for index in range(eager.QUEUE_LIMIT + 8):
+        eager.note_commit("s-missing", "work/recorded", index + 1)
+
+    assert eager._dropped - before == 8
+
+
+def test_a_dropped_wake_is_recovered_by_the_next_read():
+    """A dropped wake costs currency, never correctness: the read still folds it.
+
+    What makes dropping safe. The queue overflowing means some entry never woke its
+    fold, so the memo sits behind the file -- and the read path's own continuation
+    carries it forward, which is the lazy behaviour that was there before.
+    """
+    slot = WORK_SLOT
+    handle = _slot_log("s-work-3", slot)
+    seq = _work_entry(handle, "it-1")
+    # The wake is never delivered at all, which is the worst case overflow produces.
+    folded = crew_log.read_slot_projection(slot, "work")
+    assert folded.seq == seq
+    assert folded.value["items"]
+
+
+class _CountingLog:
+    """A crew log handle that counts the entries a caller PARSES through it.
+
+    Warm and cold reads both read each unit's tail; only the cold read parses every line.
+    That parse count is what eager folding removes, so it is measured instead of wall time.
+    """
+
+    def __init__(self, inner, counter: list[int]) -> None:
+        self._inner = inner
+        self._counter = counter
+
+    def __getattr__(self, name: str):
+        return getattr(self._inner, name)
+
+    def iter_from(self, *args, **kwargs):
+        for entry in self._inner.iter_from(*args, **kwargs):
+            self._counter[0] += 1
+            yield entry
+
+
+@pytest.fixture
+def parsed(monkeypatch):
+    """Entries parsed through any crew log handle the read path opens."""
+    counter = [0]
+    inner = crew_log.open_session_log
+
+    def _counting(unit_id: str):
+        handle = inner(unit_id)
+        return None if handle is None else _CountingLog(handle, counter)
+
+    monkeypatch.setattr(crew_log, "open_session_log", _counting)
+    return counter
+
+
+def test_a_fold_after_an_eager_fold_parses_no_entries(parsed):
+    """The eager fold already paid the parse, so a later fold parses no entries.
+
+    Measured at :func:`fold_slot_warm` with the unit list handed in: unit discovery parses
+    the conductor's log on every read by design (see ``test_work_fold_warm_read.py``).
+    """
+    slot = WORK_SLOT
+    handle = _slot_log("s-measured", slot)
+    for index in range(40):
+        handle.append(
+            "message/sent",
+            {"turn": 1, "text": f"filler {index}", "chars": 10},
+            src=GATEWAY,
+        )
+    seq = _work_entry(handle, "it-1")
+    units = ("s-measured",)
+
+    eager.note_commit("s-measured", "work/recorded", seq)
+    assert eager.drain(timeout=10.0)
+    assert parsed[0] > 0, "the eager fold itself parsed the log, which is where the cost went"
+
+    parsed[0] = 0
+    warm = crew_log.fold_slot_warm("work", units, slot=slot)
+    warm_cost = parsed[0]
+
+    crew_log.forget_slot_folds()
+    parsed[0] = 0
+    cold = crew_log.fold_slot_warm("work", units, slot=slot)
+    cold_cost = parsed[0]
+
+    assert warm.state == cold.state and warm.last_seq == cold.last_seq
+    assert warm_cost == 0, f"a fold after an eager fold parsed {warm_cost} entries"
+    assert cold_cost >= 41, f"the cold fold parses the whole unit, measured {cold_cost}"
+
+
+def test_a_report_in_the_workers_log_alone_never_reaches_the_board():
+    """The board reads its conductor's units only.
+
+    A bind in the conductor's log does not pull the bound worker's log into the
+    fold: the gateway writes the board's own copy of each report into the conductor's
+    log, so the worker's copy is never read, and the open item waits for that copy.
+    """
+    conductor_slot = WORK_SLOT
+    worker_slot = "dashboard:31"
+    conductor = _slot_log("s-conductor", conductor_slot)
+    _work_entry(conductor, "it-1")
+    assert crew_log.read_slot_projection(conductor_slot, "work").value["items"]
+
+    worker = _slot_log("s-worker", worker_slot)
+    conductor.append(
+        "work/recorded",
+        {
+            "slot": conductor_slot,
+            "actor": "conductor",
+            "by": conductor_slot,
+            "action": "bind",
+            "item_id": "it-1",
+            "worker_session_key": worker_slot,
+        },
+        src=GATEWAY,
+    )
+    worker.append(
+        "work/recorded",
+        {
+            "slot": conductor_slot,
+            "actor": "worker",
+            "by": worker_slot,
+            "action": "report",
+            "item_id": "it-1",
+            "status": "done",
+            "summary": "the worker reported",
+        },
+        src=GATEWAY,
+    )
+
+    item = crew_log.read_slot_projection(conductor_slot, "work").value["items"][0]
+    assert item["status"] is None
+    assert item["summary"] == crew_log.WORK_AWAITING_REPORT
+
+
+def test_the_real_append_path_wakes_the_eager_fold(monkeypatch):
+    """End to end through ``emit``: no test calls ``note_commit`` here.
+
+    The tests above drive the worker directly, which says nothing about whether anything
+    in the product tells it. This goes through the emitter's own append job -- the one
+    every ordinary entry type takes -- so the hook inside it is what is under test, and
+    the entry is written by the writer thread rather than by this one.
+    """
+    # The suite runs with the emitter switched OFF (``KIROCREW_CREW_LOG=0``), so a test
+    # of the append path has to switch it on for itself; with it off, ``_handle``
+    # answers None and nothing is appended at all.
+    monkeypatch.setenv("KIROCREW_CREW_LOG", "1")
+    emit.reset_caches()
+    slot = WORK_SLOT
+    emit.on_session_opened(
+        "s-emitted", agent="kirocrew", slot=slot, model="opus", cwd="/w", owner="raymond"
+    )
+    assert_drained()
+
+    emit._write(
+        "s-emitted",
+        "work/recorded",
+        {
+            "slot": slot,
+            "actor": "conductor",
+            "by": slot,
+            "action": "create",
+            "item_id": "it-1",
+            "title": "emitted",
+        },
+        src="gateway",
+    )
+    assert_drained()
+    assert eager.drain(timeout=10.0)
+
+    assert (slot, "work") in _memo_keys()
+    assert crew_log.read_slot_projection(slot, "work").value["items"]
+
+
+def test_drain_waits_for_a_wake_it_has_not_folded_yet():
+    """``drain`` answers about FOLDING, not about the queue being empty.
+
+    The counters are taken when a wake is ENQUEUED rather than when the worker takes one,
+    because a take and its count cannot be made atomic against a reader without holding a
+    lock across a blocking get. With the consumer stubbed out the queue is drained by
+    nobody, so a ``drain`` that answered on emptiness alone would say True here.
+    """
+    eager.stop_for_tests()
+    slot = WORK_SLOT
+    handle = _slot_log("s-pending", slot)
+    seq = _work_entry(handle, "it-1")
+    eager.note_commit("s-pending", "work/recorded", seq)
+    # Take the only wake off the queue without folding it -- the exact window a waiter
+    # comparing "queue empty" against a taken-count would misread.
+    assert eager._queue is not None
+    eager._queue.get_nowait()
+
+    assert eager.drain(timeout=0.3) is False
+    assert _memo_keys() == set()
+
+
+def test_a_burst_of_entries_costs_the_worker_one_pass(parsed):
+    """A burst of queued wakes is coalesced, so the worker pays one fold pass.
+
+    The worker's fold includes unit discovery over a long conductor log, so the per-pass cost
+    is what would multiply if batching failed.
+    """
+    slot = WORK_SLOT
+    handle = _slot_log("s-burst", slot)
+    for index in range(60):
+        handle.append(
+            "message/sent",
+            {"turn": 1, "text": f"filler {index}", "chars": 10},
+            src=GATEWAY,
+        )
+    first = _work_entry(handle, "it-0")
+    eager.note_commit("s-burst", "work/recorded", first, board=slot)
+    assert eager.drain(timeout=10.0)
+    one_pass = parsed[0]
+    assert one_pass > 60, f"the fold must have read the long log; measured {one_pass}"
+
+    # Eight more entries, all queued before the worker is let near them, which is the
+    # shape a turn's burst has.
+    eager.stop_for_tests()
+    seqs = [_work_entry(handle, f"it-{n}") for n in range(1, 9)]
+    parsed[0] = 0
+    for seq in seqs:
+        eager.note_commit("s-burst", "work/recorded", seq, board=slot)
+    assert eager.drain(timeout=20.0)
+    burst = parsed[0]
+
+    assert len(crew_log.read_slot_projection(slot, "work").value["items"]) == 9
+    # One batch, so one pass -- not eight. The bound is generous because the worker may
+    # legitimately wake twice if it reaches the queue between two puts.
+    assert burst <= one_pass * 3, (
+        f"eight queued entries cost {burst} parsed entries against {one_pass} for one; "
+        "the batch is not being coalesced"
+    )
+
+
+def test_a_worker_report_advances_the_conductors_board_not_its_own():
+    """The board comes from the ENTRY, never from the unit's header.
+
+    A worker's log header names the worker's own slot, while its ``work/recorded`` names
+    the conductor's board. Folding by the header advances a board nobody reads and leaves
+    the conductor's -- the one the dashboard reads -- exactly as stale as it was.
+    """
+    conductor_slot = WORK_SLOT
+    worker_slot = "dashboard:51"
+    conductor = _slot_log("s-c-board", conductor_slot)
+    worker = _slot_log("s-w-board", worker_slot)
+    _work_entry(conductor, "it-1")
+    conductor.append(
+        "work/recorded",
+        {
+            "slot": conductor_slot,
+            "actor": "conductor",
+            "by": conductor_slot,
+            "action": "bind",
+            "item_id": "it-1",
+            "worker_session_key": worker_slot,
+        },
+        src=GATEWAY,
+    )
+    report_data = {
+        "slot": conductor_slot,
+        "actor": "worker",
+        "by": worker_slot,
+        "action": "report",
+        "item_id": "it-1",
+        "status": "done",
+        "summary": "the worker reported",
+    }
+    report = worker.append("work/recorded", report_data, src=GATEWAY)
+    # The board's own copy, in the conductor's log, as the report route writes it.
+    conductor.append("work/recorded", report_data, src=GATEWAY)
+
+    eager.note_commit("s-w-board", "work/recorded", int(report.seq), board=conductor_slot)
+    assert eager.drain(timeout=10.0)
+
+    warm = _memo_keys()
+    assert (conductor_slot, "work") in warm, "the conductor's board is the one that advanced"
+    assert (worker_slot, "work") not in warm, "the worker's own board is not this entry's"
+    assert (
+        crew_log.read_slot_projection(conductor_slot, "work").value["items"][0]["status"] == "done"
+    )
+
+
+def test_the_real_emitter_sends_a_worker_report_to_the_conductors_board(monkeypatch):
+    """End to end through the emitter, with the board different from the unit's header.
+
+    A worker's report names the conductor's board while its header names the worker's slot,
+    so only this case tells whether the emitter passes the board or the folder guesses it.
+    """
+    monkeypatch.setenv("KIROCREW_CREW_LOG", "1")
+    emit.reset_caches()
+    conductor_slot = WORK_SLOT
+    worker_slot = "dashboard:61"
+    conductor = _slot_log("s-e2e-c", conductor_slot)
+    _work_entry(conductor, "it-1")
+    conductor.append(
+        "work/recorded",
+        {
+            "slot": conductor_slot,
+            "actor": "conductor",
+            "by": conductor_slot,
+            "action": "bind",
+            "item_id": "it-1",
+            "worker_session_key": worker_slot,
+        },
+        src=GATEWAY,
+    )
+    emit.on_session_opened(
+        "s-e2e-w", agent="kirocrew", slot=worker_slot, model="opus", cwd="/w", owner="raymond"
+    )
+    assert_drained()
+
+    emit._write(
+        "s-e2e-w",
+        "work/recorded",
+        {
+            "slot": conductor_slot,
+            "actor": "worker",
+            "by": worker_slot,
+            "action": "report",
+            "item_id": "it-1",
+            "status": "done",
+            "summary": "reported through the emitter",
+        },
+        src="gateway",
+    )
+    assert_drained()
+    assert eager.drain(timeout=10.0)
+
+    warm = _memo_keys()
+    assert (conductor_slot, "work") in warm, "the emitter did not pass the entry's board"
+    assert (worker_slot, "work") not in warm, "the worker's own board is not this entry's"
+
+
+def test_one_unit_writing_two_boards_folds_both():
+    """A batch is keyed by (unit, board), so two boards from one unit are both folded.
+
+    A worker bound to two conductors reports to both from its own log. Keying the batch on
+    the unit alone would collapse the two wakes onto one entry and fold whichever won,
+    leaving the other board stale with nothing raised.
+    """
+    eager.stop_for_tests()
+    first, second = WORK_SLOT, "dashboard:62"
+    worker = _slot_log("s-two-boards", "dashboard:63")
+    seqs = []
+    for board in (first, second):
+        entry = worker.append(
+            "work/recorded",
+            {
+                "slot": board,
+                "actor": "worker",
+                "by": "dashboard:63",
+                "action": "report",
+                "item_id": "it-1",
+                "status": "progress",
+                "summary": f"reporting to {board}",
+            },
+            src=GATEWAY,
+        )
+        seqs.append((board, int(entry.seq)))
+    for board, seq in seqs:
+        eager.note_commit("s-two-boards", "work/recorded", seq, board=board)
+    assert eager.drain(timeout=20.0)
+
+    warm = _memo_keys()
+    assert (first, "work") in warm and (
+        second,
+        "work",
+    ) in warm, f"one unit's two boards did not both fold; warm = {sorted(warm)}"
+
+
+def test_two_concurrent_folds_never_pair_one_passs_seq_with_anothers_state():
+    """The (state, seq) a pass returns describes one moment.
+
+    Two passes on one slot share the memo cell, so without serialization a pass could return
+    the other's newer state under its own older seq. The interleaving is forced with an event,
+    not raced for, so pass A deterministically sees pass B's state if the lock is missing.
+    """
+    slot = WORK_SLOT
+    handle = _slot_log("s-race", slot)
+    _work_entry(handle, "it-0", slot=slot)
+    units = ("s-race",)
+    # Warm the cell, so both passes take the CONTINUATION path -- the one that shares.
+    crew_log.fold_slot_warm("work", units, slot=slot)
+    _work_entry(handle, "it-1", slot=slot)
+
+    entered = threading.Event()
+    b_done = threading.Event()
+    held = threading.Event()
+    inner_vouched = crew_log._vouched
+
+    #: How long pass A waits for pass B while holding its window open. Reached only when
+    #: the fix is PRESENT: B is then queued behind A's lock and cannot signal, so A waits
+    #: this out and releases. Without the fix B runs at once and A wakes immediately, so
+    #: the wait costs nothing in the direction that must fail.
+    _B_WAIT = 3.0
+
+    def gated_vouched(unit_id, before):
+        # The window the finding is about: pass A's stream has ENDED, so its own ``reached``
+        # is fixed, but it has not yet read the shared cell to pair with it. Hold A here and
+        # let another pass drive that cell past A's position.
+        if not held.is_set():
+            held.set()
+            entered.set()
+            b_done.wait(timeout=_B_WAIT)
+        return inner_vouched(unit_id, before)
+
+    a_result: list[tuple[int, int]] = []
+    b_result: list[tuple[int, int]] = []
+    errors: list[BaseException] = []
+
+    def fold(into: list, done: "threading.Event | None" = None) -> None:
+        try:
+            cp = crew_log.fold_slot_warm("work", units, slot=slot)
+            into.append((cp.last_seq, len(cp.state["order"])))
+        except BaseException as exc:  # pragma: no cover - reported, not swallowed
+            errors.append(exc)
+        finally:
+            if done is not None:
+                done.set()
+
+    with unittest.mock.patch.object(crew_log, "_vouched", gated_vouched):
+        pass_a = threading.Thread(target=fold, args=(a_result,))
+        pass_a.start()
+        assert entered.wait(timeout=10.0), "pass A never reached its window"
+        # A's stream is done and its seq is fixed at it-1. A third entry lands and pass B
+        # folds it, driving the very cell A is about to read.
+        _work_entry(handle, "it-2", slot=slot)
+        pass_b = threading.Thread(target=fold, args=(b_result, b_done))
+        pass_b.start()
+        pass_a.join(timeout=30.0)
+        pass_b.join(timeout=30.0)
+
+    assert not errors, f"a fold raised: {errors!r}"
+    assert a_result and b_result, f"both passes must return; A={a_result!r} B={b_result!r}"
+    a_seq, a_items = a_result[0]
+    b_seq, b_items = b_result[0]
+    assert b_items == 3, f"pass B should have folded all three items, got {b_items}"
+    # THE PROPERTY: a pass's state may be older than another's, never newer than its own
+    # seq allows. A sampled a log stopping at it-1, so two items is the most it can carry.
+    assert a_items <= 2, (
+        f"pass A returned {a_items} items at seq {a_seq} while B reached seq {b_seq} with "
+        f"{b_items}: A is wearing B's state under its own older number"
+    )
+
+
+def test_a_finished_fold_keeps_no_lock_for_the_slot_it_folded():
+    """The lock table holds passes in flight, not every slot ever folded.
+
+    The per-key lock must outlive a waiting pass, but a table keyed on every fold ever run is
+    unbounded (``SLOT_FOLD_CACHE_SLOTS`` caps only the memos).
+    """
+    inner_vouched = crew_log._vouched
+    inside: list[int] = []
+
+    def watching(unit_id, before):
+        # Mid-pass: this key's lock is held, so it must still be in the table.
+        inside.append(len(crew_log._slot_fold_locks))
+        return inner_vouched(unit_id, before)
+
+    with unittest.mock.patch.object(crew_log, "_vouched", watching):
+        for index in range(3):
+            unit = f"s-lock-{index}"
+            slot = f"dashboard:lock-{index}"
+            handle = _slot_log(unit, slot)
+            _work_entry(handle, "it-0", slot=slot)
+            crew_log.fold_slot_warm("work", (unit,), slot=slot)
+
+    assert inside, "no pass reached the window, so this measured nothing"
+    assert max(inside) == 1, (
+        f"a pass saw {max(inside)} lock entries while holding one key's lock; the table "
+        "should hold the pass in flight and nothing else"
+    )
+    assert crew_log._slot_fold_locks == {}, (
+        f"three finished folds left {len(crew_log._slot_fold_locks)} lock(s) behind: "
+        f"{sorted(crew_log._slot_fold_locks)} -- the table grows with slots seen"
+    )
+
+
+def test_a_worker_that_will_not_stop_fails_the_case_instead_of_outliving_it():
+    """A stop that cannot finish raises instead of being assumed.
+
+    The worker is a process-wide daemon; a batch still folding after
+    :func:`eager.stop_for_tests` writes into whatever home the env names once ``monkeypatch``
+    undoes the pin. The stop is the only point where the leak is attributable, as in
+    ``drain_breadcrumb_writes`` in ``test/conftest.py``.
+    """
+    monkeypatch = pytest.MonkeyPatch()
+    inside = threading.Event()
+    release = threading.Event()
+
+    def wedged(batch, closers=None):
+        inside.set()
+        release.wait(timeout=30.0)
+
+    monkeypatch.setattr(eager, "_fold_batch", wedged)
+    monkeypatch.setattr(eager, "_STOP_JOIN_SECONDS", 0.2)
+    try:
+        eager.note_commit(SESSION, "work/recorded", 1, board=WORK_SLOT)
+        assert inside.wait(timeout=10.0), "the worker never entered the wedged batch"
+        with pytest.raises(TimeoutError, match="crew-log-eager-fold"):
+            eager.stop_for_tests()
+        # The expiry KEEPS the handle. A later stop is the only thing that can ever join
+        # this thread, so dropping it here would leave it running and unjoinable for the
+        # life of the process -- and the counters it is still using are left alone with it.
+        stranded = eager._worker
+        assert (
+            stranded is not None and stranded.is_alive()
+        ), "the timed-out stop dropped its handle on a live worker; nothing can join it"
+    finally:
+        release.set()
+        monkeypatch.undo()
+        # The wedged batch is free now, so the retained handle is joinable and this case
+        # leaves no thread behind for the next one.
+        eager.stop_for_tests()
+        assert eager._worker is None, "the second stop did not join the retained worker"
+
+
+def test_an_entry_after_the_closer_leaves_its_fold_warm(monkeypatch):
+    """One batch applies a closer and a later entry in commit order, ending warm.
+
+    An append after ``session/closed`` is accepted (a reset keeps the id mapped). If the
+    closer won the key, the later wake would be discarded and the next read refolds it all.
+    """
+    slot = WORK_SLOT
+    handle = _slot_log("s-after-close", slot)
+    handle.append("session/closed", {"reason": "reset"}, src=GATEWAY)
+    closed_seq = handle.last_seq
+    after = _work_entry(handle, "it-after", slot=slot)
+    assert after > closed_seq, "the fixture must append AFTER the closer"
+
+    # The worker exists but consumes nothing, so both wakes are still queued and this test
+    # drives the coalesce-and-fold pass itself -- which is where the ordering lives.
+    eager.stop_for_tests()
+    monkeypatch.setattr(eager, "_run", lambda: None)
+    eager.note_commit("s-after-close", "session/closed", closed_seq, board=slot)
+    eager.note_commit("s-after-close", "work/recorded", after, board=slot)
+    crew_log.forget_slot_folds()
+
+    queued = eager._queue
+    assert queued is not None, "the wakes were never queued"
+    batch, closers, _taken = eager._coalesce(queued.get_nowait())
+    eager._fold_batch(batch, closers)
+    # The drop left the cell cold, so the advance handed its fold to one background
+    # prime rather than folding every unit on the eager worker; wait for that prime.
+    from kiro_crew.crew_log import slot_prime
+
+    assert slot_prime.drain(timeout=30.0), "the background prime never finished"
+
+    warm = {(key[1], key[2]) for key in crew_log._slot_memos}
+    assert (slot, "work") in warm, (
+        f"the entry after the closer left no warm fold; warm = {sorted(warm)}. The closer "
+        "took the key and the later entry was discarded"
+    )
+    held = crew_log._slot_memos[(str(crew_log.data_home()), slot, "work")]
+    reached, _revision = crew_log._slot_checkpoint("work", held)
+    assert reached.last_seq == after, (
+        f"the warm fold stands at seq {reached.last_seq}, not at the post-closer entry "
+        f"{after}: the drop was applied after the advance"
+    )
+
+
+def test_a_later_entry_of_another_type_does_not_hide_a_slot_folds_advance(monkeypatch):
+    """MUTATION-SENSITIVE: coalescing keeps one wake per TYPE, not one per (unit, board).
+
+    Which slot folds a wake moves is decided by its type. A ``work/recorded`` followed in
+    the same batch by an entry the work fold does not read (``panel/published`` here)
+    collapsed, under a (unit, board) key, onto the later wake alone -- so the work fold
+    was never advanced and the eager board sat stale until a reader folded it lazily.
+    """
+    slot = WORK_SLOT
+    handle = _slot_log("s-mixed-batch", slot)
+    seq = _work_entry(handle, "it-mixed", slot=slot)
+    later_type = "panel/published"
+    assert not crew_log._FOLDS["work"].touched_by_type(
+        later_type
+    ), "the fixture needs a later type the work fold does not read"
+
+    eager.stop_for_tests()
+    monkeypatch.setattr(eager, "_run", lambda: None)
+    eager.note_commit("s-mixed-batch", "work/recorded", seq, board=slot)
+    eager.note_commit("s-mixed-batch", later_type, seq + 1, board=slot)
+    crew_log.forget_slot_folds()
+
+    queued = eager._queue
+    assert queued is not None, "the wakes were never queued"
+    batch, closers, _taken = eager._coalesce(queued.get_nowait())
+    eager._fold_batch(batch, closers)
+    # The cell was cold, so its fold went to one background prime.
+    from kiro_crew.crew_log import slot_prime
+
+    assert slot_prime.drain(timeout=30.0), "the background prime never finished"
+
+    warm = {(key[1], key[2]) for key in crew_log._slot_memos}
+    assert (slot, "work") in warm, (
+        f"the work fold was not advanced; warm = {sorted(warm)}. The later wake of another "
+        "type took the coalescing key and the work wake was dropped"
+    )
+
+
+def test_a_closer_in_the_same_batch_as_an_earlier_entry_still_drops_the_slot(monkeypatch):
+    """The closer is matched to its unit, not to a board it never names.
+
+    ``work/recorded`` wakes carry a board; ``session/closed`` wakes carry none. Looked up by
+    (unit, board), the closer would miss the work wake and leave a closed session warm.
+    """
+    slot = WORK_SLOT
+    handle = _slot_log("s-close-batch", slot)
+    seq = _work_entry(handle, "it-1", slot=slot)
+    closed = handle.append("session/closed", {"reason": "done"}, src=GATEWAY)
+    assert int(closed.seq) > seq
+
+    eager.stop_for_tests()
+    monkeypatch.setattr(eager, "_run", lambda: None)
+    # Exactly what the emitter sends: the board for the work entry, nothing for the closer.
+    eager.note_commit("s-close-batch", "work/recorded", seq, board=slot)
+    eager.note_commit("s-close-batch", "session/closed", int(closed.seq))
+    crew_log.forget_slot_folds()
+
+    queued = eager._queue
+    assert queued is not None, "the wakes were never queued"
+    batch, closers, _taken = eager._coalesce(queued.get_nowait())
+    eager._fold_batch(batch, closers)
+    # A cold cell's fold goes to one background prime; wait for it.
+    from kiro_crew.crew_log import slot_prime
+
+    assert slot_prime.drain(timeout=30.0), "the background prime never finished"
+
+    warm = {(key[1], key[2]) for key in crew_log._slot_memos}
+    assert (slot, "work") not in warm, (
+        f"a closed session was left warm; warm = {sorted(warm)}. The closer's wake carries "
+        "no board, so matching it by board misses the entry it outranks"
+    )
+
+
+def test_a_workers_last_report_still_reaches_the_conductors_board_when_the_worker_closes(
+    monkeypatch,
+):
+    """Closing a unit drops its own board, never a board it only writes to.
+
+    A worker's report (naming the conductor's board) and its ``session/closed`` often share a
+    batch. A closer outranks a wake only when both are the same unit (seqs are per unit) and
+    the wake's target is that unit's own board; otherwise the conductor loses the report.
+    """
+    conductor_slot = WORK_SLOT
+    worker_slot = "dashboard:52"
+    conductor = _slot_log("s-c-close", conductor_slot)
+    worker = _slot_log("s-w-close", worker_slot)
+    _work_entry(conductor, "it-1", slot=conductor_slot)
+    conductor.append(
+        "work/recorded",
+        {
+            "slot": conductor_slot,
+            "actor": "conductor",
+            "by": conductor_slot,
+            "action": "bind",
+            "item_id": "it-1",
+            "worker_session_key": worker_slot,
+        },
+        src=GATEWAY,
+    )
+    report = worker.append(
+        "work/recorded",
+        {
+            "slot": conductor_slot,
+            "actor": "worker",
+            "by": worker_slot,
+            "action": "report",
+            "item_id": "it-1",
+            "status": "done",
+            "summary": "the worker reported before closing",
+        },
+        src=GATEWAY,
+    )
+    closed = worker.append("session/closed", {"reason": "done"}, src=GATEWAY)
+    assert int(closed.seq) > int(report.seq), "the closer must follow the report"
+
+    eager.stop_for_tests()
+    monkeypatch.setattr(eager, "_run", lambda: None)
+    # Exactly what the emitter sends: the conductor's board on the report, none on the closer.
+    eager.note_commit("s-w-close", "work/recorded", int(report.seq), board=conductor_slot)
+    eager.note_commit("s-w-close", "session/closed", int(closed.seq))
+    crew_log.forget_slot_folds()
+
+    queued = eager._queue
+    assert queued is not None, "the wakes were never queued"
+    batch, closers, _taken = eager._coalesce(queued.get_nowait())
+    eager._fold_batch(batch, closers)
+    # The board's cell was cold, so its fold went to one background prime.
+    from kiro_crew.crew_log import slot_prime
+
+    assert slot_prime.drain(timeout=30.0), "the background prime never finished"
+
+    warm = {(key[1], key[2]) for key in crew_log._slot_memos}
+    assert (conductor_slot, "work") in warm, (
+        f"the conductor's board lost the report; warm = {sorted(warm)}. The worker's closer "
+        "suppressed a wake aimed at a board that unit does not own"
+    )
+    assert (
+        worker_slot,
+        "work",
+    ) not in warm, f"the closed worker's own board is still warm; warm = {sorted(warm)}"
+
+
+def test_a_wake_after_retirement_starts_no_worker_until_the_next_test_resumes():
+    """The gap between tests is fenced; the test itself is not.
+
+    An append can land after the stop returns, and ``note_commit`` would start a daemon that
+    resolves the data home after the pin lifts. Retirement fences such wakes, and
+    ``resume_for_tests`` lifts the fence so every test still meets a live worker.
+    """
+    eager.retire_for_tests()
+    eager.note_commit(SESSION, "work/recorded", 1, board=WORK_SLOT)
+    assert eager._worker is None, (
+        "a wake inside the fence started a worker; its fold would resolve a data home no "
+        "caller pinned"
+    )
+    assert eager._queue is None, "a wake inside the fence was queued for a stopped worker"
+
+    eager.resume_for_tests()
+    eager.note_commit(SESSION, "work/recorded", 1, board=WORK_SLOT)
+    assert (
+        eager._worker is not None
+    ), "the fence outlived the resume, so this process would fold nothing eagerly again"
+
+
+def test_a_late_wake_during_the_stop_starts_no_worker():
+    """The fence covers the stop window, not just after it.
+
+    ``flush`` waits only 5s, so the emit writer can wake between the old worker's ``join``
+    and the reset taking ``_lock``, and ``_ensure_worker`` would start a daemon the reset
+    orphans. The fence is set before the stop; this injects a ``note_commit`` from inside
+    ``stop_for_tests`` and asserts no worker survives.
+    """
+    real_stop = eager.stop_for_tests
+
+    def _stop_then_a_late_wake() -> None:
+        # Run the real stop (join + reset _worker/_queue to None), THEN stand in for the
+        # still-live emit writer landing an append in the window the stop just opened:
+        # ``flush``'s 5s wait is bounded and its result discarded, so the writer can wake
+        # after the reset. With the fence set BEFORE this call, the wake is dropped and
+        # starts nothing. With the fence set only after ``stop_for_tests`` returns, the
+        # wake reaches ``_ensure_worker`` here and starts a daemon nothing joins -- the
+        # orphan that survives retirement and resolves an unpinned data home.
+        real_stop()
+        eager.note_commit(SESSION, "work/recorded", 1, board=WORK_SLOT)
+
+    with unittest.mock.patch.object(eager, "stop_for_tests", _stop_then_a_late_wake):
+        eager.retire_for_tests()
+
+    assert eager._worker is None, (
+        "a wake landing during the stop started a replacement worker; its fold would "
+        "resolve a data home no caller pinned"
+    )
+    assert eager._retired.is_set(), "retirement returned without the fence in force"
+
+    eager.resume_for_tests()
+    eager.stop_for_tests()
+
+
+def test_worker_creation_under_the_fence_hands_back_a_queue_and_starts_nothing():
+    """The fence is re-read where the worker is created, not only at the gate.
+
+    A wake that read the latch as clear just before it went up still reaches ``_enqueue``, so
+    ``_ensure_worker`` re-reads it under ``_lock``. Driven at the seam since the race cannot be
+    scheduled: it must still return a queue (the caller's ``put_nowait`` needs one) and must
+    leave the worker stopped.
+    """
+    eager.retire_for_tests()
+    assert eager._worker is None, "retirement left a worker running"
+
+    pending = eager._ensure_worker()
+
+    assert pending is not None, "a wake already past the gate was given no queue to land in"
+    assert eager._worker is None, (
+        "worker creation ignored the fence and started a daemon the reset would orphan; its "
+        "fold would resolve a data home no caller pinned"
+    )
+
+    eager.resume_for_tests()
+    eager.stop_for_tests()
+
+
+def test_a_late_wake_after_the_reset_leaves_the_progress_counters_consistent():
+    """A wake counted after retirement's reset must not skew the progress counters.
+
+    A late ``_queued += 1`` after the reset would leave ``_queued`` at 1 with no worker to
+    settle it, so ``drain`` never reaches parity. ``_enqueue`` re-checks the fence inside
+    ``_progress``, the lock the reset takes.
+    """
+    eager.retire_for_tests()
+    assert eager._queued == 0 and eager._settled == 0, "retirement did not zero the counters"
+
+    # A wake that got past note_commit's gate just before the latch, now reaching the
+    # count under the fence. Drive _enqueue directly: note_commit's own gate would drop it
+    # earlier, but the window this closes is the one INSIDE _enqueue, after the gate.
+    eager._enqueue(eager._Wake(SESSION, "work/recorded", 1, WORK_SLOT))
+
+    assert (
+        eager._queued == 0
+    ), "a wake counted after the reset skewed _queued; drain would never reach parity"
+    assert eager.drain(timeout=0.0) is True, "the progress counters are not at parity"
+
+    eager.resume_for_tests()
+
+
+def test_a_stale_enqueue_onto_a_replaced_queue_does_not_skew_the_next_test(monkeypatch):
+    """A wake holding a queue the reset replaced must not count.
+
+    The ``_retired`` flag alone cannot close this: between the wake capturing ``pending`` and
+    resuming, teardown replaces ``_queue`` and ``resume_for_tests`` clears the flag. The check
+    ``pending is not _queue`` drops it. Here ``_ensure_worker`` hands back a foreign queue to
+    stand in for the captured one; without the check ``_queued`` sticks at 1.
+    """
+    eager.resume_for_tests()
+    eager.stop_for_tests()  # zero the counters and null the queue, as between cases
+    assert eager._queued == 0 and eager._settled == 0, "reset did not zero the counters"
+    assert not eager._retired.is_set(), "the fence is up; this test is about the fence being DOWN"
+
+    # The live queue for the current case. _ensure_worker would normally return this; we
+    # make it hand back a different object to model a wake that captured `pending` before
+    # the queue was replaced under it.
+    live = queue.Queue(maxsize=eager.QUEUE_LIMIT)
+    orphan = queue.Queue(maxsize=eager.QUEUE_LIMIT)
+    with eager._lock:
+        eager._queue = live
+    monkeypatch.setattr(eager, "_ensure_worker", lambda: orphan)
+
+    eager._enqueue(eager._Wake(SESSION, "work/recorded", 1, WORK_SLOT))
+
+    assert eager._queued == 0, (
+        "a wake landing on a replaced (orphaned) queue counted against the live counter; "
+        "the next test's drain would never reach parity"
+    )
+    assert orphan.qsize() == 0, "the stale wake was put on the orphaned queue instead of dropped"
+
+    with eager._lock:
+        eager._queue = None
+    eager.resume_for_tests()
+
+
+def test_a_stop_wakes_the_parked_worker_instead_of_waiting_out_its_poll(monkeypatch):
+    """The stop wakes a parked worker instead of waiting out its poll.
+
+    A ``threading.Event`` cannot interrupt ``queue.get(timeout=_POLL_SECONDS)``, so the stop
+    puts a sentinel on the queue. The poll interval is made long so a loaded runner cannot
+    turn the margin into a false pass.
+    """
+    parked = 30.0
+    monkeypatch.setattr(eager, "_POLL_SECONDS", parked)
+    eager.resume_for_tests()
+
+    # Start the worker and let it settle into its parked get.
+    eager.note_commit(SESSION, "work/recorded", 1, board=WORK_SLOT)
+    assert eager.drain(timeout=10.0), "the worker never folded its first wake"
+    time.sleep(0.3)
+    worker = eager._worker
+    assert worker is not None and worker.is_alive(), "no worker to park"
+
+    started = time.monotonic()
+    eager.stop_for_tests()
+    elapsed = time.monotonic() - started
+
+    assert eager._worker is None, "the stop did not complete"
+    assert elapsed < parked / 4, (
+        f"the stop took {elapsed:.1f}s against a {parked:.0f}s poll interval: it waited for "
+        "the parked get to lapse instead of waking it"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# 4. Eager is the DEFAULT, and lazy is an exception that has to say why
+# --------------------------------------------------------------------------- #
+
+
+def test_every_fold_is_eager_or_carries_a_reason_to_be_lazy():
+    """The posture is decided in the declaration, never by omission.
+
+    ``mode`` defaults to ``"eager"`` and ``_Fold`` refuses a lazy fold with no
+    ``lazy_reason``, so staying lazy requires a stated reason.
+    """
+    for name, fold in crew_log._FOLDS.items():
+        assert fold.mode in ("eager", "lazy"), f"{name} declares mode {fold.mode!r}"
+        if fold.mode == "lazy":
+            assert fold.lazy_reason.strip(), (
+                f"the {name} fold is lazy with no reason; eager is the default, so an "
+                "exception has to state its ground in the declaration"
+            )
+        else:
+            assert not fold.lazy_reason, (
+                f"the eager {name} fold carries a lazy_reason, which describes a posture "
+                "this registry no longer holds"
+            )
+
+
+def test_a_lazy_fold_declared_without_a_reason_is_refused():
+    """MUTATION-SENSITIVE: the requirement is in the TYPE, not only in the pin above.
+
+    A test that merely walks the registry passes the moment someone adds a reason; this is
+    what makes a reason impossible to leave out in the first place.
+    """
+    with pytest.raises(ValueError, match="lazy with no lazy_reason"):
+        replace(crew_log._FOLDS["work"], mode="lazy", lazy_reason="")
+
+
+def test_an_eager_fold_declared_with_a_lazy_reason_is_refused():
+    """A reason left behind a flip would describe a posture the registry does not hold."""
+    with pytest.raises(ValueError, match="carries a lazy_reason"):
+        replace(crew_log._FOLDS["work"], lazy_reason="left over from when it was lazy")
+
+
+def test_a_fold_with_no_mode_written_down_is_eager():
+    """The default itself, asserted on a fold built without naming a mode."""
+    built = crew_log._Fold(
+        "probe",
+        crew_log._FOLDS["work"].start,
+        crew_log._FOLDS["work"].step,
+        crew_log._FOLDS["work"].render,
+        affects=frozenset({"work/recorded"}),
+    )
+    assert built.mode == "eager"
+
+
+def test_status_and_class_declare_the_whole_vocabulary_rather_than_none():
+    """``affects=None`` read as both "every type" and "not decided yet". Now it says which.
+
+    Both are eager, and the wide set is WHY every committed entry wakes the worker; what
+    spelling it out buys is that a reader of the registry can tell a fold that genuinely
+    consumes everything from one whose posture was never written down.
+    """
+    for name in ("status", "class"):
+        affects = crew_log._FOLDS[name].affects
+        assert affects is not None, f"{name} still leaves affects undeclared"
+        assert affects == crew_log.KNOWN_TYPES, (
+            f"{name} declares {len(affects)} types against the vocabulary's "
+            f"{len(crew_log.KNOWN_TYPES)}; these two are moved by every entry"
+        )
+
+
+# --------------------------------------------------------------------------- #
+# 5. The push: an advanced fold reaches a listener with a value and a revision
+# --------------------------------------------------------------------------- #
+
+
+def _subscribe_slot_events(sink: list) -> None:
+    """Append each SLOT event to *sink* as ``(slot, fold, revision, value)``.
+
+    A ``work`` event carries no value (it is a delta); its whole render is what the WS
+    exporter looks up inside the publish, ``eager.published_value`` at its revision.
+    """
+
+    def _record(event: Any) -> None:
+        value = event.value
+        if value is None:
+            value = eager.published_value(event.key, event.fold, event.revision)
+        sink.append((event.key, event.fold, event.revision, value))
+
+    bus.subscribe(bus.FOLD_ADVANCED, _record, scope=bus.SCOPE_SLOT)
+
+
+@pytest.fixture
+def pushed():
+    """Every ``(slot, fold, revision, value)`` an eager advance published in this test."""
+    seen: list[tuple[str, str, int, dict]] = []
+    bus.reset_for_tests()
+    _subscribe_slot_events(seen)
+    yield seen
+    bus.reset_for_tests()
+
+
+def test_an_advanced_fold_is_pushed_with_its_value_and_revision(pushed):
+    """The folded value reaches a consumer, not just the memo.
+
+    An eager advance that only STORED the value would still leave a dashboard reading it.
+    The frame carries the value, so the read is removed rather than made cheap.
+    """
+    slot = WORK_SLOT
+    handle = _slot_log("s-push-1", slot)
+    seq = _work_entry(handle, "it-pushed")
+    eager.note_commit("s-push-1", "work/recorded", seq, board=slot)
+    assert eager.drain(timeout=10.0)
+
+    assert pushed, "an eager advance published nothing; the dashboard still has to poll"
+    # A ``work/recorded`` entry wakes every slot fold that declares it, so the frames
+    # are selected by fold rather than taken off the end: this test is about the
+    # ``work`` frame carrying its value, not about which folds share the type.
+    frames = [frame for frame in pushed if frame[1] == "work"]
+    assert len(frames) == 1, f"expected one work frame, got {[f[1] for f in pushed]}"
+    board, fold, revision, value = frames[0]
+    assert (board, fold) == (slot, "work")
+    assert revision > 0, "a frame with no revision cannot be ordered by its client"
+    assert [item["item_id"] for item in value["items"]] == [
+        "it-pushed"
+    ], f"the pushed value is not this board's record: {value}"
+
+
+def test_a_burst_pushes_once_per_board_rather_than_once_per_entry(pushed, monkeypatch):
+    """MUTATION-SENSITIVE: the worker's coalesce is what bounds the frames, not a timer.
+
+    A turn writes several entries. The worker drains its whole queue per batch and folds
+    each (slot, fold) once, so the push inherits that and needs no second coalesce window
+    -- which is why the slot half of ``CrewLogPublisher.on_fold_advanced`` adds none.
+    """
+    slot = WORK_SLOT
+    handle = _slot_log("s-push-2", slot)
+    # Queued while the worker consumes nothing, so all three are in ONE batch. Stopping
+    # is not enough on its own: ``note_commit`` restarts a stopped worker, and a live one
+    # that takes the first wake before this test drains the rest splits the burst.
+    eager.stop_for_tests()
+    monkeypatch.setattr(eager, "_run", lambda: None)
+    bus.reset_for_tests()
+    seen: list[tuple[str, str, int, dict]] = []
+    _subscribe_slot_events(seen)
+    seqs = [_work_entry(handle, f"it-{index}", slot=slot) for index in range(3)]
+    for seq in seqs:
+        eager.note_commit("s-push-2", "work/recorded", seq, board=slot)
+    queued = eager._queue
+    assert queued is not None, "the wakes were never queued"
+    batch, closers, _taken = eager._coalesce(queued.get_nowait())
+    eager._fold_batch(batch, closers)
+    # A cold cell's fold goes to one background prime; wait for it.
+    from kiro_crew.crew_log import slot_prime
+
+    assert slot_prime.drain(timeout=30.0), "the background prime never finished"
+
+    # The coalesce is per ``(slot, fold)``, so the bound is one frame PER FOLD that
+    # declares the type -- three entries must not produce three frames for any of
+    # them. Counted per fold rather than in total, which would make this test fail the
+    # next time a fold starts reading ``work/recorded``.
+    per_fold = Counter(fold for _board, fold, _revision, _value in seen)
+    assert per_fold and set(per_fold.values()) == {1}, (
+        f"three entries of one board published {dict(per_fold)}; the push is not "
+        "inheriting the worker's per-batch coalesce"
+    )
+    assert "work" in per_fold, f"the work fold published no frame: {sorted(per_fold)}"
+    work_frame = next(frame for frame in seen if frame[1] == "work")
+    assert [item["item_id"] for item in work_frame[3]["items"]] == ["it-0", "it-1", "it-2"]
+
+
+def test_a_listener_that_raises_does_not_stop_the_fold(pushed):
+    """A dropped push is safe, which is the property the dropped WAKE already had.
+
+    The memo is still advanced and the next lazy read serves the current value, so a
+    listener's own failure costs a client latency and never an answer.
+    """
+    bus.reset_for_tests()
+    bus.subscribe(bus.FOLD_ADVANCED, lambda _event: (_ for _ in ()).throw(RuntimeError("no")))
+    landed: list[tuple] = []
+    _subscribe_slot_events(landed)
+
+    slot = WORK_SLOT
+    handle = _slot_log("s-push-3", slot)
+    seq = _work_entry(handle, "it-raise", slot=slot)
+    eager.note_commit("s-push-3", "work/recorded", seq, board=slot)
+    assert eager.drain(timeout=10.0)
+
+    assert (slot, "work") in _memo_keys(), "the raising listener cost the fold its memo"
+    assert landed, "a listener registered after the raising one was never called"
+    assert crew_log.read_slot_projection(slot, "work").value[
+        "items"
+    ], "the read path cannot serve the board a failed push was about"
+
+
+def test_a_closer_pushes_nothing_because_it_drops_rather_than_advances(pushed):
+    """``session/closed`` removes a cell; there is no value to publish for a removal.
+
+    A frame carrying the pre-drop value would tell a client the board just changed to what
+    it already held, and a frame carrying an empty one would claim the record is empty.
+    """
+    slot = "dashboard:push-closed"
+    handle = _slot_log("s-push-4", slot)
+    seq = _work_entry(handle, "it-0", slot=slot)
+    eager.note_commit("s-push-4", "work/recorded", seq, board=slot)
+    assert eager.drain(timeout=10.0)
+    before = len(pushed)
+
+    closed = handle.append("session/closed", {"reason": "done"}, src=GATEWAY)
+    eager.note_commit("s-push-4", "session/closed", int(closed.seq))
+    assert eager.drain(timeout=10.0)
+
+    assert (
+        len(pushed) == before
+    ), f"the closer published {len(pushed) - before} frame(s); a drop has no value to send"
+
+
+def test_each_push_of_one_board_carries_a_higher_revision_than_the_last(pushed):
+    """The client rule is "keep the highest", so successive pushes have to rise."""
+    slot = "dashboard:push-rising"
+    handle = _slot_log("s-push-5", slot)
+    for index in range(3):
+        seq = _work_entry(handle, f"it-{index}", slot=slot)
+        eager.note_commit("s-push-5", "work/recorded", seq, board=slot)
+        assert eager.drain(timeout=10.0)
+
+    revisions = [frame[2] for frame in pushed if frame[0] == slot]
+    assert len(revisions) >= 2, f"only {len(revisions)} frame(s) for this board"
+    assert revisions == sorted(set(revisions)), (
+        f"the revisions this board pushed were {revisions}; a client keeping the highest "
+        "would discard a value it should have taken"
+    )

@@ -1,0 +1,323 @@
+// MCP Management: the pre-resolve control must report what the pass produced.
+//
+// Contract under test:
+// - a pass that resolved something says how many servers now skip resolution
+// - a pass that resolved nothing says so rather than claiming a win
+// - "no targets routed yet" is a distinct answer, not an empty success
+// - a pass where every install failed reports the failures, never "nothing needed"
+// - a mixed pass reports both halves
+// - a 409 reads as an in-flight pass, not as a failure
+// - a failed pass surfaces an error and does not claim anything was updated
+// - the button disables itself while a pass is in flight, so a second press
+//   cannot start the duplicate the backend would refuse with a 409 anyway
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { act, cleanup, render, screen, waitFor } from '@testing-library/react'
+import { MemoryRouter } from 'react-router-dom'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+
+import { api, ApiError } from '../api/client'
+import { McpManagement } from '../pages/settings/McpManagement'
+import { i18nT } from '../i18n/t'
+/** The page's own English copy, so a wording change never breaks a test. */
+const M = (key: string, vars?: Record<string, unknown>) => i18nT(`pages.mcpManagement.${key}`, vars)
+
+function mount() {
+  const qc = new QueryClient({
+    defaultOptions: { queries: { retry: false, staleTime: Infinity } },
+  })
+  return render(
+    <MemoryRouter>
+      <QueryClientProvider client={qc}>
+        <McpManagement initialAdvancedOpen />
+      </QueryClientProvider>
+    </MemoryRouter>,
+  )
+}
+
+const status = () => ({
+  enabled: false,
+  stub: [] as string[],
+  stub_count: 0,
+  running: false,
+  ping_ok: false,
+  supported: true,
+})
+
+function stubPage() {
+  vi.spyOn(api, 'mcpGatewayStatus').mockResolvedValue(status() as never)
+  vi.spyOn(api, 'mcpGatewayServers').mockResolvedValue({ servers: [] } as never)
+}
+
+const pressUpdate = async () => {
+  const button = await screen.findByRole('button', { name: M('resolve_update_now') })
+  act(() => { button.click() })
+  return button
+}
+
+beforeEach(() => {
+  vi.restoreAllMocks()
+  // The hero's memory read: answered with no figures unless a test says otherwise.
+  vi.spyOn(api, 'mcpGatewayFootprint').mockResolvedValue({ using_now_bytes: null, with_sharing_bytes: null, open_chats: 0, stale_chats: [] } as never)
+})
+afterEach(cleanup)
+
+describe('McpManagement pre-resolve', () => {
+  it('reports how many servers now launch without resolving', async () => {
+    stubPage()
+    vi.spyOn(api, 'mcpResolveRefresh').mockResolvedValue({
+      ok: true,
+      resolved: { 'foo@latest': 'ready', 'bar@1.0.0': 'ready' },
+      ready: ['bar@1.0.0', 'foo@latest'],
+    } as never)
+
+    mount()
+    await pressUpdate()
+
+    await waitFor(() => {
+      expect(screen.getByRole('status').textContent).toContain('2')
+    })
+  })
+
+  it('names one server and several servers in their own English forms', async () => {
+    stubPage()
+    const refresh = vi.spyOn(api, 'mcpResolveRefresh')
+    refresh.mockResolvedValueOnce({
+      ok: true,
+      resolved: { 'foo@latest': 'ready' },
+      ready: ['foo@latest'],
+    } as never)
+
+    mount()
+    const button = await pressUpdate()
+    await waitFor(() => {
+      expect(screen.getByRole('status').textContent).toContain('1 server pre-installed.')
+    })
+
+    refresh.mockResolvedValueOnce({
+      ok: true,
+      resolved: { 'foo@latest': 'ready', 'bar@1.0.0': 'ready' },
+      ready: ['bar@1.0.0', 'foo@latest'],
+    } as never)
+    act(() => { button.click() })
+    await waitFor(() => {
+      expect(screen.getByRole('status').textContent).toContain('2 servers pre-installed.')
+    })
+  })
+
+  it('names the failed servers in the right English form', async () => {
+    stubPage()
+    vi.spyOn(api, 'mcpResolveRefresh').mockResolvedValue({
+      ok: true,
+      resolved: { 'foo@latest': 'error' },
+      ready: [],
+    } as never)
+
+    mount()
+    await pressUpdate()
+
+    await waitFor(() => {
+      expect(screen.getByRole('alert').textContent).toContain('Could not pre-install 1 server.')
+    })
+  })
+
+  it('says nothing needed pre-resolving instead of claiming a win', async () => {
+    stubPage()
+    vi.spyOn(api, 'mcpResolveRefresh').mockResolvedValue({
+      ok: true,
+      resolved: {},
+      ready: [],
+    } as never)
+
+    mount()
+    await pressUpdate()
+
+    await waitFor(() => {
+      expect(screen.getByRole('status').textContent).toContain(M('resolve_none_ready'))
+    })
+  })
+
+  it('states "no targets routed" as information, not as an alarm', async () => {
+    // ok:false with this reason means no broker start has computed a target set.
+    // That is the operator having nothing stubbed, which this page states as
+    // plain text elsewhere -- a red alert would overstate a benign fact.
+    stubPage()
+    vi.spyOn(api, 'mcpResolveRefresh').mockResolvedValue({
+      ok: false,
+      reason: 'no_targets',
+      resolved: {},
+    } as never)
+
+    mount()
+    await pressUpdate()
+
+    await waitFor(() => {
+      expect(screen.getByRole('status').textContent).toContain(M('resolve_no_targets'))
+    })
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it('reports failures instead of a false all-clear when every install failed', async () => {
+    // ready === 0 has two causes and they must not read the same. This is the
+    // one where nothing worked: a registry outage or a rejected token. Telling
+    // the person who just pressed the button "nothing needed pre-resolving"
+    // would say launches now skip the network when not one of them does.
+    stubPage()
+    vi.spyOn(api, 'mcpResolveRefresh').mockResolvedValue({
+      ok: true,
+      resolved: { 'foo@latest': 'error', 'bar@1.0.0': 'error' },
+      ready: [],
+    } as never)
+
+    mount()
+    await pressUpdate()
+
+    await waitFor(() => {
+      // Per-package install failures are an error, not a status: they render
+      // through ErrorNotice, so the role is `alert`.
+      const text = screen.getByRole('alert').textContent ?? ''
+      expect(text).toContain('2')
+      expect(text).not.toContain(M('resolve_none_ready'))
+    })
+    expect(screen.queryByRole('status')).toBeNull()
+  })
+
+  it('counts an unresolved install as a failure, not as already up to date', async () => {
+    // The backend maps an install that ran and failed (registry unreachable)
+    // to 'unresolved'. Reading only 'error' as a failure turned a pass where
+    // every install failed into "Already up to date."
+    stubPage()
+    vi.spyOn(api, 'mcpResolveRefresh').mockResolvedValue({
+      ok: true,
+      resolved: { '@modelcontextprotocol/server-everything': 'unresolved' },
+      ready: [],
+    } as never)
+
+    mount()
+    await pressUpdate()
+
+    await waitFor(() => {
+      const text = screen.getByRole('alert').textContent ?? ''
+      expect(text).toContain(M('resolve_all_failed', { count: 1 }))
+    })
+    expect(screen.queryByRole('status')).toBeNull()
+  })
+
+  it('counts unresolved installs in a mixed pass', async () => {
+    stubPage()
+    vi.spyOn(api, 'mcpResolveRefresh').mockResolvedValue({
+      ok: true,
+      resolved: { 'foo@latest': 'ready', 'bar@1.0.0': 'unresolved', 'baz@2.0.0': 'error' },
+      ready: ['foo@latest'],
+    } as never)
+
+    mount()
+    await pressUpdate()
+
+    await waitFor(() => {
+      const text = screen.getByRole('alert').textContent ?? ''
+      expect(text).toContain(M('resolve_partly_ready', { ready: '1', failed: '2' }))
+    })
+  })
+
+  it('reports both halves of a mixed pass', async () => {
+    stubPage()
+    vi.spyOn(api, 'mcpResolveRefresh').mockResolvedValue({
+      ok: true,
+      resolved: { 'foo@latest': 'ready', 'bar@1.0.0': 'error', 'baz@2.0.0': 'error' },
+      ready: ['foo@latest'],
+    } as never)
+
+    mount()
+    await pressUpdate()
+
+    await waitFor(() => {
+      // A mixed pass still carries failures, so it too renders as an alert.
+      const text = screen.getByRole('alert').textContent ?? ''
+      // One ready, two failed -- a notice naming only the win would still be a
+      // partial all-clear.
+      expect(text).toContain('1')
+      expect(text).toContain('2')
+    })
+  })
+
+  it('treats a 409 as an in-flight pass, not a failure', async () => {
+    // The endpoint answers 409 + resolve_in_progress deliberately, as
+    // information rather than something to retry. A second dashboard tab must
+    // not be told the pass failed while it is running fine.
+    stubPage()
+    const conflict = new ApiError(
+      409,
+      'A pre-resolve pass is already running.',
+      JSON.stringify({ error: 'A pre-resolve pass is already running.', code: 'resolve_in_progress' }),
+    )
+    vi.spyOn(api, 'mcpResolveRefresh').mockRejectedValue(conflict)
+
+    mount()
+    await pressUpdate()
+
+    await waitFor(() => {
+      expect(screen.getByRole('status').textContent).toContain(M('resolve_already_running'))
+    })
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it('surfaces a failed pass without claiming an update', async () => {
+    stubPage()
+    vi.spyOn(api, 'mcpResolveRefresh').mockRejectedValue(new Error('boom'))
+
+    mount()
+    await pressUpdate()
+
+    await waitFor(() => {
+      expect(screen.getByRole('alert')).toBeTruthy()
+      expect(screen.queryByRole('status')).toBeNull()
+    })
+  })
+
+  it('clears the previous result so a new pass cannot contradict it', async () => {
+    // Without the clear, a success notice from the last press sits beside the
+    // new error and the page states two incompatible outcomes at once.
+    stubPage()
+    const refresh = vi.spyOn(api, 'mcpResolveRefresh')
+    refresh.mockResolvedValueOnce({
+      ok: true,
+      resolved: { 'foo@latest': 'ready' },
+      ready: ['foo@latest'],
+    } as never)
+
+    mount()
+    const button = await pressUpdate()
+    await waitFor(() => {
+      expect(screen.getByRole('status').textContent).toContain('1')
+    })
+
+    refresh.mockRejectedValueOnce(new Error('boom'))
+    act(() => { button.click() })
+
+    await waitFor(() => {
+      expect(screen.getByRole('alert')).toBeTruthy()
+      expect(screen.queryByRole('status')).toBeNull()
+    })
+  })
+
+  it('disables the button while a pass is in flight', async () => {
+    stubPage()
+    let release: (v: unknown) => void = () => {}
+    vi.spyOn(api, 'mcpResolveRefresh').mockReturnValue(
+      new Promise(resolve => {
+        release = resolve
+      }) as never,
+    )
+
+    mount()
+    const button = await pressUpdate()
+
+    await waitFor(() => {
+      expect((button as HTMLButtonElement).disabled).toBe(true)
+    })
+    release({ ok: true, resolved: {}, ready: [] })
+    await waitFor(() => {
+      expect((button as HTMLButtonElement).disabled).toBe(false)
+    })
+  })
+})

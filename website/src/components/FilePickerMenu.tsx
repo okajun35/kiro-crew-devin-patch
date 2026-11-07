@@ -1,0 +1,465 @@
+import { RetryControl } from './RetryControl'
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
+import { OverlayPortal } from './overlayRoot'
+import { useQuery } from '@tanstack/react-query'
+import { FileText, Folder, Eye } from 'lucide-react'
+import { usePickerSource } from './dashboardPickerSource'
+import { pickerQueryKey, type FileKind, type FileResult, type FileSearchResponse } from '../chat-core/composer/pickerSource'
+import ErrorNotice from './ErrorNotice'
+import { RETRYABLE_SEARCH_CAUSES, SEARCH_FAILURE_KEYS, searchErrorCause, type SearchErrorCause } from '../lib/searchErrorCause'
+import { useListKeyboardNav } from '../hooks/useListKeyboardNav'
+import { splitPathToken } from './composerTokens'
+import { menuGeometry, bottomUpOrder } from '../lib/pickerMenu'
+import type { SendMode } from '../pages/chat/ChatSettings'
+
+import { i18nT } from '../i18n/t'
+import { fmtBytes, fmtDateFields, fmtRelative } from '../i18n/format'
+
+export type { FileKind } from '../chat-core/composer/pickerSource'
+
+/** A search payload stamped with the `project` it was asked for, so a
+ *  placeholder can tell whether its rows belong to the current project. */
+type PickerPayload = FileSearchResponse & { project: string }
+
+interface Props {
+  /** @-mention query, or the whole `./`-token in `pathMode`. */
+  query: string
+  anchorRef: React.RefObject<HTMLElement | null>
+  open: boolean
+  onSelect: (info: { path: string; relativePath: string; kind: FileKind }) => void
+  onClose: () => void
+  onFileOpen?: (path: string) => void
+  project?: string
+  /**
+   * Path-completion mode: `query` is a relative-path token (`./src/comp`) and the
+   * rows are ONE directory level of `project`, from `/api/path-complete`, instead
+   * of a fuzzy @-mention search. Same rows, same keyboard contract, same geometry
+   * — only the source and the shape of the accepted text differ, which is why this
+   * is a mode of the picker rather than a second menu.
+   *
+   * `project` is REQUIRED here: it is the root the token resolves against. The
+   * endpoint refuses an empty one, which surfaces as the settled search-failed
+   * state — deliberately, rather than gating the fetch, since a mode that never
+   * fetches also never settles and would swallow Enter with nothing to choose.
+   */
+  pathMode?: boolean
+  /**
+   * The composer's effective send binding (see ChatInput's SendMode). Consulted
+   * for every empty-state copy: in 'ctrl-enter' mode a bare Enter is not a send
+   * key, so the empty state must not name it as sending or as the held sender.
+   */
+  sendOnEnter?: SendMode
+  /**
+   * Show each row's FOLDER (relative to the search root when it is under it)
+   * cut from its start, so the end of the path, which is what tells same-named
+   * files apart, stays visible in a narrow menu. Off by default: the dashboard
+   * composers keep the full path cut at its end.
+   */
+  pathTail?: boolean
+}
+
+/** The folder a row sits in, relative to `root` when it is under it. */
+export function rowFolder(path: string, root: string): string {
+  const rel = makeRelative(path, root)
+  const cut = rel.replace(/[\\/]+$/, '').search(/[\\/][^\\/]*$/)
+  return cut <= 0 ? (rel === path ? path : './') : rel.slice(0, cut + 1)
+}
+
+const formatSize = (bytes: number): string => fmtBytes(bytes)
+
+/** Cause copy with NO send-key suffix: where rows survive the failure Enter PICKS the
+ *  highlighted row, so any "Enter sends the message" claim would be the opposite of the key. */
+// `denied` and `root_missing` override the shared map: those two name a root, and the folder
+// tab's own cwd is a different directory from the chat project this menu searches.
+const SEARCH_CAUSE_KEYS = {
+  ...SEARCH_FAILURE_KEYS,
+  denied: 'components.filePickerMenu.search_denied',
+  root_missing: 'components.filePickerMenu.search_root_missing',
+} as const satisfies Record<SearchErrorCause, string>
+
+// A refusal in `pathMode` can be one blocked subpath while the project folder is fine.
+const SEARCH_DENIED_PATH_KEY = 'components.filePickerMenu.search_denied_path'
+
+
+function formatAge(mtime: number): string {
+  const diff = Date.now() / 1000 - mtime
+  // Under 30 days this is an elapsed age; beyond that a calendar date reads
+  // better. Both halves now follow the app language instead of the browser's.
+  if (diff < 86400 * 30) return fmtRelative(mtime)
+  return fmtDateFields(mtime, { month: 'short', day: 'numeric' })
+}
+
+/**
+ * Strip the project root prefix so the inserted token is a short relative path.
+ *
+ * Separator-aware: on native Windows the search result and the root both use
+ * backslashes, so a `/`-only prefix check would never match and the picker
+ * would insert the ABSOLUTE path instead of the short relative form.
+ */
+export function makeRelative(path: string, root: string): string {
+  if (!root) return path
+  const r = /[/\\]$/.test(root) ? root : root + (root.includes('\\') && !root.includes('/') ? '\\' : '/')
+  return path.startsWith(r) ? path.slice(r.length) : path
+}
+
+/** Normalize a possibly-absent kind from the search response. */
+export function resultKind(f: { kind?: FileKind }): FileKind {
+  return f.kind === 'dir' ? 'dir' : 'file'
+}
+
+/**
+ * Build the payload handed to onSelect. Directory paths get a trailing slash on
+ * the relative form so the inserted @-token reads unambiguously as a folder.
+ */
+export function selectionFor(f: FileResult, root: string, dirPrefix?: string): { path: string; relativePath: string; kind: FileKind } {
+  const kind = resultKind(f)
+  // Path completion rebuilds the token from the prefix the user typed plus the
+  // entry name, so an accepted `../` stays `../` instead of being rewritten to
+  // the project-relative form; the @-mention flow strips the root instead.
+  const rel = dirPrefix === undefined ? makeRelative(f.path, root) : dirPrefix + f.name
+  return {
+    path: f.path,
+    // `endsWith` covers either separator so a Windows path is not given a second
+    // trailing one; the inserted token then always ends in a slash.
+    relativePath: kind === 'dir' && !/[/\\]$/.test(rel) ? rel + '/' : rel,
+    kind,
+  }
+}
+
+export default function FilePickerMenu({ query, anchorRef, open, onSelect, onClose, onFileOpen, project, pathMode = false, sendOnEnter = 'enter', pathTail = false }: Props) {
+  const rootRef = useRef('')
+  const resultsRef = useRef<FileResult[]>([])
+  const onFileOpenRef = useRef(onFileOpen)
+  onFileOpenRef.current = onFileOpen
+
+  // Debounce the query string — a timer + setState ONLY, not an API call, so the
+  // fetch itself stays on React Query (below). React Query handles cancellation
+  // (via the queryFn `signal`), caching, and dedup; this just throttles how often
+  // the query key changes while the user types.
+  const [debounced, setDebounced] = useState(query)
+  const [retrying, setRetrying] = useState(false)
+  const retryRef = useRef<HTMLButtonElement | null>(null)
+  const lastCauseRef = useRef<SearchErrorCause>('failed')
+  // Read by the timer, not captured by it: a timer armed for an earlier query
+  // can fire after a newer query has rendered but before this effect's cleanup
+  // clears it (passive effects flush after the commit), and publishing that
+  // overtaken query would move the fetch key off the newer query's in-flight
+  // search, cancelling it and leaving the old root's placeholder rows non-busy.
+  const latestQueryRef = useRef(query)
+  latestQueryRef.current = query
+  useEffect(() => {
+    const t = setTimeout(() => {
+      if (latestQueryRef.current === query) setDebounced(query)
+    }, 200)
+    return () => clearTimeout(t)
+  }, [query])
+
+  // The directory prefix + partial name the path-mode token carries. Keyed on
+  // the DEBOUNCED token so the fetch key moves at the debounce, like the search
+  // query does; the live token still drives the empty-state copy below.
+  const scope = useMemo(() => splitPathToken(debounced), [debounced])
+  const dirPrefixRef = useRef('')
+
+  // A path token needs no minimum: `./` is already an unambiguous request for a
+  // listing, where two characters of a fuzzy query are the floor that keeps an
+  // unscoped walk from running on the first keystroke.
+  const ready = pathMode || query.length >= 2
+
+  // File search via React Query (consistent with the $skill / /command pickers,
+  // which already use useQuery). `enabled` gates on 2+ chars outside path mode;
+  // the queryFn `signal` aborts stale requests; `placeholderData` keeps the prior
+  // results on screen while the next query resolves so the list doesn't flicker
+  // to empty.
+  const source = usePickerSource()
+  const load = pathMode ? source.pathComplete : source.fileSearch
+  const { data, isFetching, isError, isPlaceholderData, error, refetch } = useQuery<PickerPayload>({
+    queryKey: pickerQueryKey(source, pathMode
+      ? ['path-complete', project, scope.dir, scope.partial]
+      : ['file-search', debounced, project]),
+    queryFn: async ({ signal }) => pathMode
+      // Stamped with the prefix it was asked for, which is what makes a
+      // placeholder payload self-describing rather than merely stale.
+      ? { ...(await source.pathComplete!(project ?? '', scope.dir, scope.partial, signal)), dir: scope.dir, project: project ?? '' }
+      : { ...(await source.fileSearch!(debounced, project, signal)), project: project ?? '' },
+    // An empty `scope.dir` means the debounced token is not a path token yet —
+    // the tick right after the menu opens. Fetching there would ask for the
+    // project root under a token that names something else.
+    enabled: open && !!load && (pathMode ? scope.dir !== '' : debounced.length >= 2),
+    // The one bounded read that keeps the shared throttle ladder: a 429 here must recover.
+    // Only rows from the SAME project stand in. A row is relativized against
+    // its payload's root, so another project's rows (the previous chat's, after
+    // a session switch) would insert a token that names a different file here.
+    placeholderData: prev => (prev?.project === (project ?? '') ? prev : undefined),
+    staleTime: 10_000,
+  })
+  rootRef.current = data?.root || ''
+  // The prefix an accepted row is rebuilt on is read back out of the PAYLOAD the
+  // rows came in, so the two cannot come from different tokens (see `dir` above).
+  dirPrefixRef.current = pathMode ? (data?.dir ?? '') : ''
+
+  // Order bottom-up (shared helper) when the menu opens above. Gate on `ready`,
+  // which reads the LIVE `query` (not the debounced one) so results clear
+  // immediately when the user drops below 2 chars; `data` is keyed on
+  // `debounced`, so it lags by up to one debounce tick — the intended debounce
+  // behavior.
+  // NOT gated on `isError`: a refetch failing on the same key leaves the last good page in
+  // `data`, and dropping it swaps a list the user was about to click for a retype.
+  // A retry of a key that never succeeded falls back to another query's placeholder rows.
+  const staleRetry = retrying && isPlaceholderData
+  const { ordered: results, initialIndex } = useMemo(() => {
+    const raw = (open && ready && !staleRetry ? data?.results : []) || []
+    const above = anchorRef.current ? menuGeometry(anchorRef.current, raw.length, 48).above : false
+    return bottomUpOrder(raw, above)
+  }, [data, open, ready, staleRetry, anchorRef])
+
+  // Open the highlighted file in the viewer (the eye/preview action) instead of
+  // inserting an @-mention. Shared by the Cmd/Ctrl+Enter path (via onChoose's
+  // withModifier flag) and the Alt+Enter path (via onAltEnter). Returns true so
+  // the hook knows the default choose was superseded. Directories have nothing
+  // to preview, so they fall through to the normal insert.
+  const openInViewer = useCallback((idx: number): boolean => {
+    const f = resultsRef.current[idx]
+    if (f && resultKind(f) === 'file' && onFileOpenRef.current) {
+      onFileOpenRef.current(f.path); onClose(); return true
+    }
+    return false
+  }, [onClose])
+
+  // Enter inserts the @-mention. Cmd/Ctrl+Enter opens in the viewer — the
+  // shared useListKeyboardNav hook threads the modifier state through
+  // onChoose's 2nd arg (withModifier).
+  const choose = useCallback((idx: number, withModifier = false) => {
+    const r = resultsRef.current
+    const eff = idx >= r.length ? 0 : idx
+    const f = r[eff]
+    if (!f) return
+    if (withModifier && openInViewer(eff)) return
+    onSelect(selectionFor(f, rootRef.current, dirPrefixRef.current || undefined))
+  }, [onSelect, openInViewer])
+
+  // "Settled and genuinely empty": only then does the menu have no claim on
+  // the keyboard. During the debounce window (debounced lagging the live
+  // query) or an in-flight fetch the results are transiently [] or stale, and
+  // releasing Enter there would irreversibly send a draft whose mention the
+  // user was still completing. A settled ERROR counts as settled-empty too —
+  // Enter must still reach the composer there, so keeping the swallow would
+  // recreate the trap on the error path; Tab goes to Retry instead of closing.
+  const releaseKeysWhenEmpty = ready && debounced === query && !isFetching && (data !== undefined || isError)
+
+  const { selected, setSelected, selectedRef, itemRefs, hoverSelect, restoreEmptyFocus } = useListKeyboardNav({
+    open,
+    count: results.length,
+    onChoose: choose,
+    onClose,
+    onAltEnter: openInViewer,
+    releaseKeysWhenEmpty,
+    emptyActionRef: retryRef,
+  })
+
+  // Mirror the ordered results into the ref that choose()/openInViewer read at
+  // keypress time, and set the initial selection (the bottom row when the menu
+  // opens above) whenever the result set changes. Keyed on the memoized results,
+  // so arrow-key navigation (which changes `selected` but not `results`) doesn't
+  // reset the selection.
+  useEffect(() => {
+    resultsRef.current = results
+    setSelected(initialIndex)
+  }, [results, initialIndex, setSelected])
+
+  // Scroll the selected row into view once results render (the selection is set
+  // before rows mount, so the hook's own scrollIntoView no-ops on open). Keyed
+  // on [results] so it fires on open + new search, not per-arrow (the hook
+  // already scrolls on move). Matches the $skill picker.
+  useEffect(() => {
+    if (!open) return
+    itemRefs.current[selectedRef.current]?.scrollIntoView({ block: 'nearest' })
+  }, [results, open, itemRefs, selectedRef])
+
+  if (!open || !anchorRef.current) return null
+
+  const { above, top, bottom, left, width, maxHeight } = menuGeometry(anchorRef.current, results.length, 48)
+
+  // 'ctrl-enter' makes a bare Enter a newline, so naming it as the send key —
+  // held or releasing — would be false there.
+  const ctrl = sendOnEnter === 'ctrl-enter'
+
+  // An empty result set has two different causes in path mode, and only one of
+  // them is "nothing matched": a token that resolved out of the project lists
+  // nothing BY RULE, however full that directory is. The verdict is the
+  // endpoint's — it decides containment to serve the request at all, so
+  // re-deriving it here would be a second spelling of the same rule that could
+  // disagree with the answer on screen.
+  const outsideProject = pathMode && data?.outside === true
+
+  // A failed search is not an empty one, and each arm names its own cause so a refusal
+  // does not read as transient and invite a pointless retry.
+  const cause = searchErrorCause(error)
+  if (isError) lastCauseRef.current = cause
+  // A retry re-enters `pending` because this query has never succeeded, dropping `error`, so the
+  // cause is remembered: otherwise the notice would rewrite itself to the generic copy mid-press.
+  const shownCause = isError ? cause : lastCauseRef.current
+  const pathDenied = pathMode && shownCause === 'denied'
+  const causeKey = pathDenied ? SEARCH_DENIED_PATH_KEY : SEARCH_CAUSE_KEYS[shownCause]
+
+  // Enter AND Tab are swallowed while the gate is closed, so Send is not
+  // keyboard-reachable — the copy names Escape, whose branch runs before them.
+  const emptyKey = !ready
+    ? (ctrl
+        ? 'components.filePickerMenu.type_2_chars_to_search_files_ctrl_enter_held'
+        : 'components.filePickerMenu.type_2_chars_to_search_files_enter_held')
+    : isFetching
+    ? (ctrl
+        ? 'components.filePickerMenu.searching_ctrl_enter_held'
+        : 'components.filePickerMenu.searching_enter_held')
+    // Enter's meaning flips with the gate (pick → send), so the copy announces
+    // it; the plain arm is the ≤200ms debounce flash between two announced ones.
+    : !releaseKeysWhenEmpty
+    ? 'components.filePickerMenu.no_matches'
+    : outsideProject
+    ? (ctrl
+        ? 'components.filePickerMenu.outside_project_ctrl_enter_sends'
+        : 'components.filePickerMenu.outside_project_enter_sends')
+    : ctrl
+    ? 'components.filePickerMenu.no_matches_ctrl_enter_sends'
+    : 'components.filePickerMenu.no_matches_enter_sends'
+
+  // A SETTLED failure, or a retry in flight: `refetch()` unmounted the very button being
+  // pressed, and the plain "no matches" copy would claim the search found nothing.
+  const searchFailed = ready && debounced === query
+    && (retrying || (isError && !isFetching))
+
+  // Withheld from a refusal, where re-asking a 403 or a 404 returns the same answer, and from a
+  // list with rows, where retyping already re-queries and Tab stays the row pick.
+  const retryButton = results.length > 0 || !RETRYABLE_SEARCH_CAUSES.has(shownCause) ? null : (
+    <RetryControl
+      busy={retrying}
+      controlRef={retryRef}
+      cause={i18nT(causeKey)}
+      onRetry={() => {
+        restoreEmptyFocus()
+        setRetrying(true)
+        return refetch().finally(() => setRetrying(false))
+      }}
+    />
+  )
+
+  const searchHintKeys: string[] = []
+  if (retrying) {
+    searchHintKeys.push(ctrl
+      ? 'components.filePickerMenu.searching_ctrl_enter_held'
+      : 'components.filePickerMenu.searching_enter_held')
+  }
+  if (!RETRYABLE_SEARCH_CAUSES.has(shownCause)) {
+    searchHintKeys.push(pathDenied
+      ? 'components.filePickerMenu.check_path_inside_project'
+      : 'components.filePickerMenu.check_project_folder')
+  }
+  // Only where Enter SENDS: with rows on screen it picks the highlighted one instead, and
+  // `releaseKeysWhenEmpty` is already false for the whole retry window.
+  if (results.length === 0 && releaseKeysWhenEmpty) {
+    searchHintKeys.push(ctrl
+      ? 'components.filePickerMenu.ctrl_enter_sends'
+      : 'components.filePickerMenu.enter_sends')
+  }
+
+  const searchHints = (
+    <div
+      aria-live="polite"
+      data-testid="file-picker-search-hint-region"
+      className={`flex flex-col gap-0.5 text-[11px] text-muted whitespace-normal${
+        searchHintKeys.length > 0 ? ' mt-1.5' : ''
+      }`}
+    >
+      {searchHintKeys.map(k => (
+        <div key={k} data-testid="file-picker-search-hint">{i18nT(k)}</div>
+      ))}
+    </div>
+  )
+
+  const failureNotice = (
+    <div className="px-3 py-3">
+      <div className="flex items-start gap-2">
+        {/* No hand-off: the composer's unsent message lives in this tree, so a
+            navigation would discard the draft this picker was opened to complete. */}
+        <ErrorNotice
+          variant="inline"
+          className="whitespace-normal"
+          message={i18nT(causeKey)}
+          testId="file-picker-search-error"
+        />
+        {retryButton}
+      </div>
+      {searchHints}
+    </div>
+  )
+
+  // One region for every empty state, so a transition is a text change inside a
+  // live region rather than a mount — what screen readers announce least well.
+  // A failure leaves that region: an empty result is not an error.
+  const empty = searchFailed
+    ? failureNotice
+    : <div role="status" className="px-3 py-3 text-[12px] text-muted">{i18nT(emptyKey)}</div>
+
+  return <OverlayPortal>
+    <div
+      className="fixed z-[9999] bg-card border border-border rounded-lg shadow-lg overflow-y-auto py-1 animate-slide-up"
+      role="listbox"
+      // While a search is in flight the rows on screen are the PREVIOUS payload
+      // (`placeholderData`), relativized against that payload's root; busy says
+      // so. Clearing it means the rows answer the DEBOUNCED query and project,
+      // not yet the live one: busy is also false during the <=200ms debounce
+      // window before the next fetch starts. A caller that needs the rows for
+      // the text just typed waits for a fetch issued after that text, as
+      // `releaseKeysWhenEmpty` and `searchFailed` do with `debounced === query`.
+      aria-busy={isFetching}
+      style={{ ...(above ? { bottom } : { top }), left, width: Math.min(width, 420), maxHeight }}
+    >
+      {searchFailed && results.length > 0 && failureNotice}
+      {results.length === 0 ? empty : results.map((f, i) => {
+        const kind = resultKind(f)
+        const isDir = kind === 'dir'
+        return (
+        <div
+          role="option"
+          aria-selected={i === selected}
+          data-kind={kind}
+          tabIndex={-1}
+          key={f.path}
+          ref={el => { itemRefs.current[i] = el }}
+          className={`w-full text-left px-3 py-2 flex items-center gap-3 cursor-pointer transition-colors ${i === selected ? 'bg-accent-subtle text-text' : 'text-muted hover:bg-bg-hover hover:text-text'}`}
+          title={f.path}
+          onMouseMove={e => hoverSelect(i, e)}
+          onMouseDown={e => { e.preventDefault(); onSelect(selectionFor(f, rootRef.current, dirPrefixRef.current || undefined)) }}
+        >
+          {isDir
+            ? <Folder size={14} aria-label={i18nT('components.filePickerMenu.folder')} className="shrink-0 lucide-inline" />
+            : <FileText size={14} className="shrink-0 lucide-inline" />}
+          <div className="flex-1 min-w-0">
+            <div className="text-[13px] font-mono font-semibold truncate">{isDir ? f.name + '/' : f.name}</div>
+            {pathTail
+              // rtl on the box puts the ellipsis at the START; the inner
+              // ltr bdi keeps the path itself reading left to right.
+              ? <div dir="rtl" data-testid="file-picker-row-folder" className="text-[11px] text-muted truncate text-left"><bdi dir="ltr">{rowFolder(f.path, rootRef.current)}</bdi></div>
+              : <div className="text-[11px] text-muted truncate">{f.path}</div>}
+          </div>
+          <span className="text-[11px] text-muted shrink-0 whitespace-nowrap">
+            {isDir ? `${i18nT('components.filePickerMenu.folder_kind')} · ${formatAge(f.mtime)}` : `${formatSize(f.size)} · ${formatAge(f.mtime)}`}
+          </span>
+          {onFileOpen && !isDir && (
+            <button
+              type="button"
+              aria-label={i18nT('components.filePickerMenu.open_in_viewer')}
+              tabIndex={-1}
+              className="shrink-0 p-1 rounded hover:bg-bg-hover text-muted hover:text-text cursor-pointer bg-transparent border-none"
+              title={i18nT('components.filePickerMenu.open_in_viewer')}
+              onMouseDown={e => { e.preventDefault(); e.stopPropagation(); onFileOpen(f.path); onClose() }}
+            >
+              <Eye size={16} />
+            </button>
+          )}
+        </div>
+        )
+      })}
+    </div>
+  </OverlayPortal>
+}

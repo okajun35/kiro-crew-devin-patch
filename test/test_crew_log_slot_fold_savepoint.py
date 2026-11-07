@@ -1,0 +1,928 @@
+"""The slot fold's ON-DISK savepoint: resume after a restart, or fold cold.
+
+The slot fold is kept warm in a process-wide table, and a gateway restart and an
+eviction from the table's byte ceiling each empty it. Without a savepoint the next
+read folds a slot's whole crew log from its first record, which is 70 s on a 644 MB
+log; with one the state is read back beside the newest unit's log and only the tail
+above it is folded.
+
+The two load-bearing tests are
+:func:`test_a_resumed_read_parses_nothing_below_the_savepoint`, which is the whole
+point (a read with a cleared memo must not walk the log), and
+:func:`test_a_resumed_read_equals_a_cold_fold_on_every_refused_shape`, which is the
+rule the speed must never cost: every shape ``_continuable`` refuses in memory is a
+shape the savepoint refuses on disk, and each one falls back to the cold fold rather
+than to a different record.
+
+Most tests lower ``MIN_ADVANCE_ENTRIES``, because the threshold is 256 entries and
+appending that many through the emitter dominates the file's runtime.
+:func:`test_a_slot_below_the_write_threshold_leaves_no_savepoint` pins the real
+number.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+from typing import Any
+
+import pytest
+from crew_log_drain import assert_drained
+
+from kiro_crew import crew_log as lg
+from kiro_crew.crew_log import CrewLog
+from kiro_crew.crew_log import checkpoint as savepoints
+from kiro_crew.crew_log import eager as crew_log_eager
+from kiro_crew.crew_log import emit as crew_log_emit
+from kiro_crew.crew_log import projection as crew_log
+from kiro_crew.crew_log import store as crew_log_store
+from kiro_crew.projection import DirectoryCheckpointStore
+from kiro_crew.session_ledger import _MAX_ARTIFACTS
+
+SLOT = "chat-savepoint"
+OTHER_SLOT = "chat-elsewhere"
+FIRST = "acp-sp-first"
+SECOND = "acp-sp-second"
+
+
+@pytest.fixture(autouse=True)
+def _isolated_home(tmp_path, _floor_monkeypatch):
+    """Own data home, crew log on, no warm cell carried in, eager folder silenced.
+
+    The eager folder is silenced because this file counts ``CrewLog.iter_from`` on the
+    CLASS, and a background fold would add its reads to the count.
+
+    Uses ``_floor_monkeypatch``, not ``monkeypatch``, so a test calling
+    ``monkeypatch.undo()`` cannot drop the ``KIROCREW_HOME`` pin and hit the real home.
+    """
+    _floor_monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / "home"))
+    _floor_monkeypatch.setenv("KIROCREW_CREW_LOG", "1")
+    _floor_monkeypatch.setattr(crew_log_eager, "note_commit", lambda *a, **k: None)
+    crew_log_emit.reset_caches()
+    crew_log_eager.stop_for_tests()
+    crew_log.forget_slot_folds()
+    yield
+    crew_log_emit.reset_caches()
+    crew_log_eager.stop_for_tests()
+    crew_log.forget_slot_folds()
+
+
+@pytest.fixture
+def _cheap_writes(monkeypatch):
+    """Earn a savepoint write after two entries instead of 256.
+
+    The threshold is a property of the files and is pinned on its own; what every test
+    below is about is what happens once a file EXISTS, and paying 256 emitter round
+    trips to reach one would make this file the slowest in the suite for nothing.
+    """
+    monkeypatch.setattr(savepoints, "MIN_ADVANCE_ENTRIES", 2)
+
+
+def _unit(unit_id: str, *, slot: str = SLOT) -> None:
+    """Create one session crew log, then drop the handle so it holds no lease."""
+    CrewLog.create(lg.KIND_SESSION, unit_id, owner="owner", agent="kirocrew", slot=slot)
+
+
+def _ledger(unit_id: str, *, slot: str = SLOT, **fields: Any) -> None:
+    payload: dict[str, Any] = {"slot": slot}
+    payload.update(fields)
+    crew_log_emit.on_ledger_recorded(unit_id, payload)
+    assert_drained()
+
+
+def _steps(unit_id: str, first: int, last: int, *, slot: str = SLOT) -> None:
+    for step in range(first, last + 1):
+        _ledger(unit_id, slot=slot, next=f"step {step}", event=f"e{step}", event_kind="progress")
+
+
+def _normalized(value: dict[str, Any]) -> str:
+    """One fold value as canonical JSON, so two of them compare byte for byte."""
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def _cold(units: tuple[str, ...], *, slot: str = SLOT) -> str:
+    """The ledger folded from EMPTY over *units* -- the answer every route must match.
+
+    ``fold_slot`` takes neither the memo nor the savepoint, so it is the from-scratch
+    answer by construction rather than by a reset this test would have to remember.
+    """
+    return _normalized(crew_log.fold_slot("ledger", units, slot=slot).value)
+
+
+def _read(units: tuple[str, ...], *, slot: str = SLOT) -> str:
+    """The ledger through the warm route -- the one that resumes."""
+    return _normalized(
+        crew_log.projection_of(crew_log.fold_slot_warm("ledger", units, slot=slot)).value
+    )
+
+
+def _restart(units: tuple[str, ...], *, slot: str = SLOT) -> tuple[str, int]:
+    """One read with the warm table cleared. ``(value, entries parsed)``.
+
+    A cleared table is what a restart or a byte-ceiling eviction leaves; the savepoint
+    stays on disk. Cost is counted as entries parsed via ``CrewLog.iter_from``, not
+    seconds.
+    """
+    crew_log.forget_slot_folds()
+    parsed = {"entries": 0}
+    real = CrewLog.iter_from
+
+    def counted(self, *args, **kwargs):
+        for entry in real(self, *args, **kwargs):
+            parsed["entries"] += 1
+            yield entry
+
+    CrewLog.iter_from = counted  # type: ignore[method-assign]
+    try:
+        value = _read(units, slot=slot)
+    finally:
+        CrewLog.iter_from = real  # type: ignore[method-assign]
+    return value, parsed["entries"]
+
+
+def _savepoint_path(unit_id: str):
+    return savepoints.slot_checkpoint_path(lg.KIND_SESSION, unit_id, "ledger")
+
+
+def _stored_state(payload: dict[str, Any]) -> dict[str, Any]:
+    """The fold state inside a savepoint payload, whatever framing it carries.
+
+    The state is a JSON STRING because the kernel store uses ``sort_keys=True`` and
+    these folds age out ``next(iter(...))``, so key order matters.
+
+    The plain-object shape is accepted too, so a changed encoding fails the code under
+    test rather than this helper with a ``KeyError``.
+    """
+    state = payload["state"]
+    encoded = state.get(savepoints._SLOT_STATE_JSON) if isinstance(state, dict) else None
+    return json.loads(encoded) if isinstance(encoded, str) else state
+
+
+# --------------------------------------------------------------------------- #
+# the replay is gone
+# --------------------------------------------------------------------------- #
+
+
+def test_a_resumed_read_parses_nothing_below_the_savepoint(_cheap_writes):
+    """A read with the warm table cleared folds the tail, not the log.
+
+    The count is against the log's own length, so the assertion fails on the behaviour
+    this file exists to change: with no savepoint the read walks all six entries.
+    """
+    _unit(FIRST)
+    _steps(FIRST, 1, 6)
+    assert _read((FIRST,)) == _cold((FIRST,))
+    assert _savepoint_path(FIRST).is_file(), "the read that folded cold wrote a savepoint"
+
+    value, parsed = _restart((FIRST,))
+
+    assert parsed == 0, "the whole log is below the savepoint, so nothing is re-parsed"
+    assert value == _cold((FIRST,))
+
+
+def test_a_resumed_read_parses_only_the_entries_appended_since(_cheap_writes):
+    """The tail is what it costs, and the tail is what it reads."""
+    _unit(FIRST)
+    _steps(FIRST, 1, 6)
+    _read((FIRST,))
+    _steps(FIRST, 7, 9)
+
+    value, parsed = _restart((FIRST,))
+
+    assert parsed == 3, "only the three entries above the savepoint"
+    assert value == _cold((FIRST,))
+
+
+def test_a_resumed_read_joins_the_units_a_slot_ran_under(_cheap_writes):
+    """A slot owns one session id at a time, so the record spans its units.
+
+    The savepoint's state was folded over BOTH units and its ordinal base is derived
+    from the earlier one's height, so a resume that got the base wrong would fold the
+    tail onto ordinals the cell has already consumed and silently drop it.
+    """
+    _unit(FIRST)
+    _steps(FIRST, 1, 4)
+    _unit(SECOND)
+    _steps(SECOND, 5, 8)
+    units = (FIRST, SECOND)
+    assert _read(units) == _cold(units)
+    _steps(SECOND, 9, 11)
+
+    value, parsed = _restart(units)
+
+    assert parsed == 3, "the first unit is below the savepoint and is not re-read"
+    assert value == _cold(units)
+    assert json.loads(value)["next"] == "step 11"
+
+
+def test_the_savepoint_moves_forward_as_the_log_grows(_cheap_writes):
+    """A live gateway's cell brings its own savepoint forward.
+
+    Otherwise a restart replays everything since the first fold. A warm continuation may
+    write because the cell carries its prefix digest and ``_prefix_holds`` re-checks it.
+    """
+    _unit(FIRST)
+    _steps(FIRST, 1, 4)
+    _read((FIRST,))
+    first_written = _savepoint_path(FIRST).read_text(encoding="utf-8")
+
+    _steps(FIRST, 5, 12)
+    _read((FIRST,))  # a WARM continuation, not a cold fold
+    moved = _savepoint_path(FIRST).read_text(encoding="utf-8")
+
+    assert json.loads(moved)["watermark"] > json.loads(first_written)["watermark"]
+    value, parsed = _restart((FIRST,))
+    assert parsed == 0
+    assert value == _cold((FIRST,))
+
+
+def _reuse_the_tail_seqs(unit_id: str, keep_through_seq: int, fresh: int) -> None:
+    """Drop the records above *keep_through_seq* and re-append *fresh* at the same seqs.
+
+    The store's recovery does this: it truncates a chunk group and appends closers at
+    the same seqs. To stats and seqs the file just GREW, so a cell's evidence must cover
+    the bytes its own pass folded.
+
+    The cut is counted, as the store counts it; otherwise this would stand for a
+    hand-edit. ``test_crew_log_cut_counter.py`` covers the real repair end to end.
+    """
+    path = lg.store.crew_log_path(lg.KIND_SESSION, unit_id)
+    _a_completed_cut(path.parent)
+    kept: list[bytes] = []
+    for line in path.read_bytes().split(b"\n"):
+        if not line:
+            continue
+        seq = re.search(rb'"seq":(\d+)', line)
+        if seq is None or int(seq.group(1)) <= keep_through_seq:
+            kept.append(line)
+    for index in range(fresh):
+        seq = keep_through_seq + 1 + index
+        kept.append(
+            b'{"type":"ledger/recorded","seq":%d,"time":1700000000000,"src":"gateway",'
+            b'"data":{"slot":"%s","next":"reused %d","event":"reused %d",'
+            b'"event_kind":"progress"}}' % (seq, SLOT.encode(), seq, seq)
+        )
+    path.write_bytes(b"\n".join(kept) + b"\n")
+
+
+def test_a_reused_tail_seq_after_a_resume_still_reads_as_the_cold_fold(_cheap_writes):
+    """The bytes a RESUMED pass folded are covered by the cell's digest, or it folds cold.
+
+    A resumed pass's state covers S+N records but the savepoint's digest ends at S, and
+    the store's tail repair rewrites exactly the seqs above S. So the newest unit is
+    rewritten after a resume and the next read must match the from-empty answer.
+    """
+    _unit(FIRST)
+    _steps(FIRST, 1, 6)
+    assert _read((FIRST,)) == _cold((FIRST,))
+    assert _savepoint_path(FIRST).is_file()
+    _steps(FIRST, 7, 9)
+
+    resumed, parsed = _restart((FIRST,))
+    assert parsed == 3, "the resumed pass folded the tail"
+    assert resumed == _cold((FIRST,))
+
+    # The repair: seqs 7-9 go away and four records take their place, 7-10. The file is
+    # TALLER than the cell, so a continuation is admitted on height alone.
+    _reuse_the_tail_seqs(FIRST, keep_through_seq=6, fresh=4)
+    value = _read((FIRST,))
+
+    assert value == _cold((FIRST,))
+    assert "reused 10" in value, "the rewritten tail is what the record now carries"
+    assert "e9" not in value, "and the entries it replaced are gone from it"
+
+
+def _ordered(value: dict[str, Any]) -> str:
+    """One fold value as JSON with its key ORDER preserved.
+
+    ``_normalized`` sorts, which is what makes two records comparable regardless of how
+    they were built -- and exactly what would hide the defect below. These folds order
+    their maps by INSERTION and age out the first one, so for an artifact map the order
+    IS part of the value and has to be compared as one.
+    """
+    return json.dumps(value, separators=(",", ":"), default=str)
+
+
+def test_a_resumed_artifact_map_keeps_the_order_it_was_recorded_in(_cheap_writes):
+    """Insertion order survives the savepoint round trip, so the right key ages out.
+
+    The store uses ``sort_keys=True`` and ``_ledger_step`` evicts
+    ``next(iter(artifacts))``, so a sorted state would drop the wrong key. The keys are
+    reverse-alphabetical so sorted and insertion order differ at every position.
+    """
+    oldest = f"k{_MAX_ARTIFACTS:03d}"
+    _unit(FIRST)
+    _steps(FIRST, 1, 6)
+    # Recorded newest-last and in reverse alphabetical order, one per entry so each takes
+    # its own insertion position. So sorted order and insertion order disagree at every
+    # position, and the key that sorts FIRST is the one recorded LAST.
+    for index in range(_MAX_ARTIFACTS):
+        _ledger(FIRST, artifacts={f"k{_MAX_ARTIFACTS - index:03d}": f"v{index}"})
+
+    # The setup guard, read off the fold's own value rather than off the file, so it
+    # holds whatever framing the savepoint uses.
+    recorded = list(crew_log.fold_slot("ledger", (FIRST,), slot=SLOT).value["artifacts"])
+    assert (
+        recorded == sorted(recorded, reverse=True) != sorted(recorded)
+    ), "the recorded order is reverse alphabetical, so a sort is visible"
+
+    crew_log.forget_slot_folds()
+    _read((FIRST,))
+    assert _savepoint_path(FIRST).is_file()
+
+    # One more artifact, past the cap, so the map has to evict -- the eviction is what
+    # reads the order. The first read after the restart is the one that resumes.
+    crew_log.forget_slot_folds()
+    _ledger(FIRST, artifacts={"k999": "pushes one out"})
+    resumed = _ordered(
+        crew_log.projection_of(crew_log.fold_slot_warm("ledger", (FIRST,), slot=SLOT)).value
+    )
+    crew_log.forget_slot_folds()
+    cold = _ordered(crew_log.fold_slot("ledger", (FIRST,), slot=SLOT).value)
+
+    artifacts = json.loads(resumed)["artifacts"]
+    assert len(artifacts) == _MAX_ARTIFACTS
+    assert "k999" in artifacts, "the newest artifact is kept"
+    assert oldest not in artifacts, "the OLDEST artifact is the one dropped"
+    assert resumed == cold, "and the whole record, key order included, is the cold one"
+
+    stored = _stored_state(json.loads(_savepoint_path(FIRST).read_text(encoding="utf-8")))
+    assert list(stored["artifacts"]) != sorted(
+        stored["artifacts"]
+    ), "the order on disk is the recorded one too, not the sorted one"
+
+
+def test_a_repair_between_admission_and_the_pass_falls_back_to_a_cold_fold(_cheap_writes):
+    """The window between admitting a savepoint and capturing the pass's digest.
+
+    A supersede repair after ``load_slot`` admits the savepoint replaces records below
+    the tail, and the pass's digest, taken after the repair, still passes ``_vouched``.
+    The repair is forced inside the window by wrapping ``load_slot``.
+    """
+    _unit(FIRST)
+    _steps(FIRST, 1, 6)
+    assert _read((FIRST,)) == _cold((FIRST,))
+    _steps(FIRST, 7, 9)
+    crew_log.forget_slot_folds()
+
+    real = savepoints.load_slot
+    fired: list[int] = []
+
+    def repair_inside_the_window(*args: Any, **kwargs: Any):
+        admitted = real(*args, **kwargs)
+        if admitted is not None and not fired:
+            fired.append(1)
+            # Records at seqs 4-6 go away and four take their place. The savepoint
+            # stands at 6 and the tail starts at 7, so the fold reads none of this.
+            _reuse_the_tail_seqs(FIRST, keep_through_seq=3, fresh=6)
+        return admitted
+
+    crew_log_checkpoint_load = savepoints.load_slot
+    try:
+        savepoints.load_slot = repair_inside_the_window  # type: ignore[assignment]
+        value = _read((FIRST,))
+    finally:
+        savepoints.load_slot = crew_log_checkpoint_load  # type: ignore[assignment]
+
+    assert fired, "the repair ran inside the window"
+    crew_log.forget_slot_folds()
+    assert value == _cold((FIRST,))
+    assert "reused 4" in value, "the record carries what the repair wrote"
+    assert "e5" not in value, "and not the entries it replaced"
+
+
+def test_two_restarts_in_a_row_each_resume_from_disk(_cheap_writes):
+    """A resumed read leaves a savepoint the NEXT restart can use.
+
+    A resumed pass must write a witness for the boundary it reached, not the one it
+    resumed from, or every other restart cold-folds while the savepoint looks healthy.
+    """
+    _unit(FIRST)
+    _steps(FIRST, 1, 6)
+    _read((FIRST,))
+    _steps(FIRST, 7, 12)
+
+    first_value, first_parsed = _restart((FIRST,))
+    second_value, second_parsed = _restart((FIRST,))
+
+    assert first_parsed == 6, "restart one folds the tail above the savepoint"
+    assert second_parsed == 0, "restart two finds the savepoint restart one wrote"
+    assert first_value == second_value == _cold((FIRST,))
+    witness = json.loads(_savepoint_path(FIRST).read_text(encoding="utf-8"))["witness"]
+    assert witness["seq"] == 12, "the witness names the boundary this pass reached"
+
+
+def test_a_slot_below_the_write_threshold_leaves_no_savepoint():
+    """The real 256-entry threshold, with nothing lowered.
+
+    A short slot folds cheaply from the start, so a file for it would be a write spent
+    on a replay worth nothing -- and the read is correct either way.
+    """
+    _unit(FIRST)
+    _steps(FIRST, 1, 4)
+
+    assert _read((FIRST,)) == _cold((FIRST,))
+    assert not _savepoint_path(FIRST).exists()
+    value, parsed = _restart((FIRST,))
+    assert parsed == 4, "no savepoint, so the cold fold -- the behaviour before the fix"
+    assert value == _cold((FIRST,))
+
+
+# --------------------------------------------------------------------------- #
+# resumed equals cold on every shape a continuation refuses
+# --------------------------------------------------------------------------- #
+
+
+# Every helper below edits a crew log IN BYTES, and that is a platform requirement
+# rather than a style. The store appends with `newline="\n"`, so a crew log is LF-only
+# on every platform; `read_text` / `write_text` go through universal newlines, which on
+# Windows translates every LF back out as CRLF and rewrites the file one byte per line
+# longer than it was. For a case that only needs the digest or the height to move, that
+# is survivable; for the one case below that asserts nothing but the identity moved, it
+# is the difference between forcing the shape and corrupting the fixture. Bytes have no
+# such mode.
+
+
+def _grow_an_earlier_unit(units: tuple[str, ...]) -> None:
+    _steps(units[0], 90, 91)
+
+
+def _rewrite_the_prefix(units: tuple[str, ...]) -> None:
+    """Change an already-folded record, leaving its seq and the height alone.
+
+    No stat can see this: the store's truncation recovery rewrites a committed prefix
+    and reuses consumed seqs. The cut is counted, as the store counts it; the counter
+    catches it, or the digest on a unit without one.
+    """
+    path = lg.store.crew_log_path(lg.KIND_SESSION, units[-1])
+    lines = path.read_bytes().split(b"\n")
+    for index, line in enumerate(lines):
+        if b'"event":"e' in line:
+            lines[index] = line.replace(b'"event":"e', b'"event":"rewritten-e')
+            break
+    else:  # pragma: no cover - the fixture always appends an event to the newest unit
+        raise AssertionError("no folded entry to rewrite")
+    _a_completed_cut(path.parent)
+    path.write_bytes(b"\n".join(lines))
+
+
+def _truncate_below_the_savepoint(units: tuple[str, ...]) -> None:
+    """Cut the newest unit back, so the log is SHORTER than the savepoint stands at."""
+    path = lg.store.crew_log_path(lg.KIND_SESSION, units[-1])
+    lines = path.read_bytes().split(b"\n")
+    path.write_bytes(b"\n".join(lines[:3]) + b"\n")
+
+
+def _recreate_an_earlier_unit(units: tuple[str, ...]) -> None:
+    """Give the oldest unit a new creation identity, and change NOTHING else.
+
+    ``origin`` (header ``createdAt`` plus device and inode) is what tells a recreated
+    log from a grown one. A same-length edit to the stamp, with the mtime restored,
+    leaves ``size`` and ``mtime_ns`` unchanged, so only ``origin`` moves.
+
+    The stamp is rewritten instead of rebuilding the directory because the open
+    ``.lease`` makes ``rmtree`` raise ``PermissionError`` on Windows.
+    """
+    path = lg.store.crew_log_path(lg.KIND_SESSION, units[0])
+    before = path.stat()
+    header, separator, rest = path.read_bytes().partition(b"\n")
+    stamp = re.search(rb'"createdAt":(\d+)', header)
+    assert stamp is not None, "the header carries the creation stamp this case edits"
+    digits = stamp.group(1)
+    # Same LENGTH, different value: a longer or shorter number would move the file's
+    # size, and this case has to leave every other mark field alone.
+    fresh = digits[:-1] + (b"0" if digits[-1:] != b"0" else b"1")
+    path.write_bytes(
+        header.replace(b'"createdAt":' + digits, b'"createdAt":' + fresh) + separator + rest
+    )
+    os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+    assert path.stat().st_size == before.st_size, "only the identity moved"
+
+
+def _corrupt_the_savepoint(units: tuple[str, ...]) -> None:
+    _savepoint_path(units[-1]).write_text("{not json", encoding="utf-8")
+
+
+def _nest_a_malformed_state(units: tuple[str, ...]) -> None:
+    """A state whose TOP level is the fold's shape and whose interior is not.
+
+    The admission conditions read a state's top level, so this payload is accepted and
+    then raises inside the fold -- the one failure that has to be answered by discarding
+    the file, because the alternative is a read that 500s on every later call.
+    """
+    path = _savepoint_path(units[-1])
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    state = _stored_state(payload)
+    state["events"] = [{"ts": 1, "kind": [], "text": None}, 7]
+    payload["state"] = {savepoints._SLOT_STATE_JSON: json.dumps(state)}
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def _relabel_the_savepoint_slot(units: tuple[str, ...]) -> None:
+    path = _savepoint_path(units[-1])
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["identity"]["slot"] = OTHER_SLOT
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    "damage,expect_parsed",
+    [
+        (_grow_an_earlier_unit, "all"),
+        (_rewrite_the_prefix, "all"),
+        (_truncate_below_the_savepoint, "all"),
+        (_recreate_an_earlier_unit, "all"),
+        (_corrupt_the_savepoint, "all"),
+        (_nest_a_malformed_state, "all"),
+        (_relabel_the_savepoint_slot, "all"),
+    ],
+    ids=[
+        "an-earlier-unit-grew",
+        "the-prefix-was-rewritten",
+        "the-log-is-shorter-than-the-savepoint",
+        "an-earlier-unit-was-recreated",
+        "the-file-is-not-readable",
+        "the-state-cannot-be-folded",
+        "the-file-names-another-slot",
+    ],
+)
+def test_a_resumed_read_equals_a_cold_fold_on_every_refused_shape(
+    _cheap_writes, damage, expect_parsed
+):
+    """Each shape a continuation refuses falls back to the COLD answer, not another one.
+
+    ``_cold`` is recomputed after the damage, so the read is compared to what the files
+    say NOW. An untrusted payload may cost a slower read, never a different record.
+
+    ``parsed`` asserts the read really walked the log; without it a stale resume could
+    pass whenever the damage left the record unchanged.
+    """
+    _unit(FIRST)
+    _steps(FIRST, 1, 4)
+    _unit(SECOND)
+    _steps(SECOND, 5, 8)
+    units = (FIRST, SECOND)
+    assert _read(units) == _cold(units)
+    assert _savepoint_path(SECOND).is_file(), "there is a savepoint for the damage to defeat"
+
+    damage(units)
+
+    value, parsed = _restart(units)
+
+    assert value == _cold(units)
+    assert parsed > 0, "the savepoint was refused and the log was folded"
+
+
+def test_a_refused_savepoint_is_not_left_to_be_refused_forever(_cheap_writes):
+    """A payload that could not be FOLDED is removed, so one read pays for it.
+
+    A file that fails admission is cheap to reject again, but one that fails inside the
+    fold costs a half-folded registry and an exception on every later read. It is
+    discarded instead, and the next read's own write replaces it.
+    """
+    _unit(FIRST)
+    _steps(FIRST, 1, 6)
+    _read((FIRST,))
+    _nest_a_malformed_state((FIRST,))
+
+    value, parsed = _restart((FIRST,))
+
+    assert value == _cold((FIRST,))
+    assert parsed == 6, "the cold fold"
+    replaced = _stored_state(json.loads(_savepoint_path(FIRST).read_text(encoding="utf-8")))
+    assert replaced["events"], "the unusable payload was replaced rather than left on disk"
+
+
+def test_a_savepoint_is_not_read_across_slots(_cheap_writes):
+    """Two slots never share a cell, and never share a file.
+
+    The identity block carries the slot key, so a unit that is newest for two slots
+    costs them a cold fold each rather than letting one serve the other's state.
+    """
+    _unit(FIRST)
+    _steps(FIRST, 1, 6)
+    _read((FIRST,))
+
+    value, parsed = _restart((FIRST,), slot=OTHER_SLOT)
+
+    assert value == _cold((FIRST,), slot=OTHER_SLOT)
+    assert parsed == 6
+
+
+# --------------------------------------------------------------------------- #
+# a restart after a rollover resumes from an older unit's savepoint
+# --------------------------------------------------------------------------- #
+
+THIRD = "acp-sp-third"
+
+
+def test_a_restart_after_a_rollover_resumes_from_the_older_units_savepoint(_cheap_writes):
+    """A new unit has no savepoint yet, so the one beside the unit before it is used.
+
+    Red without ``_resume_older_slot_fold``: the read folds both units from empty.
+    """
+    _unit(FIRST)
+    _steps(FIRST, 1, 6)
+    assert _read((FIRST,)) == _cold((FIRST,))
+    _unit(SECOND)
+    _steps(SECOND, 7, 9)
+    units = (FIRST, SECOND)
+    assert not _savepoint_path(SECOND).exists(), "only the older unit has a savepoint"
+
+    value, parsed = _restart(units)
+
+    assert parsed == 3, "the first unit is below its savepoint; only the new unit is read"
+    assert value == _cold(units)
+    assert _savepoint_path(SECOND).is_file(), "the resumed cell writes one for the new unit"
+    _steps(SECOND, 10, 11)
+    assert _read(units) == _cold(units), "the resumed cell continues like any other"
+
+
+def test_the_newest_unit_with_a_savepoint_is_the_one_resumed(_cheap_writes):
+    """With savepoints beside two older units, the newer one wins; without it, the older."""
+    _unit(FIRST)
+    _steps(FIRST, 1, 4)
+    _read((FIRST,))
+    _unit(SECOND)
+    _steps(SECOND, 5, 8)
+    _read((FIRST, SECOND))
+    _unit(THIRD)
+    _steps(THIRD, 9, 10)
+    units = (FIRST, SECOND, THIRD)
+
+    value, parsed = _restart(units)
+    assert (value, parsed) == (_cold(units), 2), "resumed beside SECOND: only THIRD is read"
+
+    _savepoint_path(SECOND).unlink()
+    _savepoint_path(THIRD).unlink()
+    value, parsed = _restart(units)
+    assert (value, parsed) == (_cold(units), 6), "resumed beside FIRST: SECOND and THIRD"
+
+
+def test_an_older_unit_that_grew_after_its_savepoint_folds_its_tail_first(_cheap_writes):
+    """An older unit is not closed to writes, so its tail is folded before the new unit."""
+    _unit(FIRST)
+    _steps(FIRST, 1, 4)
+    _read((FIRST,))
+    _steps(FIRST, 5, 6)
+    _unit(SECOND)
+    _steps(SECOND, 7, 8)
+    units = (FIRST, SECOND)
+
+    value, parsed = _restart(units)
+
+    assert parsed == 4
+    assert value == _cold(units)
+    assert json.loads(value)["next"] == "step 8"
+
+
+def _a_unit_listed_before_the_held_ones(units: tuple[str, ...]) -> tuple[str, ...]:
+    _unit(THIRD)
+    _steps(THIRD, 50, 51)
+    return (THIRD, *units)
+
+
+def _the_older_prefix_rewritten(units: tuple[str, ...]) -> tuple[str, ...]:
+    _rewrite_the_prefix(units[:1])
+    return units
+
+
+def _an_earlier_unit_recreated(units: tuple[str, ...]) -> tuple[str, ...]:
+    _recreate_an_earlier_unit(units)
+    return units
+
+
+def _the_older_savepoint_corrupt(units: tuple[str, ...]) -> tuple[str, ...]:
+    _corrupt_the_savepoint(units[:1])
+    return units
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        _a_unit_listed_before_the_held_ones,
+        _the_older_prefix_rewritten,
+        _an_earlier_unit_recreated,
+        _the_older_savepoint_corrupt,
+    ],
+    ids=[
+        "a-unit-listed-before-the-held-ones",
+        "the-older-units-prefix-was-rewritten",
+        "an-earlier-unit-was-recreated",
+        "the-older-savepoint-is-not-readable",
+    ],
+)
+def test_an_older_savepoint_that_does_not_describe_the_list_folds_cold(_cheap_writes, damage):
+    """Every admission check on the newest unit's savepoint holds for an older one too."""
+    _unit(FIRST)
+    _steps(FIRST, 1, 4)
+    _read((FIRST,))
+    _unit(SECOND)
+    _steps(SECOND, 5, 6)
+
+    units = damage((FIRST, SECOND))
+    value, parsed = _restart(units)
+
+    assert value == _cold(units)
+    assert parsed >= 6, "the savepoint was refused and every unit was folded"
+
+
+def test_sealing_a_closed_slot_writes_a_savepoint_below_the_threshold():
+    """``seal_slot_fold`` brings the cell up to the log and writes, however few entries.
+
+    The real 256-entry threshold is left in place: a closed unit will not grow again, so
+    a write held back for it is a cold fold on the next restart or reopen. Red without
+    ``final``.
+    """
+    _unit(FIRST)
+    _steps(FIRST, 1, 4)
+    _read((FIRST,))
+    assert not _savepoint_path(FIRST).exists(), "below the threshold, no write yet"
+    _steps(FIRST, 5, 6)
+
+    crew_log.seal_slot_fold(SLOT, "ledger")
+
+    assert _savepoint_path(FIRST).is_file()
+    value, parsed = _restart((FIRST,))
+    assert (value, parsed) == (_cold((FIRST,)), 0), "the seal folded the tail it wrote"
+    _unit(SECOND)
+    _steps(SECOND, 7, 8)
+    value, parsed = _restart((FIRST, SECOND))
+    assert (value, parsed) == (_cold((FIRST, SECOND)), 2), "a reopen reads the new unit only"
+
+
+def test_sealing_a_slot_with_no_warm_cell_folds_and_writes_nothing():
+    """No held cell means nothing to seal: never a cold fold on the eager worker."""
+    _unit(FIRST)
+    _steps(FIRST, 1, 4)
+    parsed = {"entries": 0}
+    real = CrewLog.iter_from
+
+    def counted(self, *args, **kwargs):
+        for entry in real(self, *args, **kwargs):
+            parsed["entries"] += 1
+            yield entry
+
+    CrewLog.iter_from = counted  # type: ignore[method-assign]
+    try:
+        crew_log.seal_slot_fold(SLOT, "ledger")
+    finally:
+        CrewLog.iter_from = real  # type: ignore[method-assign]
+
+    assert parsed["entries"] == 0
+    assert not _savepoint_path(FIRST).exists()
+
+
+# --------------------------------------------------------------------------- #
+# what the file is, and is not
+# --------------------------------------------------------------------------- #
+
+
+def test_the_slot_savepoint_does_not_share_a_file_with_a_session_fold(_cheap_writes):
+    """A slot fold and a session fold of the same name live in separate directories.
+
+    ``tools`` is read both ways, and the kernel store derives a file name from the fold
+    name alone -- so one directory would have the two overwrite each other, and each
+    would then be refused by the other's identity block for the life of the unit.
+    """
+    _unit(FIRST)
+    _steps(FIRST, 1, 6)
+    _read((FIRST,))
+
+    slot_file = savepoints.slot_checkpoint_path(lg.KIND_SESSION, FIRST, "ledger")
+    session_dir = savepoints.checkpoint_dir(lg.KIND_SESSION, FIRST)
+
+    assert slot_file.is_file()
+    assert slot_file.parent != session_dir
+    assert slot_file.parent.name == savepoints.SLOT_CHECKPOINT_DIR
+
+
+def test_a_cell_too_big_to_keep_warm_is_not_serialized_to_be_refused(_cheap_writes, monkeypatch):
+    """A cell over the warm ceiling is skipped BEFORE the store measures it.
+
+    The store decides a payload's size by serializing it, so a ``radar`` cell at its
+    declared caps would build a 2.4 GiB string to find out it does not fit -- and because
+    such a cell is not kept warm, every read of that slot would arrive here and do it
+    again. The skip is the memory, not the refusal.
+    """
+    _unit(FIRST)
+    _steps(FIRST, 1, 6)
+    monkeypatch.setattr(crew_log, "slot_fold_cache_bytes", lambda: 1)
+    offered: list[str] = []
+    real = DirectoryCheckpointStore.save
+
+    def counted(self, store, savepoint):
+        offered.append(savepoint.key)
+        return real(self, store, savepoint)
+
+    monkeypatch.setattr(DirectoryCheckpointStore, "save", counted)
+
+    assert _read((FIRST,)) == _cold((FIRST,))
+
+    assert not _savepoint_path(FIRST).exists()
+    assert offered == [], "the store was never handed a payload to measure"
+
+
+def test_one_fold_name_read_both_ways_keeps_two_files(_cheap_writes):
+    """``tools`` is a slot fold AND a session fold, and each keeps its own savepoint.
+
+    The kernel store names a file from the fold name alone, so a shared directory would
+    let each writer overwrite the other and that fold would silently always fold cold.
+    """
+    _unit(FIRST)
+    for step in range(1, 7):
+        crew_log_emit.on_tool_called(FIRST, 1, name=f"t{step}", call_id=f"c{step}")
+    assert_drained()
+
+    crew_log.fold_slot_warm("tools", (FIRST,), slot=SLOT)
+    crew_log.fold_session(FIRST, ("tools",))
+
+    slot_payload = json.loads(
+        savepoints.slot_checkpoint_path(lg.KIND_SESSION, FIRST, "tools").read_text(encoding="utf-8")
+    )
+    session_payload = json.loads(
+        savepoints.checkpoint_path(lg.KIND_SESSION, FIRST, "tools").read_text(encoding="utf-8")
+    )
+
+    assert slot_payload["identity"]["slot"] == SLOT
+    assert "slot" not in session_payload["identity"], "the session block names no slot"
+    assert slot_payload["identity"]["unit"] == session_payload["identity"]["unit"] == FIRST
+
+
+def test_the_savepoint_names_the_bytes_its_state_came_from(_cheap_writes):
+    """The witness is the evidence a later read re-checks, so it must be there.
+
+    ``prefix_admit`` refuses an empty witness, and every test above would still pass by
+    folding cold. A unit with a cut counter carries the COUNT; the digest form for logs
+    without one is covered in ``test_crew_log_cut_counter.py``.
+    """
+    _unit(FIRST)
+    _steps(FIRST, 1, 6)
+    _read((FIRST,))
+
+    payload = json.loads(_savepoint_path(FIRST).read_text(encoding="utf-8"))
+
+    assert payload["identity"]["slot"] == SLOT
+    assert payload["identity"]["units"] == [FIRST]
+    assert payload["identity"]["marks"] == []
+    assert payload["witness"]["seq"] > 0
+    assert payload["witness"]["prefix_cuts"] == 0, "no cut yet, and 0 is a real reading"
+    assert "prefix_sha" not in payload["witness"], "one spelling, never both"
+    assert payload["watermark"] == payload["witness"]["seq"], "one unit, so base zero"
+
+
+def test_the_savepoint_records_every_earlier_unit_s_whole_mark(_cheap_writes):
+    """Height alone describes a log by how FAR it goes, never by what it says.
+
+    So the identity carries each earlier unit's whole mark, cut count included, matching
+    the warm path's whole-mark comparison; an in-place rewrite then folds cold.
+    """
+    _unit(FIRST)
+    _steps(FIRST, 1, 4)
+    _unit(SECOND)
+    _steps(SECOND, 5, 8)
+    _read((FIRST, SECOND))
+
+    payload = json.loads(_savepoint_path(SECOND).read_text(encoding="utf-8"))
+    origin, height, size, mtime_ns, cuts = payload["identity"]["marks"][0]
+
+    assert payload["identity"]["units"] == [FIRST, SECOND]
+    assert isinstance(origin, str) and origin
+    assert height == 4
+    assert isinstance(size, int) and size > 0
+    assert isinstance(mtime_ns, int) and mtime_ns > 0
+    assert cuts == 0, "the earlier unit's own cut count, and 0 is a real reading"
+    assert payload["watermark"] == height + payload["witness"]["seq"], "base plus the unit seq"
+
+
+def test_a_savepoint_whose_two_positions_disagree_is_refused(_cheap_writes):
+    """The ordinal and the witness seq are tied by the base, and the tie is checked.
+
+    A payload claiming an ordinal that is not the newest unit's base plus the seq its
+    witness certifies would resume the cell past entries the tail then folds again, or
+    short of ones it never folds. Nothing in the file can say which of the two numbers
+    is right, so it is not a savepoint of this fold.
+    """
+    _unit(FIRST)
+    _steps(FIRST, 1, 6)
+    _read((FIRST,))
+    path = _savepoint_path(FIRST)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["watermark"] = payload["watermark"] + 1
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    value, parsed = _restart((FIRST,))
+
+    assert value == _cold((FIRST,))
+    assert parsed == 6
+
+
+def _a_completed_cut(directory) -> None:
+    """Record a cut of *directory*'s log that has FINISHED, as the store records one.
+
+    The store brackets each cut with ``_open_cut`` / ``_close_cut``; one raise alone
+    would leave the counter odd, which reads as a cut still in flight.
+    """
+    crew_log_store._open_cut(directory)
+    crew_log_store._close_cut(directory)

@@ -1,0 +1,1386 @@
+# Knowledge Module
+
+## Overview
+
+The Knowledge Library is Kiro Crew's personal knowledge graph: a local, SQLite-backed corpus that ingests documents (folders, uploads, artifacts, fetched URLs), chunks and entity-extracts them via a bounded LLM worker pool, and serves hybrid retrieval (FTS5 keyword + graph traversal + optional vector) to the LLM through the `local_knowledge_search` MCP tool. All ingestion and search stay on-host; the only external calls are the extraction worker's ACP LLM turns and the gateway's own fetch of a web-page source from a listed host (`url_fetch.py`). Embedding runs in-process against a vendored runtime — the shared `EmbeddingBackend` singleton — so there is no inference endpoint of any kind.
+
+```
+files / uploads / artifacts / URLs
+   → FileReader (read + extract text)
+   → HeadingAwareChunker (chunk)
+   → EntityExtractor (LLMPool workers); a web-page source is fetched first by url_fetch
+   → KnowledgeStore (SQLite: items + items_fts + graph)
+   → HybridRetriever (FTS5 + graph + vector, RRF fusion)
+   → local_knowledge_search (MCP) / dashboard Knowledge tab
+```
+
+### LLM worker-pool policy
+
+Knowledge ingestion uses one long-lived worker pool, for extraction. It uses
+`knowledge.extraction_pool_size` and requests reasoning effort
+`knowledge.extraction_effort`. No worker fetches URLs: a web-page source is
+fetched by the gateway itself (`url_fetch.py`, below). The extraction effort resolves through the chain in `llm_pool._get_workload_effort`:
+`knowledge.extraction_effort` → fallback (`DEFAULT_EXTRACTION_EFFORT` = `high`
+as the last resort). The chain has no role-policy leg: extraction effort is a
+Knowledge policy, independent of `agent.role_efforts.background` (which
+controls other background workers) — an unset or invalid key keeps the
+historical always-`high` behavior, so a typo cannot silently change cost.
+`""` means the default (`high`); the key is
+dashboard-editable (`_EDITABLE_CONFIG` enum `["", *EFFORT_LEVELS]`), with the
+controls on the Knowledge tab's settings (model, extraction effort, pool size —
+effort requires a worker restart to reach the live workers; pool size applies
+at the next idle boundary without one). Both pools drive the same
+`kirocrew-knowledge` agent and preserve the
+existing model resolution: `knowledge.extraction_model` → `agent.model` →
+provider/`auto`.
+
+For the Kiro ACP backend, the worker applies the resolved level through the
+`/effort` command after reading the session's advertised effort levels; Claude
+ACP keeps its `supports_config_option` gate and advertised-level descent (the
+ladder arithmetic is `llm_pool`'s private `_select_effort_level`). An
+unsupported model or a rejected command falls back to provider default.
+
+Separate pools make the different workload policies structural for long-lived
+sessions rather than relying on a worker being reused by only one workload by
+convention. There is no `knowledge_llm_pool` compatibility alias and no
+`use_config_pool_size` flag: a pool binds an explicit
+`config_pool_size_key` (extraction only), so `knowledge.extraction_pool_size`
+cannot resize the auto_research pools.
+
+## Role & boundary
+
+The Knowledge Library is the agent's **precise-recall complement to memory** — it is defined as much by the two things it is *not*:
+
+- **Not memory.** The memory subsystem (see `memory-skills-hooks.md`) carries the small, distilled, always-on picture and is **injected into every prompt** by `ContextBuilder`; it is lossy by design (it dedups, decays, and paraphrases). The Knowledge Library instead holds the durable, **verbatim, cited** detail that memory can only approximate, and it is **pulled on demand**: the LLM reaches it only through the `local_knowledge_search` MCP tool, never as per-turn context injection (§4). Its job is to surface the exact chunk — with a citation back to source (§4, "Citation enrichment") — precisely when memory's recall is imprecise or absent.
+- **Not a workspace.** It is not scratch space for the current task's files or state; it is the durable, source-owned record that outlives any single task or session. A project directory enters the Library only as a `local_folder` source the user registers by hand, and is *ingested* read-only rather than adopted as a working set.
+
+This is the boundary the agent's write path (§2b) captures against: verbatim, long-tail durable detail that memory would only paraphrase belongs here; small, always-shaping, distilled knowledge belongs in memory; transient current-task state belongs in neither. How well the KB fills that role is measured against the criteria in "Success criteria" below.
+
+## Success criteria
+
+The Knowledge Library's job — surface the exact, cited chunk when memory's recall falls short — is judged on **two tiers**. Tier 1 has a deterministic in-tree harness (`kirocrew bench kb-retrieval`, see "What is measured today"); no Tier 2 harness exists in-tree yet. This section defines the target so a retrieval change (recency weighting, a reranker, content-typed TTL) can be judged against a fixed bar rather than by eye.
+
+### Tier 1 — intrinsic retrieval quality
+
+Against a **frozen golden set** of `(query → the chunk(s) that should answer it)`, does retrieval fetch the right chunk and rank it high? Definitions follow the IR / RAG canon:
+
+| Metric | Definition | Reads |
+|--------|------------|-------|
+| **recall@k** | `|relevant ∩ retrieved@k| / |relevant|` — fraction of relevant chunks that land in the top-k | coverage / completeness |
+| **precision@k** | `|relevant ∩ retrieved@k| / k` — fraction of the top-k that is relevant | signal-to-noise |
+| **MRR** | mean of `1 / rank_of_first_relevant` over queries | how early the first hit lands |
+| **nDCG@k** | graded relevance with a log-rank discount, normalized to the ideal ordering | rank quality when relevance is graded, not binary |
+| **hit@k** | binary: did *any* relevant chunk make the top-k | cheap "did retrieval work at all" gate |
+
+RAGAS names the rank-aware pair **context precision** / **context recall** (the latter needs a reference answer); they are the same two ideas applied to the retrieved context.
+
+### Tier 2 — extrinsic task-lift
+
+Does that recall change the outcome? Measured A/B — the same task set run with the KB **on** vs **off** (or vs a baseline), scored on **task success**, not retrieval position. Recall without task-lift means the KB retrieves the wrong thing well. This mirrors how mature agent harnesses gate on outcome rather than retrieval — GAIA2 (pass@1 against a write-action verifier), SWE-bench (fail-to-pass test execution), τ-bench (grounded end-state diff) — and π-Bench's practice of scoring "used the right context" as an axis distinct from "task completed." A companion generation check, **faithfulness** (fraction of the answer's claims actually supported by the retrieved chunk; RAGAS, reference-free), guards against a cited-but-unsupported answer.
+
+### Query classes the golden set must cover
+
+A clean teach→recall set overstates quality: memory/KB systems break on the *hard* classes. The set must enumerate them explicitly (taxonomy adapted from the LobsterAIAgent memory harness and LongMemEval):
+
+- **Clean-fact recall** — baseline single-hop lookup.
+- **Multi-hop** — the answer requires joining two or more chunks (the entity graph's reason to exist, §4).
+- **Time-bound / freshness** — a fact true only "as of" a date; the correct *version* must win.
+- **Correction** — a later chunk fixes an earlier stated fact; the corrected value must be surfaced.
+- **Contradiction** — two chunks conflict; retrieval must surface the conflict, not silently pick one.
+- **Retraction** — a withdrawn fact must stop being recalled.
+- **Reinforcement / corroboration** — repeated independent sources should raise confidence, not merely duplicate.
+- **Hypothetical-exclusion** — speculative or conditional statements must NOT return as settled fact.
+- **Abstention** — when the answer is genuinely absent, retrieval should return nothing above the score floor rather than a false near-match (LongMemEval scores this explicitly).
+- **Citation-fidelity** — the returned chunk must actually support the claim it is cited for (§4, "Citation enrichment").
+
+### What is measured today
+
+The code computes and floors a retrieval **score**, but no Tier-1/Tier-2 metric and none of the hard query classes above:
+
+- `HybridRetriever.search` fuses the keyword + graph + vector legs by RRF (`_rrf_fuse`, k=60; vector leg weighted `VECTOR_RRF_WEIGHT = 2.0`), tie-broken by `updated_at` recency — a secondary sort key, **not** a decay weight (`retrieval.py`, §4). The keyword leg's rank-1 hit is protected from truncation: when fusion pushes it past `limit`, `search` appends it as one extra trailing row, so a response may carry `limit + 1` rows.
+- Results below `min_score = 0.012` are dropped by the tool caller (`mcp_tools/knowledge.py`), not inside the retriever.
+- `kirocrew eval` ships five scenarios (`smoke_test`, `memory_recall_basic`, `lesson_application`, `context_accumulation`, `subagent_policy`) scored per-assertion (`contains` / `regex` / `judge`) with an optional 1–5 LLM judge (`eval/judge.py`, pass ≥ 3.0). The four memory scenarios are clean single-fact teach→recall or accumulate→summarize flows, and `subagent_policy` evaluates delegation decisions only; none exercises correction / contradiction / retraction / time-bound / reinforcement / hypothetical, and none reports recall@k, MRR, or task-lift.
+
+- `kirocrew bench kb-retrieval` is the Tier-1 ruler: it scores a frozen golden set (`eval/bench/data/kb_golden_v2.json`, hand-authored, covering the query classes above) against a real `KnowledgeStore` + `HybridRetriever` and reports recall@k / MRR@k / nDCG@k per class, plus `abstention_rate`. The default toy embedder is a deterministic plumbing check; `--no-embeddings` isolates the keyword/graph legs, while `--real-embedder` waits for a cold local model to finish loading before it records a semantic score. It measures **bare `HybridRetriever.search`** — the tool-caller `min_score` floor above is deliberately not applied — so its numbers describe the raw retriever, not the agent-visible MCP surface; a floor change at the tool caller will not move them.
+
+- The default golden set is **v2** (68 docs / 46 queries). v1 (17 / 12) is still packaged so archived v1 reports stay reproducible, but it could not discriminate: every class scored 1.000 recall under both a keyword-only and a semantic retriever, because each gold document was the only one in the corpus using its topic's vocabulary, so matching one term was enough to win. v2 adds competing distractors — same-topic documents that differ on the decisive attribute (a different service, environment, cache, or time window) — and the legs then separate. Keyword-only is deterministic (FTS5 + graph, no model) and reproducible: nDCG@3 0.834 / MRR@3 0.804 / MAP@3 0.781. The semantic leg measured with `qwen3-embedding:0.6b` gives nDCG@3 0.926 / MRR@3 0.900 / MAP@3 0.898 — re-measure rather than trust that triple after a model or quantization change, since it moves with both. MAP is the widest of the three separations between the legs (0.117, against 0.092 nDCG and 0.096 MRR): it is the only one of them that reads how late the *second* gold document lands, so it sees the multi-gold classes that MRR — which stops at the first hit — scores identically. Its denominator is `min(|gold|, k)` rather than the textbook `|gold|`, matching the truncation `ndcg_at_k` already applies, so the cut-off must travel with the number and it is not directly comparable to a published MAP over full gold.
+
+Gold labels are blind-audited, not author-asserted. Three annotators on separate model families relabelled all 46 queries from an anonymized packet — document ids masked to `D01`-`D68` (eight real ids name their own answer), query classes withheld, gold sets *and their sizes* withheld, corpus order shuffled — and agreed with the file on 43, 42 and 40 of 46, with 39 unanimous. Two labels the audit overturned are corrected: `q-multi-5` drops `d-mfa-baseline` (the remaining `d-vpn-access` states the VPN and MFA requirement together, so it is self-sufficient) and moves to `clean_fact`, since a single-document lookup sitting in `multi_hop` was inflating that class; `q-reinforcement-1` drops both audit documents, because corroboration is not requirement and the baseline answers the question outright. Both corrections raise `recall_all`/`recall_micro`, and `multi_hop` becomes a harder class once the single-document lookup leaves it, which widens the keyword-versus-semantic separation rather than narrowing it. Agreement is evidence the surviving questions are unambiguous, **not** proof the labels are correct: every annotator was a language model, so a shared blind spot reads as consensus. The five queries where the annotators disagreed with each other are rewritten so one reading is right, with gold sets unchanged: `q-contradiction-4` asks which ADR overrides the wiki, which the general `d-doc-precedence` rule cannot answer because it names no ADR; `d-mfa-audit-q4` reports only its own quarter, so `q-reinforcement-2` needs both audits, and `q-reinforcement-4` names both quarters; the two abstention queries ask for an approver the corpus never names, rather than a per-service budget `d-cost-budget` addresses or a staging scope `d-retention-2025` never excludes. Judgments made outside the project come from the `--external` set below. The coarse separations are the stable evidence: `multi_hop` recall_all@3 0.250 keyword versus 1.000 semantic, and at k=1 neither leg is saturated (recall_any@1 0.650 versus 0.800), which is what makes that cut-off informative. `abstention_rate` is measured over 6 queries; it reads 0.000 because bare `HybridRetriever.search` has no score floor, so the store never abstains. **A v1 report and a v2 report measure different corpora and must not be differenced** — and nothing mechanical stops it: `bench kb-retrieval` prints its report and writes no file (it has no `--out-dir`), while `bench compare` only diffs saved memory-retrieval reports and never sees a KB run. The one guard is the corpus identity in the printed header, and the corpus *name* alone is not enough of one: the two audit corrections change v2's gold labels under the unchanged name `kb_golden_v2`, so a print scored against the original labels (keyword nDCG@3 0.825, `multi_hop` recall_all@3 0.400) and one scored against the corrected labels (0.834, 0.250) differ by a labelling change, not by retriever movement. The golden set therefore carries a `label_revision` integer (`2` for v2: `1` for the two label corrections, `2` for the five rewrites, which leave the keyword triple unchanged and move the semantic one; absent on v1, whose labels are the author's originals) that the header prints beside the name — `KB retrieval eval: kb_golden_v2 (label revision 2)`, or `(unrevised labels)` when the field is absent — and a print made from the original v2 labels reads the bare name. Two prints are comparable only when both name **and** revision match; read both before comparing two of these numbers, and bump `label_revision` with every edit under an existing name that can move a score — a gold label, a question or a document.
+
+`kirocrew bench kb-retrieval --external` scores a second, externally anchored set after the authored one, never instead of it: `kb_external_nfcorpus_v1`, 40 queries and 224 papers sampled from BEIR's NFCorpus test split, whose relevance judgments come from NutritionFacts.org's links to the papers it cites, so neither our retriever nor our annotators shaped them. Only ids are committed (`eval/bench/data/kb_external_nfcorpus_v1.json`: benchmark, pinned revisions, seed, query and doc ids); the text (~2.3 MB, CC BY-SA 4.0 per BEIR's dataset card) is fetched on first use into the bench cache at pinned revisions and checked against pinned SHA-256s, like LoCoMo. Sampling (`eval/bench/kb_external.py`) keeps only queries with 2-5 relevant papers, so `recall_all` and MAP have something to measure, and pads each with up to three papers the benchmark judged relevant to a neighbouring query, which makes the rivals topically adjacent without letting any retriever pick them. Both of NFCorpus's relevance grades count as gold, so its nDCG is binary, not the benchmark's graded figure. Every query is scored as `clean_fact`: NFCorpus models none of the supersession classes or abstention, which is why the authored set and its per-class breakdown stay, and its report prints no `abstention_rate` (a set with no abstention queries has none to print). Keyword-only it reads nDCG@3 0.425 / MRR@3 0.600 / MAP@3 0.372 against v2's 0.834 / 0.804 / 0.781. That is a harder, out-of-domain set (medical abstracts), not a like-for-like comparison, and no CI gate reads either number.
+
+The remaining gap is therefore an **A/B task-lift harness** (Tier 2), plus a floor-aware variant of the Tier-1 ruler if the agent-visible surface is ever to be scored directly — the precondition for tuning recency, adding a reranker, or content-typed TTL against evidence rather than intuition.
+
+## Key Files
+
+| File | Responsibility |
+|------|----------------|
+| `knowledge/readers.py` | `FileReader` — per-extension text extraction; `SUPPORTED` format set |
+| `knowledge/folder_watcher.py` | `FolderWatcher` — recursive directory scan, per-file state, change/deletion detection |
+| `knowledge/watcher.py` | `KnowledgeWatcher` — polls registered sources for changes; sig-gated self-heal re-embed (single-flight, off-loop DB access) |
+| `knowledge/llm_pool.py` | `LLMPool` / `Worker` / `AcpWorker` — bounded pool of long-lived, sweep-shielded ACP workers |
+| `knowledge/extractor.py` | `EntityExtractor` — LLM entity/relation extraction over the pool |
+| `knowledge/url_fetch.py` | `fetch_page()` — the gateway's own fetch of one web page: `url_fetch_refusal()` (https, listed host) plus `link_unfurl.vet_unfurl_url` (public addresses, pinned connection) on the first URL and every redirect hop |
+| `knowledge/chunker.py` | `HeadingAwareChunker` — text/markdown/code/slide chunking |
+| `knowledge/embedder.py` | `InProcessEmbedder` — embedding in-process via the shared `EmbeddingBackend` (vendored llama-cpp runtime, no server and no HTTP hop); owns `embed_signature` (per-item vector-space identity) |
+| `knowledge/store.py` | `KnowledgeStore` — the import path of the store: the per-thread connection, construction and damaged-file recovery, the ingestion gate, and the class that binds its methods from the `store_parts` owners below |
+| `knowledge/store_parts/entity_graph.py` | entity, relation and mention rows, and the in-memory `SimpleDiGraph`: first load, rebuild-and-swap, neighbourhood reads |
+| `knowledge/store_parts/fulltext_index.py` | `items_fts`: its row writes (`_fts_index` / `_fts_unindex`), its term representation (`FTS_INDEX_VERSION`), the version-gated rebuild, `search_items_fts` |
+| `knowledge/store_parts/source_rows.py` | source rows: registration, the properties blob and its one-status rule, auto-registration retirement |
+| `knowledge/store_parts/item_ownership.py` | which sources hold an item (`source_locations`) and which document row owns it (`_DOC_STATE_TABLES`): adoption, detach, claim release |
+| `knowledge/store_parts/item_rows.py` | item rows and every delete: one item, a batch, a whole source |
+| `knowledge/store_parts/schema_migrations.py` | the DDL, the per-open column migrations, the search-only indexes and the vector-generation triggers |
+| `knowledge/store_parts/maintenance_sweeps.py` | the post-bind sweeps: orphan sources and entities, interrupted agent-ingest residue |
+| `knowledge/store_parts/content_stats.py` | read-only library statistics (`aggregate_stats`, `get_stats`) |
+| `knowledge/store_parts/bundle_transfer.py` | `.knowledge` export and import, and `KnowledgeBundleError` for malformed input |
+| `knowledge/store_parts/bundle_ownership.py` | which of a bundle's ownership rows an import restores and which items it withholds |
+| `knowledge/retrieval.py` | `HybridRetriever` — FTS5 + graph + vector search fused with RRF |
+| `knowledge/ingestion.py` | `IngestionPipeline` — read → chunk → extract → store orchestration; the import path of the owners below |
+| `knowledge/ingestion_budget.py` | `ImportChunkBudget` / `ImportChunkBudgetError` — the explicit-import cross-file chunk ceiling and its refusal |
+| `knowledge/ingestion_rebuild.py` | `rebuild_embeddings` — the signature-gated corpus re-embed; `start_rebuild_job` (its single-flight job row), `count_stale_items` (the watcher's trigger count) |
+| `knowledge/ingestion_jobs.py` | `reclaim_interrupted_ingest_jobs` — the startup sweep that moves source-ingest job rows a stopped gateway left `processing` to `abandoned` |
+| `knowledge/dedup.py` | Cross-source deduplication |
+| `knowledge/connectors/` | `BaseConnector`, `local_folder` + `bedrock_kb` source connectors |
+| `mcp_tools/knowledge.py` | `local_knowledge_search` MCP tool handler |
+| `mcp_core.py` | Cached `(KnowledgeStore, embedder)` accessor the tool reads |
+| `dashboard/handlers/knowledge.py` | Dashboard Knowledge-tab API: the facade every route below is imported and patched through; it keeps no code of its own |
+| `dashboard/handlers/knowledge_access.py` | the owner gate on mutating routes (`_require_knowledge_owner`), the SEL audit, the app's store, pipeline and task registry |
+| `dashboard/handlers/knowledge_library.py` | namespaces, items (an item `PATCH` reads a null `title` or `item_type`, both NOT NULL columns, as no change), entities and the graph, the source-scoped list and `/source-counts`, statistics |
+| `dashboard/handlers/knowledge_sync.py` | a source's sync status, the sync claim, `POST /api/knowledge/sources/{id}/sync` and the tasks it hands off |
+| `dashboard/handlers/knowledge_sources.py` | listing, adding, renaming, deleting, pausing, confirming and resuming sources; the folder picker; a folder source's file rows; `GET /api/knowledge/config` |
+| `dashboard/handlers/knowledge_ingest.py` | text an agent fetched for a source (`POST /api/knowledge/sources/{id}/ingest-text`; a non-string `name` falls back to the source's name and a list or object `namespace` to `default`, so neither fails the ingest), uploaded files and archives, `GET /api/knowledge/jobs/{id}` |
+| `dashboard/handlers/knowledge_bundles.py` | `.knowledge` export and import |
+| `dashboard/handlers/knowledge_embeddings.py` | embedding status, the batch embed that fills missing vectors, the background rebuild job |
+| `dashboard/handlers/knowledge_agent_context.py` | the chat context-injection search (`GET /api/knowledge/search-for-context`) and the agent's `POST /api/knowledge/agent-document` |
+| `dashboard/handlers/knowledge_lifecycle.py` | `setup_knowledge_routes`, the source watcher, artifact auto-ingest, live config reloads, the pools' shutdown |
+| `agent_materialization/service_agents.py:_install_knowledge_agent` | Installs the `kirocrew-knowledge` kiro-cli agent used by the pool |
+| `agent_materialization/service_agents.py:repair_knowledge_agent_spec` | Rewrites that spec from the same template before each pool worker spawn when the file on disk is not it |
+| `agent_materialization/service_agents.py:knowledge_view_without_registered_injection` | Builds the spec's native skill view from the template when the file's only change is an injection an edition-registered filter (`agent_spec_injections.py`) removes exactly, so a Kiro worker launches with zero tools and the file is not rewritten |
+
+`KnowledgeStore`'s behaviour lives in the `knowledge/store_parts/` owners in the table above,
+one responsibility each. A member's body is a module-level function there whose first
+parameter is `self` (annotated `KnowledgeStore` for type checkers only), and the class binds
+it by name under one comment header per owner (`add_entity = _entity_graph.add_entity`,
+`staticmethod(...)` for a static method). Every member therefore stays an attribute of the one
+class, so a patch of a method on the class or on a store reaches every caller, and every field
+stays on the instance; each owner's docstring names the fields its members write and read.
+A bound member's `__module__` names its owner and its `__qualname__` is the bare function
+name; nothing reads either. A class an owner defines keeps that owner as its `__module__`
+(`SimpleDiGraph`, its two views, `SourceContentStats`, `ContentStats`), except
+`KnowledgeBundleError`, which carries `kiro_crew.knowledge.store` so a traceback names it
+by its import path. `store.py` keeps the
+constructor, the connection, the properties, the gate delegations and the two static methods
+that name `KnowledgeStore`, and re-exports every name callers import from it (its own
+standard-library and typing imports aside). It is a plain facade: an owner reads its globals in its own namespace, so a name a
+test patches through `kiro_crew.knowledge.store` must be one only `store.py` reads.
+`_STORE_OWNERS` lists the owners lowest layer first; an owner imports only owners before it and
+never `store.py` at run time, and an owner that logs does so under the `kiro_crew.knowledge.store`
+logger.
+`test/test_store_parts_bindings.py` pins the member inventory, the binding, the layering and
+that patch rule. A new store method goes to the owner whose row names its responsibility, with
+one binding line under that owner's header in the class and a row in that test's member
+inventory.
+
+`dashboard/handlers/knowledge.py` is a mirror facade (`kiro_crew._facade_mirror`) over the
+`knowledge_<role>.py` owners in the table above: the dashboard server, the handler tests and
+every patch of `knowledge.<name>` go through it, a patch reaches every owner that binds the
+name, and no owner imports the facade. Owners import each other lowest layer first, in the
+table's order, and every owner that logs uses the facade's logger name. New handler work goes
+to the owner of its responsibility; `test/test_knowledge_handlers_facade.py` pins the family.
+
+`knowledge/ingestion.py` is a mirror facade (`kiro_crew._facade_mirror`) over
+`ingestion_budget.py` and `ingestion_rebuild.py`, lowest layer first. It keeps
+`IngestionPipeline`, the ingestion gate and `handoff_gate_context`, `EmbedRateLimiter`,
+`run_to_completion` and the redaction and chunking helpers the pipeline reads. A patch of
+`kiro_crew.knowledge.ingestion.<name>` reaches every owner that binds the name, so a patch of
+`bulk_pace_delay` reaches the re-embed sweep. No owner imports the facade, and an owner that
+logs does so under the facade's logger name. `ImportChunkBudgetError` carries
+`kiro_crew.knowledge.ingestion` as its `__module__`, so a traceback names it by its import
+path. New budget work goes to `ingestion_budget.py`, new re-embed or job-row work to
+`ingestion_rebuild.py`, and new pipeline work stays in `ingestion.py`;
+`test/test_ingestion_facade.py` pins the family.
+
+## Constants
+
+| Constant | Value | Location | Purpose |
+|----------|-------|----------|---------|
+| `FileReader.SUPPORTED` | see below | `readers.py` | Extensions the watcher/reader will ingest |
+| `DEFAULT_POOL_SIZE` | `3` | `llm_pool.py` | Worker count in a pool |
+| `DEFAULT_TIMEOUT` | `60.0` | `llm_pool.py` | Per-message worker timeout (extraction) |
+| `FETCH_TIMEOUT` | `120.0` | `llm_pool.py` | worker timeout |
+| `FETCH_TIMEOUT_SECONDS` / `MAX_PAGE_BYTES` | `30.0` / 5 MiB | `url_fetch.py` | one web-page fetch, all hops included; the hop limit is `link_unfurl.MAX_REDIRECTS` |
+| `AGENT_NAME` | `"kirocrew-knowledge"` | `llm_pool.py` | kiro-cli agent the ACP worker drives |
+| `_VALID_SANDBOX_MODES` | `{auto, standard, strict, cc, off}` | `llm_pool.py` | Accepted `agent.sandbox` values |
+| `HARD_SKIP_DIRS` | `{.git, node_modules, __pycache__, .venv, venv, dist, build, out, target, cdk.out}` | `folder_watcher.py` | Directories never walked |
+| `_LARGE_REBUILD_WARN_THRESHOLD` | `1000` | `watcher.py` | Stale-item count at which the self-heal rebuild logs a prominent WARNING (usually an embedder-sig change invalidating the whole corpus) |
+| `DEFAULT_MAX_FILES` | `5000` | `folder_watcher.py` | Per-source file cap (newest-first) |
+| `CHUNK_TOKEN_SIZE` | `800` | `chunker.py` | Target chunk size in estimated tokens (`_word_count`): a space-separated word is 1.3; in a script written without spaces (`_UNSPACED`: CJK, kana, Thai, Lao, Myanmar, Khmer, full-width forms) each character is 1, and other characters in that run about 4 per token. A run with no unspaced script is one word however long. An unspaced run too large for one chunk is cut into slices of the source |
+| `CHUNK_OVERLAP` | `200` | `chunker.py` | Chunk overlap, in the same estimated tokens; an unspaced tail is cut to this budget rather than copied whole |
+| `MAX_CHUNKS_PER_FILE` | `50` | `chunker.py` | Most chunks one document becomes. A document that splits into more merges neighbouring chunks (`_merge_plan`, `_fit_cap`) instead of dropping its tail |
+| `MAX_MERGE_WIDTH` | `4` | `chunker.py` | Most pieces one stored chunk merges, so a stored chunk stays a few times `CHUNK_TOKEN_SIZE`. A document past `MAX_CHUNKS_PER_FILE` x `MAX_MERGE_WIDTH` pieces keeps the first ones and logs a warning naming how many were indexed |
+| `VECTOR_RRF_WEIGHT` | `2.0` | `retrieval.py` | Weight of the vector leg in RRF fusion |
+| `DEFAULT_MODEL` | `"qwen3-embedding:0.6b"` | `embedder.py` | Embedding model the in-process runtime loads, and the fallback id when the active backend cannot be reached to name itself; the live identity is `get_shared_embedder().model_id` |
+| `TIMEOUT` | `10` | `embedder.py` | Retained for config compatibility (`knowledge.embed_timeout_secs`, positive-only; 0/unset/negative → this default). The in-process runtime has no per-request call for it to bound |
+| `_EMBED_CONTENT_BUDGET` | `(CHUNK_TOKEN_SIZE + CHUNK_OVERLAP) * 10` | `embedder.py` | Chunk-content fold budget (chars). Overridable via `knowledge.embed_content_budget` (positive-only; folded into the embed signature so a change re-embeds) |
+| `ANY_EMBEDDING_SPACE` | `"<any-embedding-space>"` | `retrieval.py` | Named opt-out from the vector leg's `embedding_sig` predicate; the only value that drops it |
+
+`VECTOR_RRF_WEIGHT` has a consequence worth naming here: because the vector leg outweighs the keyword leg, a document only the keyword leg found can be truncated away by fusion even when it is the single right answer. `HybridRetriever.search` compensates by **appending** that document (§4, "RRF fusion") rather than by retuning the weight — no weight setting both keeps semantic dominance and keeps the literal match.
+
+## 1. FileReader & supported formats (`readers.py`)
+
+`FileReader.read(path)` returns `(text, meta)`. It first refuses sensitive paths — `is_sensitive_path(path)` raises `PermissionError("Refusing to read sensitive path: …")` before any open — then dispatches by lower-cased extension.
+
+`FileReader.SUPPORTED` (`readers.py`) is the ingestion allowlist:
+
+```
+'', '.md', '.txt', '.org', '.py', '.java', '.ts', '.js', '.rs', '.go',
+'.html', '.htm', '.docx', '.pdf',
+'.adoc', '.asciidoc',
+'.csv', '.log', '.json', '.jsonl', '.ndjson', '.yaml', '.yml', '.sh', '.rb', '.ps1', '.psm1', '.psd1', '.php', '.phtml', '.c', '.cpp', '.h',
+'.cs', '.kt', '.kts', '.swift', '.scala'
+```
+
+It includes markdown/plain-text (`.md`/`.txt`/`.org`, AsciiDoc `.adoc`/`.asciidoc`; `.asc` is excluded because it also names PGP armor), source-code extensions, and the two binary formats with declared optional deps (`.pdf` → pdfplumber, `.docx` → python-docx).
+
+**`SUPPORTED` must be a superset of `ingestion.CODE_EXTS`.** The two sets are hand-maintained and overlap: `SUPPORTED` gates the folder scan (`folder_watcher._walk`, and a source's `include_extensions` can only narrow it), while `CODE_EXTS` picks the code-aware chunker. A code extension present in `CODE_EXTS` but absent from `SUPPORTED` is therefore skipped before any reader runs — a folder source over such a repo ingests only its README and config, with no error. `test/test_knowledge.py` pins the subset relation so the two cannot drift again.
+
+**Dispatch (`_DISPATCH`, `readers.py`)** routes only `.pdf`/`.pptx`/`.docx`/`.html`/`.htm`/`.adoc`/`.asciidoc` to specialized readers. Anything else — including `.org`, `.txt`, `.md`, and every source-code extension — falls through to the generic `_read_text` path and into the generic chunker downstream. So `.org` is treated as plain text; there is no Org-mode-specific parser. Text decoding (shared by `_read_text` and `_read_html` via `_decode_text_bytes`) is a single-open buffer decode: BOM-sniffed UTF-16 LE/BE first, otherwise UTF-8 with a latin-1 fallback. The UTF-16 branch is extension-agnostic — any text format arriving as BOM'd UTF-16 decodes correctly, not only the PowerShell files (Windows tooling writes UTF-16LE) that motivated it.
+
+**`.pptx` is intentionally out of `SUPPORTED`** even though `_read_pptx` exists: python-pptx is not declared in `setup.cfg`, so the format is kept off the allowlist (the comment at `readers.py` documents this). Reachable only if `.pptx` were re-added to `SUPPORTED`.
+
+**Binary/optional-dep readers** degrade gracefully — a missing optional import returns an `{'format': 'error'}` meta with an install hint rather than raising:
+- `_read_pdf` — pdfplumber, run in a memory-bounded child (`kiro_crew.pdf_extract`,
+  `extractor` rlimit profile: `RLIMIT_AS` 1 GiB / `RLIMIT_CPU` 60 s; the file handle is the
+  child's stdin). Concatenates per-page text, records `page_count` (pages opened), and caps
+  the document at `_PDF_MAX_CHARS` characters / `PDF_MAX_PAGES` pages / `_PDF_WALL_SECS`
+  wall seconds, setting `truncated: True` when a cap cut it. A child stopped by its ceiling
+  is the ordinary `format: 'error'` result, which `ingest_file` records as a per-file
+  failure. The child releases each page immediately after extraction (`Page.close()` when
+  available, `flush_cache()` for pdfplumber 0.10). Shared with file-grep's document pass
+  (`file-search.md`) so the two call sites cannot drift in what they bound.
+- `_read_docx` — python-docx; extracts body and table-cell paragraphs in document order, including nested tables, each physical merged cell once, and content-control (`w:sdt` / `w:customXml`) wrappers. Converts `Heading N` paragraph styles to `#`-prefixed markdown (`content_type: 'markdown'`); `paragraph_count` remains the top-level body paragraph count. Revision-wrapped paragraphs remain excluded.
+- `_read_html` — html2text when importable (`ignore_images=True`, `ignore_links=False`); otherwise a regex fallback strips `<script>`/`<style>` and tags.
+
+**AsciiDoc includes (`_read_asciidoc`, `_AdocIncludes`).** `.adoc`/`.asciidoc` read as text through `_read_text`, then each line matching Asciidoctor's `include::target[attrs]` form (line start, not `\`-escaped) is replaced by the target file's text, recursively, so included content is indexed inside the document that includes it. Expansion runs only when the caller passes `include_paths` (`FileReader.read(path, *, include_paths=None)` → `_read_asciidoc`; other readers ignore it), and only the folder scan does: an include may pull in **only a file the scan already selected for this source**, so every walk rule (`.kiroignore`, `ignore_patterns`, `include_extensions`, `HARD_SKIP_DIRS`, pruned dot-directories, `DEFAULT_IGNORE_GLOBS`, the `SUPPORTED` suffix filter, `is_sensitive_path`, `confine_to_root`) holds for included text at the time the includer is read. The reader adds the `os.path.normcase` real path of every target it actually inlined, at every depth and including a kernel path the fence accepted, to the caller's `included` set (`FileReader.read(..., included=...)`); a directive left as text adds nothing. The scan stores that set per includer in `folder_include_targets` and re-reads an includer once one of its recorded targets is no longer in a later walk set (see *AsciiDoc include record* in §2), so a part that is deleted, newly excluded, or rejected by any walk rule leaves the includer's copy whatever the part's own state, the includer's mtime, its place under `max_files`, or the logical path it was reached through. A target is read only when all hold: no `scheme:` prefix (URLs, Antora resource ids), not absolute, no unresolved `{attribute}`, its `realpath` lies inside the top-level document's own directory (Asciidoctor's safe-mode jail, so `../` and outward symlinks are refused even when the outside file is in the walk set) with no dot-named component below it (the walk prunes dot-directories but still selects a dot-named file such as `.env`), its `realpath` is a member of `include_paths` (the scan normcases each member once when it builds the set; the reader uses the set as given and normcases only the candidate, and a document with no `include::` never touches it), it is a regular file with no NUL byte (the walk selects `.pdf`/`.docx` too, and an include is pasted in as raw text), it is not already on the include stack (cycles), and the expansion is within `_ADOC_MAX_INCLUDE_DEPTH` (8), `_ADOC_MAX_INCLUDES` (256 directives that reach the filesystem, failed ones included), `_ADOC_MAX_INCLUDE_BYTES` (1 MB per file, checked by `fstat` before reading) and `_ADOC_MAX_CHARS` (4M chars per document). The read goes through `pinned_fs.open_fenced_for_read`: a link at the final name, a non-regular file and a hardlinked file are refused, and the kernel's own path for the opened descriptor (`fd_real_path`) is judged, as that exact string and without resolving it again, by the same jail, dot-name and membership rules whenever it differs from the checked path, so a parent directory swapped for a symlink around the open cannot redirect the read. A directive that fails any check stays in the text as written. Include attributes (`tag=`, `lines=`, `leveloffset=`) are not applied: the whole file is indexed. **Known limit:** single local-file sources, dashboard uploads, artifact ingest, agent-source docs and remote syncs never pass `include_paths`, so their include directives stay as text (may be revisited later). An included part also keeps its own entry, as intended: the scan indexes every file it selects and the includer carries the part's text for context, so a search can return both, and hits are not deduplicated across the two. `xref:` and `<<anchor>>` are links, not inclusions, and stay as text; their targets are indexed as their own documents. A folder source re-reads a document when its own mtime changes, so an edit to only an included file refreshes that file's own entry but not the includer's copy until the includer is next re-read. This is an accepted risk, including for redaction: text removed from a part by an edit stays searchable inside its includers until each includer is next re-read, and removing or excluding the part, rather than editing it, is what takes it out of the includers.
+
+Base metadata always carries `format`, `title` (file stem), `file_size`, `extension`, and a computed `line_count`.
+
+## 2. Folder discovery & scan (`folder_watcher.py`)
+
+**Namespace routing**: folder/vault sources read their target namespace from `properties["namespace"]` (default `"default"`). The `add_source` handler accepts namespace either as a top-level body field or inside `properties`; a top-level `namespace` is folded into `properties` (if dict and not already set) before storage. This ensures FolderWatcher and Watcher resolve the correct namespace at scan time via `props.get("namespace", "default")`.
+`FolderWatcher.scan_source(source)` scans a folder-type source under a per-`source_id` `asyncio.Lock` (one scan per source at a time) and returns `{new, changed, deleted, skipped, capped, failed}`.
+
+**`_walk(root, ignore_patterns, extra_skip_dirs)`** (run via `asyncio.to_thread`) is the discovery step:
+- Prunes `HARD_SKIP_DIRS`, any per-source-type extra skip dirs (`SOURCE_TYPE_SKIP_DIRS["obsidian_vault"] = {.obsidian, .trash}`), and **all** dotfiles/dot-dirs in place during `os.walk`. Build-output trees are in `HARD_SKIP_DIRS` because a rebuild presents hundreds of regenerated files as changed content; `cdk.out` (AWS CDK synth output) needs its own entry because its name only *contains* a dot, so the dot-prefix rule never prunes it.
+- Skips files that are never documents by case-insensitive basename match against `DEFAULT_IGNORE_GLOBS`. Two classes:
+  - OS junk / editor and Office lock files (macOS AppleDouble `._*`, `.ds_store`, Office `~$*`, LibreOffice `.~lock.*`, `thumbs.db`, `desktop.ini`, `*.tmp`, editor swap/backup, partial downloads). A discovered-but-unreadable file carrying a supported extension fails ingestion, is never auto-retried, and would leave a source permanently stalled below 100%.
+  - Dependency lock files (`package-lock.json`, `npm-shrinkwrap.json`, `yarn.lock`, `pnpm-lock.yaml`, `bun.lockb`, `bun.lock`, `poetry.lock`, `uv.lock`, `pipfile.lock`, `cargo.lock`, `gemfile.lock`, `composer.lock`, `packages.lock.json`, `gradle.lockfile`, `flake.lock`). These ingest successfully, which is the problem: they are large machine-generated resolution output, each chunk costs one extraction call, and regenerating one bills it again on the next sweep.
+- Applies the source's `ignore_patterns` (fnmatch against the relative path).
+- **`.kiroignore` (`kiroignore.py`)**: when the SOURCE ROOT holds a `.kiroignore`, its rules are compiled once per sweep and applied on top of everything above. Matching **directories are pruned in place** during `os.walk`, so a generated tree (`cdk.out`, coverage output) is never descended rather than filtered file by file. The rule file itself is never indexed — its extensionless name is in `FileReader.SUPPORTED`, so it would otherwise be ingested as a document.
+  - Syntax is a documented SUBSET of gitignore: `#` comments, blank lines, trailing `/` (directories only), leading `/` (root-anchored), any other embedded `/` (also anchored; a separator-free pattern matches that basename at any depth), `*` / `?` / `**`, and `!` negation where the last matching rule wins. NOT supported: `[a-z]` character classes (brackets match literally), backslash escapes other than a leading `\#` / `\!`, nested `.kiroignore` files in subdirectories, and re-including a path underneath an excluded directory (as in git).
+  - **Defensive by contract**: the file is user-authored and re-read every sweep, so an unreadable, oversized (> `MAX_FILE_BYTES` = 64 KiB) or undecodable one degrades to "no extra exclusions" and never raises mid-scan; a single unusable pattern is dropped and the rest of the file still applies. Rules are capped at `MAX_RULES` = 1000.
+  - **Encoding**: a file starting with a UTF-16 LE/BE BOM (Windows PowerShell 5.1's `Out-File` and `>` default) is decoded as UTF-16; anything else as UTF-8 with an optional BOM stripped, `errors="replace"` in both cases. Decoded text containing NUL (BOM-less UTF-16, binary) logs one WARNING per sweep naming the file and asking for UTF-8, since no rule can contain NUL and its rules match nothing.
+  - **`.gitignore` is deliberately NOT read as a fallback.** A scan treats a file that stops being discovered as DELETED and archives its items (`_handle_deleted`), so honouring `.gitignore` implicitly would, on the next sweep, drop already-indexed documents out of every existing folder source whose root happens to be a repository. Creating a `.kiroignore` is an explicit act, so the same removal is the user's intent.
+- **Extension filter**: keeps a file only if its lower-cased suffix is in `FileReader.SUPPORTED` **or** equals `.canvas` (Obsidian canvas files).
+- **Sensitive-path guard**: resolves each candidate (`Path.resolve()`) and skips it if `is_sensitive_path()` matches.
+- Returns `[(full_path, mtime)]`.
+
+**Scan bookkeeping (`_do_scan`)**:
+- **Embedding attendance is call-scoped.** Scheduled `KnowledgeWatcher` folder and
+  single-file re-ingest pass `PRIORITY_BULK` through `FolderWatcher` and
+  `IngestionPipeline`, so background work uses the reduced bulk inference pool.
+  Dashboard/manual `scan_source` and `ingest_file` calls omit the argument and retain
+  `PRIORITY_NORMAL`. The priority is never stored on the shared pipeline, so a
+  concurrent attended ingest cannot be downgraded by a watcher sweep.
+- Discovered files above `props["max_files"]` (default `DEFAULT_MAX_FILES` = 5000) are capped **newest-first** (sort by mtime desc); the surplus count is reported as `capped`.
+- **AsciiDoc include set.** `_do_scan` builds one `frozenset` of the resolved paths `_walk` itself screened (`is_sensitive_path`, `confine_to_root`) for every file it selected (the full, pre-cap walk; collected through `_walk(..., screened_out=...)`), each passed through `os.path.normcase` once, never a second resolution of the discovered names, so a name re-pointed after the walk cannot admit a file the walk rejected. It passes the include set for every file it ingests, and a fresh `included` set for each file, since the reader is picked by the resolved suffix and a `.md` link to an `.adoc` file inlines too: `_ingest_file(..., include_paths=..., included=...)` → `IngestionPipeline.ingest_file(...)` → `FileReader.read`, where only the AsciiDoc reader uses them. Every other `ingest_file` caller leaves both `None`. See *AsciiDoc includes* above.
+- **AsciiDoc include record.** `folder_include_targets(source_id, file_path, targets)` holds, per includer, the JSON list of targets its indexed text inlined; no row means it inlined nothing, which is true of every row written before the table existed (main read `.adoc` as plain text). It is a side table so the many `INSERT OR REPLACE` writers of `folder_file_state` need not carry it and an older build cannot null it; an older build ignores it, and a record it leaves stale can only cause an extra re-read. The record is replaced, or deleted when empty, only on a successful read: in the commit callback before its `done` update, before the caller's `done` write when that write lands, and inside the gate's transaction by `_record_deduped_state`. `failed`, `scanning`, `skipped` and touched-but-unchanged writes leave it, so it keeps naming what the indexed text still holds. `_handle_deleted` and `delete_source_cascade` delete it with the row. Each sweep (step 4) loads the source's records off the loop and marks an includer **stale** when it has a state row, is still in the walk, and its record does not parse or names a target outside this sweep's walk set. Staleness is recomputed from the record and the walk every sweep, so it survives a pause, a chunk-budget stop, a cancellation or a crash. The stale text leaves in that same step, whatever later stops the sweep (chunk budget, pause, a failed re-read): in one `BEGIN IMMEDIATE` (`_retire_stale_include_text`), a stale row with items has them archived (as `_handle_deleted` does), every stale row gets `item_ids = '[]'` and `text_hash = NULL`, and a `done`/`deduped`/`pending` one also gets `content_hash = ''` (a `scanning` row is re-read anyway and keeps the hash that keys its retry budget), which fails both unchanged checks (the mtime shortcut needs a non-empty stored hash), so an includer with an empty bytes hash is processed first even when its target came back before it was reached. A stale row with no items, whatever its status, first releases its claim on its previous `text_hash`, once per distinct hash, because its expanded text changes without its bytes changing, which `release_stale_claim` cannot see. The release preserves a shared claim when another document in the source has the same text hash; the shared-claim count ignores folder rows the same sweep removes and the other stale rows, each of which is re-read and re-claims through the dedup gate if it is still a duplicate. The record stays, so a sweep stopped before the re-read finds the row stale again, except on a `failed`/`skipped` row, which the scan does not re-read: its record goes and the user's retry reads it again. Every other stale row is processed first in step 5, ahead of and past the `max_files` cap, with both unchanged shortcuts bypassed. So is an includer (a row with a record) left `scanning`, since its newest group may not match its record yet, and one an earlier sweep retired but did not reach (empty `content_hash`); neither is retired in step 4 unless its record also names a target outside the walk.
+- Deletion detection uses the **full** discovered set (pre-cap) so capping never triggers false deletions; a vanished file's items are archived via `_handle_deleted` → `store.delete_items_batch`.
+- Change detection is mtime-then-content-hash: unchanged mtime with a non-empty stored bytes hash → `last_seen` bump only; changed mtime but identical SHA-256 → state refresh, no re-ingest. A stale includer skips both.
+- Claim release for a stale includer and on deletion uses the text hash, falling back to the bytes hash for legacy rows with a null or empty text hash. Ownership lookups use `COALESCE(NULLIF(text_hash, ''), content_hash)` so a surviving legacy plaintext copy still preserves a shared claim. This fallback cannot reconstruct a missing transformed-text hash.
+- Batched `last_seen` flush/commit and stale-claim release run off the asyncio
+  event loop; each flush and its commit stay within one worker hop so they share
+  the thread-local SQLite connection.
+- Per-file state lives in the `folder_file_state` table with `status` ∈ `{done, scanning, skipped, failed, deduped}`. `scanning` is written **before** ingest so a crash mid-file is recoverable; `skipped`/`failed`/`deduped` files are not auto-retried (user must retry).
+- **The committed group is recorded inside the commit hop, and never over a verdict.** `_ingest_file`'s `on_committed` callback turns the `scanning` marker into the `done` row in the pipeline's finalize hop; a write that fails (writer-lock contention) is retried once there under `BEGIN IMMEDIATE`, and a second failure is swallowed so it cannot poison the committed ingest. The scan's own terminal write (`_settle_done`) then lands only while the row is still `scanning`, read and written under one `BEGIN IMMEDIATE` in a `run_to_completion` hop. Once the callback's write lands the row is a `done` row the dedup sweep enumerates, so a collapse may already have deleted the group and marked the row `deduped`; writing the captured ids over that would name deleted items, and the sweep's verdict stands instead.
+- **TOCTOU defense**: `_ingest_file` re-resolves symlinks and re-checks `is_sensitive_path` at ingest time; a block writes `status='failed'` and emits an SEL `knowledge.source.file.ingest_denied` (`outcome="denied"`, `reason=sensitive_path_toctou`) audit event.
+- After a successful scan, each newly ingested/changed file gets a **targeted** cross-source dedup (`dedup_document(..., apply=True)`) — O(k·n) over the k changed files rather than a full O(n²) corpus sweep — so a folder copy collapses any matching one-shot upload.
+- Fuzzy filename matching compares valid ISO dates with their year intact: a numeric date whose span falls wholly inside a valid ISO span is not also parsed as a yearless date, while a numeric date that only partly overlaps an over-matched ISO span keeps its own explicit year. Reports dated a year apart therefore remain distinct even when their embeddings are nearly identical, including date-range filenames such as `04-01-2024_04-30-2024`. Malformed ISO-shaped tokens remain available to the generic numeric-date guard, and genuinely separate numeric dates in the filename still participate in the closest-date comparison.
+- **The dedup unit is always the DOCUMENT, never the source.** For a folder source a document is a `folder_file_state` row; for everything else it is one `content_hash` group of `items` (`enumerate_docs` groups by `(source_id, content_hash)`), so an aggregate source holding many documents (`artifact`, `agent`) dedups per document like any other. `_collapse_doc` drops the loser document's items and marks its owning state row `deduped` so nothing re-ingests it; it removes the source row only once the source is provably empty (`_source_is_now_empty`: no items, no state rows, and not a folder/vault), which is what keeps a collapsed one-shot upload from lingering as an empty row. There is no source-level unit and no carve-out for aggregate source types: a carve-out at that level would mean aggregate documents were never deduped at all.
+- **Scheduled sweeps.** `KnowledgeWatcher._maybe_dedup_sweep` runs a full `dedup_sweep` every `knowledge.dedup_every_n_sweeps` sweeps (default 12, ~hourly at the 300s interval; 0 disables). The targeted per-ingest call and the pre-ingest exact-hash gate cannot catch a near-duplicate or a pre-existing one, so the periodic pass is required for duplicates to actually be collapsed.
+- **One document, several locations.** A document held by two sources is ONE stored copy with a `source_locations` row per source, not two copies where one is destroyed. A collapse attaches the loser's source as a location of the winner's items, deletes the loser's redundant copy, and records `merged_into_source_id` on the loser's state row. Three consequences follow, and each closes a way a copy-per-source design would lose data: `delete_source_cascade` re-points `items.source_id` to a surviving holder instead of deleting a document another source holds (`reassign_item_source` is the only path that moves ownership, since `_ITEM_COLUMNS` deliberately excludes the column); deleting the winner clears the marker so the document is ingested again rather than stranded; and "empty source" means holding nothing by location either, in both the dedup check and the post-bind orphan sweep (`reclaim_orphans`), because reaping a source would delete the very rows recording co-ownership. The marker names a SOURCE and never the winner's item ids: `item_ids` means "the items this row owns", and dedup derives a document's hash and embedding from whatever it points at, so a row naming the winner's items would be enumerated as a second document over one physical item set — and collapsing that pair deletes the surviving copy. `_match_reason` refuses any pair whose `item_ids` overlap for the same reason. Per-source counts report what a source HOLDS, while the Library total counts documents, so a shared document is visible under both sources without inflating the total.
+
+- **Pre-ingest duplicate gate.** `IngestionPipeline._skip_as_duplicate` refuses a write whose whole-text `content_hash` already exists in another source, on every ingest path, recording a terminal `ingestion_jobs` row with `status='skipped_duplicate'`. Refusing is not the same as doing nothing: the items the call was going to REPLACE are deleted first, because the document's content changed to something already stored elsewhere and its previous items are superseded. Leaving them would keep the old text searchable and — since the state row is then recorded with an empty group — unreachable by the deleted-file path. A folder file refused this way is marked `deduped` rather than `done`; an artifact or agent document gets the same marker in its item-state row so the owning sync does not retry a write the gate will refuse again. The gate is not order-blind: it consults the same `PERSISTENT_SOURCE_TYPES` ranking `pick_winner` uses, so an incoming **persistent** source (folder / vault / wiki) is allowed to land when the current holder is **transient** (a one-shot upload or chat capture), and the post-ingest sweep then collapses the pair keeping the persistent copy. Refusing on arrival order alone inverted that ranking: the folder copy was marked `deduped`, the only searchable copy stayed inside the upload, and deleting the upload left none. Equal rank still refuses, which is the cheap path — it skips the chunking and extraction the sweep would immediately undo. Exact-hash only — the fuzzy tier needs embeddings and cannot run inline. The whole gate is ONE `BEGIN IMMEDIATE` transaction that re-reads the holder **under the write lock** and declines to dedupe when it is gone (a cheap unlocked probe runs first so the common not-a-duplicate answer does not serialize every ingest): it makes the incoming source DEPEND on the holder, so a concurrent `delete_source_cascade` must not cascade that copy away in between. The scan's terminal `deduped` write (`FolderWatcher._record_deduped_state`) takes the same lock and derives the file's item group from **its own row** instead of assuming it empty, because a cascade landing after the gate committed reassigns the surviving item to this source and can adopt it into that row; predicting `[]` there would erase the adoption and leave the last copy owned but named by no row — unreachable by the deleted-file path and undeletable. The derivation is row-scoped, never by `(source_id, content_hash)`: two documents in one source may legitimately hold identical text, and a hash-scoped read would name one physical item into both rows, destroying it on the first delete of either. **All three doc-state tables do this**, through the one primitive `KnowledgeStore.surviving_group_in_txn(table, source_id, key)` — `folder_file_state` keyed by `file_path`, `artifact_item_state` and `agent_item_state` by `slug` (`_DOC_STATE_KEY_COL`). An aggregate row that ends up owning items is written `active`, not `deduped`, because `find_document_by_hash` only matches `active` and a row owning content while reporting `deduped` would let the same text in again under a second slug. Every one of the three takes `BEGIN IMMEDIATE` and therefore runs off the event loop through `run_to_completion`; `test_deduped_state_writes_are_never_called_on_the_event_loop` is the ratchet. **Known gap, pre-existing and folder-only:** for a transformed file (PDF/DOCX/HTML) the adoption itself matches nothing, because `_adopt_reassigned_item` keys on `COALESCE(text_hash, content_hash)` and a refused folder row derives `text_hash` from a byte-identical sibling row it may not have — so nothing lands in the row for the terminal write to preserve. The aggregate tables store the text hash in `content_hash` directly and are unaffected. Closing it needs the incoming document's text hash carried out of the gate rather than derived from a sibling.
+- **Legacy items with a null `content_hash` are not exact-matchable.** The column arrived by `ALTER TABLE`, so rows written before it are null, and tier-1 requires both sides non-null — on a real Library that was 435 of 526 folder items. Those documents reach de-duplication only through the filename+embedding tier. Backfilling is NOT done here: the extracted text is not retained, so the pipeline's hash cannot be reproduced, and any derived value has to be grouped per DOCUMENT (`folder_file_state` / item-state rows) rather than per source — grouping by source gives every file in a folder one identical key, which the sweep then reads as an exact match and collapses. What IS enforced is that every ingest path stamps the column, asserted by test, so the gap cannot grow.
+
+## 2b. The agent's write path (`agent_source.py`)
+
+One path adds documents without the user registering a source by hand, and it is the
+agent's: the `knowledge_add_document` MCP tool, gated off by default on
+`knowledge.auto_add_documents`. **Nothing registers a file or folder on its own.**
+
+**No auto-registration of any kind.** There is no workspace drop folder, no
+per-project document discovery, and no config key that turns either on. Such a path
+would register directories the user never named and spend LLM extraction on them with
+no confirmation step, which is the property ruled out here — an opt-in default does not
+make it acceptable. A folder enters the Library exactly one way: the user adds it and
+confirms it. See `docs/system-specs/post-launch-removals.md`.
+
+The per-folder safety properties are generic and reachable from any hand-added source:
+`confine_to_root` (a file whose resolved path lands outside the registered root is
+skipped — `os.walk` does not descend a directory symlink, but a file symlink IS
+followed on open), the `max_files` cap, and `folder_chunk_budget` pacing.
+
+**Agent-added documents (`agent_source.py`).** The `knowledge_add_document` MCP tool
+lands documents in one aggregate `agent://` source named "Auto-added", with per-document
+groups in `agent_item_state` keyed by a slug derived from the document's `source_uri` and
+never from its content, so an edit replaces the group rather than accumulating copies. The
+identity must not be the title alone: two unrelated documents are both routinely called
+"README", and since a matching key means "same document, replace it", a title-keyed group
+lets the second add delete the first document's items. It routes
+through `IngestionPipeline.ingest_file` — one ingestion path — and content and title are
+redacted before they cross into the store. Adds are serialised by a module lock, because
+new items are attributed to a document by diffing the source's item ids around the
+ingest.
+
+**The Auto-added row has nothing to sync.** Kiro Crew fetches nothing for it: its
+documents arrive only when the agent submits text. Its uri `agent://` is a control uri,
+not a URL, so `POST /api/knowledge/sources/{id}/sync` never hands it to the agent
+web-page fetch, whose failure would leave the row in a sticky `error`. The request
+answers 409 `source_not_syncable` and the row's status is unchanged. `GET
+/api/knowledge/sources` carries the same rule as a per-row `syncable` flag (false only
+for this row), and the Sources list offers Sync from that flag, so the button and the
+refusal cannot drift apart. In place of the "manual" hint, which points at the Sync
+button, the row says "added by agent", with a tooltip saying there is nothing to sync.
+
+**Ownership is recorded from inside the ingest, not after it returns.** The items become
+durable during `ingest_file`; `ingest_file` therefore takes an `on_committed` callback and
+invokes it in its finalize hop, on the success branch, right after the superseded group is
+deleted. The ids it hands over are **collected at each `add_item`**, not inferred from a
+before/after comparison of the source: `import_bundle` writes into the same aggregate in
+its own transaction and under no shared lock, so a comparison would attribute anything it
+committed meanwhile to whichever document happened to be ingesting — giving that document
+delete authority over knowledge it never created, and destroying it on the next edit. Writing the group
+afterwards instead would leave several awaits — the temp-file cleanup, the job-status read
+— between the items existing and the record that makes them replaceable, and each is a
+cancellation point on the gateway loop. Interrupted there, nothing names the items, and
+**both** of the aggregate's duplicate defences read that same row: `get_state` reports no
+previous group, so the next add replaces nothing and `find_document_by_hash` cannot see
+the content either. The document is then stored twice, and because replacement is what
+carries delete authority, an edited re-add leaves the superseded version searchable
+permanently. Running inside the hop gives the ownership write the same run-to-completion
+guarantee as the delete it belongs with. The `deduped` marker is written by the caller
+instead, because the duplicate gate returns before the hop ever runs.
+
+**The superseded group's delete and the new ownership row commit as ONE transaction.**
+The agent path passes `on_committed_in_txn=True`, so the finalize hop opens one
+`BEGIN IMMEDIATE`, runs `delete_items_batch_in_txn` on the old group, invokes
+`on_committed` (which writes the row and clears this attempt's intent marker without
+committing), and commits once. Run-to-completion covers a cancellation, not a hard kill
+or a raising write. Committing as one transaction is what keeps a crash from leaving
+the old version deleted and the new version named by no row with its intent marker
+present, a state the residue sweep below would read as crash residue and reap,
+deleting the document's only copy. A raise inside the callback rolls the delete back
+with it. The folder and artifact
+paths keep the two-step form; their owners never reap on intent markers.
+
+**The residue sweep never deletes a document's sole surviving copy.**
+`KnowledgeStore.reclaim_agent_source_residue` reaps unowned agent items only on positive
+evidence (an `agent_ingest_intent` marker naming their hash, created at or after the
+attempt began). Its first step, `_adopt_agent_sole_copy_residue`, covers the one case where
+that evidence names a document's last copy: a slug whose ownership row names a non-empty
+group of which no id still exists in `items` at all (an item set non-active, or detached
+to another source, still exists and keeps the row's claim). The unowned items of EVERY
+marker at that slug are ADOPTED into the row (group and `active` status rewritten) and
+those markers are retired; nothing at the slug is reaped. The row's `content_hash` is
+cleared rather than set to an attempt's hash: chunk sets carry no completeness marker, so
+a hard kill after any chunk commit leaves residue that looks the same as a finished
+attempt, and a matching hash is what makes the next add of the same text return
+"unchanged since last add" -- a truncated attempt adopted under it would never get its
+missing chunks written. Keeping every attempt rather than the newest follows from the
+same gap: the newest may be a truncated edit and an older attempt the last complete
+version. The next add at the slug, of any content, replaces the whole adopted group. Until
+then the group is left out of de-duplication: `enumerate_docs` keeps its items claimed but
+builds no document for them, because a mixed group has no single hash and an exact match on
+any one attempt's hash would delete the other versions with it. A
+first-add crash (no row) and a row that owned nothing (refused / `deduped`) are reaped as
+before, since nothing was replaced. A hash marked at more than one such slug cannot be
+attributed to one document and is spared — neither adopted nor deleted — and so is every
+other attempt at a slug holding one. The state cannot tell a crash apart from a user
+having deleted every item of a document while a stale marker for it remained; that case
+now adopts the (already searchable) residue rather than reaping it, which is accepted: it
+keeps content rather than losing it. A store written before the transaction above existed
+is repaired by this step rather than emptied.
+
+The tool takes the document TEXT and **never opens a file**. A path opened here on
+behalf of whatever supplied it is exactly the case where a component can be swapped for a
+link to a credential file between the check and the open, and a path pointing at a binary
+crashes the decode. Text the agent has already read carries no such window: it was read
+through the agent's own file tools, under their approval and audit. Documents that
+arrive fetched are text to begin with, and documents in the user's project reach the
+Library through a folder source the user registers, which scans through the guarded
+folder path.
+
+`source_uri` is an **opaque identity label**, not a read instruction: it is redacted,
+capped, stored and hashed, and never opened, resolved, stat-ed or fetched. It is
+**required**, because a title does not identify a document. The identity is hashed from
+the RAW uri while only the redacted form is stored or audited — redaction is lossy, so two
+uris differing only in a same-length credential-shaped segment reduce to the same string,
+and hashing that would merge two documents into one group. A caller needing the bytes at
+that location reads them itself and passes `content`. The redacted form is persisted in
+`agent_item_state.source_uri` on every state write, and citation enrichment attaches it
+to the document's search hits (§4), so a reader can see where the adding agent said the
+document came from — the value is writer-supplied and never resolved, so it is a stated
+origin, not a verified one — while `agent://` stays the aggregate row's control uri
+only. Rows written before the column existed carry NULL and fall back to the aggregate
+uri; a later add of the same document backfills them, including the unchanged-content
+duplicate shortcut, which writes no state row and therefore repairs the locator
+in place.
+
+This replaces the never-built server-side doc-link scanner. Rather than Kiro Crew
+regex-matching links in chat and fetching them unattended, the agent reads the document
+with its own tools under its own approval and hands over text. Kiro Crew fetches nothing,
+so `knowledge.doc_ingest_hosts` — whose default is `[]` = deny-all — must NOT gate this
+path, or the feature would ingest nothing on a default config while its toggle read on.
+
+**Chunk budget.** `folder_watcher._do_scan` orders discovered files newest-first
+unconditionally and stops once a sweep has ingested its budget of chunks. Files not
+reached keep (or lack) their `folder_file_state` row, so the next sweep resumes from
+them — the existing `status` column already carries the resume point. Every folder
+source is budgeted by `knowledge.folder_ingest_chunk_budget` (resolved by
+`folder_watcher.folder_chunk_budget`, overridable per source via a `chunk_budget`
+property, 0 = unbounded), capped in turn by the watcher's global
+`knowledge.sweep_chunk_budget`. A folder still gets ingested in full; the budget only
+decides how fast. It applies to the confirm- and resume-triggered scans as well as the sweep,
+because the confirm scan is the largest burst — nothing is ingested yet, so every
+discovered file is new.
+
+The watcher's **single-file `local_file` loop draws from the same global counter**,
+and the two populations **alternate which spends the budget first** on the sweep
+counter's parity — so sustained pressure from one side (a churning folder source,
+or many changed single files) delays the other by at most one sweep, never
+permanently. The single-file loop walks rows **least-recently-attempted first** — every served row (committed,
+deduped, oversized, or failed) stamps `sweep_attempted_at` into its properties and
+rotates to the back, with `last_synced` as the fallback key for never-served rows —
+so under sustained contention every source makes progress and a persistently
+failing row cannot hold the front of the order while its charged attempts consume
+the budget. It checks the remaining
+`sweep_chunk_budget` allowance per row and charges back the
+**attempted** chunk total the pipeline's `on_progress` callback reports for the
+`extracting` phase — the calls the budget meters are extraction calls, and they are
+spent whether or not the write later commits, so a rolled-back partial ingest still
+charges (never a `get_job_status` read-back, which is blocking SQLite on the event
+loop). The gate sits below the existence check and defers with a per-row `continue`
+rather than the folder loop's `break`, so zero-cost `sync_status` upkeep (the
+'missing' marker) still lands on a sweep whose folder sources spent the whole
+budget. A deferred row's `mtime`/`content_hash` stay unrecorded so the next sweep
+resumes from it. Terminal outcomes are latched from the pipeline's `on_committed`
+(fully committed) and `on_duplicate` (pre-ingest gate refusal) callbacks: only those
+persist bookkeeping, so a rolled-back partial ingest stays retryable — bounded by
+the attempted-charge above — instead of being parked behind a recorded hash while
+the superseded document stays searchable.
+
+**On battery.** `power.on_battery` (`normal` | `reduced` | `paused`, default `normal`)
+gates `KnowledgeWatcher._scan`, the background sweep that runs the folder loop, the
+single-file loop, the stale re-embed tail and the scheduled dedup. `_battery_budget`
+decides once per sweep and the decision is latched, so unplugging midway never
+aborts work in flight. `normal`, or any power source other than `POWER_BATTERY`
+(`POWER_UNKNOWN` included, see [platform-compat](../common/platform-compat.md)),
+leaves `sweep_chunk_budget` unchanged, and the power source is read only when the
+mode throttles. On battery, `reduced` spends a quarter of the budget
+(`BATTERY_REDUCED_DIVISOR`), never below `BATTERY_REDUCED_FLOOR_CHUNKS` and never
+above the configured budget; an unbounded budget (0) is bounded by a quarter of the
+default. `paused` returns before the sweep reads anything, and sources resume on
+the first sweep back on mains. An explicit add never runs through `_scan`: uploads,
+the agent's write path and artifacts call `ingest_file` directly, and confirming or
+resuming a folder source calls `FolderWatcher.scan_source` directly, so the policy
+never blocks them. That folder scan is still paced by `folder_ingest_chunk_budget`,
+though: the rest of a folder larger than one batch arrives through `_scan`, so under
+`paused` it waits for mains like any other sweep work.
+
+**Explicit-import chunk ceiling.** Every budget above governs a WATCHER sweep. The
+explicit one-shot import routes reach `IngestionPipeline` directly and no sweep
+counter ever sees them, so they carry their own cross-file ceiling:
+`ImportChunkBudget` in `ingestion_budget.py`, sized by `knowledge.import_chunk_budget`
+(0 = disabled, the default) over a rolling `_IMPORT_CHUNK_BUDGET_WINDOW_SECS`
+window. A single file is already capped at `MAX_CHUNKS_PER_FILE`; this bounds the
+cost ACROSS files, which is the shape a run of deliberate adds has.
+
+*Counted by default, exempt only where something else bounds it.* The opt-out is
+`ingest_file`'s `count_toward_import_budget`, defaulting to `True`, so a new caller
+is counted unless it asks not to be. `ingest_text` carries no such flag: only the
+sweeps opt out, and none of them reach it. Read that default as the rule and this
+list as its only exceptions -- a new path (a new connector, say) inherits the
+ceiling deliberately rather than by forgetting a keyword:
+
+| Path | Counted? | Why |
+|---|---|---|
+| dashboard single-file add, multipart upload, agent `knowledge_add_document`, direct text ingest, remote connector sync | yes | no other counter sees them |
+| auto-research add-to-knowledge (§7) | yes | a user's click with no bound of its own |
+| folder-watcher sweeps, single-file sweep | no | bounded by `sweep_chunk_budget` / `folder_ingest_chunk_budget` above |
+| artifact-sync reconcile | no | bounded per reconcile by `RECONCILE_INGEST_BUDGET` |
+
+*Reserve / settle / release.* The true chunk count is unknown until after an await,
+so `reserve()` books `MAX_CHUNKS_PER_FILE` as a placeholder INTO the window at
+admission, and every concurrent `reserve` sees it -- without that, N simultaneous
+imports would each pass before any recorded. `settle(token, n)` reconciles it down
+to the real count once the fallible finalize has succeeded, keeping the RESERVATION
+timestamp so the window expires the cost from when the import began; `release` in a
+`finally` reclaims a token on every non-settling exit, including the no-op success
+paths (content-hash unchanged, dedup-refused) that would otherwise strand a
+placeholder. An OPEN reservation is exempt from window pruning, so an import slower
+than the window cannot age out of the ceiling it occupies while it is still running.
+Trip behaviour is a reasoned refusal, never truncation: `ImportChunkBudgetError`
+carries budget, window and spend.
+
+*Admission before acceptance.* A route that answers the client and ingests
+afterwards cannot discover a refusal in its background task -- the multipart upload
+route's staged temp file is the only server-side copy, so a late refusal would
+discard a file the client was told had been accepted. Such a caller reserves with
+`reserve_import_budget()` before responding, answers `429` on refusal, and passes
+the token to `ingest_file` with `count_toward_import_budget=False`. That flag is
+required, not decorative: a disabled budget admits with a token of `None`, so
+leaving the flag `True` would re-enter the budget on a second config read.
+`release_import_budget` reclaims a token the caller never handed over.
+
+**Cost visibility.** `POST /api/knowledge/sources` walks a folder before ingesting
+anything and returns `file_count`, `capped_file_count`, `estimated_chunks`,
+`estimated_llm_calls` and `chunk_budget_per_sweep` alongside the
+`pending_confirmation` status. The walk uses `folder_watcher.walk_filters`, the same
+filter set the sweep applies, so the count describes the files that would actually be
+ingested. The chunk figure is derived from the chunker's target size and file bytes
+(`_estimated_chunks`), never measured: it exists to show order of magnitude before the
+user confirms, and no code path treats it as a bound.
+
+**Web-page sources and the fetch allowlist.** A source with no connector (the
+dashboard's Web Page type is `url`) is fetched by the gateway itself,
+`url_fetch.fetch_page`, and handed to `ingest_file` like an upload: decoded (HTML by
+`link_unfurl.decode_html`: the header's charset, then a `<meta charset>`, then UTF-8; text and
+Markdown by the header's charset, else UTF-8, never sniffed from their prose), scrubbed with `security.redact` (outside
+text, and `ingest_file` scrubs only an agent-added document itself), and staged as
+UTF-8 under the suffix of its content type (`.html`, `.txt`, `.md`; anything else is
+refused). No
+agent is involved and no worker gains a tool. `knowledge.doc_ingest_hosts` gates it,
+read fresh on every use, and two checks run on the first URL and on every redirect
+hop:
+
+- `url_fetch.url_fetch_refusal`, the user's rule: `https://` only, port 443 or none,
+  no userinfo, no backslash, whitespace or control character, an ASCII host, and that
+  host equal to a listed entry (case and a trailing dot aside, no subdomain match).
+- `link_unfurl.vet_unfurl_url`, the network rule: one resolution, and every address
+  must be public (loopback, private, link-local, CGNAT and the metadata endpoint are
+  refused, tunnel encodings unwrapped). The request then goes through
+  `link_unfurl.pinned_connector`, so the socket can reach only the addresses that
+  check approved: a second DNS answer cannot move it (DNS rebinding), and a redirect
+  hop is resolved and checked again.
+
+A redirect is followed only to the same host (`url_redirect_off_host` otherwise), at
+most `MAX_REDIRECTS` times. The whole fetch is bounded by `FETCH_TIMEOUT_SECONDS`, and
+the body by `MAX_PAGE_BYTES` while it is read (never by trusting `Content-Length`);
+a page over the cap is refused, not truncated. The request asks for `identity` and
+does not decompress, so the cap bounds the bytes held; a compressed answer is refused. The rule runs at three points:
+`add_source` refuses the row (403 `url_host_not_allowed`, otherwise 400 with the
+rule's code), `POST /sources/{id}/sync` refuses before any status write, and the
+background task reads the list again before it fetches, so a host removed after the
+request was accepted is not fetched. Every refusal writes `source.add_denied` or
+`source.sync_denied` to the security event log with the rule's code. The list is
+empty by default, so a default config fetches nothing. A load that could not read
+`config.json`, `config.local.json` or the knowledge section whole fails closed:
+`_doc_ingest_hosts` raises `DocIngestHostsUnavailable`, add and sync answer 503
+`doc_ingest_hosts_unavailable`, and the background task ends in `error`, because the
+loader's defaults are not the user's list. `GET /api/knowledge/config` returns the
+list as `url_allowed_hosts` (`null` when it cannot be read); the add form re-reads
+it each time it opens, reports a failed or `null` read as an error, never as an
+empty list, and offers the `kirocrew config set` command row
+while the list is empty or the typed link's site is not on it (prefilled with the listed
+sites plus that one, the Add button held until it is listed).
+
+## 3. LLMPool workers (`llm_pool.py`)
+
+Entity extraction (`EntityExtractor`) acquires workers from **workload-isolated** `LLMPool` instances — provider-agnostic, bounded pools of **long-lived** ACP workers (the extraction pool sized by `knowledge.extraction_pool_size`, default `DEFAULT_POOL_SIZE` = 3). A `Worker` ABC has two concrete paths:
+
+- **Default (kiro-cli)** — `AcpWorker` drives the `kirocrew-knowledge` agent over ACP (`AGENT_NAME`). That agent is installed by `agent_materialization/service_agents.py:_install_knowledge_agent`. Its model resolves `knowledge.extraction_model` → `agent.model` → `"auto"` (`kiro_crew.agent.knowledge_agent_model`; the installer writes it into the spec, which kiro-cli reads, and `AcpWorker._spawn_client` hands the same pin as `model=` to every other harness, which reads no spec of Crew's), and it declares no MCP servers and no tools (`mcpServers: {}`, `tools: []`, `includeMcpJson: false`). That spec is meant as a total ban. The agents directory is shared, and a tool that rewrites every spec in it (a launcher adding its own MCP server to `tools`, `allowedTools` and a `permissions` block) would otherwise leave the pool refusing every batch until the next rebuild re-derives the spec. So `AcpWorker._spawn_client` first calls `service_agents.repair_knowledge_agent_spec` off the event loop, on every backend, before each spawn. It compares the file, parsed and type-strict, against the governed template, and rewrites it through the same governed tail when the two differ or the file cannot be read as a spec, logging a WARNING that names the differing top-level keys and never their values. A write this data home may not make (`SharedAgentHomeRefused`) or one that fails leaves the file as it is, and the confirmation below still decides. One change can be left in the file for a Kiro worker. A tool that rewrites every spec on each of its launches would otherwise take turns on the file with this repair forever, so a downstream edition may register a filter for that tool's exact injection (`agent_spec_injections.register_spec_injection_filter`). The public core registers none. When a registered filter turns the file back into exactly the governed template, the repair leaves the file alone, logs that once per filter per process, and the native skill projection builds the agent's view from the template itself, never from the filter's output, so the view and its published alias still declare `"tools": []`. A lookalike entry, or any other change beside the injection, is repaired as before. Every other backend parses the file itself, so it is still repaired there, and a Kiro worker that got no view (projection off, or no alias) repairs the file and starts once more on it. The harness is `agent.acp_backend`, read per worker by `_get_acp_backend()` through `resolve_selected_backend` (H3) and then narrowed to a backend that answers two `SessionCapabilities` questions True: `honors_zero_tool_ban` (kiro-cli/KAS natively; claude because a zero-tool session there is started with no tool mounted at all, so no inherited `~/.claude` allow rule has one to pre-approve; opencode/goose/deepseek/pi via `AcpClient._deny_zero_tools`, which refuses every permission request — MCP or the harness's own native Bash/Read/Write — on an `AcpClient` session of an enforced-routing backend whose `SessionMcpProjection.zero_tools` is set from the same spec parse as the MCP array, by the backend's mirror or, for pi, which has none, beside its member mounts; codex is served by `AcpRuntime`, which carries no such refusal at all) and `acp_client_spawnable` (kiro, claude, opencode, goose, pi, deepseek — not kas/codex, which need `AcpRuntime` and have no arm in `AcpClient._spawn`). Today that intersection is `{kiro, claude, opencode, goose, deepseek, pi, strands}`. The resolved backend is passed to `AcpClient` as `acp_backend=`; an unselectable, malformed, or not-yet-qualifying value degrades to Kiro, and `_get_acp_backend` logs a warning naming the configured backend and which capability failed, once per backend per process. Once the session is ready, `AcpWorker.start()` confirms the ban instead of assuming it. A backend not routed through `Routing.AGENT_SPEC` must have the session's consumed projection (its mirror's, or pi's mirror-less parse) confirm `zero_tools` (`AcpClient.spec_zero_tools`), and if it does not — a missing, malformed, or shadowed spec — the worker restarts on Kiro before any prompt is sent. A worker that ends on a `Routing.AGENT_SPEC` backend (Kiro, originally or after that restart) has no mirror to confirm through, and kiro resolves `--agent` against `<cwd>/.kiro/agents` before the global directory while the pool's cwd is `config_dir()/workspace`, so a project-level `kirocrew-knowledge.json` carrying tools would shadow the installed spec. It therefore confirms the ban with `AcpClient.effective_spec_declares_zero_tools`. With a prepared projection the `NativeSkillProjection` hands the harness a view through `--agent` before the spawn, under the alias it published to the user-level agents directory, and the confirmation requires `"tools": []` in both: the captured view, and the published alias file, read after start because that file is what kiro-cli loads (a checkout cannot claim an alias name, `acp/managed_agent_shadow.py`). The authored spec is not read on this branch, so an edit to it after the view was prepared cannot change the answer. With no prepared projection (the `agent.native_skill_projection: false` / `KIROCREW_NATIVE_SKILL_PROJECTION=0` rollback, or an alias that could not be taken) kiro-cli loads the named spec itself, so `AcpWorker._spawn_client` reads the authored spec (`AcpClient.authored_spec_declares_zero_tools`, project checkout first) before each Kiro client's spawn and the confirmation reads it again after start; both reads must declare `"tools": []`. On either branch the read after start narrows a change to the file kiro-cli loads but cannot close one made and restored inside the spawn window. The confirmation runs off the event loop because both branches read a file. `AcpWorker.start()` raises `RuntimeError` without sending a prompt when the ban is not confirmed; no safer backend remains after Kiro. Effort follows the backend's capability rather than its identity (`effort_via_config_option`, `effort_via_slash_command`); a backend answering neither logs that the provider default applies and sends nothing. An effort option offering `off` alone (goose on a model with no extended thinking) sends nothing either, and neither does an opencode model with no variants, which advertises no `effort` option at all. `AcpWorker.send_message` shuts its client down on any failed send and re-raises, so the next `acquire` respawns it: a timed-out turn is still running in the child, and a reused client would answer "Prompt already in progress".
+- **`agent.provider="claude_code"` (legacy seam)** — `CCWorker` drives a long-lived `claude` CLI subprocess over stream-json I/O (haiku model, `bypassPermissions`); URL-fetch tools are opt-in via `KIROCREW_KNOWLEDGE_FETCH_TOOLS`. Its stdout stream is opened with a 10 MiB line limit (`STDOUT_LINE_LIMIT`, the ACP transports' ceiling, pinned equal by a test) rather than asyncio's 64 KiB, and stderr goes to `DEVNULL`, so the limit sizes the one pipe that is read and an unread stderr can neither hold memory nor stall the CLI; the reader drops a line over the limit, or one that is not a JSON object, and keeps reading. `_collect_response` skips values of the wrong type, takes the CLI's non-empty string `result` (the final answer) as the reply and joins the assistant text only when the result carries none, so the narration of an earlier tool-use turn never reaches the caller, and fails the message on `is_error: true`. The worker outlives a message only when that message's result event was consumed; anything else (a timeout, a dead reader, a cancelled caller, including one cancelled while the prompt write is still draining, which the same timeout bounds) retires the process so a later prompt cannot read this one's leftovers. A respawn that fails retires the old process as well, since its reader is already gone, and `is_alive()` reports a worker whose reader ended as dead. Kiro Crew's provider enum is `["acp"]`, so this branch is dormant in practice.
+
+### Sweep shielding + audit source
+
+`AcpWorker.start()` wires two protections that matter for a long-lived pool worker (`llm_pool.py`):
+
+- **Sweep shielding via `register_protected_pid`** — pool workers are direct `AcpClient` sessions, **not** `SessionMap` sessions or warm-pool providers, so the gateway's periodic orphan sweep cannot see them via `_collect_active_pids` and would SIGKILL a *busy* worker mid-task (surfacing as `ACP process exited (code=1)`). After `ensure_ready()`, `AcpWorker` registers the worker's kiro-cli PID in the sweep-protected set via `register_protected_pid` (`session_pid_tracking.py`), and unregisters it in `shutdown()` and on respawn — so the orphan sweep treats it like a live session (the same `register_protected_pid` mechanism the shared `WorkerPool` engine in `acp/worker_pool.py` applies to `ReviewPool`'s `AcpReviewWorker`).
+- **`audit_source="subagent"`** — pool workers run tools without passing through `chat_runner` or `SubagentManager`, so their tool calls would otherwise never reach the security audit log. With `audit_source` set, `AcpClient` emits an SEL `log_tool_invocation` record (`source="subagent"`, `outcome="auto_approved"`) per auto-approved tool call; the emit is offloaded to `subprocess_executor()` and bounded by `asyncio.wait_for` so a hung SEL backend never stalls tool dispatch. `None` (chat/subagent clients) never double-logs.
+
+### Sandbox parity
+
+`_get_sandbox_mode()` reads `agent.sandbox`. An **absent** value resolves to `"auto"`, the intended default: OS-level isolation, deferring to kiro-cli's own internal sandbox on macOS when that is enabled. A **present but unrecognised** value also resolves to `"auto"` (fail-secure), so a config error can never silently disable sandboxing or reach `wrap_argv` as an unknown mode. Knowledge workers honour the same `agent.sandbox` setting as chat/Slack providers (parity), so the default flows through here too.
+
+### Pool mechanics
+
+`LLMPool.start()` reads config once off the event loop and spawns all workers; `acquire()` blocks on a semaphore when all workers are busy and transparently replaces a dead worker (`is_alive()` false) on acquire. `send()` is the acquire→send→release convenience; `send_batch()` runs prompts concurrently bounded by pool size. A failed spawn during `start()` tears down all already-started workers. After `knowledge.pool_idle_ttl_secs` (default 300; `0` disables it) of full idleness — no worker checked out — the pool scales to zero, shutting every worker down; the next `acquire()` respawns lazily. A config write reaches a running pool through `reconfigure()`, which adopts the new idle TTL at once and a new pool size at the next idle boundary.
+
+**Untrusted-chunk delimiters (CWE-94).** `EntityExtractor` wraps each untrusted chunk in **per-request nonce-suffixed** delimiters (`<<<BEGIN_UNTRUSTED_CHUNK_{nonce}>>>` / `<<<END_UNTRUSTED_CHUNK_{nonce}>>>`, `nonce = uuid4().hex`), so content that embeds a legacy static delimiter cannot forge the boundary and inject instructions. Both `extract` (single) and `extract_batch` (the ingestion path) apply this, and the batch path mints a **distinct nonce per chunk**.
+
+**Extraction failures are logged, never the text.** An extraction batch whose pool call fails, or whose chunks get an empty or unparseable reply, stores those chunks with no entities and no summary and logs one WARNING naming the source id (set by `IngestionPipeline` through `extractor.extraction_source`), the exception type or the empty/unparseable counts. A failed or unusable source summary (`generate_source_summary`) logs a WARNING the same way. No warning carries document text, the model's reply, an exception message or a document name.
+
+**Interrupted ingest jobs.** An ingest writes its `ingestion_jobs` row as `processing` before any work. A gateway that stops mid-ingest leaves that row behind, so `setup_knowledge_routes` registers `_reclaim_interrupted_ingest_jobs` as the first knowledge startup hook. The hook only schedules a tracked background task (`_run_ingest_job_reclaim`), so startup does not wait on a scan that grows with job history; the task moves every row with a `source_id` still `processing` and created before this process's boot timestamp to `abandoned`. Rebuild rows (`source_id IS NULL`) keep `start_rebuild_job`'s staleness sweep. Nothing is re-ingested; an interrupted folder file is picked up by the next scan through its scan marker. Two gateways sharing one data home is not a supported layout; if it happens, a restart of one marks the other's live ingests `abandoned`, which only mislabels rows that hold no lock.
+
+## 4. FTS5 + graph + vector retrieval (`retrieval.py`, `store.py`)
+
+`HybridRetriever.search(query, limit)` runs three legs and fuses them with Reciprocal Rank Fusion.
+
+**Store (`KnowledgeStore`, `store.py`; FTS writes in `store_parts/fulltext_index.py`, the graph in `store_parts/entity_graph.py`)** — SQLite (prefers `pysqlite3`, falls back to stdlib `sqlite3`), WAL journal, `foreign_keys=ON`. Items live in `items` (with an `embedding BLOB` and `status`), keyword search is served by the FTS5 virtual table `items_fts(title, content, tags, content=items, content_rowid=rowid)`, and the entity graph is an in-memory `SimpleDiGraph` (a minimal networkx-free replacement). The store keeps `items_fts` in sync on every insert/update/delete of the FTS-backed columns.
+
+- **Keyword leg (`_keyword_search`)** — FTS5 `MATCH` over `items_fts`, ordered by `rank`. `_sanitize_fts5_query` double-quotes each token (doubling internal quotes) so user input never contributes FTS5 operators (parameterized quoting), drops `_STOPWORDS`, and OR-joins the remainder so a natural-language query does not require every literal token to match. An all-stopword query falls back to the raw tokens rather than dropping the leg.
+
+- **CJK recall (`fts5_segment_for_index` + `fts5_cjk_match_groups`, `_sqlite_compat.py`)** — FTS5's `unicode61` tokenizer classifies CJK ideographs as letters, so it stores an entire spaceless run as ONE token: a whole clause becomes a single term and no query can address a word inside it. If both sides tokenized that way they would agree, and the recall loss would stay invisible behind the vector leg. So the **index copy** of `title`/`content`/`tags` is written with a boundary around each CJK character, so the tokenizer emits one term per character; a **query** run expands to its overlapping adjacent-character pairs as FTS5 phrases, OR-ed. A phrase over per-character terms is exact substring matching, so a four-character query for "memory leak" matches both a document spelling the run verbatim and one spelling "memory" and "leak" apart, while a document that merely reuses those characters in other words ("internal", "to save", "relief valve", "water leak") is excluded — the same adjacency floor the session search applies (`history.md`). Non-CJK input produces byte-identical text and the byte-identical expression `fts5_quote_tokens` produced, so Latin matching is unchanged; a token mixing Latin and CJK ANDs its runs. Hangul is deliberately excluded, because modern Korean is space-separated.
+  - Only the index copy is transformed. `items_fts` is an external-content table (`content=items`), so `snippet()`/`highlight()` and every read of the item still see the original text.
+  - **Every** writer must route through `KnowledgeStore._fts_index` / `_fts_unindex`, which write in the representation the database currently declares (`_fts_terms_segmented`, read from `user_version`). FTS5's `'delete'` command subtracts the exact terms it is handed, so the wrong representation either leaves the old terms in place — serving deleted or superseded content as live hits, which `'integrity-check'` does **not** flag — or raises `database disk image is malformed` outright. Unconditional segmentation is not available because a legacy database has writers that run before any reader can migrate it: the post-bind orphan reclaim (`reclaim_orphans`) and the startup watcher sweep. The declaration is latched only in the True direction, since `user_version` only increases and another process on the same database may migrate it at any time — a cached False would keep writing raw terms into a migrated index.
+  - **The declaration is serialized by SQLite's writer lock, not a Python one.** Every FTS-touching transaction is `BEGIN IMMEDIATE`, so a reader of the declaration already excludes the rebuild that can change it — across processes as well as threads, which a Python lock cannot do. The FTS write path therefore takes **no** Python lock: taking one there inverts against SQLite's, because a writer holding SQLite's lock would wait on Python's while the rebuilding reader holds Python's and waits on SQLite's — a deadlock that resolves only when `busy_timeout` expires, returning 500 from an event-loop write. The surviving `_fts_lock` guards the rebuild alone (so two reader threads in one process do not both start one) and is always acquired *before* SQLite's, never after.
+  - There are exactly **three** FTS readers, and each calls `ensure_fts_index_current` first: `KnowledgeStore.search_items_fts`, `HybridRetriever._keyword_search`, and the dashboard's entity-items lookup (`_entity_items_rows`). The last builds its own query and matches the name as ONE phrase over the segmented text, which is what an entity name is — a contiguous string, not a bag of words. For a name with no CJK that is byte-identical to quoting the name directly, so a multi-word ASCII entity (`New York`) still requires those words adjacent; for a CJK name the segmentation is what lets the phrase address the characters the index stores. It runs under `asyncio.to_thread`, like the other knowledge readers in that module.
+  - The term representation is versioned by `FTS_INDEX_VERSION` and `PRAGMA user_version`, not by a schema probe: the `CREATE VIRTUAL TABLE` text is identical before and after, so nothing in the schema records which representation a database holds. `_migrate_fts_index` rebuilds in batches of `_FTS_REBUILD_BATCH` and bumps the marker only after the whole rebuild commits, so an interrupted rebuild restarts on the next open rather than resting half-built.
+  - **The migration is one-way, and downgrading needs the index rebuilt.** A build from before this change knows nothing about `user_version`, so it writes and deletes raw terms against an already-segmented index — which by the rule above either leaves stale terms behind or raises `database disk image is malformed`, and the old code has no rebuild path to recover. Rolling back past this change therefore requires dropping and recreating `items_fts` (or deleting `knowledge.db`, which is a derived cache of ingested sources). Forward upgrades need nothing: the post-bind maintenance task migrates, or else the first search.
+  - **The rebuild is triggered after bind, never by the constructor.** `KnowledgeStore.__init__` runs on the gateway's boot path (`start_dashboard` builds the lazy `state.knowledge_store` on a worker thread just before `setup_knowledge_routes` reads it, before the socket binds), while its FTS readers run on other worker threads (`run_in_embed_pool` / `asyncio.to_thread`) — the store's own threading contract, and why it hands each thread its own connection. A data-scaled reindex in `__init__` would therefore stall the gateway at boot for the length of a full reindex: measured at 4,000 CJK items it is ~137 ms of work, and it grows linearly with the corpus. The first trigger is the post-bind knowledge maintenance task (`_kick_knowledge_orphan_reclaim`), which calls `ensure_fts_index_current` on a worker thread inside the store's maintenance window, together with the deferred search indexes, so ingestion waits at the gate instead of on SQLite's writer lock. Each FTS reader still calls it first, as the fallback when that task could not take the writer lock; it is lock-guarded so concurrent callers wait rather than each starting a rebuild, and steady state is a single boolean check (~1 us).
+  - **Known limitation:** `add_item` persists tags with `json.dumps` at its default `ensure_ascii=True`, so a CJK tag is stored with its characters backslash-escaped and reaches the index as terms like `u6a21`/`u578b`. A CJK tag is unsearchable for that reason, which no query-side change can reach.
+- **Graph leg (`_graph_search`)** — resolves query words and adjacent word-pairs to entities, expands via graph neighbors (depth 2), and ranks items by mention count. `get_neighbors` walks `entity_relations` through its `source_id` / `target_id` indexes, one statement per hop and chunk of `_NEIGHBOR_CHUNK` ids, so a search never loads the in-memory `SimpleDiGraph`: only the dashboard's graph views (`get_entity_graph`, `get_full_graph`) materialise it. A spaceless CJK run is one whitespace word but several entity names, so an entity named for a word *inside* the run is unreachable by the split alone; `_cjk_subruns` adds the run's own contiguous CJK substrings as extra candidates, longest first (so the most specific entity name is tried before a shorter prefix of it) and bounded by `_CJK_SUBRUN_MAX_LEN` / `_CJK_SUBRUN_MAX_CANDIDATES`, since each candidate costs a `find_entity` query. A query with no CJK gets the plain whitespace-split candidate list. `find_entity` tries the exact name, then `LOWER(name)` (`idx_entities_name_lower`), then the alias fallback, which every missed candidate reaches: it reads `(rowid, aliases)` through the partial index `idx_entities_with_aliases`, whose predicate is the fallback's own, so it visits only the entities that carry aliases instead of every entity, and sorts them by `rowid` so the first match (and the first malformed row to raise) is the one a table scan would meet first. The matched row is re-read by `rowid` AND the aliases just matched: `entities` has no AUTOINCREMENT, so a row deleted between the two reads can hand its rowid to an unrelated entity, which this read skips. Both indexes are in `_SEARCH_INDEXES`, built post-bind for a populated library; without them the answer is the same, only slower.
+- **Vector leg (`_vector_search`)** — brute-force cosine over `items` with `embedding IS NOT NULL AND status='active' AND embedding_sig = ?`; returns `None` when no embedder is wired. Rows are scored `_SCORE_BATCH_ROWS` (1024) at a time by `_score_rows_numpy` when numpy is importable, else by the Python reference path `_score_rows_python`. Items whose stored embedding dimension differs from the query vector are **skipped** (not scored 0.0), with a single per-search WARNING so a stale index surfaces as "re-index needed". `_cosine_similarity` is a one-off helper outside the search loop; it returns 0.0 for differing-length or zero vectors.
+  - **Matrix cache (`_cached_matrix`)** — with numpy, the leg scores against a cached float32 matrix plus float64 row norms built from its candidate query, keyed by `(db path, sql, params, query width)`. An entry is valid while the store's `vector_generation()` value matches, read in the same snapshot as the rows. Triggers on `items` and `source_locations` (insert, delete, and an update of a vector-relevant column) set `vector_generation.gen` to a fresh `random()`, so a write to any other table keeps the entry, a write from any connection or process drops it, and a replaced library file does not repeat a value. A store with no generation table (a read-only open of a file no migrating open has touched) returns `None` and is not cached. At most `_MATRIX_CACHE_MAX_ENTRIES` (2) entries, and everything they retain (matrix, norms, ids) shares one `_MATRIX_CACHE_MAX_BYTES` (512 MiB) budget; the oldest entry is evicted first. A result past the budget, or one the cache will not hold (mixed widths, legacy JSON vectors float32 cannot hold exactly), is remembered as an empty entry for that generation and scored by the reference path, so it is read once per search. Builds are serialised per database, so concurrent misses on one library wait for one read and a build never blocks another library. The cache lives for the process; it is not dropped on idle.
+  - **One-statement build (`_read_packed`)** — a build reads its candidates in ONE statement: `count(*)`, `json_group_array(id)` and `CAST(group_concat(embedding, '') AS BLOB)` over the candidate query, so SQLite joins the vectors and lists the ids in the same row order, and Python takes one row. Fetching row by row re-took the GIL once per row (~22k times on a 22k-item library), and under agent-turn load each reacquire waited behind busy threads: the first search after start spent seconds there against ~0.15 s idle. The same pass counts the rows that are not a BLOB of the query's width, and any such row, a packed blob that parses as a JSON list, a database not in UTF-8 (`group_concat` reads a BLOB as text in the database encoding) a SQLite without the JSON functions, or a joined result past SQLite's length limit (`SQLITE_TOOBIG`, raised as `DataError`) sends the build to the row path (`_read_snapshot` + `_join_packed`), which admits exactly the same rows. Nothing is built ahead of a search, so a library that is never searched holds no matrix.
+  - The `embedding_sig` predicate is the **read-side refusal** that makes an embedding-model change safe, and it is what the dimension guard cannot do: an old-space vector of the SAME WIDTH passes every length check, so without the predicate it is cosine-scored against a new-space query and returned with a confident score. A NULL signature — an item never stamped — reads as unproven and drops out of the leg until the sig-gated rebuild re-stamps it.
+  - The pair `(query embedder, embed_sig)` is resolved by **one** function, `retrieval.vector_leg(embedder)`, and handed to the constructor together, so a call site cannot wire an embedder without the identity its vectors must carry. All three production call sites (`/api/knowledge/items?q=`, `/api/knowledge/search-for-context`, the `local_knowledge_search` MCP tool) go through it, and each is pinned by a test.
+  - **`HybridRetriever(embedder=…)` REQUIRES `embed_sig` and raises `ValueError` without it.** The predicate fails OPEN: an absent signature scores every stored vector, including a foreign-space one of the same width, and no downstream assertion goes red for it — so the safe state has to be what a caller gets by default, and the mistake has to be loud at construction, where the caller still holds the embedder the signature is read from. Since `vector_leg` never returns an embedder without a signature, no production path can reach the raise. The unfiltered leg is spelled `retrieval.ANY_EMBEDDING_SPACE` — a named, greppable opt-out for a caller holding a bare `callable(str) -> list[float]` with no declarable identity (ad-hoc probes, the tests of the dimension guard itself), valued with characters no hex digest contains so it cannot collide with a real signature.
+  - **The degraded mode is FTS5 + graph, and it genuinely returns results.** Zero vector candidates makes `_vector_search` return `[]`, which `_rrf_fuse` folds in as an empty leg (it skips only `None`) and `match_type` simply omits `vector` from; nothing raises and nothing short-circuits to empty. The degraded window is announced once, by the watcher's `_LARGE_REBUILD_WARN_THRESHOLD` line, rather than per search — a per-search signal would cost a `COUNT` on every zero-candidate query.
+- **RRF fusion (`_rrf_fuse`, k=60)** — per-leg weights align positionally with `(keyword, graph, vector) = (1.0, 1.0, VECTOR_RRF_WEIGHT=2.0)` so semantically-strong matches dominate when the keyword leg returns literal junk. Results are tie-broken by recency (`updated_at`), and each result's `match_type` records which legs it appeared in (`keyword+graph+vector`).
+  - **The keyword leg's rank-1 hit is protected from truncation.** The weight above is what makes a keyword-only document losable: a query carrying an exact error string, a ticket id or a rare technical term can have its one correct document pushed past `limit` by weighted semantic neighbours, and the caller sees related-but-wrong rows with no signal that the right one was found and dropped. When that happens `search` **appends** the keyword winner as one extra trailing row, so a response may carry `limit + 1` rows. Only rank 1 is protected, and nothing already ranked is removed, reordered or demoted — the rescue can only add. The appended row carries its real fused score (the tool caller's `min_score` floor depends on it: a keyword-rank-1-only row scores `1.0 / (60 + 1) = 0.0164`, which clears `0.012`) and its normal `match_type`, and it is appended *before* the citation-enrichment passes below, so it is exactly as citable as a ranked row. A keyword hit whose item no longer resolves (a stale FTS row) adds nothing.
+
+### Embedding vector space (`embedder.py`, `store.py`, `ingestion.py`, `ingestion_rebuild.py`)
+
+Vectors are comparable only to vectors from the same model at the same width. Three pieces enforce that, and they are deliberately not three independent identities.
+
+**One identity, two consumers.** `embedder.embed_signature(model, dim, content_budget)` is built ON TOP of `embeddings.embedding_space_signature(model_id, dim)` — it hashes that function's output verbatim, then folds `content_budget` on. So anything that moves memory's notion of the vector space necessarily moves the knowledge library's, and the two cannot disagree. An independently assembled hash over the same fields is **not** equivalent: it is a second definition of "same vector space", and the next input added to one definition reaches only that consumer — which is what leaves the KB serving vectors from a space it believes it is still in, invisibly to both the per-search dimension guard and the sig-gated rebuild. The call therefore goes through the module (`_embeddings.embedding_space_signature`) so the dependency is **observable**: displacing that function moves the KB's value too, and `test_the_kb_identity_is_derived_from_memorys_not_reassembled` is what pins derivation rather than mere agreement. `content_budget` stays the KB's own input (it changes how much chunk text one item folds in, which is no concern of memory's). `embedder_signature(embedder)` is the single call sites use; it reads `model` and `dim` live from the active backend, and `InProcessEmbedder.dim` costs no model load because a backend sets `dim` at construction.
+
+> **Folding `dim` in changed the hash, so it invalidated every `embedding_sig` written before it and forces a ONE-TIME full re-embed of the corpus.** That is deliberate and is the cost of the fix: the values it invalidates are exactly the ones that could not distinguish two vector spaces. No user action is needed — every item reads as stale, the watcher's sig-gated self-heal re-embeds them at `PRIORITY_BULK`, and until each item is reached it is keyword- and graph-searchable and refused by the vector leg.
+
+**Re-embed scheduling class.** `rebuild_embeddings(..., pace: bool = True)` sets the class every embed in the loop runs at on the one shared inference slot, and **attendance** decides it, not corpus size — the same rule vector memory's paced sweep applies. The paced default embeds at `PRIORITY_BULK` on the reduced `memory.embedding_bulk_threads` pool and idles between rows per `memory.embedding_bulk_duty`, so a caller that forgets the argument gets the quiet behaviour. The watcher's unattended self-heal (`_run_reembed_job`) relies on that default, so a multi-hour rebuild yields to interactive embeds and to memory's paced sweeps. The dashboard-triggered rebuild (`_rebuild_embeddings_job`) passes `pace=False`: a user clicked it and is polling the job row, so it embeds at `PRIORITY_NORMAL` with the full pool and never idles. `InProcessEmbedder.embed` / `embed_for_item` forward a priority to the backend and default to `PRIORITY_NORMAL`.
+
+**Citation enrichment** — `_attach_source_locations` batch-fetches `source_locations` (adds `section_title`, `chunk_range`, `anchor`); `_attach_citation_sources` adds `source_type`/`source_name`/`source_uri` plus the most specific per-document locator: `file_path` for folder/vault sources (from `folder_file_state`), `artifact_slug`/`artifact_name` for the aggregate artifact source (deep-links `/artifacts/<slug>`), and for the aggregate agent source the hit's `source_uri` is replaced with the document's own stored locator (from `agent_item_state.source_uri`) — the aggregate's `agent://` is a control uri, not a citation, and stands only for legacy rows whose column is NULL. Missing/unmapped sources degrade cleanly (extra keys simply absent).
+
+The retrieval benchmark builds a disposable corpus with one embedding callable
+for both ingestion and queries. It explicitly uses `ANY_EMBEDDING_SPACE` because
+those synthetic rows have no persisted model signature and never share a store
+with user data. Production retrieval still requires the active signature.
+
+### Remote sources: `bedrock_kb` (`knowledge/connectors/bedrock_kb.py`)
+
+A `bedrock_kb` source points at one or more **Amazon Bedrock Knowledge Bases**
+in the user's own AWS account and holds **no local items**: the KB keeps its
+own index and embeddings, so Kiro Crew queries it live at search time instead
+of ingesting it (issue #7947). Consequences, in the order the code enforces
+them:
+
+- **Config, no secrets.** `properties` carry `kb_ids` (comma-separated; a
+  full KB ARN is accepted and normalized to its trailing ID so one knowledge
+  base has one spelling in the dedupe, the result ids and the audit rows),
+  `region`, optional `profile`. `kb_ids` is the one caller-supplied field a
+  source retains and re-parses on every search, so it is bounded where it is
+  parsed (`_parse_kb_ids`): at most `_MAX_KB_IDS` entries (also the
+  per-search fan-out cap), each raw entry at most `_MAX_KB_ID_ENTRY_CHARS`,
+  each normalized id exactly the `[0-9A-Za-z]{10}` shape the Retrieve API
+  accepts. `validate_config` parses strictly and refuses the first violation
+  by name before any probe, and the insert only runs after validation, so
+  nothing out of bounds is probed or stored; the search-time parse of a
+  stored row drops what fails and truncates. The insert stores the
+  connector's `retained_properties(config)`: exactly those three keys, each
+  in the VALIDATED form the gates judged rather than the caller's raw
+  spelling -- `kb_ids` as the canonical comma-joined bare ids the strict
+  parse produced, `region` and `profile` as the stripped strings the
+  grant-equality check matched. Every gate strips or parses before it
+  judges, so a whitespace-padded value (or an ARN spelling) passes them
+  all; retaining the raw copy would store what nothing validated, bounded
+  only by the request-body cap. So the row's size follows the gates' own
+  bounds, its spelling is the one every later compare and result id uses,
+  and an extra field in the body, flat or nested, never reaches storage.
+  The row's `uri` -- the UNIQUE dedup key -- is likewise the server's
+  `canonical_source_uri(retained)` (`bedrock-kb://<region>/<sorted kb ids,
+  +-joined>`), never the caller's: a caller who chose the handle could mint
+  a row per request for one knowledge base, each carrying a `name` up to
+  the body cap, whereas the derived handle is one per distinct SET of
+  knowledge bases: the same ids in any order dedupe to one row (`409
+  source_exists`), so a search pays one Retrieve per KB rather than one per
+  spelling, while a set that shares a first id with an existing row (`A` vs
+  `A,B`) is a different source, not a false `409`. The form therefore posts
+  no `uri` for this type, and its default `name` (when the owner leaves the
+  field blank) is `Bedrock KB <bare first id>`, the trailing segment of a
+  pasted ARN: an ARN also carries the account id, and `name` is a column
+  every authenticated caller reads off the sources list. `add_source`
+  resolves the stored name once, after the uri is final, as `name or uri`.
+  For `bedrock_kb` only, it cuts that name rather than refusing it, to the
+  connector's `_MAX_RESULT_SOURCE_NAME_CHARS` (200). A name written by the
+  gateway therefore reads back unchanged through `_BOUNDED_ROW_SELECT`. If an
+  in-sandbox database writer later enlarges it, the SELECT returns NULL rather
+  than a clipped prefix, and result and conflict displays use
+  `Bedrock KB <validated kb id>` instead. Every other
+  source type stores the name as sent, explicit or uri-derived, because the
+  Markdown panel, the Knowledge tab and md-notebook can send longer names.
+  Credentials
+  resolve through
+  the standard AWS chain for the named profile at call time; nothing
+  credential-shaped is stored. boto3 ships in the optional `[bedrock]` extra
+  (same pin as `[voice-aws]`) and is imported lazily, and never on the event
+  loop: the module imports boto3 at its top, so the consent POST names it
+  only inside the worker that records the grant and only for `bedrock-kb`
+  (a Polly or Transcribe confirmation never loads it); without it the source
+  reports the missing extra on add instead of breaking core imports.
+- **Consent precedes every request.** Bedrock KB retrieval is registered as a
+  gated paid service in `kiro_crew.aws_consent` (`SERVICE_BEDROCK_KB`): the
+  add-time probe and every retrieval first pass the account-bound
+  authorization check (grant keyed on service+profile+region, live account
+  re-checked), refusing fail-closed — a repointed profile cannot receive so
+  much as an access check, and a revoked grant silently removes the source
+  from search results (logged by the consent layer) instead of billing an
+  unconfirmed account. One search runs the consent probe and the client's
+  STS verify once per (profile, region) and shares the client across every
+  source on that target (`search_remote_sources`), so several sources fit
+  the 5-second budget; each Retrieve still rechecks the grant and its own
+  source's attestation. **The sandboxed MCP server never evaluates consent
+  in-process**: the sandbox seals `aws_service_consent.json` with an
+  inode-pinning self-bind, so a host-side withdrawal (atomic rename) is
+  invisible to a sandboxed reader — its remote leg therefore calls the
+  gateway's internal `POST /api/knowledge/remote-search` (loopback +
+  `X-Internal-Secret`), and authorization, credential freeze-verify, and
+  per-retrieve rechecks all run in the gateway process against the live
+  keystone store. The per-retrieve recheck (`_refusal_reason`) runs
+  immediately before every paid request and reads one local snapshot of the
+  keystone store, deriving both facts from that same complete file version:
+  the grant is still the one the frozen credentials were verified against,
+  AND the row the search runs for is still attested under it. The
+  enumeration checks the registration once when it starts, but a
+  delete landing during a search revokes the attestation and leaves the
+  grant in place, so a recheck that read only the grant would let the rest
+  of that search keep billing for a source the owner had just removed. A
+  retrieve the recheck refuses writes its own SEL `aws_consent.denied` event
+  naming the KB and which check refused (grant withdrawn or replaced, or
+  source registration withdrawn), so the audit log records every paid
+  request that did not happen, not only the ones the front gate turned
+  away; the freeze-verify refusal in `_get_client` (no grant, credentials
+  resolving to an account other than the confirmed one, or a grant confirmed
+  for a different profile/region) writes the same `denied` event naming the
+  target and which check refused, before any client is built. The grant is recorded from the **add-source form's own
+  consent card**: `bedrock-kb` is the one service whose target is taken from
+  the request (the source exists only in the form until saved), which is safe
+  because the shown account is probed fresh from that exact target, the POST
+  409s on any echo mismatch, and `is_granted` demands exact (profile, region)
+  equality at call time — a grant for a target nothing uses is inert. The
+  form's submit stays disabled until that grant exists (it subscribes to the
+  same consent query the card polls), so the server-side refusal is never a
+  first-time user's first signal — the card above the button is the visible
+  reason and the order. **The request body's shape is checked once, first**
+  (`_add_source_shape_error`): every text field `add_source` reads (`name`,
+  `source_type`, `uri`, `namespace`) must be a string or absent/`null`, and
+  `properties` an object, else 400 `<field> must be a string` / `properties
+  must be an object` before any field is used. Per-field checks at each
+  first use would leave one gap per field: a connector's `validate_config`
+  may ignore `url`, so a JSON object in `uri` would pass validation and
+  reach `str.startswith` as a 500. **Registering the source is an owner action**, the
+  same rule the consent endpoints apply (`is_owner_dashboard_request`, via
+  `_shared.require_owner_dashboard_request`): `add_source` refuses a
+  `bedrock_kb` body from a non-owner dashboard caller (an allow-listed
+  messaging user reaches the route with `app == ""`) or an app token with
+  403 `owner_only` BEFORE validation, because validation probes the KB with
+  the owner's credentials and the insert registers a KB the gateway then
+  queries on the owner's account against the owner's grant. Local sources
+  keep `add_source`'s existing, ungated behaviour. The bundle routes are not
+  a way around the rule: `/api/knowledge/import` is open to every
+  authenticated caller and carries no consent, validation or target check,
+  so `KnowledgeStore.import_bundle` refuses a `bedrock_kb` row, and a row of
+  any type whose `uri` starts with `bedrock-kb://` (it would squat the
+  handle the owner's add dedupes on), counted as
+  `sources_refused` in the result and the `knowledge.import` SEL line; and
+  `export_all` leaves `bedrock_kb` rows out -- a live account binding with no items is
+  not knowledge (`_ACCOUNT_BOUND_SOURCE_TYPE`). "No items" is enforced at
+  the writer, not assumed: `KnowledgeStore.add_item` and
+  `add_source_location_in_txn` raise `LiveSourceHoldsNoItems` for a
+  `source_id` naming an account-bound row (one primary-key read inside the
+  write transaction), and the agent's `POST
+  /api/knowledge/sources/{id}/ingest-text` refuses such a target with 409
+  `live_source_holds_no_items` before the body is read, so the caller sees a
+  coded refusal rather than the store's as a 500 after extraction. Without
+  the writer-side rule the export filter would be the defect: an item
+  written under a `bedrock_kb` row (its id is readable by any authenticated
+  caller, and the ingest-text route takes any existing id) would travel
+  while its source row does not, and a clean store's import would trip
+  `items.source_id`'s foreign key and roll the whole bundle back. The
+  export holds the same line for what the writer rule cannot reach:
+  `knowledge.db` is agent-writable in-sandbox, so a row planted under a
+  `bedrock_kb` source by a direct write bypasses `add_item`, and
+  `export_all` leaves such items out together with the locations,
+  mentions and relations riding on them (the set `import_bundle` refuses,
+  ids compared as text), so an export never names a row it dropped. The
+  deletion paths hold the same line: when a source is deleted
+  (`delete_source_cascade`) or drops its copy of a document
+  (`delete_items_batch_in_txn`), a surviving item's new owner comes from
+  `_reassignment_candidates`, the holders of the item that are not
+  account-bound, so a planted `source_locations` row never makes a
+  `bedrock_kb` row the owner of a local document (the document would
+  survive live and vanish from every bundle); an item whose only other
+  holders are account-bound goes with its owner, as if no other holder
+  existed, and the planted row goes with it. The
+  refusal extends to
+  what depends on such a row: a bundle item whose `source_id` names a
+  refused row OR an already-registered account-bound source (its id is
+  readable by any authenticated caller off the sources list) is refused and
+  counted as `items_refused`, and the locations, mentions and relations
+  riding on that item are dropped with it -- so no local content ever lands
+  under a live-only source, and a crafted bundle cannot fail the whole
+  import on that item's FK. Only a refused row or item that carries an id
+  joins its refused set, and a dependent is matched only when its own id is
+  not null: `str(None)` is the text "None", which a bundle can also spell as
+  a source or item id, so a local source called "None" keeps its items and
+  an evidence-free relation is not dropped because a refused item was
+  called "None". **The row itself is not the registration; the attestation
+  is.** `knowledge.db` is agent-writable in-sandbox (the MCP server ingests
+  into it in-process, and the sandbox seals neither `workspace/knowledge` nor
+  the file), so a `bedrock_kb` row on its own proves nothing about who put
+  it there: an agent could clone one, or point a clone at any KB the granted
+  profile reaches, and the enumeration would pay to query it. So the
+  owner-gated, consent-checked insert also records the row in
+  `aws_service_consent.json` (`aws_consent.record_source_attestation`, under
+  the `bedrock-kb.sources` key beside the grants, written under the same
+  lock; the file is in `sandbox._CREW_READONLY_LEAVES`, so only the gateway
+  writes it), pinned to the row's id, uri and retained `kb_ids`/`region`/
+  `profile`, AND to the account the grant confirms at that moment: a
+  profile name is not an account (the reason `authorize` re-verifies it on
+  every call), and re-pointing the profile then confirming again keeps the
+  same profile and region, so without the account the old registration
+  would authorize paid retrieval of the same KB id in the new account.
+  `attested_sources` therefore returns only entries recorded under the
+  CURRENT grant's account; a grant confirmed for another account leaves
+  every earlier registration unattested until the owner removes the source
+  and adds it again. A plain re-add is not that recovery: it dedupes on the
+  row's `uri` (`409 source_exists`, the code and id every type answers
+  with) and only a row the add CREATES is attested, so for this type the
+  409's text names the remove-then-add path (`_source_exists_response`)
+  instead of the generic "source already exists" the form would otherwise
+  show. The two writes of an add (row, attestation) and of a delete are not
+  one transaction, so each fails in the safe direction: an attestation
+  write that fails undoes the insert (`bedrock_kb_attestation_failed`, no
+  row), and a delete revokes the attestation FIRST (a failed revoke deletes
+  nothing: `bedrock_kb_attestation_revoke_failed`), so a failure between the
+  two leaves at worst a dark row a retry removes, never an attestation
+  without a row that a later row minted under the same id and values would
+  inherit. `revoke_source_attestation` reads the store strictly for the
+  same reason `revoke_for_profile` does: an unreadable store must raise
+  (the route answers the coded 500 and deletes nothing) rather than read as
+  "nothing attested", which would delete the row and leave the attestation
+  on disk for a re-minted row to inherit; only a missing store is the
+  ordinary nothing-attested case. Deleting a `bedrock_kb` row is owner-only
+  like adding one
+  (`knowledge.delete_source.bedrock_kb`); a local source's delete is not
+  gated. Whether a row IS a Bedrock row is decided from the sealed
+  attestation under its id (`has_source_attestation`, read strictly, any
+  account, before the row's type is trusted) OR from its `source_type`,
+  never from the type alone: that column lives in the agent-writable
+  `knowledge.db`, so a registered row an agent re-labelled as a local one
+  would otherwise skip both the owner gate and the revoke and leave its
+  attestation for a row re-minted under the same id and values to inherit.
+  An unreadable store refuses the delete (the same coded 500) before
+  anything is mutated. Every field the row retains carries its own bound at the retention
+  site: `kb_ids` through `_parse_kb_ids`, and `region`/`profile` through
+  `aws_consent.target_is_well_formed` (the shapes a grant can be confirmed
+  under: profile at most 128 characters, region at most 64), checked by
+  `validate_config` before any probe and again by `retained_properties`
+  (`bedrock_kb_config_invalid`), so no value a grant could never name
+  reaches the row or the attestation. `search_remote_sources` reads
+  the attestations once per enumeration and searches only rows that still
+  match one; a row that does not (a clone, or an attested row whose stored
+  KB set was widened afterwards) is skipped before any consent or credential
+  work, with an `aws_consent.denied` SEL line naming the row id (not its KBs
+  or the account). Registration and enumeration share
+  `MAX_BEDROCK_KB_SOURCES` (64). Under `target_change_lock`, add first
+  rechecks the canonical URI, so an existing registration still answers
+  `source_exists` when the population is full. A new registration then
+  strictly counts `recorded_source_attestations` across every account and,
+  at the limit, returns `bedrock_kb_source_limit` (409) before either the
+  database row or the sealed attestation is written; the response tells the
+  owner to remove a source first. Before it refuses, a full population
+  revokes each attestation whose row is gone (one SEL
+  `knowledge.source.attestation_reclaim` line each): the delete route answers
+  404 for a missing row, so a row removed outside the dashboard routes would
+  otherwise hold its slot for good. An unreadable consent store refuses the
+  check with `bedrock_kb_conflict_check_failed` (503) and adds nothing.
+  `search_remote_sources` pins at most the same number of current-account
+  attestations and applies that constant as its SQL limit. Pinned ids sort
+  first and cannot be dropped by the limit because their count is no larger
+  than it. Only an over-cap attestation written outside the gated insert can
+  fall outside an unscoped window; that legacy or external state logs one
+  warning per call with the number of omitted ids. The SQL bound is still
+  needed because the table is agent-writable and each unattested row the
+  loop reaches costs one synchronous SEL write. Planted rows can crowd the
+  registered sources out of neither the window nor the budget, and the
+  search budget is checked before any per-row work, so a spent budget buys
+  the planter no audit write either. A row count bounds memory only when
+  every field a read keeps is bounded too, so both reads of `bedrock_kb`
+  rows (this enumeration and the target lookup below) start from one SELECT.
+  It admits an id or uri only when it equals its bounded projection, so a
+  NUL-suffixed or oversized stored identity cannot become an attested identity
+  after `substr`: id is bounded to 64 characters and uri to 256. Properties are
+  cut to 1024. A name at most 200 characters is returned whole; any larger or
+  NUL-suffixed name is returned as NULL for the safe KB-id fallback above.
+  Each ceiling is above the largest value a gateway insert writes, so a
+  registered row reads back unchanged. The
+  consent store holds ONE grant per service, so v1 supports one Bedrock
+  account at a time (keying grants per (service, profile, region) is the
+  follow-up #14337, which removes both guards below) — ENFORCED at add: a
+  second source whose (profile, region) differs from a registered
+  bedrock_kb source is refused with
+  `bedrock_kb_target_conflict` (409), because letting it in would let its
+  re-confirmation silently disable the first source's retrievals — and
+  ENFORCED at confirm: the consent POST refuses (409, same code) a
+  bedrock-kb target that differs from a registered source's, since
+  recording it would overwrite the single per-service grant in place: the
+  registered source would go silently dark while the new target still
+  could not be added past the add-time guard. What that follow-up inherits
+  needs no migration: an attestation under `bedrock-kb.sources` is keyed by
+  the row's id and records the row's `uri`, its retained `kb_ids`, `region`
+  and `profile`, and the `account` the grant confirmed when the row was
+  registered; it holds no grant id and nothing that names the
+  one-grant-per-service layout. Keyed grants read existing entries as they
+  are: the grant covering an entry is the one keyed (`bedrock-kb`,
+  `entry.profile`, `entry.region`), and the account pin compares against
+  that grant's account the way `bedrock_authorization_snapshot` compares
+  against the single grant's today; an entry whose keyed grant is absent or
+  names another account stays unattested until the owner removes the source
+  and adds it again, the recovery that exists today. With one grant per
+  target the one-target code has no case left, so the follow-up deletes
+  `registered_target_mismatch` and both `bedrock_kb_target_conflict`
+  refusals (add and confirm). The `bedrock_kb_grant_changed` recheck in the
+  locked insert stays and reads the keyed grant for the source's target;
+  `_reclaim_rowless_attestations` and the remove-then-add text in
+  `_source_exists_response` serve the registration limit and the account pin,
+  which keyed grants do not change. A registered source for both
+  guards is a row a gateway attestation pins, under any account
+  (`aws_consent.recorded_source_attestations`): a row written straight into
+  `knowledge.db` is never searched, so it holds no target, and the lookup
+  fetches only the attested ids (at most `MAX_BEDROCK_KB_SOURCES`), so
+  planted rows are never read at all. Same-target re-confirmation
+  stays allowed (the mid-probe re-confirmation path depends on it). Both
+  refusals name the source that holds the other target, and that name is a
+  `sources` row an in-sandbox agent can write directly, past the handler's
+  name bound; the compare renders it through the platform shim
+  `kiro_crew.platform.redact_via_context` (a composed companion policy's
+  extra shapes on top of the OSS baseline, which runs the URL pass before
+  the credential pass) before either payload is built, so a planted
+  credential or exfiltration URL reaches the operator as the redaction tag
+  and the `(profile, region)` stays readable. Both
+  gates run their compare-and-write as ONE critical section under the
+  connector's `target_change_lock` (the slow probes/validation stay
+  outside), so a concurrent add and confirm cannot interleave between check
+  and write; the locked insert also re-checks the LIVE grant for the
+  source's exact target (`bedrock_kb_grant_changed`, 409) so a source can
+  never be registered against a grant that moved during validation, and
+  requires the grant's ACCOUNT to be the one validation verified (same
+  code). `BedrockKBConnector.validate_registration` returns that account:
+  STS resolved the frozen credentials to it, the grant read after that call
+  named it, and every probe rechecked that the store still held exactly
+  that grant. An account read before validation began is not enough, since
+  the grant can move to another account and back while the probes run, and
+  that read would then match the final grant for a KB proven only in the
+  other account. Same target is not the same account either: a
+  profile can be re-pointed and re-confirmed for the same (profile, region)
+  while validation was probing the KB in the account before, and the
+  attestation pins the account the grant confirms at insert, so without
+  the account check the row would authorize paid retrieval of a KB never
+  validated there. A same-target, same-account re-confirmation (a fresh
+  `grant_id`) still passes. `record_source_attestation` takes that
+  `expected_account` and refuses to pin any other, so the attestation cannot
+  name an account the KB was not probed in whatever ran between validation
+  and the write; and the compare FAILS CLOSED — a sources-table lookup error
+  refuses with `bedrock_kb_conflict_check_failed` (503) rather than reading
+  as "no conflict"; that code covers the lookup alone, so a grant write
+  that fails propagates as the unhandled error it is, for every service,
+  the way the other consent writes do. The remote-leg
+  budget (`REMOTE_SEARCH_TIMEOUT_SECS`) explicitly absorbs the uncached
+  per-search STS consent probe, and is enforced INSIDE the worker as a
+  monotonic deadline checked before each enumerated row's attestation check
+  and before each per-source and per-KB request —
+  the pool future's `result(timeout)` alone only abandons the waiter,
+  leaving the worker issuing paid Retrieve calls it can no longer deliver.
+  A budget skip is fail-open silence, never a validate-visible KB failure.
+- **Probe on add.** `validate_config` issues a 1-result `Retrieve` per KB, so
+  a bad id, region, or profile is refused at add time. Authorization-class
+  errors fail validation; service-side errors (throttling, 5xx) prove the KB
+  exists and pass.
+- **Retrieve with the managed fallback.** Retrieval tries
+  `vectorSearchConfiguration` first and retries with
+  `managedSearchConfiguration` only when the ValidationException names it —
+  MANAGED-type KBs reject the vector key (`implicitFilterConfiguration` is
+  never sent on the managed path). Both keys are members of the Retrieve
+  request's `retrievalConfiguration`
+  ([KnowledgeBaseRetrievalConfiguration](https://docs.aws.amazon.com/bedrock/latest/APIReference/API_agent-runtime_KnowledgeBaseRetrievalConfiguration.html));
+  the rejection the fallback matches is `MANAGED_ERR` in
+  `test/test_bedrock_kb_connector.py`, recorded from a live Retrieve against a
+  MANAGED-type KB: "vectorSearchConfiguration is not supported for managed
+  knowledge bases. Use managedSearchConfiguration instead." The fallback is its own paid request and
+  gets the same two checks the per-KB loop applies before each request: the
+  grant is re-asserted, and a rejection slow enough to spend the search
+  budget leaves the fallback unissued (empty result, not an error). Multi-KB
+  sources fan out one Retrieve per
+  KB and merge by relevance score; one unreachable KB is logged and skipped
+  rather than sinking the others. The query text is the one part of a
+  knowledge search that leaves the host, and it is caller-supplied free
+  text, so it goes out through the same platform shim,
+  `kiro_crew.platform.redact_via_context`, never `security.redact`
+  directly: on a host whose profile composes a companion credential
+  policy the companion's shapes apply too, and the baseline runs the URL
+  pass before the credential pass; a credential inside a URL's query
+  string blanked ahead
+  of the URL pass leaves a placeholder the URL matcher does not recognise,
+  and the URL's host and remaining query would reach the Retrieve API.
+  Local search legs keep the raw text; only this egress redacts.
+- **Citations from document metadata.** Each result's URL comes from the
+  `source_uri` metadata attribute (the convention KB-building crawlers write),
+  falling back to the reserved `x-amz-bedrock-kb-source-uri` key and then the
+  raw storage location — so hits cite the original document, not an S3 object.
+  Retrieved content, metadata titles, citation URLs and complete source names
+  pass through `kiro_crew.platform.redact_via_context` before any connector
+  length bound. The summary is derived from the already-redacted content. This
+  order prevents a bound from leaving a credential fragment too short for the
+  downstream MCP and dashboard redactors to recognize; a source name SQL could
+  not return whole uses the validated KB-id fallback described above.
+- **Query path: async callers only, bounded, fail-open.** The remote leg runs
+  in `local_knowledge_search` (MCP) and `search_for_context` (dashboard) via
+  `search_remote_sources_bounded` — a shared worker pool plus
+  `REMOTE_SEARCH_TIMEOUT_SECS` wall-clock budget over per-request boto
+  connect/read timeouts. Any failure or timeout returns `[]` and local results
+  stand alone. It never runs inside `HybridRetriever.search` (sync, and the
+  scoped-search exhaustion loop would multiply remote round trips). An
+  install with no `bedrock_kb` rows pays one indexed `SELECT ... LIMIT 1` and
+  no thread. On the MCP tool, a `source_id` scope keeps the leg (the
+  enumeration applies `sources.id = ?`) and a `namespace` scope skips it
+  entirely: namespaces live on `items.namespace` and a `bedrock_kb` source
+  holds no items, so no remote hit can fall inside one.
+- **Merge by rank, not score.** Local RRF scores (~0.01–0.06) and Bedrock
+  relevance scores (0–1) are not comparable, so `merge_by_rank` interleaves
+  the two legs positionally (local first) instead of sorting on raw score.
+- **Sync is a no-op.** `detect_changes` is always `False`, so `SyncScheduler`
+  never ingests the source; the dashboard shows it as connected rather than
+  synced.
+- **Last search per source.** In place of sync state, the gateway keeps how
+  the last search of each registered row went, in memory (`_last_searches`,
+  read through `last_searches()`; every search runs in the gateway, and a
+  restart starts it empty): `ok` (every KB answered), `refused` (the consent
+  check at the start of the search turned it away before any request, which
+  includes an account it could not confirm, as with expired credentials) or
+  `error` (the client setup, or a Retrieve for at least one KB, failed; a
+  refusal mid-search is one), with the time. Sources sharing a target share
+  its consent and client answer; a spent budget, including one that cut the
+  consent probe short, records nothing; each enumeration drops the ids it
+  does not attest.
+  `GET /api/knowledge/sources` adds it as `last_search` to a `searchable`
+  row only. The Sources list shows `ok` as the row's badge, `refused` and
+  `error` as an `ErrorNotice` under the row, and the day beside either.
+
+### On-loop connection guard (`on_loop_db.py`)
+
+`KnowledgeStore.db` is the single accessor every query in the store funnels through, so it carries the runtime half of the off-loop discipline. `OnLoopDBGuard.check()` runs at the top of the property, before the cached-connection fast path — a second query on an already-open connection must not escape it:
+
+- **Off the loop** (worker thread, `executors.py` lane, CLI, cron, subagent) — no-op. This is the sanctioned path.
+- **On the loop, strict** — raises `OnLoopStoreError`, so an un-offloaded call-site fails a test instead of shipping.
+- **On the loop, otherwise** — a throttled WARNING with `stack_info` (once per 60s per guard) and the call proceeds. Production deliberately does not raise: that would convert a slow query into a failed request.
+
+**Construction is the one vetted on-loop take.** `setup_knowledge_routes()` reads the gateway's lazy `knowledge_store` property at route registration, before the socket binds. `start_dashboard` builds that store on a worker thread (`asyncio.to_thread`) immediately before, because construction prepares and opens SQLite files (owner-only preparation, schema init, migrations) and that file I/O must not run on the loop; so on the gateway `__init__` is on the boot path but off the loop, and `test_dashboard_server_startup_coverage.py::TestStartDashboardWiring::test_the_knowledge_store_is_built_off_the_loop` pins it. Other callers (a CLI command, a test, a handler harness) may still construct on a loop thread, so the take stays sanctioned there. The constructor wraps exactly those calls in `OnLoopDBGuard.allow_on_loop()`, a `ContextVar`-scoped opt-out (mirroring `history.allow_on_loop_persist`) that ends with the `with` block: the non-constructor `_load_graph()` call sites and every query path stay fully guarded, and `test_knowledge_store_onloop_db.py::TestConstructionOnLoopIsSanctioned` pins both directions. Sanctioned is not the same as free, so both data-scaled pieces of construction have left the boot path. **The orphan sweep** is `KnowledgeStore.reclaim_orphans()`, not part of `_migrate()` (it ends by marking the graph stale, see below): it is a writer-locked full scan over `sources`, `items` and the state tables, and on a large store it would stall boot long enough for the runtime's timeouts to kill the gateway. `start_dashboard` kicks it via `_kick_knowledge_orphan_reclaim` — a tracked `_background_tasks` entry running `asyncio.to_thread`, the same shape as `_kick_connections_warm_scavenge` — strictly after `_start_site` returns, so the listener is already accepting and the store stays readable (WAL readers do not wait on the writer) while it runs. Only a store construction already built is swept; the API-only entrypoint never registers the knowledge routes and gets none. The one-time `source_locations` de-duplication in `_migrate()` is likewise gated on `idx_source_locations_item_source` not existing yet — once the unique index is in place duplicates are impossible and the `GROUP BY` scan would run on every open for nothing. **The graph load does not run at construction either**: `_load_graph()` full-scans `entities`/`entity_relations` and is deferred to the first graph reader via `ensure_graph_loaded`, the same shape as the FTS rebuild — measured at 2.39 s of 5.06 s total construction at 250k entities / 750k relations, and 5.12 s of 11.32 s at 500k / 1.5M, so roughly 45% of construction leaves the boot path and scales linearly with entity count.
+
+**A damaged library file does not stop the gateway.** The gateway opens the store through `KnowledgeStore.open_recovering`, not the constructor. When SQLite reports the file itself as damaged (`file is not a database`, `database disk image is malformed`; the rule is `sqlite_quarantine.is_damaged_database_error`, shared with the task store), the file and its `-journal` / `-wal` / `-shm` sidecars are renamed to `knowledge.db.corrupt-<utc>.<us>Z-<pid>` by `sqlite_quarantine.quarantine_sqlite_file` (never overwriting, never deleting), one warning names the copy, and an empty library opens. The log line keeps the path and the SQLite error; a plain-words notice goes on `KnowledgeStore.warnings`, and the gateway posts it to the dashboard notification feed with a link to the Knowledge Library, so an empty library is never silent. The library opts into `data_sidecars_must_move`: a `-wal` or `-journal` that will not move (another opener holds it on Windows) raises `SidecarNotMovable` with every file put back, because a new library beside it would overwrite pages that exist nowhere else, so the gateway fails start instead. The task store keeps the default, where a stuck sidecar is reported and the file is still recreated. Sources must be added again, and a document the agent added inline (`knowledge_add_document`) has no source to rebuild from, so it lives only in the kept copy. A locked, busy, read-only or full database is not damage and still raises. The CLI and MCP tool openers keep the plain constructor and report a damaged file instead of moving it. `test/test_knowledge_store_damaged_file.py` pins all of this.
+
+**The deferral is only safe because the loop-thread readers offload it.** `get_entity_graph` and `get_full_graph` are `async def` and read `store.graph` on the event loop, so each calls `await asyncio.to_thread(store.ensure_graph_loaded)` before its first `.graph` touch. Without that the deferred scan would run *on the loop* after the bind — where the loop-stall watchdog is armed (`LoopStallWatchdog` is constructed and started after `_start_site`), unlike the pre-bind window, where nothing is armed and nothing is served. `allow_on_loop()` is not available for this: its contract restricts it to constructor-shaped setup paths. The `graph` property still materialises lazily as a backstop, so a reader nobody found is served a correct graph — and flagged by the on-loop guard if it is on the loop — rather than a silently empty one, which is indistinguishable from "this entity has no neighbours". `ensure_graph_loaded` is lock-guarded like `ensure_fts_index_current` so concurrent first-touch readers wait rather than each scanning. The lock is **re-entrant, and `_load_graph` acquires it too, so EVERY rebuild serializes** — not only the first. Guarding the first-touch call site alone was not enough: the mutation sites hold no lock of their own, so a first graph GET racing a source DELETE put two threads through the rebuild at once and the loser's rows survived into a graph whose `_graph_loaded` was then set True — a flag asserting "loaded" over stale data, which is worse than an unloaded graph because the flag stops it ever being rescanned. Serializing the whole rebuild also settles *which* snapshot wins, since the `SELECT`s run after acquisition, so the rebuild that acquires last reads the freshest committed state. There is no ordering to invert against SQLite's writer lock: `_load_graph` is read-only and every remaining caller runs it after its own `COMMIT`, unlike the FTS rebuild, which takes its lock and then `BEGIN IMMEDIATE`.
+
+**A delete marks the graph stale instead of rebuilding it.** `delete_item`, `delete_items_batch`, `delete_source_cascade`, `reclaim_orphans` and `reload_graph` call `mark_graph_stale()` after their `COMMIT`: under `_graph_lock` it publishes an empty `SimpleDiGraph` and clears `_graph_loaded`, so the next reader rebuilds through `ensure_graph_loaded`. A rebuild at every delete held the whole graph (~110 MiB at 59k entities, measured with tracemalloc on a real library) from the boot-time orphan sweep and every artifact sync, whether or not anyone opened the graph. Taking the lock means a rebuild in progress finishes before the flag drops, and a reader already holding the old object keeps it. Because a delete can now unload the graph at any moment, a reader must use the graph `ensure_graph_loaded` returns rather than read `store.graph` again later: `get_full_graph` takes that return value from its worker thread, and `get_entity_graph` runs `get_entity_subgraph` on a worker, so neither reads the property on the event loop. `mark_graph_stale` clears the flag before it publishes the empty graph, and the lock-free fast path returns the graph it read only if the flag is up and that graph is still the published one, so no reader is handed the empty placeholder. `bundle_transfer` import and `add_entity_relation` still rebuild, because they add rows a reader expects to see at once. `test_knowledge_graph_stale.py` pins it.
+
+**The rebuild publishes a fresh object by reference swap, and multi-step readers pin one reference.** `_load_graph` builds a new `SimpleDiGraph` from the tables and assigns it to `self._graph` in one step, rather than clearing the live object and re-adding row by row. Serialization alone fixed *which* rebuild wins, but an in-place clear-then-repopulate still left the object a reader was holding momentarily empty: a reader iterating `store.graph`, or one that re-read `store.graph` across its own steps (degree ranking, then per-node attribute reads, then edges), could observe the window between the clear and the last insert and return an empty or truncated graph. Building fresh and swapping means the old object is never mutated — a reader holding it sees a complete, consistent old graph until it drops the reference, and the next read sees the complete new one. **The reader contract is therefore: capture `store.graph` once and read through that local for the whole multi-step read** — `get_full_graph`, `get_neighbors` and `get_entity_subgraph` do this, so a swap mid-read cannot mix old and new nodes. Readers hold a plain object reference, not `_graph_lock`, so a rebuild never blocks a reader or vice versa. The two incremental writers (`add_entity`, `add_entity_relation`) commit their row and then apply a single `add_node`/`add_edge` under `_graph_lock`, so a committed add always lands on the currently published graph and is never orphaned onto an object a concurrent swap is about to discard.
+
+This complements `scripts/check_sync_io_in_async.py` rather than duplicating it. The gate rejects a blocking call written *lexically* inside an `async def`; it cannot see an `async def` that reaches the store through a plain synchronous helper one frame down (`store.get_item(...)`), and no name-based AST scan can without whole-program type inference. The guard fires for every caller regardless of stack depth. `test_knowledge_store_onloop_db.py::test_static_gate_is_blind_to_that_same_call` asserts the blind spot against the real gate, so if a future gate learns to see the interprocedural form the overlap gets re-judged deliberately instead of silently.
+
+**Strictness** comes from `strict_enabled()`, the single parser of the truthy/falsy rules, which takes the env var name as a parameter — because "strict" means "this surface is fully offloaded, so enforce it", a property of a *surface* rather than of the process. Two surfaces can sit at different stages of the same cleanup, so each gets its own switch:
+
+| Surface | Switch | Dev mode arms strict? |
+|---|---|---|
+| `history.py` session mutations | `KIROCREW_STRICT_ON_LOOP_PERSIST` | yes |
+| auto_research campaigns DB (§7) | `KIROCREW_STRICT_ON_LOOP_PERSIST` (shared default) | yes |
+| knowledge store | `KIROCREW_STRICT_ON_LOOP_STORE` | **no** |
+
+The knowledge store's two narrowings exist for one reason and are both temporary: it still carries on-loop callers. That backlog is **the watcher's self-heal rebuild alone** — its two takes, which finalize the job row inline on the cancellation path where an interrupted `to_thread` could drop the write. They carry inline `# on-loop-io-ok:` markers and `.github/sync-io-in-async-baseline.txt` is empty; a marker is an *exemption*, not an offload, so the finalize still runs on the loop and an empty baseline is NOT the completion signal. `start_rebuild_job` sweeps a stale 'processing' row to 'abandoned', so the single-flight guard recovers either way. The `knowledge_<role>.py` owners of `dashboard/handlers/knowledge.py` take the store through a worker for every take of their own, endpoints and background tasks alike, so the `/api/knowledge/stats` and `/api/knowledge/namespaces` handlers are off the loop. The claim is scoped to those owners' own takes on purpose, and `SyncScheduler.sync_source` does not undercut it: every store take on that path runs on a worker thread, and both sync-outcome writers — the success reset and the failure increment — are cancellation-drained `run_to_completion` units whose read-modify-write goes through `KnowledgeStore.revise_source_properties`: one `BEGIN IMMEDIATE` take that reads the row's current blob under the write lock and guards its UPDATE with the blob it read, the shape `merge_source_properties` is the fixed-delta form of. Ingestion's finalize hop stamps its `content_hash` and reader metadata through the same take as a key delta rather than rewriting the row from its ingest-start snapshot, so the three same-row writers on worker threads serialize in the database itself and none can resurrect a stale blob over another's commit. The separate switch is load-bearing because `KIROCREW_STRICT_ON_LOOP_PERSIST` is **already exported** into the e2e gateway by `setup.py`'s `test_e2e` and `.github/workflows/ci.yml`, scoped when written to history's clean surface — on that switch the watcher's finalize would raise inside the e2e run. Excluding the dev-mode arm matters for the same backlog: raising on tracked work reports it as a regression, and the developer's rational response (unsetting `KIROCREW_DEV_MODE`) would silence `history_offload.py`'s guard too. When the watcher's cancel-path finalize genuinely runs off the loop (not merely marker-exempt), both arguments go and this store joins the shared switch — `test_knowledge_store_onloop_db.py::TestSharedSwitchCannotArmThisStore` asserts the CI export against the real workflow file, so that flip has to be deliberate.
+
+### `local_knowledge_search` MCP tool (`mcp_tools/knowledge.py`)
+
+The LLM reaches retrieval through the `kirocrew-core` MCP tool `local_knowledge_search`:
+- DB path: `config_dir()/workspace/knowledge/knowledge.db`; a missing DB returns "Knowledge Library is not configured…" (SEL `not_configured`).
+- `_get_knowledge_search` caches the `(KnowledgeStore, embedder)` pair across calls and rebuilds only when the knowledge DB (or its `-wal`) or `config.json` changes — avoiding the per-call schema DDL / migrate / graph-load.
+- Default `limit` is 3; results below `min_score = 0.012` are dropped. The retriever may return `limit + 1` rows (the protected keyword rank-1 hit, §4) and the tool does **not** re-truncate, so the LLM can see one extra result — the `limit` property description says so. Output is run through `redact_exfiltration_urls()` + `redact_credentials()` before returning, and every call emits an SEL audit event (`success` / `no_results` / `not_configured` / `unknown_source`). Input is validated against `LOCAL_KNOWLEDGE_SEARCH_SCHEMA` (`validation_parts/messaging_session_schemas.py`).
+- When the embedder is unavailable the output (including the no-results message) ends with ` (vector path unavailable; keyword results only)`. The embedder caches an unavailable verdict and rechecks it after `NEGATIVE_CACHE_TTL` (300s).
+- Optional `source_id` scopes the SEED legs only (FTS5 keyword + vector similarity, via parameterized WHERE clauses in `HybridRetriever`); the graph leg stays unfiltered so cross-source entity connections still contribute traversal context. Scope membership is ownership OR location — `items.source_id` or a `source_locations` row, so an item surviving a cross-source dedup collapse still belongs to the losing source's scope (the same rule as `/api/knowledge/graph`'s filter). Omitting it keeps the unscoped behavior. A nonexistent id returns a guidance message naming `knowledge_list_sources` (SEL `unknown_source`), not an exception.
+- The companion tool `knowledge_list_sources` (no arguments; `KNOWLEDGE_LIST_SOURCES_SCHEMA`) opens with one `Knowledge library: N source(s), N document(s), N item(s).` totals line from `store.aggregate_stats()`, then one `name — id (N item(s))` line per source, counting **active** items only (superseded/deduped copies would overstate a source's coverage) — so agents both discover valid `source_id` values and answer "how much is in the library" without a dashboard round-trip. The per-source lines keep the ownership-OR-location scope rule above while the totals count ownership, so the lines and the total can disagree in either direction, and the tool names each gap WITH its count rather than leaving it to be guessed at: items owned by no registered source are in the total and on no line (the tool lists no sourceless bucket, since there is no `source_id` to scope by), and an item surviving a cross-source dedup collapse adds a membership to a second line. Each caveat is appended only when a given library is actually in that state, rather than spent on every call.
+- **`kirocrew knowledge stats [--json]` is the CLI twin of that surface** (§6), and both read `aggregate_stats()` — one aggregate, two renderings, no second copy of the SQL.
+- **The response is written through a private stdout descriptor, not fd 1.** The first search's availability probe (`InProcessEmbedder.is_available` → `embed`) kicks the background GGUF load, and the vendored llama-cpp wraps that load in `suppress_stdout_stderr`, which `dup2`s **fd 1 process-wide to `/dev/null`** for the duration (~0.7s) *and* rebinds the `sys.stdout` object. Because the probe returns `None` immediately, the search answers keyword-only in milliseconds — so a response written to fd 1 would race that window and be silently destroyed: no exception, no short write, SEL still logging `success`, and the client hanging until the ACP tool-stall watchdog (`acp/client_timeouts.py::_TOOL_STALL_TIMEOUT`, 600s) kills the turn. `mcp_shared.run_mcp_stdio_loop` therefore takes an `os.dup(1)` snapshot (`snapshot_stdout_fd`) at server startup before any tool can run, and `respond()` writes through it under a lock, so responses (and `ping` / `tools/list` replies, equally exposed) always reach the client. Falls back to `sys.stdout` when stdout is not fd-backed. Note that "has `sys.stdout` been swapped?" is *not* a usable guard — the suppressor swaps the object too, so it reads as swapped exactly inside the window that must be survived.
+
+The dashboard Knowledge tab uses the same store via a lazily-initialized `KnowledgeStore` on `DashboardState` (`dashboard/state_parts/dashboard_state.py`).
+
+## 5. Source-scoped list API (`dashboard/handlers/knowledge_library.py`)
+
+The dashboard Knowledge list view is **source-first**: it renders one collapsed
+row per source and pages *within* a source, rather than paging all items globally
+and grouping whatever landed on the page. Two pieces of API surface support this.
+
+**Owner gate on every route.** Every `/api/knowledge` route calls `_require_knowledge_owner`
+before acting: the 17 mutating routes, and the 19 reads too (items, item content and
+export, entities, graphs, sources, source files, counts, stats, config, jobs, embedding
+status, `search-for-context` and the whole-library `export`), because a disclosed document
+cannot be taken back. It gates only dashboard-user requests (`app == ""`), which must come
+from the dashboard owner; a non-owner dashboard session (a Telegram, Teams or Webex
+allowlist link) gets 403 `owner_only`. Any other caller passes this gate and stays under the
+control that already governs it: an app token is confined to its manifest's declared paths
+by `_enforce_app_scope`, and an `X-Internal-Secret` loopback caller is admitted on the secret
+itself. `test/test_knowledge_owner_gate.py` pins the writes and
+`test/test_dashboard_owner_gate_history_kb_tasks.py` the reads.
+
+### `GET /api/knowledge/items?source_id=<id>`
+
+Scopes the page to a single source. Composes with the existing `type`, `status`,
+`namespace`, `q`, `page`, and `limit` params.
+
+- The reported `total` is **scoped to that source**, not the global count. The
+  in-group pager derives its page count from it, so a global total would break
+  the pager math.
+- `source_id=__none__` selects items with no source (`source_id` NULL or empty).
+- Applied in both branches of `list_items`: as a SQL predicate in the list
+  branch, and via `_matches_source` after ranking in the hybrid-search branch.
+- Because the hybrid-search branch filters *after* the retriever has ranked
+  globally, a scoped search escalates its candidate pool
+  (`_search_until_exhausted`: `_SCOPED_SEARCH_START` doubling to
+  `_SCOPED_SEARCH_MAX`) until the retriever short-reads, so the scoped total is
+  exact rather than truncated by a fixed window. At the cap the total may
+  understate. `HybridRetriever.search` now accepts `source_id` (seed-scoped —
+  see §4); adopting it in this branch is the remaining follow-up. Unscoped
+  searches keep the cheap `limit * 3` window.
+
+### `GET /api/knowledge/source-counts`
+
+Returns the item count per source **under the active filters**:
+
+```json
+{ "counts": { "<source_id>": 42, "__none__": 3 }, "total": 45 }
+```
+
+- Accepts `type`, `status`, and `namespace`; the counts reflect them, which is
+  why the list view uses this rather than `/sources.item_count` (a source's
+  unfiltered, all-namespace total that would over-report when filtered).
+- Sourceless items are reported under the `__none__` key.
+- The list view derives its rows from these counts, which is what guarantees
+  every source is visible at once regardless of relative size.
+
+## 6. Read-only stats (`store.aggregate_stats`, `kirocrew knowledge stats`)
+
+`KnowledgeStore.aggregate_stats()` returns the library's admitted content as a
+frozen `ContentStats`: `sources`, `documents`, `items`, and a `per_source` tuple
+of `SourceContentStats` carrying the same two counts per source. It is the single
+aggregate behind both the CLI verb and the MCP tool, so the two can never
+disagree.
+
+The two units it separates are the reason the verb exists at all:
+
+- an **item** is a row in `items` — a CHUNK. This is the unit
+  `knowledge_list_sources` and `/source-counts` already call an item, and the
+  count the release note names the "admitted item count".
+- a **document** is `(source_id, content_hash)`. Every chunk of one document
+  carries that document's whole-text hash, which is the identity `dedup` groups
+  on. An item written without a content hash counts in `items` and belongs to no
+  document.
+
+Two properties make the numbers auditable:
+
+- **`per_source` reconciles exactly** — its `items` sum to `items` and its
+  `documents` to `documents`. That is why membership here is plain ownership
+  (`items.source_id`), NOT the ownership-OR-location rule §4 uses to estimate a
+  scope's yield; under that rule an item surviving a cross-source dedup collapse
+  counts for two sources.
+- **Every registered source is listed, even at zero**, so a source that ingested
+  nothing is visible rather than absent. The sourceless bucket is the opposite:
+  it is not a registered row, so it appears only when it holds something, and it
+  reports `source_id = None`. It holds every active item no registered source
+  owns: rows with a NULL `source_id`, and rows whose `source_id` names a source
+  that no longer exists. The second kind is unreachable through the store's own
+  writes (`items.source_id REFERENCES sources(id)` under `foreign_keys=ON`), but a
+  database written before the constraint was enforced can hold one, and the
+  reconciliation is a promise about any database the verb reads, not only one
+  this store wrote. The store deliberately does not spell it with the
+  dashboard's `__none__` sentinel — that string is a contract between the items
+  API and the SPA, and a third copy in the store would have to change with them
+  while nothing in SQLite needs it. `sources` counts registered sources, so the
+  bucket is never one of them.
+
+`kirocrew knowledge stats` prints the totals line plus a `SOURCE / DOCS / ITEMS`
+table, its name column padded by `messaging.tables.display_width` so a CJK or
+accented source name keeps the count columns aligned; `--json` emits
+`{sources, documents, items, per_source:[{id, name,
+documents, items}]}` with `id: null` for the bucket. A missing DB is reported
+(SEL `not_configured`), as JSON under `--json` so a script parses one shape
+either way; every call emits an SEL event under tool name `knowledge_stats`.
+
+**Read-only is the boundary, not a default.** There is no flush, rebuild, repair
+or reindex verb beside it, and a caller who finds the numbers wrong has a
+diagnosis rather than a fix — the existing repair paths (the watcher's sig-gated
+self-heal, `dedup`) keep owning that. The verb opens the FILE read-only:
+`KnowledgeStore.open_read_only` runs neither the schema DDL nor `_migrate()`, both of
+which every ordinary open runs (as `knowledge dedup --apply` and the dashboard do), and
+opens every connection with SQLite's `mode=ro`, so a write is refused by the engine
+rather than by convention. The orphan sweep is not part of any open: it runs only in
+`KnowledgeStore.reclaim_orphans()`, which the gateway kicks from a worker thread after
+the listener binds. The trade is that a library behind this schema is
+reported (SEL `schema_behind`, `{"error": "schema_behind"}` under `--json`) and
+not migrated; any migrating open (the gateway, `knowledge dedup --apply`) repairs it. The
+MCP twin, `knowledge_list_sources`, opens the file the same way -- its own
+`KnowledgeStore.open_read_only` connection, `mode=ro`, closed after the call --
+rather than borrowing the cached store `local_knowledge_search` builds with the
+migrating constructor, and it reports a schema-behind library (SEL
+`schema_behind`, with the same `knowledge dedup --apply` pointer) instead of
+migrating it.
+
+## 7. Research Lab campaign engine (`apps/builtins/auto_research/`)
+
+Research Lab (the `auto-research` builtin app) reaches this module twice: a campaign's findings become a Knowledge Library source (§2b), and its campaigns table sits behind the on-loop guard (§4). The app's backend is one route facade over single-owner components:
+
+- `handlers.py` keeps what is HTTP -- auth, request parsing, the status and JSON each route answers with, `register_routes`, and the watchdog task handle `_watchdog_task` -- plus its own `LLMPool` binding, from which `register_routes` builds the grill's LLM pool, so `handlers.LLMPool` is not forwarded. Every other name it defined, and every Kiro Crew collaborator it imported, resolves as `handlers.<name>` to the one component that binds it, for reads, writes and deletes alike, so a patch applied through the facade reaches every caller. Because a write or delete lands on the owner and nothing is remembered in the facade, `monkeypatch` and `unittest.mock.patch`, nested in either order, restore the owner's binding. `mock.patch(..., create=True)` of a forwarded name is not supported, since it ends by deleting the owner's binding. `test_auto_research_facade.py` parses every Python file under `test/` and each `src/**/tests` directory that mentions `auto_research` or lies inside that package. It fails on any `unittest.mock` or pytest-mock `patch`, `patch.object` or `patch.multiple` call or decorator whose target resolves to the facade and whose `create` is not the literal `False`. Targets resolve through imports (relative ones included), `importlib.import_module`, `sys.modules`, plain assignments, string constants, f-strings and `+` concatenation. A call on the facade whose patched name cannot be read statically counts as a `<dynamic>` hit. No test is exempt: the allowlist is empty. `__all__`, derived from the facade's own names and the forwarding table, carries every public historic name for a star import, and each forwarded name is imported from its owner under `TYPE_CHECKING`, with the forwarding `__getattr__` hidden from mypy, so mypy types `handlers.<name>` instead of reading `Any`.
+- The components import one way, in the table's order, never import the facade, reach each other through the module (`storage._get_db()`) rather than a from-import, bind each forwarded collaborator once (`agent_mode.research_slot_key`), and log under the historic `kiro_crew.apps.builtins.auto_research.handlers` logger name. The one name they import by name is the `CampaignStatus` value type, from `storage`, so a patch of `handlers.CampaignStatus` reaches `storage` and not the copies the other components bound at import. `test_auto_research_facade.py` pins all of this; `test_auto_research_campaign_contract.py` pins the behaviour the facade preserves.
+
+| File (under `apps/builtins/auto_research/`) | Responsibility |
+|------|----------------|
+| `handlers.py` | HTTP/SSE route adapters, route registration, the watchdog task, the historic-name forwarding |
+| `campaign/untrusted.py` | The only binding of the canonical credential/exfil-URL redactor (`_HAS_SECURITY`, fail-closed masking) and the nonce fence around untrusted text in LLM prompts |
+| `campaign/storage.py` | Data-home paths (`research_dir`, `db_path`, resolved per call), the campaigns schema and migrations, `_get_db` behind `_ON_LOOP_DB_GUARD`, the campaign-directory file interface, cycle-file discovery, scrubbed row and finding reads |
+| `campaign/lifecycle.py` | Validation, create/transition/delete, which transitions are legal, the per-campaign transition lock, the `started_at` run-generation fence of `_guarded_transition`, settle-before-cancel for worker-thread writes, SSE fan-out, the SEL audit trail |
+| `campaign/publication.py` | `brief.md` (published after the row it renders commits, in commit order), the report and its artifact export, the Knowledge Library export |
+| `campaign/exploration.py` | Emergent sub-questions, the reserve zone of trailing cycles, FINALIZE MODE |
+| `campaign/agent_mode.py` | Agent-mode execution: launching, pausing and tearing down the autonudge worker, the `worker_done.json` marker, cycle accounting |
+| `campaign/workflow_mode.py` | Workflow-mode execution: Dynamic Workflow launch and cancel, the poll adapter, the `workflow_run.json` run id and cycle offset |
+| `campaign/watchdog.py` | The watchdog loop body: disabled-app suspension, the 24h trust expiry, question pauses, the stall verdict, terminal settlement |
+| `campaign/grill.py` | The question-tree planner behind the grill endpoint |
+| `session_keys.py`, `subquestion_queue.py`, `workflow_template.py` | Worker-slot identity, the emergent-question queue, the Dynamic Workflow template |
+| `seams.py` | The app's provider for the core's `stopped_loop_tombstone` seam (see "Repository boundary" below) |
+
+**Repository boundary.** Research Lab is to leave this repository whole, so no module under `src/kiro_crew` outside `apps/builtins/`, and no `scripts/` file, imports `kiro_crew.apps.builtins.auto_research`. The one core decision that depends on the app is the autonudge stop of a legacy loop: on a canonical `research-<campaign id>` worker slot carrying the persisted `auto-research` provenance it deactivates the loop with `AUTONUDGE_STOP_REASON` (the tombstone the watchdog reads as a deliberate finish) instead of removing it. `session_directive_apply_monitor._keeps_stopped_loop` asks the `stopped_loop_tombstone` seam in `kiro_crew/apps/seams.py` with the slot key and the slot's persisted `_app`. The app's `seams.py` holds that seam and answers with `session_keys.is_owned_research_slot`, so a slot keeps a tombstone exactly when it did under the old import, with the app enabled or not. With no provider, or a provider that raises, nothing is kept and the stop removes the row. `test_app_seams_stopped_loop_tombstone.py` pins that equivalence. `test_core_auto_research_decoupling.py` is the gate, on the shared `test/core_app_independence.py` scanner: the only core strings left naming the app are the `security_posture.py` rows classifying its backend modules, a pinned list that may only shrink. Its dashboard half is `website/src/apps/auto-research/researchLabBoundary.test.ts`: outside `src/apps/auto-research/`, only `apps/builtinRegistry.ts` imports the UI, and the page's tests live beside it. What still names the app in core, deliberately for this wave: the `kirocrew-research` service agent (`agent_materialization/service_agents._install_research_agent`, whose rewrite folds into the ceiling-hold of `agent_parts/spec_rebuild.py`), the dashboard API owner `website/src/api/client/autoResearch.ts`, the app-store row in `appManifest.ts`, the `apps.autoResearch.*` catalog keys, the packaged `docs/research-lab.md` and its tip, and the `research-<id>` slot fixtures core tests use.
+
+**The add-to-knowledge row in §2b is `publication._ingest_findings`.** It calls `ingest_file` with the default `count_toward_import_budget`, so the export counts against the explicit-import ceiling, and an `ImportChunkBudgetError` parks the source `pending` rather than `error`. What is ingested is the scrubbed copy `findings_for_knowledge.md`, never the raw `FINDINGS.md`, and its resolved path is the dedup key the status probe reads.
+
+**The campaigns-DB row in §4 is `storage._ON_LOOP_DB_GUARD`,** consulted at the top of `storage._get_db`. `test_auto_research_onloop_db.py::TestStaticRatchet` recomputes the DB-touching closure and scans every coroutine across all of the app's modules, bare or component-qualified calls alike, so a coroutine in any component that reaches the campaigns DB without `asyncio.to_thread` or `run_in_executor` fails there.
+
+## Invariants
+
+- **`sources.properties` / `entities.aliases` well-formedness is enforced at the writer** — `store.import_bundle()` validates that any present value is UTF-8-encodable JSON text parsing to an object / array of strings (absent/`null` falls back to the schema defaults `'{}'`/`'[]'`), raising `KnowledgeBundleError` before the INSERT. The dashboard import handler is the store's only production caller today; enforcing at the writer makes any future caller (MCP tool, CLI import, app backend) safe by construction. Several readers parse the raw column with `json.loads()` and no shape guard (source detail handlers index the parsed dict; `find_entity()` calls `.lower()` on each parsed alias), so a corrupt committed row would crash a later, unrelated read. The dashboard import handler maps the typed error to a 400 (`code: malformed_knowledge_bundle`).
+- **Sensitive paths never ingested** — `FileReader.read`, `FolderWatcher._walk`, `_hash_file`, and `_ingest_file` all gate on `is_sensitive_path()` (with symlink re-resolution at ingest time for TOCTOU).
+- **`.org` and unknown-but-supported extensions are plain text** — only `_DISPATCH` extensions get specialized readers; everything else in `SUPPORTED` flows through `_read_text` → generic chunker.
+- **Pool workers are long-lived and must be sweep-shielded** — any direct `AcpClient` worker that outlives a chat turn (not tracked in `SessionMap`/warm pool) must register its PID via `register_protected_pid`, or the orphan sweep will kill it mid-task.
+- **LLM-derived text is redacted before storage and before return** — ingestion redacts extracted text (`ingestion._redact`), and `local_knowledge_search` redacts its assembled output.
+- **FTS query input is parameterized** — user query tokens are always double-quoted literals; the user never injects FTS5 operators.
+- **Embedding-dimension mismatches are skipped, not scored** — vector search excludes incomparable-dimension items so a model swap cannot fill the top-K with all-zero ghosts.
+- **A vector is scored only against a query from its OWN embedding space** — the vector leg pins `embedding_sig`, so an unproven or foreign-space vector is refused rather than scored. The dimension guard above is not a substitute: a same-width space change is invisible to it. The KB then degrades to FTS5 + graph, which returns results (`_vector_search` yields `[]`, not `None`, and RRF folds an empty leg in).
+- **The knowledge library and vector memory share ONE vector-space identity** — `embedder.embed_signature` is derived from `embeddings.embedding_space_signature`, so no change can move one and not the other. `test_knowledge_embedding_rebuild.py::TestEmbedSignature::test_dim_change_moves_both_identities`, `::test_the_two_identities_partition_spaces_identically` and `::test_the_kb_identity_is_derived_from_memorys_not_reassembled` are the ratchet; they are also the only place both symbols are named together. The last is the one that refuses a re-derivation: it displaces the shared function and requires the KB's value to follow.
+- **Wiring a query embedder without its space signature is a `ValueError`, not a permissive default** — the predicate fails OPEN, so `HybridRetriever` refuses the ambiguous construction and `ANY_EMBEDDING_SPACE` is the named opt-out. All three production call sites resolve the pair through `vector_leg` and each is pinned.
+- **A bundle carries `embedding_sig` with the vector** — `import_bundle`'s item INSERT writes it, so imported vectors stay in the vector leg instead of landing at NULL and being refused until a full re-embed. A foreign-space signature travels through unchanged and is refused on the signature, deliberately. The value's grammar belongs to `embed_signature`; the store checks only that it is a non-empty UTF-8 string, and rejects anything else as a typed `KnowledgeBundleError` rather than letting a non-string raise at bind time.
+- **A bundle carries per-document OWNERSHIP only for the table whose owner never reaps by absence** — `export_all` ships all three state tables (`store.BUNDLE_STATE_KEY_COL` is the one list, derived from `_DOC_STATE_TABLES`, that the importer and the dashboard's bundle validator both read), and the import restores `agent_item_state` alone. A state row is a claim that a LOCAL subsystem owns this document, and importing one makes that claim on the subsystem's behalf without its knowledge — so wherever that subsystem deletes a document because its state row names something the subsystem cannot see, the row is not a stale marker but an order to delete the items the import just brought. Two of the three owners reap that way: `FolderWatcher._do_scan` step 4 drops every state row whose path its walk did not yield, without consulting `status`, and `reconcile_artifacts` takes `known.keys() - live` on every `ArtifactKnowledgeSync.start` and removes each provably absent slug's group (`_known_kinds` reads every row regardless of `status`, so no status value hides one from that pass). Nothing reaps agent state: `agent_source.remove_document` runs only when a caller explicitly deletes that document. An item with no state row is unmanaged — nothing claims it for de-duplication, the Sources UI has no per-document group label for it, and a later ingest of the same document adds a second copy instead of replacing the first — so a table left out costs its items exactly that, which is the state a bundle carrying no state tables already leaves them in, and the owning subsystem re-derives its row the next time it sees the document. A restored row still has to clear the rest: it owns the items THIS import inserted and nothing else (an id the bundle ships that already existed here was skipped by `INSERT OR IGNORE`, so the row in the store is local content and naming it would hand a foreign document the authority to replace or delete it), and a row written fresh carries that table's own live status.
+- **An exported ownership group names only items that export carries and files under that row's source** — the accepting pass keeps only the ids the import actually wrote, so an id the export omits is named on every restore of that document in the account of what arrived owned by nothing, and it never enters a group. That shape is routine rather than exotic: no delete path prunes a state row's group (`_delete_item_cascade` and `delete_items_batch_in_txn` both leave it), by design, because the group becomes accurate again when the chunk returns — so a document that lost one chunk has a row naming a dead id, and shipping it verbatim reports content as unowned that nothing is missing. `export_all` therefore prunes each group to `exported_owner`, the items it carries keyed to the source each is filed under, and drops a row that prunes to empty. This subsumes the namespace filter that `source_locations` still needs: a row belonging wholly to another namespace prunes to nothing, so that namespace's `file_path`, document name and content hashes stay in the machine. A bundle built elsewhere can still name an absent item; that id stays out of the group — partial ownership would claim items another document holds — and it is reported in `withheld` as `ownership_row_names_absent_items` with the document key and the ids, because its content is here owned by nothing and nothing else would say so. One id the bundle files under a DIFFERENT source is not a partial statement but an inconsistent one, and refuses the whole row: this store's own export cannot produce it. A row whose text `source_id` the bundle's `sources` list never declares resolves to no source here, so it is skipped and the items it names arrive owned by nothing; the ids this import wrote are reported in `withheld` as `ownership_row_source_undeclared` with the table, the source id as the bundle gave it, the document key and those ids. A non-text `source_id` is skipped with no entry, because it names no document a caller could look for. A group naming an id another document already claims, and a group naming an id this import filed under a different source, are each refused as a whole row -- an inconsistent statement rather than a partial one -- and the ids this import wrote for the refused row are reported in `withheld` as `ownership_row_item_claimed_elsewhere` and `ownership_row_item_source_mismatch` respectively, with the table, source, document key and those ids, because that content is here owned by nothing and nothing else would say so. An id another row claims, or one filed under a different source, is never blocked as an ITEM, so without these two entries the account would read whole while the content arrived unowned. The one remaining skip that adds no entry is an empty or non-text document key: a withheld entry is keyed on the document key, and such a row names none a caller could search by, the same reasoning that keeps the non-text `source_id` silent.
+- **Every bundle string that reaches a SQLite bind is UTF-8-validated at the writer** — `isinstance(value, str)` is not enough: a lone surrogate is a `str` SQLite cannot encode, and the `UnicodeEncodeError` sits outside every arm the import endpoint catches, so it surfaces as a 500 instead of the typed `malformed_knowledge_bundle` 400. `_bundle_state_text` gates the state rows' key and carried text columns, the same rule `sources.properties`, `entities.aliases` and `items.embedding_sig` already hold; the key is validated in `_bundle_blocked_items`, the FIRST bind it reaches.
+- **A local state row wins a document-key collision only while it OWNS live items, and then the bundle's copy of that document does not arrive at all** — a `(source, key)` pair IS a document's identity within a source, so two documents cannot share one. A local row whose group is empty or names only deleted items is holding a marker (a `deduped` loser, a pending or failed scan), not ownership, so the imported row takes the key; its claim on another source's items is released with it through `detach_source_location_by_hash`, because a claim left behind under a hash no row names any more means a later deletion of the holder reassigns an item into this source with nothing to adopt it into. A row that DOES own items keeps the key, and `_bundle_blocked_items` then withholds that document's items from the import entirely — importing them anyway would leave them permanently unowned, which is the defect this round-trip exists to remove, not a lesser version of it. A collision is only a DIFFERENT document holding the key, though: when the local row's own group overlaps the bundle's, this is that same document coming back, and nothing is withheld. Deleting one chunk of a chunked document leaves the group naming it while a surviving sibling keeps the row live, so the absolute rule held the deleted chunk back — silently, with no exit but deleting the document's remaining chunks first, which asks the user to destroy content to recover content. Letting it through is only half: the ids that arrive JOIN the live row's group, and the accepting pass tests that overlap ITSELF rather than inheriting it from the blocking pass. It has to: an id two bundle rows both name is shared and therefore never blocked, so it arrives with a live local row on its key whose group shares nothing with the bundle's -- a different document by the same rule the blocking pass uses. Merging there would file the arriving id under that unrelated local document, and its own delete would then take the imported content with it, unannounced and with no pass that reaps the row. Such a row is skipped instead; its items arrive unowned and are named in `withheld` as `ownership_row_key_held_locally` with the document key. A second bundle for a document already here — a newer backup restored before an older one, where `export_all` pruned the newer group to the chunks it still carried — names ids the first restore already put down alongside the one it brings, and a row refused for that leaves the arriving chunk searchable and owned by nothing. `agent_item_state` is the table nothing reaps, so the document's own `remove_document` takes the ids its row names and walks past the rest, forever. A merge extends the group and touches nothing else: the row's hash, name and status describe THIS store's copy of the document, and a bundle reaching this branch can be older than it. Where the group already names the returning id — a chunk deleted locally, restored from a bundle of the same revision — nothing has to be added, since no delete path rewrites a group and the row becomes accurate again when the chunk returns. The withheld count is reported as `items_withheld`, and every withholding is additionally named in `withheld` by reason and by the document or id it belongs to, so a caller can say WHICH content did not arrive rather than only how much. A colliding row withholds ITS OWN document alone: an id another bundle row also claims, or one the bundle files under a different source, is never blocked -- the store's own writer produces the latter when a reassigned item leaves one row naming an item its new owner's row never names. A withheld item takes its locations, mentions and relations with it, or their foreign keys would refuse the whole import. That is the only refusal reason that blocks an item: every other one rejects a ROW as an untrustworthy statement about items that are themselves legitimate — an unparsable group, one whose ids another row already owns, one the bundle files under a different source — and those items arrive unowned exactly as they do from a bundle carrying no state tables. An over-claiming group is not among them: the ids the import wrote are owned and the rest are only named in the account. One id a local row already claims is held back the same way, with a single exception for this document meeting its OWN row -- keyed on the bundle's row at the same `(table, source, key)`, which is what makes it an exemption rather than a blanket amnesty. It covers every table the bundle states, not only the one whose rows get written: a folder file or artifact slug this host still holds owns its chunk correctly, `_delete_item_cascade` never prunes a group so a per-chunk delete leaves the row naming that chunk, and nothing re-derives an id withheld here — the scan reaps only a row whose path the walk missed and skips a `done` row whose mtime and content hash did not change. The opposite risk, a row whose document is gone here and not yet reconciled away, cannot be deferred to the reap it belongs to: the reap is the deleter rather than a recovery path, so a stale `folder_file_state` claim exempted here lets the import make the ids live, then the next scan reaps that same key and cascades the delete over the items just restored, with nothing to re-ingest them. `_backing_object_present` closes the one slice of that existence answer reachable in the transaction: a `folder_file_state` key IS a filesystem path, so a regular file at it on disk (is_file, not exists -- the folder walk yields files, so a directory at the path is not a backing object it would re-ingest) is a direct, bounded test, and a LOCAL row whose file is absent does not earn the exemption, so the folder reap stays consistent with the import. The check runs in the second loop against the LOCAL row's recorded key (`row["row_key"]`), never a bundle-authored path — the first loop builds `restored_groups` from the bundle's own rows with no filesystem access, because stat-ing a bundle-supplied `file_path` would let an uploaded bundle name any host path (a UNC path leaks NTLM over SMB on Windows, a stalled mount holds the import's write lock) before a single local row is consulted. The local stat itself runs inside the import's `BEGIN IMMEDIATE` transaction, an accepted and bounded risk: it is one `is_file()` per local `folder_file_state` row whose source and path the bundle's own rows also name, on a path this host recorded, so a watched folder on a stalled mount can hold the import, and every knowledge writer queued behind its lock, for at most that mount's stat timeout per such row. The other two tables keep the exemption unconditionally — nothing reaps `agent_item_state` by absence, and `artifact_item_state` existence lives in the artifact store the `reconcile_artifacts` pass holds and this transaction cannot reach, where withholding is the rejected variant that loses a per-chunk-deleted document for good. Every `IN` list on this path is chunked under `store._MAX_SQL_PARAMS`, because its length is untrusted bundle input: a bundle names as many sources as it likes and one state row's group runs to `_MAX_ITEM_GROUP_MEMBERS`, both past the 999 bind ceiling a host still on a pre-3.32 sqlite enforces (the floor `vector_memory` already records), and the `OperationalError` would land mid-transaction — rolling the whole import back and answering 500 where it should have succeeded.
+- **One item is never owned by two state rows** — a group whose ids are already claimed, by a local row of the same source or by an earlier row in the same bundle, is refused. Two rows naming one item is content-destroying rather than untidy: the next document-level delete hands `delete_items_batch` an item whose only other holder is a state row it does not consult, finds nothing else holding it, and removes it, leaving the second row naming deleted content. `_adopt_reassigned_item` and `detach_source_location_by_hash` already refuse the same shape, so this closes a gap in an invariant the module holds elsewhere. The subset rule is not redundant with it: only the subset rule stops a bundle claiming pre-existing UNOWNED local content — residue — which it never shipped.
+- **A withheld or stranded row never leaves content unreachable** — the one refusal that blocks an ITEM is a live local row owning the same `(source, key)`; every other refusal rejects a ROW, and its items arrive unowned. A withheld item takes its locations, mentions and relations with it, or their foreign keys would refuse the whole import. That leaves an entity the bundle referenced only from rows naming withheld items reachable from nothing, so the import drops it and does not count it in `entities_created` — scoped three ways, to entities this import inserted, ones the bundle actually referenced (a bundle carrying a standalone entity and no mentions means it), and ones nothing in the store references now, so a pre-existing local orphan is left alone.
+- **The withheld account is redacted on the way OUT, because its fields are the ones the inbound loop cannot touch** — a withheld entry names the content that did not arrive in the bundle's own words: the document key, the item ids it claimed, and the source they resolved to. Those are exactly the values `_BUNDLE_STATE_PLAIN_FIELDS` exempts from the inbound `_redact()` loop, because the store matches them against a PRIMARY KEY and against `items.id` and so needs them byte-exact — and a document key carries no length bound. That leaves the HTTP response as the one path on which bundle-authored text would reach a reader unfiltered, since `web.json_response` returns the account verbatim. `_WITHHELD_REDACTED_FIELDS` is applied in the handler after the store has used and stored the real values, so the stored key stays byte-exact while the response carries no bundle-authored credential or exfiltration URL. The SEL copy is covered separately by `_redact_and_clip`; `reason` and `table` are module constants and are not listed.
+- **A source's cross-store identity is its `uri`, not its id** — `sources.uri` is UNIQUE and each store mints its own ids, so `import_bundle` resolves every bundle source by uri and rewrites `items.source_id`, `source_locations.source_id` and the state rows through that map. `sources.id` and `sources.uri` must each be a non-empty string, enforced at the writer like the properties and aliases columns: both become dictionary keys during the rewrite, so a list or dict raises an unhashable-type `TypeError` that no handler arm catches — a 500 in place of the typed 400. One id may name only one uri: a `sources` list repeating an id under two uris is a `KnowledgeBundleError`, because `sources.id` is a PRIMARY KEY so no export produces one, and the later entry would otherwise overwrite the earlier one's place in the map and file items under a source never named for them. A uri absent locally is CREATED; if its id is taken by a source holding a different uri, the uri arrives under a freshly minted id rather than being filed under the unrelated row or dropped. A source id that resolves nowhere is REFUSED as a typed `malformed_knowledge_bundle` 400, and the refusal covers the case a foreign key cannot: an id this store happens to hold under a source the bundle never names satisfies the constraint, so the content would be filed under an unrelated local source with nothing owning it. The declared path already refuses exactly that outcome — a bundle uri absent here whose id is held by a different uri arrives under a freshly minted id rather than the unrelated row — and an undeclared reference cannot be repaired that way, because nothing in the bundle names the source its content belongs to. This is also what makes the plain `INSERT` in the sources loop defence in depth rather than a hope: were it to fail and leave a uri unmapped, its items are refused instead of misfiled. A NULL reference is not a reference: an item filed under no source imports unchanged.
+- **An unattended re-embed runs at `PRIORITY_BULK`** — attendance, not corpus size, picks the scheduling class, or a multi-hour watcher self-heal holds the single shared inference slot against every interactive embed and every paced memory sweep.
+- **Taking `store.db` on the event loop is a diagnosable event, not a silent one** — the accessor is guarded (`on_loop_db.OnLoopDBGuard`): strict raises `OnLoopStoreError`, production logs a throttled WARNING with a stack and proceeds. This is what covers callers the lexical `check_sync_io_in_async` gate cannot see, so the two must both stay — neither alone closes #3057.
+- **The self-heal rebuild path never touches SQLite on the event loop** — `_maybe_reembed_stale`'s stale COUNT, `rebuild_embeddings`' total COUNT / page SELECTs / batch progress commits, and the success-path job finalize all run via `asyncio.to_thread` (`store.db` is a per-thread connection, so each worker thread uses its own connection to the same WAL db). On a large KB (observed: ~1.3GB after an embedder-sig change) an inline COUNT can stall past the 25s loop-watchdog threshold and crash-loop the gateway. The one deliberate exception is the CancelledError finalize in `_run_reembed_job`, which stays inline so cancellation cannot pre-empt the single-flight finalize. When the stale count exceeds `_LARGE_REBUILD_WARN_THRESHOLD` the watcher logs a prominent WARNING before starting the full re-embed.
+- **`__none__` is a shared wire contract** — the no-source sentinel is defined as `_NO_SOURCE` in `dashboard/handlers/knowledge_library.py` and mirrored as `NO_SOURCE` in `website/src/pages/knowledge/SourceGroup.tsx`. Both sides must change together; it is effectively un-renameable once shipped.
+- **A source-scoped `total` is scoped, never global** — `/items?source_id=` reports the count for that source alone, because the per-source pager computes its page count from it.
+- **`aggregate_stats` reconciles, and stays read-only** — `per_source` sums to the totals in both columns, which is what makes the numbers auditable and why it counts ownership rather than scope membership. Both the CLI verb and `knowledge_list_sources` render THAT call, so a second copy of the SQL cannot drift; the CLI verb and the MCP tool each open the file `mode=ro` (`KnowledgeStore.open_read_only`), so neither runs the schema DDL or `_migrate()` and neither can write; and no repair verb ships beside it, so a wrong count is a diagnosis and never a self-mutation.
+- **Per-source badge counts are filter-aware** — list-view badges come from `/source-counts` (which honours `type`/`status`/`namespace`), not from `/sources.item_count`, so a badge never disagrees with the group's contents under a filter.
+- **The search branch's candidate load runs off the event loop** — a scoped search escalates its candidate pool, so `_load_items_by_id` (batch `SELECT` plus per-row serialization) and the `source_counts` aggregate both run via `asyncio.to_thread`. `store.db` is a per-thread connection, so each worker thread uses its own. Run inline, either can stall the loop past the watchdog threshold on a large KB.
+- **Frontend selection is bounded to on-screen items** — in source-first mode item data lives in per-`SourceGroup` caches, so bulk actions read the items each expanded group reports as rendered, and selected IDs are pruned when a group collapses or pages away. Reading the react-query cache directly would let a bulk Delete reach a retained cache for a source the user can no longer see.
+- **Per-source caches are keyed under the `knowledge-items` prefix** — `['knowledge-items', 'source-items', ...]` and `['knowledge-items', 'source-counts', ...]` so every existing `invalidateQueries(['knowledge-items'])` call site reaches them. Consequently any `setQueriesData` on that prefix must guard on the payload shape, since the counts entry has no `items` array.
+- **A connection belongs to the thread that opened it; production closes the others by exiting** — `store.db` hands each thread its own SQLite connection through a thread-local (the constructor's on the loop thread, one per `asyncio.to_thread` / embed-pool worker that touches the store). `close()` releases the CALLING thread's connection and nothing else, which `test_knowledge_cross_thread.py::test_close_only_releases_calling_threads_connection` pins; there is no production moment at which every thread is provably idle short of process exit, so no production path closes another thread's handle. Tests have that moment, and need it: on CPython 3.11+ an unclosed `sqlite3.Connection` is a reference cycle (its statement cache is an `lru_cache` over the connection), so a dropped store holds `db` + `-wal` + `-shm` per thread until the cyclic collector runs. `_close_all_for_tests()` is that test-only seam: it closes every connection the store ever opened, on any thread (`test/conftest.py` flips the module flag `_ALLOW_CROSS_THREAD_CLOSE_FOR_TESTS` once per session -- for the `test/` testpath only, since the app test trees under `src/kiro_crew/apps/builtins` do not load `test/conftest.py` and so do not activate the flip themselves; under it a connection is opened `check_same_thread=False` through the `_ThreadAffineTestConnection` factory, which re-applies the thread-affinity guard in Python on every statement entry point the store uses (`cursor`, `execute*`, `commit`, `rollback`), leaving only `close()` cross-thread, and is registered for the teardown close. Production connections keep SQLite's native guard, register nothing -- so no exited thread's handle is pinned -- and the seam raises `RuntimeError` when the flag is off: `test_knowledge.py::TestKnowledgeStore::test_production_keeps_the_thread_guard_and_the_seam_refuses_without_the_flag` and `::test_the_test_mode_connection_still_refuses_another_threads_use`), bumps a generation so a thread whose handle was closed from elsewhere reopens lazily on its next `db` take, and is idempotent — `test_knowledge.py::TestKnowledgeStore::test_close_all_releases_every_threads_connection_and_reopens_lazily`. Tests call it at teardown where another thread held a connection (the `opened` fixture in `test/conftest.py` uses it for every `KnowledgeStore` it tracks); a store only the test thread touched closes through `close()`. Nothing in production may.
+
+## Graph internals
+
+How the entity graph behind knowledge search is built and stored. The
+user-facing behaviour — what gets ingested, what search returns, and the
+citation format — is
+[`src/kiro_crew/docs/knowledge-library-how-it-works.md`](../../../src/kiro_crew/docs/knowledge-library-how-it-works.md).
+
+### Graph Construction
+
+#### Entities → Nodes
+
+Each extracted entity becomes a node in the graph:
+- Deduplication: exact name matching + case-insensitive alias lookup
+- If "DynamoDB" appears in chunk 1 and chunk 5, both map to the same node
+- Stored in SQLite `entities` table + in-memory `SimpleDiGraph`
+
+#### Relations → Edges
+
+Each extracted relation becomes a directed edge:
+- Only created between entities extracted from the **same chunk**
+- Edge types: `owns | uses | works_on | part_of | calls | depends_on`
+- Stored in SQLite `entity_relations` table + in-memory graph
+
+#### Cross-Chunk Connections
+
+There is NO cross-chunk relation extraction (too expensive). Connections across chunks happen through **shared entity names**:
+
+```
+Chunk 1: AuthService ──uses──► DynamoDB
+Chunk 5: BackupService ──depends_on──► DynamoDB
+
+Graph result:
+  AuthService ──uses──► DynamoDB ◄──depends_on── BackupService
+```
+
+The shared "DynamoDB" node creates an implicit connection between AuthService and BackupService — they're 2 hops apart in the graph.
+
+#### Mentions
+
+Every entity-in-chunk creates a `mention` record linking the item (chunk) to the entity. This enables: "show me all chunks that mention DynamoDB."
+
+### Data Model
+
+```
+┌──────────────┐         ┌──────────────┐
+│   sources    │         │   entities   │ ← Graph Nodes
+│ (files/URLs) │         │ (name, type) │
+└──────┬───────┘         └──────┬───────┘
+       │ source_id               │ entity_id
+       ▼                         ▼
+┌──────────────┐         ┌──────────────┐
+│    items     │◄────────│   mentions   │
+│  (chunks)    │ item_id │(item↔entity) │
+└──────────────┘         └──────────────┘
+
+                         ┌──────────────────┐
+                         │ entity_relations  │ ← Graph Edges
+                         │(src→tgt, type)   │
+                         └──────────────────┘
+```
+
+
+### Storage and search implementation
+
+- Embeddings are generated **after** extraction, in the same ingestion pipeline
+- Stored as packed float32 binary in the `items.embedding` BLOB column
+- Vector search uses brute-force cosine similarity
+- Existing items with a stale embedding signature are transparently re-embedded by the signature-gated rebuild
+
+Known gaps in the construction above, stated as current behaviour rather than as
+a plan: entities connect only through shared names, so `auth layer` and
+`AuthService` produce two nodes; `merge_entities` exists but no ingestion path
+calls it; and nothing computes entity communities, so a cluster of related
+entities has no representation a query can select on.
+
+Writers: `knowledge/store_parts/entity_graph.py` (the `entities`, `entity_relations`
+and `mentions` tables, the in-memory `SimpleDiGraph`), `knowledge/store_parts/item_rows.py`
+(`items.embedding`, which the signature-gated re-embed rewrites), `knowledge/extractor.py` (per-chunk entity and relation extraction),
+`knowledge/ingestion.py` (chunking, dedup, the embedding pass),
+`knowledge/ingestion_rebuild.py` (the signature-gated re-embed's vector writes and its job row),
+`knowledge/retrieval.py` (the three search legs and their RRF fusion).

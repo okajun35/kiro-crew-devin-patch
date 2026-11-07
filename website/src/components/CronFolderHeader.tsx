@@ -1,0 +1,164 @@
+import { useRef, useState } from 'react'
+import { ChevronRight, Folder, MoreHorizontal, Pencil, Trash2 } from 'lucide-react'
+import { Btn, Input } from './ui'
+import {
+  DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem,
+} from './ui/dropdown-menu'
+import type { CronFolder } from '../utils/cronFolders'
+import { TableCell, TableRow } from './ui/table'
+import { i18nT } from '../i18n/t'
+import { useImeGuard } from '../hooks/useImeGuard'
+
+interface Props {
+  folder: CronFolder
+  jobCount: number
+  collapsed: boolean
+  onToggleCollapse: () => void
+  onRename: (name: string) => void
+  onDelete: () => void
+  colSpan: number
+}
+
+export default function CronFolderHeader({ folder, jobCount, collapsed, onToggleCollapse, onRename, onDelete, colSpan }: Props) {
+  const ime = useImeGuard()
+  const [editing, setEditing] = useState(false)
+  const [editName, setEditName] = useState(folder.name)
+  const [confirmingDelete, setConfirmingDelete] = useState(false)
+
+  // The collapse toggle replaces the input when the editor closes. Closing
+  // unmounts the focused input, and a browser then drops focus to
+  // `document.body`, so Enter and Escape hand focus back to the toggle the
+  // editor stood in for. A pointer blur moves nothing: the user already chose
+  // where focus goes. The toggle mounts in the same render that closes the
+  // editor, so the move waits a frame for it.
+  const toggleRef = useRef<HTMLButtonElement>(null)
+  // Set by Enter and Escape before they close the editor, so a blur the
+  // browser fires on the unmounting input neither commits again nor commits
+  // the abandoned draft.
+  const closedRef = useRef(false)
+  // The menu skips Radix's focus restore (see `onCloseAutoFocus`), so the
+  // delete confirmation takes focus when it opens, and Cancel hands it back to
+  // the toggle. Both targets mount in the render that opens or closes the row,
+  // so the move waits a frame, as the rename editor's does.
+  const confirmDeleteRef = useRef<HTMLButtonElement>(null)
+  const openDeleteConfirm = () => {
+    setConfirmingDelete(true)
+    requestAnimationFrame(() => confirmDeleteRef.current?.focus({ preventScroll: true }))
+  }
+  const cancelDelete = () => {
+    setConfirmingDelete(false)
+    requestAnimationFrame(() => toggleRef.current?.focus({ preventScroll: true }))
+  }
+
+  const commitRename = () => {
+    const trimmed = editName.trim()
+    if (trimmed && trimmed !== folder.name) onRename(trimmed)
+  }
+  const closeEditor = (reason: 'enter' | 'escape' | 'blur') => {
+    if (reason === 'blur') {
+      if (closedRef.current) return
+      commitRename()
+      setEditing(false)
+      return
+    }
+    closedRef.current = true
+    if (reason === 'enter') commitRename()
+    setEditing(false)
+    requestAnimationFrame(() => toggleRef.current?.focus({ preventScroll: true }))
+  }
+
+  return (
+    <>
+      <TableRow className="bg-bg-elevated/50 hover:bg-transparent">
+        <TableCell colSpan={colSpan} className="px-2.5 py-1.5">
+          <div className="flex items-center gap-2">
+            {editing ? (
+              <>
+                <Folder size={14} className="text-accent shrink-0" />
+                <Input
+                  autoFocus
+                  aria-label={i18nT('pages.schedulePage.cronFolders.rename')}
+                  className="bg-bg rounded px-2 py-0.5 flex-none min-w-[120px]"
+                  value={editName}
+                  onChange={e => setEditName(e.target.value)}
+                  {...ime.bindEnter({ onEnter: () => closeEditor('enter'), onEscape: () => closeEditor('escape'), onBlur: () => closeEditor('blur') })}
+                />
+              </>
+            ) : (
+              <button
+                ref={toggleRef}
+                type="button"
+                onClick={onToggleCollapse}
+                aria-expanded={!collapsed}
+                className="flex items-center gap-1.5 bg-transparent border-none cursor-pointer p-0 text-text hover:text-accent transition-colors"
+                aria-label={`${collapsed ? i18nT('pages.schedulePage.cronFolders.expand_folder') : i18nT('pages.schedulePage.cronFolders.collapse_folder')} ${folder.name}`}
+              >
+                <ChevronRight size={14} className={`transition-transform ${collapsed ? '' : 'rotate-90'}`} />
+                <Folder size={14} className="text-accent shrink-0" />
+                <span className="text-sm font-medium">{folder.name}</span>
+              </button>
+            )}
+
+            <span className="text-[12px] text-muted">
+              {i18nT('pages.schedulePage.cronFolders.job_count', { count: jobCount })}
+            </span>
+
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Btn className="!p-1 !border-none ml-auto" aria-label={i18nT('pages.schedulePage.cronFolders.folder_actions')}>
+                  <MoreHorizontal size={14} />
+                </Btn>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent
+                align="end"
+                className="min-w-[140px]"
+                // Radix restores focus to the trigger when the menu closes, and
+                // that restore is deferred, as is mounting the rename input. With
+                // no ordering between them the restore can land AFTER the input
+                // has autofocused, which fires `focusout` on an input the user has
+                // not typed in yet: `commitRename` then reads an unchanged name,
+                // commits nothing, and closes the box the user just opened. The
+                // item that ran has already put focus where it belongs (the input,
+                // or the delete confirmation), so the restore has nothing to add.
+                onCloseAutoFocus={e => e.preventDefault()}
+              >
+                <DropdownMenuItem onSelect={() => { setEditName(folder.name); closedRef.current = false; setTimeout(() => setEditing(true), 0) }}>
+                  <Pencil size={13} className="shrink-0" />
+                  <span>{i18nT('pages.schedulePage.cronFolders.rename')}</span>
+                </DropdownMenuItem>
+                <DropdownMenuItem onSelect={openDeleteConfirm} className="text-danger">
+                  <Trash2 size={13} className="shrink-0" />
+                  <span>{i18nT('pages.schedulePage.cronFolders.delete_folder')}</span>
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+          </div>
+        </TableCell>
+      </TableRow>
+      {confirmingDelete && (
+        <TableRow className="bg-danger/5 border-danger/20 hover:bg-transparent">
+          <TableCell colSpan={colSpan} className="px-4 py-2">
+            <div className="flex items-center gap-3 text-sm">
+              <span className="text-text">{i18nT('pages.schedulePage.cronFolders.confirm_delete_folder', { name: folder.name })}</span>
+              <Btn
+                ref={confirmDeleteRef}
+                danger
+                onClick={() => { onDelete(); setConfirmingDelete(false) }}
+                // Focus lands here while the Enter or Space that picked the menu
+                // item may still be held (the menu selects on keydown for both),
+                // and a repeated key on a button activates it. Deleting needs its
+                // own press.
+                onKeyDown={e => { if (e.repeat && (e.key === 'Enter' || e.key === ' ')) e.preventDefault() }}
+              >
+                {i18nT('pages.schedulePage.cronFolders.delete_folder_named', { name: folder.name })}
+              </Btn>
+              <Btn onClick={cancelDelete}>
+                {i18nT('pages.schedulePage.cancel')}
+              </Btn>
+            </div>
+          </TableCell>
+        </TableRow>
+      )}
+    </>
+  )
+}

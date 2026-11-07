@@ -1,0 +1,836 @@
+import { useState, useEffect, useRef, useCallback, useMemo, lazy, Suspense } from 'react'
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { Search, BookOpen, Network, FolderSync, HelpCircle, FileText, X, Copy, Settings } from 'lucide-react'
+import { Btn, SearchInput, Badge, EmptyState, ContentSkeleton } from '../../components/ui'
+import Clickable from '../../components/Clickable'
+import Modal from '../../components/Modal'
+import SimpleSelect from '../../components/SimpleSelect'
+import ErrorNotice from '../../components/ErrorNotice'
+import { errMessage } from '../../utils/thunkError'
+import { knowledgeApi } from './api'
+import { useCopy, ITEM_TYPES, STATUSES, DEFAULT_STATUS_FILTER, ONBOARDING, FALLBACK_SUPPORTED_FORMATS, formatSupportedFormats } from './helpers'
+import DetailView from './DetailView'
+import SourcesList from './SourcesList'
+import { ItemCard } from './ItemCard'
+import { SourceGroup, NO_SOURCE } from './SourceGroup'
+import { EmbeddingStatus } from './EmbeddingStatus'
+import { SettingsTab } from './SettingsTab'
+import { useIngestionJobs } from './useIngestionJobs'
+import type { KnowledgeItem, Entity, Source, NamespaceInfo, IngestionJob } from './types'
+import { displaySyncStatus } from './knowledgeUtils'
+import { fmtNumber } from '../../i18n/format'
+import { itemTypeLabel } from './helpers'
+
+/**
+ * Visible label per knowledge status. FULL literal keys, resolved at render —
+ * not `pages.knowledge.index.status_${s}`: an assembled key is invisible to the
+ * key-reference gate, so it cannot be verified to exist and would render its own
+ * dotted name to the user if it did not. Module-level `i18nT` is likewise out —
+ * it would freeze at the boot language.
+ *
+ * The status needs catalog copy at all because the closed dropdown trigger
+ * DISPLAYS the selected value; the old native `<select>` hid it from view.
+ */
+const STATUS_LABEL_KEY = {
+  active: 'pages.knowledge.index.status_active',
+  archived: 'pages.knowledge.index.status_archived',
+} as const
+
+import { i18nT } from '../../i18n/t'
+import { useImeGuard } from '../../hooks/useImeGuard'
+import { editableEventTarget } from '../../utils/editableTarget'
+import { useRovingTabs } from '../../components/Tablist'
+const KnowledgeGraph = lazy(() => import('./KnowledgeGraph'))
+
+const TABS = ['list', 'graph', 'sources', 'settings'] as const
+type Tab = typeof TABS[number]
+const ROVING_TABS = TABS.map(key => ({ key }))
+/** The one panel every tab controls: the body below the rail is a single
+ *  subtree parameterised by `tab`, not a panel per tab. */
+const TAB_PANEL_ID = 'knowledge-tabpanel'
+const tabId = (t: Tab) => `knowledge-tab-${t}`
+
+// Backend list_items() hard-caps page size at 100 (dashboard/handlers/knowledge.py).
+// The unfiltered list must request exactly that so totalPages math and Prev/Next stay correct.
+const MAX_PAGE_SIZE = 100
+/**
+ * Catalog KEYS for the tab labels, flat and separate from the icons: keys rather
+ * than strings because this is evaluated at module load, where an `i18nT()` call
+ * would freeze the boot language, and flat because a nested
+ * `TAB_META[t].labelKey` is not statically resolvable by
+ * `scripts/check-i18n-keys.mjs`. The lookup happens in the tab bar's `.map()`.
+ */
+const TAB_LABEL_KEY: Record<Tab, string> = {
+  list: 'pages.knowledge.index.list_view',
+  graph: 'pages.knowledge.index.graph_view',
+  // `…index.sources` is NOT reusable here: it already holds the lowercase count
+  // noun in "{n} sources" (below), a different string in a different grammatical
+  // role. Sharing it would lowercase this tab and let either use-site's
+  // translation break the other.
+  sources: 'pages.knowledge.index.sources_tab',
+  settings: 'pages.knowledge.index.settings_tab',
+}
+const TAB_ICON: Record<Tab, React.ReactNode> = {
+  list: <FileText size={14} />,
+  graph: <Network size={14} />,
+  sources: <FolderSync size={14} />,
+  settings: <Settings size={14} />,
+}
+
+function EntityAutocomplete({ query, onSelect }: { query: string; onSelect: (name: string) => void }) {
+  const [debouncedQuery, setDebouncedQuery] = useState('')
+  useEffect(() => {
+    const t = setTimeout(() => setDebouncedQuery(query), 250)
+    return () => clearTimeout(t)
+  }, [query])
+
+  const { data: entities = [] } = useQuery({
+    queryKey: ['knowledge-entity-autocomplete', debouncedQuery],
+    queryFn: () => knowledgeApi<Entity[]>(`/entities?q=${encodeURIComponent(debouncedQuery)}&limit=5`),
+    enabled: debouncedQuery.length >= 2,
+    staleTime: 500,
+    placeholderData: (prev: Entity[] | undefined) => prev,
+  })
+
+  if (!entities.length || query.length < 2) return null
+
+  return (
+    <div className="absolute top-full left-0 right-0 mt-1 border border-border rounded-md bg-bg-elevated shadow-lg z-20 overflow-hidden">
+      {entities.map(e => (
+        <button key={e.id} onClick={() => onSelect(e.name)}
+          className="w-full px-3 py-2 text-left text-[13px] hover:bg-bg-hover flex items-center gap-2 bg-transparent border-none cursor-pointer">
+          <span className="text-accent text-[11px]">{e.entity_type}</span>
+          <span className="text-text">{e.name}</span>
+        </button>
+      ))}
+    </div>
+  )
+}
+
+/** The server's reason for a failed request, or a plain line when it gave none. */
+function failureText(error: unknown): string {
+  return errMessage(error) || i18nT('pages.knowledge.index.error_no_reason')
+}
+
+/**
+ * Send every request of a bulk action, wait for all of them, then fail with the
+ * first refusal. `Promise.all` would reject on the first refusal while the rest
+ * are still in flight, so the rollback and its refetch could run before those
+ * writes land.
+ */
+async function settleAll(requests: Promise<unknown>[]): Promise<void> {
+  const results = await Promise.allSettled(requests)
+  const refused = results.find((r): r is PromiseRejectedResult => r.status === 'rejected')
+  if (refused) throw refused.reason
+}
+
+// Each bulk action carries the ids it was started on, and on success drops
+// only those from the selection (`onActed`). The optimistic update hides those
+// rows, which empties the selection while the requests run, so any row checked
+// in that window is a new pick of the user's, not part of the action.
+function BulkActions({ selectedIds, items, onDone, onActed }: { selectedIds: Set<string>; items: KnowledgeItem[]; onDone: () => void; onActed: (ids: string[]) => void }) {
+  const queryClient = useQueryClient()
+  // A bulk action that failed part-way still changed the items whose requests
+  // went through. The snapshot puts every selected row back; this refetch takes
+  // away the ones the server did archive or delete, so they are not shown as
+  // live rows that a retry would only fail on again. Awaited by `onError`, so
+  // the mutation stays pending (its buttons disabled) until the reads finish:
+  // a retry's own `cancelQueries` could otherwise cancel this refetch.
+  const refetchAfterPartialFailure = () => Promise.all([
+    queryClient.invalidateQueries({ queryKey: ['knowledge-items'] }),
+    queryClient.invalidateQueries({ queryKey: ['knowledge-stats'] }),
+  ])
+
+  const bulkArchiveMutation = useMutation({
+    mutationFn: async ({ status, ids }: { status: string; ids: string[] }) => {
+      await settleAll(ids.map(id =>
+        knowledgeApi(`/items/${id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ status }) })
+      ))
+    },
+    onMutate: async ({ ids }) => {
+      // Each action clears the other's failure, so the notice names the latest one.
+      bulkDeleteMutation.reset()
+      await queryClient.cancelQueries({ queryKey: ['knowledge-items'] })
+      const prev = queryClient.getQueriesData({ queryKey: ['knowledge-items'] })
+      // The 'knowledge-items' prefix also covers the source-counts cache,
+      // whose payload has no `items` array. Only rewrite item-shaped entries.
+      queryClient.setQueriesData<{ items: KnowledgeItem[]; total: number }>({ queryKey: ['knowledge-items'] }, old => {
+        if (!old || !Array.isArray(old.items)) return old
+        const kept = old.items.filter(i => !ids.includes(i.id))
+        return { ...old, items: kept, total: old.total - (old.items.length - kept.length) }
+      })
+      return { prev }
+    },
+    onError: async (_err, _vars, ctx) => {
+      ctx?.prev.forEach(([key, data]) => queryClient.setQueryData(key, data))
+      await refetchAfterPartialFailure()
+    },
+    onSuccess: (_data, { ids }) => {
+      queryClient.invalidateQueries({ queryKey: ['knowledge-items'] })
+      queryClient.invalidateQueries({ queryKey: ['knowledge-stats'] })
+      onActed(ids)
+    },
+  })
+
+  const bulkDeleteMutation = useMutation({
+    mutationFn: async ({ ids }: { ids: string[] }) => {
+      await settleAll(ids.map(id =>
+        knowledgeApi(`/items/${id}`, { method: 'DELETE' })
+      ))
+    },
+    onMutate: async ({ ids }) => {
+      // Each action clears the other's failure, so the notice names the latest one.
+      bulkArchiveMutation.reset()
+      await queryClient.cancelQueries({ queryKey: ['knowledge-items'] })
+      const prev = queryClient.getQueriesData({ queryKey: ['knowledge-items'] })
+      // The 'knowledge-items' prefix also covers the source-counts cache,
+      // whose payload has no `items` array. Only rewrite item-shaped entries.
+      queryClient.setQueriesData<{ items: KnowledgeItem[]; total: number }>({ queryKey: ['knowledge-items'] }, old => {
+        if (!old || !Array.isArray(old.items)) return old
+        const kept = old.items.filter(i => !ids.includes(i.id))
+        return { ...old, items: kept, total: old.total - (old.items.length - kept.length) }
+      })
+      return { prev }
+    },
+    onError: async (_err, _vars, ctx) => {
+      ctx?.prev.forEach(([key, data]) => queryClient.setQueryData(key, data))
+      await refetchAfterPartialFailure()
+    },
+    onSuccess: (_data, { ids }) => {
+      queryClient.invalidateQueries({ queryKey: ['knowledge-items'] })
+      queryClient.invalidateQueries({ queryKey: ['knowledge-stats'] })
+      onActed(ids)
+    },
+  })
+
+  const { copied, copy } = useCopy()
+  const copySelected = () => {
+    const selectedItems = items.filter(i => selectedIds.has(i.id))
+    const text = selectedItems.map(i => i.content || i.summary || i.title).join('\n\n---\n\n')
+    copy(text)
+  }
+
+  const pending = bulkArchiveMutation.isPending || bulkDeleteMutation.isPending
+  // The rollback puts the rows back; this says why they came back.
+  const failed = bulkArchiveMutation.isError ? bulkArchiveMutation : bulkDeleteMutation.isError ? bulkDeleteMutation : null
+
+  return (
+    <>
+    {/* Only the toolbar follows the selection. The optimistic update hides the
+        selected rows, which empties the selection, so the notice and the
+        mutations that own it must stay mounted without one. */}
+    {selectedIds.size > 0 && (
+    <div className="flex items-center gap-2 px-3 py-2 bg-accent/5 border border-accent/20 rounded-lg mb-3">
+      <span className="text-[13px] text-text-strong font-medium">{i18nT('pages.knowledge.index.selected_count', { count: selectedIds.size })}</span>
+      <Btn disabled={pending} onClick={() => bulkArchiveMutation.mutate({ status: 'archived', ids: Array.from(selectedIds) })}>{i18nT('pages.knowledge.index.archive')}</Btn>
+      <Btn disabled={pending} onClick={() => { if (confirm(i18nT('pages.knowledge.index.delete_items_permanently', { count: selectedIds.size }))) bulkDeleteMutation.mutate({ ids: Array.from(selectedIds) }) }}>{i18nT('pages.knowledge.index.delete')}</Btn>
+      <Btn onClick={copySelected}><Copy size={12} /> {copied ? i18nT('pages.knowledge.index.copied') : i18nT('pages.knowledge.index.copy_content')}</Btn>
+      <button onClick={onDone} className="ml-auto text-[12px] text-muted hover:text-text bg-transparent border-none cursor-pointer">{i18nT('pages.knowledge.index.clear')}</button>
+    </div>
+    )}
+    <ErrorNotice
+      askAgent
+      className="mb-3"
+      testId="knowledge-bulk-error"
+      title={failed === bulkDeleteMutation
+        ? i18nT('pages.knowledge.index.bulk_delete_failed')
+        : i18nT('pages.knowledge.index.bulk_archive_failed')}
+      message={failed ? failureText(failed.error) : ''}
+      onDismiss={() => { bulkArchiveMutation.reset(); bulkDeleteMutation.reset() }}
+    />
+    </>
+  )
+}
+
+/** `embedded` — hosted as a pane inside Agent Capabilities' SidePanelLayout,
+ *  which already renders the tab's label + description as the pane header, so
+ *  the page's own title block would duplicate it. The Help affordance moves
+ *  into the internal tab strip instead of disappearing with the header. */
+export default function KnowledgePage({ embedded = false }: { embedded?: boolean } = {}) {
+  const ime = useImeGuard()
+  const queryClient = useQueryClient()
+  const [tab, setTab] = useState<Tab>('list')
+  const [query, setQuery] = useState('')
+  const [searchInput, setSearchInput] = useState('')
+  const [typeFilter, setTypeFilter] = useState('')
+  const [statusFilter, setStatusFilter] = useState(DEFAULT_STATUS_FILTER)
+  const [page, setPage] = useState(1)
+  const [selectedId, setSelectedId] = useState<string | null>(null)
+  const [selectedEntity, setSelectedEntity] = useState<string | null>(null)
+  const ingestion = useIngestionJobs()
+  const [showHelp, setShowHelp] = useState(false)
+  const [namespaceFilter, setNamespaceFilter] = useState('')
+  const [uploadNamespace, setUploadNamespace] = useState('default')
+  const [showAutocomplete, setShowAutocomplete] = useState(false)
+  const [selectedItems, setSelectedItems] = useState<Set<string>>(new Set())
+  const selectTab = (t: Tab) => { setTab(t); setSelectedId(null); setSelectedItems(new Set()) }
+  const rovingTab = useRovingTabs(ROVING_TABS, tab, selectTab)
+  // Items currently rendered by each expanded SourceGroup. Selection-wide
+  // actions read this instead of the react-query cache, so they can never reach
+  // an item that is not on screen (a retained cache from a previously expanded
+  // source would otherwise be swept into a bulk Delete).
+  const [visibleBySource, setVisibleBySource] = useState<Record<string, KnowledgeItem[]>>({})
+  const searchRef = useRef<HTMLDivElement>(null)
+  const entitySectionRef = useRef<HTMLDivElement>(null)
+  const listContainerRef = useRef<HTMLDivElement>(null)
+  const limit = query ? 20 : MAX_PAGE_SIZE
+  // Source-first list: when nothing is searched the top level renders one row
+  // per source and each row pages within itself, so the item-level query below
+  // is only used for flat search results.
+  const sourceFirst = !query
+
+  const { data: itemsData, isLoading: itemsLoading, error: itemsError } = useQuery({
+    queryKey: ['knowledge-items', { page, query, typeFilter, statusFilter, namespaceFilter, limit }],
+    queryFn: () => {
+      const params = new URLSearchParams({ page: String(page), limit: String(limit) })
+      if (query) params.set('q', query)
+      if (typeFilter) params.set('type', typeFilter)
+      if (statusFilter) params.set('status', statusFilter)
+      if (namespaceFilter) params.set('namespace', namespaceFilter)
+      return knowledgeApi<{ items: KnowledgeItem[]; total: number }>(`/items?${params}`)
+    },
+    enabled: !sourceFirst,
+  })
+
+  // Per-source counts under the active filters. This is what makes every source
+  // visible at once: the rows come from these counts, not from whichever items
+  // happened to land on a shared page.
+  const { data: countsData, isLoading: countsLoading, error: countsError } = useQuery({
+    // Shared 'knowledge-items' prefix: see SourceGroup for the rationale.
+    queryKey: ['knowledge-items', 'source-counts', { typeFilter, statusFilter, namespaceFilter }],
+    queryFn: () => {
+      const params = new URLSearchParams()
+      if (typeFilter) params.set('type', typeFilter)
+      if (statusFilter) params.set('status', statusFilter)
+      if (namespaceFilter) params.set('namespace', namespaceFilter)
+      const qs = params.toString()
+      return knowledgeApi<{ counts: Record<string, number>; total: number }>(`/source-counts${qs ? `?${qs}` : ''}`)
+    },
+    enabled: sourceFirst,
+  })
+
+  // Memoize so the `?? []` fallback doesn't create a new array reference on
+  // every render — that reference feeds the keyboard-shortcut useEffect below,
+  // and an unstable identity would make it re-subscribe each render.
+  const items = useMemo(() => itemsData?.items ?? [], [itemsData])
+  const total = sourceFirst ? (countsData?.total ?? 0) : (itemsData?.total ?? 0)
+  const loading = sourceFirst ? countsLoading : itemsLoading
+  // The read behind the list that is on screen. A failure with no rows to show,
+  // cached or not, is not an empty library: it must not read as onboarding or
+  // "no matches". Cached rows stay on screen under the notice.
+  const listError = sourceFirst ? countsError : itemsError
+  const listRows = sourceFirst ? (countsData?.total ?? 0) : (itemsData?.items.length ?? 0)
+  const listUnread = !!listError && listRows === 0
+
+  const { data: stats } = useQuery({
+    queryKey: ['knowledge-stats'],
+    queryFn: () => knowledgeApi<{ items: number; entities: number; relations: number; sources: number; embeddings?: { enabled: boolean; provider?: string; model?: string; available?: boolean; embedded_items?: number } }>('/stats'),
+  })
+
+  const { data: namespaces = [] } = useQuery({
+    queryKey: ['knowledge-namespaces'],
+    queryFn: () => knowledgeApi<NamespaceInfo[]>('/namespaces'),
+  })
+
+  const { data: config } = useQuery({
+    queryKey: ['knowledge-config'],
+    queryFn: () => knowledgeApi<{ enabled: boolean; supported_formats: string[]; accepts_no_extension?: boolean }>('/config'),
+  })
+  // Build the upload accept filter from the backend's advertised formats
+  // (single source of truth) so it never drifts from FileReader.SUPPORTED.
+  // Until config resolves, fall back to the parity-tested mirror of that list.
+  const supportedFormats = config?.supported_formats && config.supported_formats.length
+    ? config.supported_formats
+    : FALLBACK_SUPPORTED_FORMATS
+  const uploadAccept = supportedFormats.filter(Boolean).join(',')
+  const supportedFormatsDisplay = formatSupportedFormats(supportedFormats.filter(Boolean))
+  const acceptsNoExtension = config?.accepts_no_extension ?? true
+
+  const { data: sources = [] } = useQuery({
+    queryKey: ['knowledge-sources'],
+    queryFn: () => knowledgeApi<Source[]>('/sources'),
+    refetchInterval: (query) => {
+      const data = query.state.data
+      if (data?.some(s => displaySyncStatus(s) === 'syncing' || s.sync_status === 'active')) return 5000
+      return false
+    },
+  })
+
+  // Invalidate items when any source finishes scanning
+  const wasSyncingRef = useRef(false)
+  useEffect(() => {
+    const isSyncing = sources.some(s => displaySyncStatus(s) === 'syncing' || s.sync_status === 'active')
+    if (wasSyncingRef.current && !isSyncing) {
+      queryClient.invalidateQueries({ queryKey: ['knowledge-items'] })
+      queryClient.invalidateQueries({ queryKey: ['knowledge-stats'] })
+    }
+    wasSyncingRef.current = isSyncing
+  }, [sources, queryClient])
+
+  const { data: entityItems = [], error: entityItemsError } = useQuery({
+    queryKey: ['knowledge-entity-items', selectedEntity],
+    queryFn: () => knowledgeApi<KnowledgeItem[]>(`/entities/by-name/${encodeURIComponent(selectedEntity!)}/items`),
+    enabled: !!selectedEntity,
+  })
+
+  // One row per source that has at least one matching item, ordered the way the
+  // Sources tab orders them (most recently updated first) with the sourceless
+  // bucket last. Derived from /source-counts, so a source is never hidden just
+  // because its items fell on a later page.
+  const sourceRows = useMemo(() => {
+    if (!sourceFirst) return null
+    const counts = countsData?.counts ?? {}
+    // Explicit element type: rows for unknown or sourceless buckets carry no
+    // Source record, which inference from the first map alone would reject.
+    const rows: { sourceId: string; source: Source | undefined; count: number }[] = sources
+      .filter(s => (counts[s.id] ?? 0) > 0)
+      .map(s => ({ sourceId: s.id, source: s as Source | undefined, count: counts[s.id] }))
+    // Sources present in counts but missing from /sources (deleted row, stale
+    // cache) still get a row so their items remain reachable.
+    const known = new Set(sources.map(s => s.id))
+    for (const [sid, count] of Object.entries(counts)) {
+      if (sid !== NO_SOURCE && !known.has(sid)) rows.push({ sourceId: sid, source: undefined, count })
+    }
+    if (counts[NO_SOURCE]) rows.push({ sourceId: NO_SOURCE, source: undefined, count: counts[NO_SOURCE] })
+    return rows
+  }, [sourceFirst, countsData, sources])
+
+  // Filters forwarded to each group's scoped item fetch. Memoized because it is
+  // part of the group query key.
+  const groupFilters = useMemo(
+    () => ({ type: typeFilter, status: statusFilter, namespace: namespaceFilter }),
+    [typeFilter, statusFilter, namespaceFilter]
+  )
+
+  const ingestMutation = useMutation({
+    mutationFn: async ({ files, namespace }: { files: File[]; namespace: string }) => {
+      const jobs: IngestionJob[] = files.map(f => ({ name: f.name, status: 'uploading' }))
+      const batch = ingestion.start([...jobs])
+      try {
+        for (let i = 0; i < files.length; i++) {
+          const fd = new FormData()
+          fd.append('file', files[i])
+          try {
+            await knowledgeApi<{ job_id: string }>(`/ingest?namespace=${encodeURIComponent(namespace)}`, { method: 'POST', body: fd })
+            jobs[i] = { name: jobs[i].name, status: 'done' }
+          } catch (e: unknown) {
+            jobs[i] = { name: jobs[i].name, status: 'error', error: e instanceof Error ? e.message : undefined }
+          }
+          ingestion.update(batch, [...jobs])
+          // Refresh sources/items after each file so they appear immediately
+          queryClient.invalidateQueries({ queryKey: ['knowledge-sources'] })
+          queryClient.invalidateQueries({ queryKey: ['knowledge-items'] })
+        }
+      } finally {
+        ingestion.scheduleClear(batch)
+      }
+      return jobs
+    },
+    onSettled: () => {
+      queryClient.invalidateQueries({ queryKey: ['knowledge-items'] })
+      queryClient.invalidateQueries({ queryKey: ['knowledge-stats'] })
+      queryClient.invalidateQueries({ queryKey: ['knowledge-namespaces'] })
+      queryClient.invalidateQueries({ queryKey: ['knowledge-sources'] })
+    },
+  })
+
+  const handleFiles = (files: File[]) => {
+    ingestMutation.mutate({ files, namespace: uploadNamespace || 'default' })
+  }
+
+  // In flat search mode the page owns the items; in source-first mode the
+  // expanded groups do.
+  const visibleItems = useMemo(
+    () => (sourceFirst ? Object.values(visibleBySource).flat() : items),
+    [sourceFirst, visibleBySource, items]
+  )
+
+  // Selection is bounded to what is on screen. A group collapsing or paging
+  // away removes its items from `visibleItems`, so drop their IDs here too:
+  // otherwise a bulk Delete would act on items the user can no longer see.
+  useEffect(() => {
+    setSelectedItems(prev => {
+      if (prev.size === 0) return prev
+      const visible = new Set(visibleItems.map(i => i.id))
+      const kept = new Set([...prev].filter(id => visible.has(id)))
+      return kept.size === prev.size ? prev : kept
+    })
+  }, [visibleItems])
+
+  // Keyboard shortcuts
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement
+      // Composed-path aware: the caret may sit in a shadow-root editor whose
+      // events are retargeted to a plain host element by the time they arrive.
+      const editable = editableEventTarget(e)
+      if (editable) {
+        if (e.key === 'Escape') {
+          editable.blur()
+          e.preventDefault()
+        }
+        return
+      }
+
+      if (e.key === '/') {
+        e.preventDefault()
+        const input = searchRef.current?.querySelector('input')
+        input?.focus()
+      } else if (e.key === 'Escape') {
+        // The help dialog owns Escape while it is open, and it is the shared
+        // Modal that closes it now (bubble-phase window listener, registered
+        // when the dialog opened). This branch only has to keep the PRECEDENCE
+        // the chain below documents: one Escape must not both dismiss the help
+        // and clear the page's selection underneath it.
+        if (showHelp) return
+        if (selectedId) { setSelectedId(null); e.preventDefault() }
+        else if (selectedItems.size > 0) { setSelectedItems(new Set()); e.preventDefault() }
+      } else if (e.key === 'ArrowRight' && !e.altKey && !e.ctrlKey) {
+        // Arrow paging drives the flat search pager only; in source-first mode
+        // each group owns its own pager and `page` is unread. A focused tab
+        // claims the arrows for itself (preventDefault before this window
+        // listener sees the event), so the same press never also turns a page.
+        if (e.defaultPrevented) return
+        if (!sourceFirst && !selectedId && page < Math.ceil(total / limit)) { setPage(p => p + 1); e.preventDefault() }
+      } else if (e.key === 'ArrowLeft' && !e.altKey && !e.ctrlKey) {
+        if (e.defaultPrevented) return
+        if (!sourceFirst && !selectedId && page > 1) { setPage(p => p - 1); e.preventDefault() }
+      } else if (e.key === 'a' && (e.ctrlKey || e.metaKey) && tab === 'list' && !selectedId) {
+        if (listContainerRef.current?.contains(document.activeElement || target)) {
+          e.preventDefault()
+          // Only what is on screen: never a retained cache for a collapsed source.
+          setSelectedItems(new Set(visibleItems.map(i => i.id)))
+        }
+      }
+    }
+    window.addEventListener('keydown', handler)
+    return () => window.removeEventListener('keydown', handler)
+  }, [selectedId, page, total, limit, tab, selectedItems.size, showHelp, sourceFirst, visibleItems])
+
+  useEffect(() => {
+    setSelectedItems(new Set())
+  }, [page, query, typeFilter, statusFilter, namespaceFilter])
+
+  useEffect(() => {
+    if (selectedEntity && entitySectionRef.current) {
+      entitySectionRef.current.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
+    }
+  }, [selectedEntity])
+
+  const handleVisibleItemsChange = useCallback((sourceId: string, groupItems: KnowledgeItem[] | null) => {
+    setVisibleBySource(prev => {
+      if (groupItems === null) {
+        if (!(sourceId in prev)) return prev
+        const next = { ...prev }
+        delete next[sourceId]
+        return next
+      }
+      if (prev[sourceId] === groupItems) return prev
+      return { ...prev, [sourceId]: groupItems }
+    })
+  }, [])
+
+  const handleEntitySelect = useCallback((name: string) => {
+    setTab('graph')
+    setSelectedEntity(name)
+    setShowAutocomplete(false)
+  }, [])
+
+  // "The user has not narrowed anything" — every filter is still at its initial
+  // value. statusFilter starts at DEFAULT_STATUS_FILTER, so it must be compared
+  // against that default rather than tested for falsiness.
+  //
+  // namespaceFilter is part of this test because selecting a namespace that
+  // holds 0 items would otherwise render onboarding, and that branch replaces
+  // the filter bar, leaving no control to clear the filter with.
+  //
+  // Known gap: a library whose every item is archived also reports 0 active
+  // items, and both the list query and /namespaces are active-scoped, so it is
+  // indistinguishable from an empty library and shows onboarding. The Sources
+  // and Graph tabs stay mounted above this branch, so it is not a dead end.
+  const filtersPristine = !query && !typeFilter && !namespaceFilter && statusFilter === DEFAULT_STATUS_FILTER
+  const isEmpty = !loading && !listUnread && total === 0 && filtersPristine
+  const totalPages = Math.ceil(total / limit)
+
+  // Extracted so the onboarding branch can render it too. Onboarding fires when
+  // total === 0 under pristine filters, which includes a library whose every
+  // item is archived. Replacing the filter bar in that state would strand the
+  // user: statusFilter defaults to active, so the only way back to their
+  // content is to change it. Keeping one definition avoids the bar drifting
+  // between the two render sites.
+  const listFilterBar = (
+    <div className="flex gap-2 mb-3 flex-wrap relative" ref={searchRef}>
+      <div className="relative flex-1 min-w-[200px]">
+        <SearchInput placeholder={i18nT('pages.knowledge.index.search_knowledge_press_enter_to_search')} value={searchInput}
+          onChange={e => { setSearchInput((e.target as HTMLInputElement).value); setShowAutocomplete(true) }}
+          {...ime.bindEnter({
+            onEnter: () => { setQuery(searchInput); setPage(1) },
+            onFocus: () => setShowAutocomplete(true),
+            onBlur: () => setTimeout(() => setShowAutocomplete(false), 200),
+          })}
+        />
+        {showAutocomplete && searchInput.length >= 2 && (
+          <EntityAutocomplete query={searchInput} onSelect={handleEntitySelect} />
+        )}
+      </div>
+      {/* The "all" row of each filter is the empty string, the same value the
+          state initialises to for type and namespace. SimpleSelect routes ''
+          through an internal sentinel, so it stays a selectable option as long
+          as '' is present in `options` — which is why it leads each array and
+          takes its visible label from the matching `optionLabels` slot. */}
+      <SimpleSelect
+        options={['', ...ITEM_TYPES]}
+        optionLabels={[i18nT('pages.knowledge.index.all_types'), ...ITEM_TYPES.map(itemTypeLabel)]}
+        value={typeFilter}
+        onChange={v => { setTypeFilter(v); setPage(1) }}
+        aria-label={i18nT('pages.knowledge.index.filter_by_type')}
+      />
+      <SimpleSelect
+        options={['', ...STATUSES]}
+        optionLabels={[i18nT('pages.knowledge.index.all_statuses'), ...STATUSES.map(s => i18nT(STATUS_LABEL_KEY[s as keyof typeof STATUS_LABEL_KEY]))]}        value={statusFilter}
+        onChange={v => { setStatusFilter(v); setPage(1) }}
+        aria-label={i18nT('pages.knowledge.index.filter_by_status')}
+      />
+      {/* Floor the TRIGGER: the popup matches its width, and namespace names are
+          user data, so a placeholder-sized trigger would clip them. */}
+      <SimpleSelect
+        style={{ minWidth: 180 }}
+        options={['', ...namespaces.map(ns => ns.name)]}
+        optionLabels={[i18nT('pages.knowledge.index.all_namespaces'), ...namespaces.map(ns => `${ns.name} (${ns.count})`)]}
+        value={namespaceFilter}
+        onChange={v => { setNamespaceFilter(v); setPage(1) }}
+        aria-label={i18nT('pages.knowledge.index.filter_by_namespace')}
+      />
+    </div>
+  )
+
+  return (
+    <div className="flex flex-col h-full">
+      {!embedded && (
+        <div className="flex items-start sm:items-end justify-between gap-3 sm:gap-4 px-4 md:px-6 pt-2 pb-3">
+          <div className="min-w-0">
+            <div className="text-xl sm:text-2xl font-bold tracking-tight text-text-strong flex items-center gap-2">
+              <BookOpen size={22} className="shrink-0" /> {i18nT('pages.knowledge.index.knowledge_library')}
+            </div>
+            <div className="text-muted text-[13px] sm:text-sm mt-1">{i18nT('pages.knowledge.index.search_explore_and_manage_your_knowledge_base')}</div>
+          </div>
+          <div className="shrink-0">
+            <Btn onClick={() => setShowHelp(true)}><HelpCircle size={14} /> {i18nT('pages.knowledge.index.help')}</Btn>
+          </div>
+        </div>
+      )}
+
+      {showHelp && (
+        // The shared Modal owns the backdrop, Escape dismissal, the focus
+        // trap/restore, the scroll lock and the keyboard isolation this
+        // hand-rolled overlay lacked. `open` is constant because the help panel
+        // is conditionally mounted. The dialog keeps its accessible name from
+        // its own rendered title, which is the same string the removed <h3>
+        // carried, and Modal's header supplies the close button the panel used
+        // to hand-roll.
+        <Modal open onClose={() => setShowHelp(false)} title={ONBOARDING.title} maxWidth={448}>
+          <p className="text-sm text-muted mb-3">{ONBOARDING.description}</p>
+          <ol className="space-y-2">
+            {ONBOARDING.steps(supportedFormatsDisplay).map((s, i) => <li key={i} className="text-[13px] text-text flex gap-2"><span className="text-accent font-bold">{i + 1}.</span>{s}</li>)}
+          </ol>
+          <div className="mt-4 pt-3 border-t border-border">
+            <div className="text-[12px] font-medium text-text-strong mb-1">{i18nT('pages.knowledge.index.keyboard_shortcuts')}</div>
+            <div className="grid grid-cols-2 gap-1 text-[11px] text-muted">
+              <span><kbd className="px-1 bg-bg-elevated border border-border rounded">/</kbd> {i18nT('pages.knowledge.index.focus_search')}</span>
+              <span><kbd className="px-1 bg-bg-elevated border border-border rounded">{i18nT('pages.knowledge.index.esc')}</kbd> {i18nT('pages.knowledge.index.back_clear')}</span>
+              {/* Arrow glyphs are keycap symbols, not prose — no translation. */}
+              <span><kbd className="px-1 bg-bg-elevated border border-border rounded">←</kbd> <kbd className="px-1 bg-bg-elevated border border-border rounded">→</kbd> {i18nT('pages.knowledge.index.prev_next_page')}</span>
+              <span><kbd className="px-1 bg-bg-elevated border border-border rounded">{i18nT('pages.knowledge.index.ctrl_a')}</kbd> {i18nT('pages.knowledge.index.select_all')}</span>
+            </div>
+          </div>
+        </Modal>
+      )}
+
+      {/* Tabs — horizontally scrollable on narrow viewports so the active
+          underline never spills past the container. A WAI-ARIA tablist on
+          the shared roving-tab keyboard model, so the selected tab is
+          announced and the arrow keys move between tabs; the Help button
+          sits outside it because a tablist may only own tabs. */}
+      <div className="flex gap-1 px-4 md:px-6 border-b border-border overflow-x-auto">
+        <div role="tablist" aria-label={i18nT('pages.knowledge.index.knowledge_library')} className="flex gap-1">
+          {TABS.map((t, i) => (
+            <button key={t} type="button" role="tab" id={tabId(t)}
+              aria-selected={tab === t} aria-controls={TAB_PANEL_ID}
+              {...rovingTab(i)}
+              onClick={() => selectTab(t)}
+              className={`flex items-center gap-1.5 px-3 py-2 text-[13px] font-medium border-b-2 transition-all bg-transparent cursor-pointer shrink-0 whitespace-nowrap ${tab === t ? 'border-accent text-text font-semibold' : 'border-transparent text-muted hover:text-text'}`}>
+              {TAB_ICON[t]} {i18nT(TAB_LABEL_KEY[t])}
+            </button>
+          ))}
+        </div>
+        {embedded && (
+          <span className="ml-auto self-center shrink-0 pb-0.5">
+            <Btn onClick={() => setShowHelp(true)}><HelpCircle size={14} /> {i18nT('pages.knowledge.index.help')}</Btn>
+          </span>
+        )}
+      </div>
+
+      <div id={TAB_PANEL_ID} role="tabpanel" aria-labelledby={tabId(tab)}
+        className={`flex-1 px-4 md:px-6 py-4 min-h-0 ${tab === 'graph' ? 'flex flex-col' : 'overflow-y-auto'}`} ref={listContainerRef}>
+        <EmbeddingStatus />
+        {isEmpty && tab === 'list' ? (
+          <>
+            {listFilterBar}
+            <div className="flex flex-col items-center justify-center py-12 animate-rise" data-testid="knowledge-onboarding">
+              <BookOpen size={48} className="text-muted/20 mb-4" />
+              <h3 className="text-lg font-bold text-text-strong mb-1">{ONBOARDING.title}</h3>
+              <p className="text-sm text-muted mb-4 text-center max-w-md">{ONBOARDING.description}</p>
+              <button onClick={() => setTab('sources')} className="px-4 py-2 bg-accent text-accent-fg rounded-md text-sm hover:bg-accent/80 cursor-pointer">{i18nT('pages.knowledge.index.go_to_sources_to_upload_files')}</button>
+            </div>
+          </>
+        ) : tab === 'list' ? (
+          selectedId ? <DetailView itemId={selectedId} onBack={() => setSelectedId(null)} onEntityClick={handleEntitySelect} /> : (
+            <>
+              {listFilterBar}
+
+              {/* Mounted with no selection too: it owns the bulk failure notice. */}
+              <BulkActions
+                selectedIds={selectedItems}
+                items={visibleItems}
+                onDone={() => setSelectedItems(new Set())}
+                onActed={ids => setSelectedItems(prev => {
+                  const kept = new Set([...prev].filter(id => !ids.includes(id)))
+                  return kept.size === prev.size ? prev : kept
+                })}
+              />
+
+              <ErrorNotice
+                askAgent
+                className="mb-3"
+                testId="knowledge-list-load-error"
+                title={i18nT('pages.knowledge.index.list_load_failed')}
+                message={listError ? failureText(listError) : ''}
+              />
+
+              {loading ? <ContentSkeleton /> : listUnread ? null : sourceRows ? (
+                !sourceRows.length ? (
+                  <EmptyState icon={<Search size={40} />} title={i18nT('pages.knowledge.index.no_items_match_your_filters')} subtitle={i18nT('pages.knowledge.index.try_a_different_type_status_or_namespace')} />
+                ) : (
+                  <div className="space-y-2 mt-3">
+                    {sourceRows.map(row => (
+                      <SourceGroup
+                        key={row.sourceId}
+                        sourceId={row.sourceId}
+                        source={row.source}
+                        count={row.count}
+                        filters={groupFilters}
+                        onVisibleItemsChange={handleVisibleItemsChange}
+                        // A single source is opened by default: there is nothing
+                        // to choose between, so an extra click buys nothing.
+                        defaultOpen={sourceRows.length === 1}
+                        onItemClick={(id) => setSelectedId(id)}
+                        selectedItems={selectedItems}
+                        onSelect={(id, checked) => {
+                          setSelectedItems(prev => {
+                            const next = new Set(prev)
+                            if (checked) next.add(id)
+                            else next.delete(id)
+                            return next
+                          })
+                        }}
+                      />
+                    ))}
+                  </div>
+                )
+              ) : !items.length ? (
+                <EmptyState icon={<Search size={40} />} title={i18nT('pages.knowledge.index.no_items_match_your_search')} subtitle={i18nT('pages.knowledge.index.try_different_keywords_or_filters')} />
+              ) : (
+                <div className="space-y-2 mt-3">
+                  {items.map(item => (
+                    <ItemCard key={item.id} item={item} onClick={() => setSelectedId(item.id)}
+                      selected={selectedItems.has(item.id)}
+                      onSelect={(checked) => {
+                        setSelectedItems(prev => {
+                          const next = new Set(prev)
+                          if (checked) next.add(item.id)
+                          else next.delete(item.id)
+                          return next
+                        })
+                      }}
+                    />
+                  ))}
+                </div>
+              )}
+              {/* Top-level pager exists only for flat search results. In
+                  source-first mode each group owns its own pager. */}
+              {!sourceFirst && totalPages > 1 && (
+                <div className="flex items-center justify-center gap-3 mt-4 py-3 border-t border-border">
+                  <Btn disabled={page <= 1} onClick={() => setPage(p => p - 1)}>{i18nT('pages.knowledge.index.prev')}</Btn>
+                  <span className="text-[13px] text-text font-medium">{i18nT('pages.knowledge.index.page_of', { page: fmtNumber(page), pages: fmtNumber(totalPages) })}</span>
+                  <span className="text-[11px] text-muted">{i18nT('pages.knowledge.index.items_count', { count: total })}</span>
+                  <Btn disabled={page >= totalPages} onClick={() => setPage(p => p + 1)}>{i18nT('pages.knowledge.index.next')}</Btn>
+                </div>
+              )}
+            </>
+          )
+        ) : tab === 'graph' ? (
+          <div className="flex flex-col gap-4 flex-1 min-h-0">
+            <Suspense fallback={<ContentSkeleton />}>
+              <KnowledgeGraph highlightEntity={selectedEntity} onSelectEntity={(name) => {
+                setSelectedEntity(name)
+              }} />
+            </Suspense>
+            {selectedEntity && (
+              <div ref={entitySectionRef} className="border border-accent/30 rounded-lg p-4 bg-accent/5">
+                <div className="flex items-center gap-2 mb-2">
+                  <span className="text-sm font-medium text-text-strong">{i18nT('pages.knowledge.index.items_mentioning')} <Badge variant="aim">{selectedEntity}</Badge></span>
+                  <Btn aria-label={i18nT('pages.knowledge.index.clear_entity_selection')} onClick={() => { setSelectedEntity(null) }}><X size={12} /></Btn>
+                </div>
+                {/* Above any list from an earlier read, so a failed refresh is not passed off as current. */}
+                <ErrorNotice
+                  askAgent
+                  className="mb-2"
+                  testId="knowledge-entity-items-error"
+                  title={i18nT('pages.knowledge.index.entity_items_load_failed')}
+                  message={entityItemsError ? failureText(entityItemsError) : ''}
+                />
+                {entityItemsError && entityItems.length === 0 ? null : entityItems.length === 0 ? <span className="text-[13px] text-muted">{i18nT('pages.knowledge.index.no_items_found')}</span> : (
+                  <div className="flex flex-col gap-1">
+                    {entityItems.map(it => (
+                      <Clickable key={it.id} onClick={() => { setSelectedId(it.id); setTab('list') }}
+                        className="text-[13px] text-accent hover:underline">{it.title}</Clickable>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        ) : tab === 'settings' ? (
+          <SettingsTab />
+        ) : (
+          <SourcesList onIngest={handleFiles} uploadNamespace={uploadNamespace} setUploadNamespace={setUploadNamespace} namespaces={namespaces} ingestionJobs={ingestion.jobs} uploadAccept={uploadAccept} supportedFormatsDisplay={supportedFormatsDisplay} acceptsNoExtension={acceptsNoExtension} />
+        )}
+      </div>
+
+      {/* Stats bar */}
+      {stats && (
+        // Each entry is a DIV, not a SPAN, so the render-time i18n scanner reads
+        // them as separate inline runs. Its run walk treats any <span> as inline
+        // by tag name even when flex blockifies it, so span siblings grade as one
+        // run assembled from several catalog keys — the signal for a sentence
+        // spliced across keys, which a translator cannot reorder. These are four
+        // independent counts, not one sentence, and as flex items they are
+        // already block-level; the tag is what says so. Rendering is unchanged.
+        <div className="border-t border-border px-4 md:px-6 py-2 flex gap-x-3 gap-y-0.5 sm:gap-4 flex-wrap text-[11px] sm:text-[12px] text-muted shrink-0">
+          <div className="whitespace-nowrap">{i18nT('pages.knowledge.index.stats_items', { count: stats.items })}</div>
+          <div className="whitespace-nowrap">{i18nT('pages.knowledge.index.stats_entities', { count: stats.entities })}</div>
+          <div className="whitespace-nowrap">{i18nT('pages.knowledge.index.stats_relations', { count: stats.relations })}</div>
+          <div className="whitespace-nowrap">{i18nT('pages.knowledge.index.stats_sources', { count: stats.sources })}</div>
+          {stats.embeddings?.enabled ? (
+            <div className={`whitespace-nowrap ${stats.embeddings.available ? 'text-ok' : 'text-warn'}`} title={stats.embeddings.available ? `${stats.embeddings.model} — ${stats.embeddings.embedded_items} embedded` : i18nT('pages.knowledge.index.embedding_model_loading', { name: stats.embeddings.model })}>
+              ● {stats.embeddings.available ? i18nT('pages.knowledge.index.embeddings_count', { value: stats.embeddings.embedded_items }) : i18nT('pages.knowledge.index.embeddings_loading')}
+            </div>
+          ) : (
+            <div className="text-muted whitespace-nowrap" title={i18nT('pages.knowledge.index.embedding_model_is_downloading_in_the_background')}>{i18nT('pages.knowledge.index.embeddings_initializing')}</div>
+          )}
+          {tab === 'list' && <div className="ml-auto text-[10px] hidden sm:block">{i18nT('pages.knowledge.index.to_search_esc_to_back_to_page')}</div>}
+        </div>
+      )}
+    </div>
+  )
+}

@@ -1,0 +1,54 @@
+"""Owner-only worker-kit routes: ``/api/agents/{name}/worker-kit``.
+
+``GET`` reads the crewmate's own file revision; ``POST .../preview`` says what
+adding another agent's abilities would add to that file, and what it skips as
+already present; ``PUT`` adds them, once, after that preview. All disk work
+runs off the event loop through :mod:`kiro_crew.mate_worker_kit`.
+"""
+
+from __future__ import annotations
+
+from aiohttp import web
+
+from kiro_crew.dashboard.chat_utils import drained_to_thread
+from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+from kiro_crew.mate_worker_kit import WorkerKitError
+
+
+async def api_member_worker_kit(request: web.Request) -> web.Response:
+    from kiro_crew import mate_worker_kit
+
+    operation = "member_worker_kit." + request.method.lower()
+    denied = await require_owner_dashboard_request(request, operation)
+    if denied is not None:
+        return denied
+    name = request.match_info["name"]
+    try:
+        if request.method == "GET":
+            return web.json_response(await drained_to_thread(mate_worker_kit.view, name))
+        try:
+            body = await request.json()
+        except ValueError:
+            raise WorkerKitError("invalid_json", 400) from None
+        if request.method == "POST":
+            return web.json_response(await drained_to_thread(mate_worker_kit.preview, name, body))
+        from kiro_crew.dashboard.handlers.agents import _get_config_lock
+
+        async with _get_config_lock():
+            result, policy_changed = await drained_to_thread(
+                mate_worker_kit.apply_reporting, name, body
+            )
+        request.app["state"].push_refresh("agents")
+        if policy_changed:
+            # A live worker keeps the KAS permission batch it registered, so a
+            # new restriction holds only once it is reloaded onto the file
+            # (``crewmate_worker_reload``; a busy one at its turn end).
+            from kiro_crew.dashboard.crewmate_worker_reload import schedule_reload_workers
+
+            schedule_reload_workers(request.app["state"], name)
+        return web.json_response(result)
+    except WorkerKitError as exc:
+        # ``detail`` names the field or rule a refusal is about ("" when none).
+        return web.json_response(
+            {"error": exc.code, "code": exc.code, "detail": exc.detail}, status=exc.status
+        )

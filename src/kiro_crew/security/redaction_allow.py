@@ -1,0 +1,277 @@
+"""Hosts a reader allowed long queries for, one workspace at a time.
+
+The dashboard's *Allow for this host* writes here after the reader confirms.
+An allowed host skips ONLY the query-length and base64 heuristics of the
+exfiltration check (the same relaxation the platform's exact-host exemption
+gives); every credential check still runs, so an allowed host never lets a
+secret through. The list is read only when a reply is SHOWN: every saved
+reply keeps each blocked link as a placeholder with its record, and the
+display puts an allowed host's address back. So what is saved never depends
+on this list, a list that has not loaded yet only shows links blocked a
+little longer, and revoking a host re-blocks every link on it.
+
+An agent able to edit this list could allow the host it wants to send
+conversation data to, so the file lives in the ``redaction-allow`` directory,
+which the sandbox seals read-only (``sandbox._CREW_READONLY_LEAVES``): only the
+gateway's own routes write it. Every failure to read degrades to "no host
+allowed", which means more redaction, the safe direction.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import re
+import threading
+from pathlib import Path
+
+from kiro_crew.atomic_write import replace_with_retry
+from kiro_crew.config.paths import config_dir
+from kiro_crew.security.exfil import (
+    _OAUTH_EXTENSION_HOST_RE,
+    _log_operator_list_use,
+    forget_allowed_host_use,
+)
+
+logger = logging.getLogger(__name__)
+
+_LOCK = threading.RLock()
+# A lowercase DNS name, never an IP literal: an address names one machine, often
+# the reader's own loopback. Shared with the OAuth extension list; a file entry
+# of another shape is dropped on load.
+_HOST_RE = _OAUTH_EXTENSION_HOST_RE
+# A browser maps every ``*.localhost`` name to loopback without a lookup
+# (RFC 6761 section 6.3), so it names the reader's own machine like an IP does.
+# Refused here, not in the shared regex, so the OAuth list's shape is unchanged.
+LOOPBACK_SUFFIX = ".localhost"
+# DNS caps a label at 63 octets. The shared regex leaves the top-level label
+# open-ended, so the cap sits here, as the list checked hosts before sharing it.
+MAX_TLD_LEN = 63
+#: How many dropped entries one load's audit event names (the count is exact).
+_DROP_REPORT_MAX = 50
+_WORKSPACE_RE = re.compile(r"^[A-Za-z0-9 _.-]{1,128}$")
+MAX_HOSTS_PER_WORKSPACE = 200
+#: How many workspaces the list holds. With the per-workspace cap it bounds the
+#: whole file and its in-memory snapshot, on load and on every insertion.
+MAX_WORKSPACES = 64
+DEFAULT_WORKSPACE = "default"
+
+_path_override: Path | None = None
+
+
+def _path() -> Path:
+    if _path_override is not None:
+        return _path_override
+    return config_dir() / "redaction-allow" / "hosts.json"
+
+
+def normalize_workspace(workspace: str | None) -> str | None:
+    """The key a workspace is stored under, or None for a name it cannot hold.
+
+    No workspace means the default one. Any other name is kept exactly or not
+    at all: folding an unsupported name into another workspace's key would let
+    a host allowed there apply to workspaces nobody allowed it in.
+    """
+    ws = (workspace or "").strip()
+    if not ws:
+        return DEFAULT_WORKSPACE
+    return ws if _WORKSPACE_RE.match(ws) else None
+
+
+def _refusal(host: object) -> str | None:
+    """Why ``host`` cannot be allowed, or None when it can."""
+    if not isinstance(host, str) or not _HOST_RE.match(host):
+        return "not_a_dns_name"
+    if host.endswith(LOOPBACK_SUFFIX):
+        return "loopback_name"
+    if len(host.rsplit(".", 1)[-1]) > MAX_TLD_LEN:
+        return "not_a_dns_name"
+    return None
+
+
+def valid_host(host: object) -> bool:
+    return _refusal(host) is None
+
+
+# The gateway is the list's only writer, so it holds the list in memory: the
+# render paths read this snapshot and never touch the disk on the event loop.
+# Nothing loads it at boot: the first read starts a background thread and
+# answers "no host allowed" until that thread lands -- more redaction, never
+# less. A write reads the file itself under the lock and replaces the snapshot
+# whole. The snapshot is keyed by the file it was read from, so a different
+# config home reads afresh.
+_snapshot: tuple[Path, dict[str, list[str]]] | None = None
+_loading = False
+_load_thread: threading.Thread | None = None
+
+
+def preload() -> None:
+    """Read the list from disk into the snapshot. Call off the event loop."""
+    global _snapshot, _loading
+    path = _path()
+    # Under the writers' lock, so a write cannot land between this read and
+    # the snapshot it fills.
+    with _LOCK:
+        _snapshot = (path, _load(path))
+        _loading = False
+
+
+def _background_preload() -> None:
+    global _loading
+    try:
+        preload()
+    finally:
+        _loading = False
+
+
+def _start_background_load() -> None:
+    global _loading, _load_thread
+    with _LOCK:
+        if _loading:
+            return
+        _loading = True
+        _load_thread = threading.Thread(
+            target=_background_preload, name="redaction-allow-load", daemon=True
+        )
+        _load_thread.start()
+
+
+def _current() -> dict[str, list[str]]:
+    snap = _snapshot
+    if snap is None or snap[0] != _path():
+        _start_background_load()
+        return {}
+    return snap[1]
+
+
+def _read_for_write() -> dict[str, list[str]]:
+    """The list a write builds on. Call with ``_LOCK`` held.
+
+    Always the file's real contents: a write that started from the empty
+    answer ``_current`` gives while the background read is pending would
+    replace the file with that empty list and lose every entry in it.
+    """
+    snap = _snapshot
+    if snap is None or snap[0] != _path():
+        preload()
+        snap = _snapshot
+    return {ws: list(hosts) for ws, hosts in (snap[1] if snap is not None else {}).items()}
+
+
+def _load(path: Path) -> dict[str, list[str]]:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, list[str]] = {}
+    dropped: list[dict[str, str]] = []
+    count = 0
+    for ws, hosts in raw.items():
+        if len(out) >= MAX_WORKSPACES:
+            break
+        if isinstance(ws, str) and _WORKSPACE_RE.match(ws) and isinstance(hosts, list):
+            kept = []
+            for h in hosts:
+                reason = _refusal(h)
+                if reason is None:
+                    kept.append(h)
+                    continue
+                count += 1
+                if len(dropped) < _DROP_REPORT_MAX:
+                    shown = h[:253] if isinstance(h, str) else type(h).__name__
+                    dropped.append({"workspace": ws, "host": shown, "reason": reason})
+            kept = kept[:MAX_HOSTS_PER_WORKSPACE]
+            if kept:
+                out[ws] = kept
+    if count:
+        _report_dropped(path, count, dropped)
+    return out
+
+
+# Each file's drops are reported once per process: the list is re-read on
+# every write and on a config-home change, and an unchanged file drops the same
+# entries each time. Bounded by the config homes one process reads.
+_DROPS_REPORTED: set[Path] = set()
+
+
+def _report_dropped(path: Path, count: int, dropped: list[dict[str, str]]) -> None:
+    """Log and SEL-audit entries a load refused, so a narrowed list is visible."""
+    if path in _DROPS_REPORTED:
+        return
+    _DROPS_REPORTED.add(path)
+    logger.warning("allowed-hosts list: dropped %d entries no longer allowed", count)
+    meta = {"count": count, "dropped": dropped}
+    _log_operator_list_use(
+        "redaction.allowed_hosts.dropped_invalid",
+        "redaction_allow_load",
+        ",".join(sorted({d["host"] for d in dropped})),
+        lambda: meta,
+        outcome="removed",
+    )
+
+
+def _write(data: dict[str, list[str]]) -> None:
+    path = _path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+    os.chmod(tmp, 0o600)
+    replace_with_retry(tmp, path)
+    global _snapshot
+    _snapshot = (path, {ws: list(hosts) for ws, hosts in data.items()})
+
+
+def allowed_hosts_for(workspace: str | None) -> frozenset[str]:
+    """The hosts allowed in ``workspace``; empty on any read failure."""
+    ws = normalize_workspace(workspace)
+    return frozenset(_current().get(ws, ())) if ws is not None else frozenset()
+
+
+def list_allowed() -> dict[str, list[str]]:
+    """Every workspace's hosts, read from the file. Call off the event loop."""
+    with _LOCK:
+        return _read_for_write()
+
+
+def allow_host(workspace: str | None, host: str) -> bool:
+    """Allow ``host`` in ``workspace``. False when the host or workspace name is
+    off-shape, the workspace's list is full, or the list already holds
+    :data:`MAX_WORKSPACES` other workspaces."""
+    host = host.lower()
+    ws = normalize_workspace(workspace)
+    if not valid_host(host) or ws is None:
+        return False
+    with _LOCK:
+        data = _read_for_write()
+        if ws not in data and len(data) >= MAX_WORKSPACES:
+            return False
+        hosts = data.setdefault(ws, [])
+        if host in hosts:
+            return True
+        if len(hosts) >= MAX_HOSTS_PER_WORKSPACE:
+            return False
+        hosts.append(host)
+        _write(data)
+    return True
+
+
+def revoke_host(workspace: str | None, host: str) -> bool:
+    """Remove ``host`` from ``workspace``. True when it was there."""
+    host = host.lower()
+    ws = normalize_workspace(workspace)
+    if ws is None:
+        return False
+    with _LOCK:
+        data = _read_for_write()
+        hosts = data.get(ws, [])
+        if host not in hosts:
+            return False
+        hosts.remove(host)
+        if not hosts:
+            data.pop(ws, None)
+        _write(data)
+    forget_allowed_host_use(host)
+    return True

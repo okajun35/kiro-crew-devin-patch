@@ -1,0 +1,116 @@
+[
+  {
+    "agent_capabilities": {
+      "loadSession": true,
+      "mcpCapabilities": {
+        "http": true,
+        "sse": true
+      },
+      "promptCapabilities": {
+        "embeddedContext": true,
+        "image": true
+      },
+      "sessionCapabilities": {
+        "close": {},
+        "fork": {},
+        "list": {},
+        "resume": {}
+      }
+    },
+    "agent_version": "1.19.1",
+    "frame": "response",
+    "id": 1,
+    "protocol_version": 1
+  },
+  {
+    "action": "update",
+    "events": [
+      {
+        "is_shell": true,
+        "kind": "tool_call",
+        "raw_tool_params": {
+          "cwd": "<cwd>"
+        },
+        "title": "bash",
+        "tool_call_id": "call_wfvrm3ls",
+        "tool_input": "{\n  \"cwd\": \"<cwd>\"\n}",
+        "tool_kind": "execute",
+        "wire_title": "bash"
+      }
+    ],
+    "frame": "session/update",
+    "session_update": "tool_call"
+  },
+  {
+    "action": "update",
+    "events": [
+      {
+        "is_shell": true,
+        "kind": "tool_call_update",
+        "raw_tool_params": {
+          "command": "echo kirocrew-opencode-live",
+          "timeout": "null",
+          "workdir": "null"
+        },
+        "title": "echo kirocrew-opencode-live",
+        "tool_call_id": "call_wfvrm3ls",
+        "tool_input": "{\n  \"command\": \"echo kirocrew-opencode-live\",\n  \"timeout\": \"null\",\n  \"workdir\": \"null\"\n}",
+        "tool_kind": "execute",
+        "wire_title": "echo kirocrew-opencode-live"
+      }
+    ],
+    "frame": "session/update",
+    "session_update": "tool_call_update"
+  },
+  {
+    "action": "update",
+    "events": [
+      {
+        "kind": "tool_result",
+        "tool_call_id": "call_wfvrm3ls",
+        "tool_output": "The bash tool was called with invalid arguments: SchemaError(Expected number | undefined, got \"null\"\n  at [\"timeout\"]).\nPlease rewrite the input so it satisfies the expected schema.",
+        "tool_output_bytes": 181,
+        "tool_output_digest": "d74fcd9914976297027cb8c3497b2b67c9907a54f6a61163b2d4ebe7c2be3641",
+        "tool_status": "failed"
+      },
+      {
+        "is_shell": true,
+        "kind": "tool_call_update",
+        "raw_tool_params": {
+          "command": "echo kirocrew-opencode-live",
+          "timeout": "null",
+          "workdir": "null"
+        },
+        "title": "echo kirocrew-opencode-live",
+        "tool_call_id": "call_wfvrm3ls",
+        "tool_input": "{\n  \"command\": \"echo kirocrew-opencode-live\",\n  \"timeout\": \"null\",\n  \"workdir\": \"null\"\n}",
+        "tool_kind": "execute",
+        "wire_title": "echo kirocrew-opencode-live"
+      }
+    ],
+    "frame": "session/update",
+    "session_update": "tool_call_update"
+  },
+  {
+    "action": "update",
+    "events": [],
+    "frame": "session/update",
+    "session_update": "usage_update",
+    "usage": [
+      2399,
+      16384
+    ],
+    "usage_cost": 0.0
+  },
+  {
+    "frame": "response",
+    "id": 3,
+    "prompt_tokens": [
+      49,
+      78,
+      2350,
+      0
+    ],
+    "stop_reason": "end_turn"
+  }
+]
