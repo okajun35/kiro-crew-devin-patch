@@ -22,12 +22,19 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=("check", "apply", "check-reverse", "reverse"))
     parser.add_argument("checkout", type=Path)
+    parser.add_argument(
+        "--bot-only", action="store_true",
+        help="Apply only the Bot addon to the originally published Devin base patch",
+    )
     args = parser.parse_args()
     root = Path(__file__).resolve().parent
     manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
-    patch = root / manifest["patch"]
+    selection = manifest["bot_addon"] if args.bot_only else {
+        "patch": manifest["patch"], "sha256": manifest["patch_sha256"]
+    }
+    patch = root / selection["patch"]
     digest = hashlib.sha256(patch.read_bytes()).hexdigest()
-    if digest != manifest["patch_sha256"]:
+    if digest != selection["sha256"]:
         parser.exit(1, "Patch checksum mismatch; stopped.\n")
     target = args.checkout.resolve()
     try:
