@@ -1,0 +1,74 @@
+{
+  "backend": "devin",
+  "status": "experimental patch; Agent and Bot operation verified",
+  "base": "6de3b0aae57a8406ef30b39a40b3a5eef99321f5",
+  "tested_devin_cli": "3000.12.17",
+  "patch_sha256": "4848f6bfccbd774587787a87b62c23b92010c8e687a6055ad4c855023f0e0b43",
+  "validation": {
+    "backend_tests_passed": 1016,
+    "frontend_tests_passed": 149,
+    "live": "ACP handshake, advertised models, prompt, resume, MCP, Crew permission rejection and approval; user confirmed main dashboard works",
+    "live_bot": {
+      "pin": "accepted",
+      "saved_spec": "confirmed",
+      "gateway_calls": [
+        "session_status",
+        "panel_templates"
+      ],
+      "credential_transport": "process-bound IPC under the Crew OS mask",
+      "shell_rejection": "no file created",
+      "resume": "confirmed after process restart",
+      "worker": "isolated Bot echo tool and merged prompt confirmed"
+    },
+    "frontend_build": "passed",
+    "docs_lint": "passed",
+    "platform": "Linux",
+    "user_confirmation": {
+      "date": "2026-11-08",
+      "agent": "operation confirmed by user",
+      "bot": "operation confirmed by user"
+    }
+  },
+  "new_files": [
+    "scripts/convert_devin_member_capture.py",
+    "scripts/drive_devin_gate.py",
+    "scripts/probe_devin_acp.py",
+    "scripts/probe_devin_member.py",
+    "src/kiro_crew/acp/harness/devin.py",
+    "src/kiro_crew/acp/harness/devin_mcp.py",
+    "src/kiro_crew/agent_sdk/gate_extensions/devin/bridge.py",
+    "src/kiro_crew/agent_sdk/gate_extensions/devin/hook.py",
+    "src/kiro_crew/providers/mirrors/devin.py",
+    "test/fixtures/acp_frames/devin/mcp-stdio-live.expected.json",
+    "test/fixtures/acp_frames/devin/mcp-stdio-live.jsonl",
+    "test/fixtures/acp_frames/devin/member-dispatch-live.expected.json",
+    "test/fixtures/acp_frames/devin/member-dispatch-live.jsonl",
+    "test/fixtures/acp_frames/devin/member-panel-mount-live.expected.json",
+    "test/fixtures/acp_frames/devin/member-panel-mount-live.jsonl",
+    "test/fixtures/acp_frames/devin/member-spec-projection-live.expected.json",
+    "test/fixtures/acp_frames/devin/member-spec-projection-live.jsonl",
+    "test/fixtures/acp_frames/devin/permission-reject-live.expected.json",
+    "test/fixtures/acp_frames/devin/permission-reject-live.jsonl",
+    "test/fixtures/acp_frames/devin/worker-kit-live.expected.json",
+    "test/fixtures/acp_frames/devin/worker-kit-live.jsonl",
+    "test/test_acp_backend_devin.py",
+    "test/test_devin_capture_driver.py",
+    "test/test_devin_mcp_wire.py",
+    "test/test_devin_member_ipc.py",
+    "test/test_devin_member_ipc_e2e.py",
+    "test/test_devin_saved_spec.py",
+    "test/test_member_mount_devin.py"
+  ],
+  "upstream": "https://github.com/kirodotdev/KiroCrew",
+  "patch": "patches/devin.patch",
+  "licenses": {
+    "original_repository_material": "MIT",
+    "upstream_derived_material": "Apache-2.0"
+  },
+  "bot_addon": {
+    "patch": "patches/devin-bot.patch",
+    "sha256": "a799e68ad42de244dabdb5a7e2182ea433dbf1bb66cc9ee71e190f54160b22c4",
+    "requires_base_patch_sha256": "0ba06b0483fa7dee29092a60b9ff46dcfec8f40f95f756847ee668ae033f61bd"
+  },
+  "archived_base_patch": "patches/devin-base.patch"
+}
