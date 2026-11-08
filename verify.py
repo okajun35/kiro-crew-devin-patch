@@ -10,7 +10,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 FILES = {
-    '.gitattributes', '.gitignore', 'LICENSE', 'README.md', 'result.md',
+    '.gitattributes', '.gitignore', 'LICENSE', 'README.md', 'README.ja.md',
+    'result.md', 'result.ja.md',
     'manifest.json', 'manage.py', 'verify.py',
 }
 

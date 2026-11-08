@@ -1,21 +1,23 @@
-# 動作確認結果
+English | [日本語](result.ja.md)
 
-**Agent・Bot ともに動作確認済みです。**
+# Verification results
 
-| 対象 | 結果 | 確認内容・根拠 |
+**Agent and Bot operation are both confirmed.**
+
+| Area | Result | What was checked and the basis |
 | --- | --- | --- |
-| Agent | 動作確認済み | ユーザー環境で動作確認済み（2026年11月8日の申告）。隔離環境でも ACP ハンドシェイク、モデル一覧、プロンプト、再開を確認 |
-| Bot | 動作確認済み | ユーザー環境で動作確認済み（2026年11月8日の申告）。隔離環境でも選択・保存、保存した設定の照合、Bot用MCP・パネルの認証を確認 |
-| 実行権限 | 確認済み | 実DevinとAcpClientで都度承認・拒否を確認。拒否したシェル操作はファイルを作成しない |
-| セッション再開 | 確認済み | プロセス再起動後の再開と、保存済みBot設定の照合を確認 |
-| ワーカー | 確認済み | 隔離したテスト用Botで、専用echoサーバーとマージされたプロンプトを確認 |
-| 自動テスト | 通過 | 関連バックエンド1,016件、Dashboard・翻訳関連149件 |
-| ビルド・静的検査 | 通過 | Frontendビルド、変更したPythonの型チェック、ドキュメント検査 |
-| パッチ | 確認済み | 一括適用と基盤＋Bot追加分が同じコードになること、両方の逆適用、チェックサムを確認 |
+| Agent | Confirmed | Confirmed in the user's environment (self-reported, 2026-11-08). In an isolated environment: ACP handshake, model list, prompt, and resume |
+| Bot | Confirmed | Confirmed in the user's environment (self-reported, 2026-11-08). In an isolated environment: selection and saving, checking the saved settings, and authentication of Bot MCP and panels |
+| Permissions | Confirmed | Per-call approval and rejection with a real Devin and AcpClient. A rejected shell command creates no file |
+| Session resume | Confirmed | Resume after a process restart, and checking of the saved Bot settings |
+| Worker | Confirmed | A dedicated echo server and the merged prompt in an isolated test Bot |
+| Automated tests | Pass | 1,016 related backend tests and 149 Dashboard and translation tests |
+| Build and static checks | Pass | Frontend build, type check of the changed Python, and docs lint |
+| Patches | Confirmed | The combined patch and foundation plus Bot addition produce the same code; both reverse cleanly; checksums match |
 
-対応Devin CLIは `3000.12.17`、隔離環境の検証OSはLinuxです。
-他OSと、READMEに記載した未対応機能は今回の動作確認の対象に含みません。
-「実験的パッチ」という位置付けは、公式サポートや全機能対応を意味しないために残しています。
+The supported Devin CLI is `3000.12.17`, and the isolated environment ran Linux.
+Other operating systems and the unsupported features listed in the README are outside this verification.
+The "experimental patch" label stays because it does not mean official support or full feature coverage.
 
-ユーザー環境の確認結果はユーザーからの申告、隔離環境の結果は実施した検証の記録です。
-このリポジトリには、個人のBot・MCP接続先の記録ではなく、隔離したテスト用データを収録します。
+Results from the user's environment are the user's own report. Results from the isolated environment are records of the checks that were run.
+This repository contains isolated test data, not records of personal Bots or MCP endpoints.
